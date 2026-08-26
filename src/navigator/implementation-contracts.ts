@@ -93,7 +93,7 @@ export const navigatorImplementationResultSchema = z.object({
   capabilityOutcomes: z.array(capabilityOutcomeSchema).min(1).max(16),
 }).strict();
 
-const reviewFindingSchema = z.object({
+export const navigatorReviewFindingSchema = z.object({
   ruleId: identifierSchema,
   severity: z.enum(["critical", "high", "medium", "low"]),
   summary: boundedTextSchema,
@@ -105,7 +105,7 @@ export const navigatorCodeReviewResultSchema = z.object({
   reviewedHeadSha: gitShaSchema,
   outcome: z.enum(["passed", "findings"]),
   summary: boundedTextSchema,
-  findings: z.array(reviewFindingSchema).max(128),
+  findings: z.array(navigatorReviewFindingSchema).max(128),
   capabilityOutcomes: z.array(capabilityOutcomeSchema).min(1).max(16),
 }).strict().superRefine((result, context) => {
   if ((result.outcome === "passed") !== (result.findings.length === 0)) {
@@ -124,6 +124,60 @@ export const navigatorTicketWorkerResultSchema = z.discriminatedUnion("kind", [
 
 export type NavigatorTicketWorkerResult = Readonly<z.infer<typeof navigatorTicketWorkerResultSchema>>;
 
+export const navigatorTicketRepairSnapshotSchema = z.object({
+  kind: z.literal("navigator_ticket_repair_snapshot"),
+  snapshotId: identifierSchema,
+  digest: sha256Schema,
+  jobId: identifierSchema,
+  sliceId: identifierSchema,
+  ticket: artifactBindingSchema,
+  reviewAttemptId: identifierSchema,
+  reviewedHeadSha: gitShaSchema,
+  reviewResultDigest: sha256Schema,
+  gitObservationDigest: sha256Schema,
+  findings: z.array(navigatorReviewFindingSchema).min(1).max(128),
+  evidenceRefs: requiredEvidenceRefsSchema,
+  createdAt: z.number().int().min(0),
+}).strict();
+
+export type NavigatorTicketRepairSnapshot = Readonly<z.infer<typeof navigatorTicketRepairSnapshotSchema>>;
+
+const repairProposalBase = {
+  basedOn: z.object({ snapshotId: identifierSchema, digest: sha256Schema }).strict(),
+  objective: boundedTextSchema,
+  evidenceRefs: requiredEvidenceRefsSchema,
+};
+
+export const navigatorTicketRepairProposalSchema = z.discriminatedUnion("kind", [
+  z.object({
+    ...repairProposalBase,
+    kind: z.literal("implementation"),
+    taskEvidence: taskEvidenceSchema,
+  }).strict(),
+  z.object({ ...repairProposalBase, kind: z.literal("diagnosis") }).strict(),
+  z.object({ ...repairProposalBase, kind: z.literal("research") }).strict(),
+  z.object({ ...repairProposalBase, kind: z.literal("owner_boundary") }).strict(),
+]);
+
+export type NavigatorTicketRepairProposal = Readonly<z.infer<typeof navigatorTicketRepairProposalSchema>>;
+
+export const navigatorGitObservationSchema = z.object({
+  kind: z.literal("navigator_git_observation"),
+  worktreeId: identifierSchema,
+  branch: identifierSchema,
+  headSha: gitShaSchema,
+  baseHeadSha: gitShaSchema,
+  baseHeadIsAncestor: z.boolean(),
+  comparisonBaseHeadSha: gitShaSchema,
+  comparisonBaseHeadIsAncestor: z.boolean(),
+  clean: z.boolean(),
+  changedPaths: z.array(projectPathSchema).max(512),
+  evidenceRef: z.string().trim().min(1).max(1_024),
+  observedAt: z.number().int().min(0),
+}).strict();
+
+export type NavigatorGitObservation = Readonly<z.infer<typeof navigatorGitObservationSchema>>;
+
 export const navigatorPullRequestRequestSchema = z.object({
   operationId: identifierSchema,
   jobId: identifierSchema,
@@ -132,8 +186,18 @@ export const navigatorPullRequestRequestSchema = z.object({
   headSha: gitShaSchema,
   title: z.string().trim().min(1).max(256),
   body: z.string().trim().min(1).max(65_536),
+  gitObservation: navigatorGitObservationSchema,
+  gitObservationDigest: sha256Schema,
   evidenceRefs: requiredEvidenceRefsSchema,
-}).strict();
+}).strict().superRefine((request, context) => {
+  if (navigatorJsonDigest(request.gitObservation) !== request.gitObservationDigest) {
+    context.addIssue({
+      code: "custom",
+      path: ["gitObservationDigest"],
+      message: "pull request Git observation digest must match its immutable evidence",
+    });
+  }
+});
 
 export type NavigatorPullRequestRequest = Readonly<z.infer<typeof navigatorPullRequestRequestSchema>>;
 
@@ -145,20 +209,26 @@ export type NavigatorPullRequestRecord = Readonly<{
   headSha: string;
 }>;
 
-export type NavigatorTicketStepContract = Readonly<{
-  id: string;
-  revision: number;
-  skillId: "implement" | "code-review";
-  freshContext: true;
-  codeWriting: boolean;
-  resourceClass: "managed_integration_worktree";
-  resultSchema: "navigator-implementation-result-v1" | "navigator-code-review-result-v1";
-  mandatoryEvidence: readonly string[];
-  modelPools: readonly ("standard" | "strong")[];
-  timeoutMs: number;
-  maximumResultBytes: number;
-  digest: string;
-}>;
+export const navigatorTicketStepContractSchema = z.object({
+  id: identifierSchema,
+  revision: z.number().int().positive(),
+  skillId: z.enum(["implement", "code-review"]),
+  freshContext: z.literal(true),
+  codeWriting: z.boolean(),
+  resourceClass: z.literal("managed_integration_worktree"),
+  resultSchema: z.enum(["navigator-implementation-result-v1", "navigator-code-review-result-v1"]),
+  mandatoryEvidence: z.array(identifierSchema).min(1).max(16),
+  modelPools: z.array(z.enum(["standard", "strong"])).min(1).max(2),
+  timeoutMs: z.number().int().positive(),
+  maximumResultBytes: z.number().int().positive(),
+  retryClass: z.literal("bounded_exponential"),
+  maximumAttempts: z.number().int().min(1).max(20),
+  backoffBaseMs: z.number().int().positive().max(30_000),
+  backoffMaximumMs: z.number().int().positive().max(300_000),
+  digest: sha256Schema,
+}).strict();
+
+export type NavigatorTicketStepContract = Readonly<z.infer<typeof navigatorTicketStepContractSchema>>;
 
 const DISCIPLINE_BY_EVIDENCE: Readonly<Record<NavigatorTicketTaskEvidence[number], string>> = {
   "reproducible-bug": "diagnosing-bugs",
@@ -181,7 +251,7 @@ function ticketStepContract(
 export const NAVIGATOR_TICKET_STEP_CONTRACTS = Object.freeze({
   implementation: ticketStepContract({
     id: "navigator-ticket-implementation",
-    revision: 1,
+    revision: 2,
     skillId: "implement",
     freshContext: true,
     codeWriting: true,
@@ -191,10 +261,14 @@ export const NAVIGATOR_TICKET_STEP_CONTRACTS = Object.freeze({
     modelPools: ["standard", "strong"],
     timeoutMs: 14_400_000,
     maximumResultBytes: 256_000,
+    retryClass: "bounded_exponential",
+    maximumAttempts: 5,
+    backoffBaseMs: 500,
+    backoffMaximumMs: 30_000,
   }),
   review: ticketStepContract({
     id: "navigator-ticket-code-review",
-    revision: 1,
+    revision: 2,
     skillId: "code-review",
     freshContext: true,
     codeWriting: false,
@@ -204,6 +278,10 @@ export const NAVIGATOR_TICKET_STEP_CONTRACTS = Object.freeze({
     modelPools: ["strong"],
     timeoutMs: 3_600_000,
     maximumResultBytes: 256_000,
+    retryClass: "bounded_exponential",
+    maximumAttempts: 5,
+    backoffBaseMs: 500,
+    backoffMaximumMs: 30_000,
   }),
 });
 

@@ -8,17 +8,23 @@ import type { WorkArtifactClaim } from "../work-artifacts/models";
 import {
   NAVIGATOR_TICKET_STEP_CONTRACTS,
   navigatorCodeReviewResultSchema,
+  navigatorGitObservationSchema,
   navigatorImplementationResultSchema,
   navigatorJsonDigest,
   navigatorPullRequestRequestSchema,
   navigatorTicketWorkerProfile,
   navigatorTicketWorkerProfileSchema,
   navigatorTicketWorkerResultSchema,
+  navigatorTicketStepContractSchema,
+  navigatorTicketRepairProposalSchema,
+  navigatorTicketRepairSnapshotSchema,
   navigatorTicketWorkOrderSchema,
   parseNavigatorTicketModelRoute,
   type NavigatorPullRequestRecord,
   type NavigatorPullRequestRequest,
+  type NavigatorGitObservation,
   type NavigatorTicketStepContract,
+  type NavigatorTicketRepairSnapshot,
   type NavigatorTicketTaskEvidence,
   type NavigatorTicketWorkerProfile,
   type NavigatorTicketWorkerResult,
@@ -49,11 +55,12 @@ export type NavigatorTicketWorkerAttempt = Readonly<{
 export type NavigatorTicketWorkerOutcome = Readonly<{
   attemptId: string;
   sliceId: string;
-  outcome: "succeeded" | "findings" | "worker_unavailable" | "policy_failure";
+  outcome: "succeeded" | "findings" | "worker_unavailable" | "policy_failure" | "dead_letter";
   reasonCode: string;
   exactHeadSha: string;
   result: unknown;
   resultDigest: string;
+  gitObservation: NavigatorGitObservation | null;
   recordedAt: number;
 }>;
 
@@ -100,6 +107,30 @@ export interface NavigatorTicketWorkerRunner {
     resource: { kind: "bb_thread"; id: string };
     result: unknown;
   }>>;
+  reconcileUnavailableResource(
+    resource: { kind: "bb_thread"; id: string },
+    reason: "missing" | "stale",
+    signal: AbortSignal,
+  ): Promise<Readonly<{
+    resource: { kind: "bb_thread"; id: string };
+    state: "terminal" | "missing";
+    evidenceRef: string;
+    observedAt: number;
+  }>>;
+}
+
+export type NavigatorGitObservationRequest = Readonly<{
+  purpose: "implementation" | "review" | "pull_request";
+  worktreeId: string;
+  integrationBranch: string;
+  expectedHeadSha: string;
+  baseHeadSha: string;
+  comparisonBaseHeadSha: string;
+  expectedChangedPaths: readonly string[];
+}>;
+
+export interface NavigatorGitObserver {
+  observe(request: NavigatorGitObservationRequest): Promise<unknown>;
 }
 
 export class NavigatorTicketWorkerUnavailableError extends Error {
@@ -108,6 +139,14 @@ export class NavigatorTicketWorkerUnavailableError extends Error {
   public constructor(public readonly reason: "missing" | "stale") {
     super(`navigator ticket worker is ${reason}`);
   }
+}
+
+export class NavigatorTicketWorkerRetryableError extends Error {
+  public readonly name = "NavigatorTicketWorkerRetryableError";
+}
+
+export class NavigatorTicketWorkerPermanentError extends Error {
+  public readonly name = "NavigatorTicketWorkerPermanentError";
 }
 
 export interface NavigatorPullRequestPublisher {
@@ -126,6 +165,7 @@ type AttemptRow = Readonly<{
   step_contract_id: string;
   step_contract_revision: number;
   step_contract_digest: string;
+  step_contract_json: string;
   profile_json: string;
   profile_digest: string;
   model_route_json: string;
@@ -185,6 +225,8 @@ type OutcomeRow = Readonly<{
   exact_head_sha: string;
   result_json: string;
   result_digest: string;
+  git_observation_json: string | null;
+  git_observation_digest: string | null;
   recorded_at: number;
 }>;
 
@@ -192,6 +234,7 @@ type NavigatorImplementationExecutorDependencies = Readonly<{
   store: TelegramAgentStore;
   database: Database.Database;
   workerRunner: NavigatorTicketWorkerRunner;
+  gitObserver: NavigatorGitObserver;
   pullRequests: NavigatorPullRequestPublisher;
   modelRoute(kind: "implementation" | "review"): ModelRoute;
   clock: { now(): number };
@@ -227,15 +270,27 @@ function stableId(prefix: string, ...parts: readonly string[]): string {
   return `${prefix}_${createHash("sha256").update(parts.join("\0"), "utf8").digest("base64url").slice(0, 24)}`;
 }
 
+function parseRepairSnapshot(rawSnapshot: unknown): NavigatorTicketRepairSnapshot {
+  const snapshot = navigatorTicketRepairSnapshotSchema.parse(rawSnapshot);
+  const { snapshotId: _snapshotId, digest: _digest, ...payload } = snapshot;
+  if (
+    navigatorJsonDigest(payload) !== snapshot.digest ||
+    stableId("navrepair", snapshot.sliceId, snapshot.reviewAttemptId, snapshot.digest) !== snapshot.snapshotId
+  ) throw new Error(`navigator repair snapshot ${snapshot.snapshotId} has invalid durable identity`);
+  return snapshot;
+}
+
 function parseAttempt(row: AttemptRow): NavigatorTicketWorkerAttempt {
   const workOrder = navigatorTicketWorkOrderSchema.parse(JSON.parse(row.work_order_json));
   const profile = navigatorTicketWorkerProfileSchema.parse(JSON.parse(row.profile_json));
-  const stepContract = NAVIGATOR_TICKET_STEP_CONTRACTS[row.kind];
+  const stepContract = navigatorTicketStepContractSchema.parse(JSON.parse(row.step_contract_json));
+  const { digest: _digest, ...unsignedContract } = stepContract;
   if (
     navigatorJsonDigest(workOrder) !== row.work_order_digest ||
     stepContract.id !== row.step_contract_id ||
     stepContract.revision !== row.step_contract_revision ||
     stepContract.digest !== row.step_contract_digest ||
+    navigatorJsonDigest(unsignedContract) !== stepContract.digest ||
     profile.digest !== row.profile_digest
   ) {
     throw new Error(`navigator ticket attempt ${row.id} has invalid durable identity`);
@@ -263,6 +318,13 @@ function parseOutcome(row: OutcomeRow): NavigatorTicketWorkerOutcome {
   if (navigatorJsonDigest(result) !== row.result_digest) {
     throw new Error(`navigator ticket outcome ${row.attempt_id} has invalid digest`);
   }
+  const gitObservation = row.git_observation_json === null
+    ? null
+    : navigatorGitObservationSchema.parse(JSON.parse(row.git_observation_json));
+  if (
+    (gitObservation === null) !== (row.git_observation_digest === null) ||
+    (gitObservation !== null && navigatorJsonDigest(gitObservation) !== row.git_observation_digest)
+  ) throw new Error(`navigator ticket outcome ${row.attempt_id} has invalid Git observation`);
   return {
     attemptId: row.attempt_id,
     sliceId: row.slice_id,
@@ -271,6 +333,7 @@ function parseOutcome(row: OutcomeRow): NavigatorTicketWorkerOutcome {
     exactHeadSha: row.exact_head_sha,
     result,
     resultDigest: row.result_digest,
+    gitObservation,
     recordedAt: row.recorded_at,
   };
 }
@@ -405,11 +468,34 @@ export class NavigatorImplementationExecutor {
     claimId: number;
     taskEvidence: readonly string[];
     evidenceRefs: readonly string[];
+    ownerId: string;
+    generation: number;
   }>) {
     assertIdentifier(input.jobId, "jobId");
     assertIdentifier(input.ticketArtifactId, "ticketArtifactId");
     if (!Number.isSafeInteger(input.claimId) || input.claimId < 1) throw new TypeError("claimId is invalid");
     const claimEvidenceRefs = boundedRefs(input.evidenceRefs);
+    const leaseMs = this.dependencies.leaseMs ?? 30_000;
+    const claim = this.dependencies.store.getWorkArtifactClaim(input.claimId);
+    const ticketBeforeAdoption = this.requireTicket(input.jobId, input.ticketArtifactId);
+    if (
+      !claim || claim.jobId !== input.jobId || claim.artifactId !== ticketBeforeAdoption.artifact_id ||
+      claim.snapshotId !== ticketBeforeAdoption.snapshot_id ||
+      !this.bindingIsCurrent({
+        artifactId: ticketBeforeAdoption.artifact_id,
+        snapshotId: ticketBeforeAdoption.snapshot_id,
+        snapshotDigest: ticketBeforeAdoption.snapshot_digest,
+      }) || !this.dependencies.store.adoptWorkArtifactClaim({
+        artifactId: claim.artifactId,
+        workflowStepId: claim.workflowStepId,
+        jobId: input.jobId,
+        externalAssignee: claim.externalAssignee,
+        ownerId: input.ownerId,
+        generation: input.generation,
+        now: this.dependencies.clock.now(),
+        leaseMs,
+      })
+    ) throw new TypeError("implementation ticket claim could not be adopted by the current executor");
     return this.db.transaction(() => {
       const integration = this.requireWritableIntegration(input.jobId);
       const evidenceRefs = mergeEvidenceRefs(
@@ -426,9 +512,15 @@ export class NavigatorImplementationExecutor {
       if (!ticket || ticket.state !== "pending" || this.nextEligibleTicket(input.jobId)?.artifact_id !== ticket.artifact_id) {
         throw new TypeError("claimed ticket is not the next eligible implementation ticket");
       }
-      const claim = this.dependencies.store.getWorkArtifactClaim(input.claimId);
-      this.assertClaim(claim, input.jobId, ticket);
       const now = this.dependencies.clock.now();
+      this.assertClaim({
+        claim: this.dependencies.store.getWorkArtifactClaim(input.claimId),
+        jobId: input.jobId,
+        ticket,
+        ownerId: input.ownerId,
+        generation: input.generation,
+        now,
+      });
       const sliceId = stableId("navslice", input.jobId, ticket.artifact_id, ticket.snapshot_digest);
       this.db.prepare(
         `INSERT INTO navigator_ticket_slices (
@@ -469,25 +561,168 @@ export class NavigatorImplementationExecutor {
     }).immediate();
   }
 
+  public prepareRepairNavigation(input: Readonly<{
+    jobId: string;
+    ticketArtifactId: string;
+    evidenceRefs: readonly string[];
+  }>): NavigatorTicketRepairSnapshot {
+    return this.db.transaction(() => {
+      const integration = this.requireWritableIntegration(input.jobId);
+      const slice = this.requireSliceForTicket(input.jobId, input.ticketArtifactId);
+      if (slice.state !== "repair_pending" || integration.active_slice_id !== slice.id) {
+        throw new TypeError("ticket findings are not awaiting navigator reconsideration");
+      }
+      const priorReview = this.latestAttempt(slice.id, "review");
+      const reviewOutcome = this.getOutcome(priorReview.id);
+      if (
+        reviewOutcome?.outcome !== "findings" ||
+        reviewOutcome.exactHeadSha !== priorReview.workOrder.baseHeadSha ||
+        reviewOutcome.gitObservation === null
+      ) {
+        throw new TypeError("ticket repair navigation requires exact-head review findings");
+      }
+      const reviewResult = navigatorCodeReviewResultSchema.parse(reviewOutcome.result);
+      const existing = this.db.prepare(
+        "SELECT snapshot_json FROM navigator_ticket_repair_snapshots WHERE review_attempt_id = ?",
+      ).get(priorReview.id) as { snapshot_json: string } | undefined;
+      if (existing) return parseRepairSnapshot(JSON.parse(existing.snapshot_json));
+      const now = this.dependencies.clock.now();
+      const payload = {
+        kind: "navigator_ticket_repair_snapshot" as const,
+        jobId: input.jobId,
+        sliceId: slice.id,
+        ticket: priorReview.workOrder.ticket,
+        reviewAttemptId: priorReview.id,
+        reviewedHeadSha: reviewOutcome.exactHeadSha,
+        reviewResultDigest: reviewOutcome.resultDigest,
+        gitObservationDigest: navigatorJsonDigest(reviewOutcome.gitObservation),
+        findings: reviewResult.findings,
+        evidenceRefs: mergeEvidenceRefs(
+          priorReview.workOrder.evidenceRefs,
+          boundedRefs(input.evidenceRefs),
+          [`navigator-result:${priorReview.id}`],
+          [reviewOutcome.gitObservation.evidenceRef],
+        ),
+        createdAt: now,
+      };
+      const digest = navigatorJsonDigest(payload);
+      const snapshot = navigatorTicketRepairSnapshotSchema.parse({
+        ...payload,
+        snapshotId: stableId("navrepair", slice.id, priorReview.id, digest),
+        digest,
+      });
+      this.db.prepare(
+        `INSERT OR IGNORE INTO navigator_ticket_repair_snapshots (
+           id, job_id, slice_id, review_attempt_id, snapshot_json, snapshot_digest, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        snapshot.snapshotId,
+        input.jobId,
+        slice.id,
+        priorReview.id,
+        JSON.stringify(snapshot),
+        snapshot.digest,
+        now,
+      );
+      const stored = this.db.prepare(
+        "SELECT snapshot_json, snapshot_digest FROM navigator_ticket_repair_snapshots WHERE id = ?",
+      ).get(snapshot.snapshotId) as { snapshot_json: string; snapshot_digest: string } | undefined;
+      if (stored?.snapshot_json !== JSON.stringify(snapshot) || stored.snapshot_digest !== snapshot.digest) {
+        throw new Error("navigator repair snapshot changed during replay");
+      }
+      return snapshot;
+    }).immediate();
+  }
+
+  public recordRepairProposal(input: Readonly<{ snapshotId: string; rawProposal: unknown }>) {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(
+        "SELECT snapshot_json FROM navigator_ticket_repair_snapshots WHERE id = ?",
+      ).get(input.snapshotId) as { snapshot_json: string } | undefined;
+      if (!row) throw new TypeError("navigator repair snapshot was not found");
+      const snapshot = parseRepairSnapshot(JSON.parse(row.snapshot_json));
+      const proposal = navigatorTicketRepairProposalSchema.parse(input.rawProposal);
+      if (proposal.basedOn.snapshotId !== snapshot.snapshotId || proposal.basedOn.digest !== snapshot.digest) {
+        throw new TypeError("navigator repair proposal is based on a stale finding snapshot");
+      }
+      const slice = this.requireSlice(snapshot.sliceId);
+      if (slice.state !== "repair_pending" || this.latestAttempt(slice.id, "review").id !== snapshot.reviewAttemptId) {
+        throw new TypeError("navigator repair proposal no longer matches the active findings");
+      }
+      const proposalDigest = navigatorJsonDigest(proposal);
+      const proposalId = stableId("navrepairproposal", snapshot.snapshotId, proposalDigest);
+      const now = this.dependencies.clock.now();
+      this.db.prepare(
+        `INSERT OR IGNORE INTO navigator_ticket_repair_proposals (
+           id, snapshot_id, route, proposal_json, proposal_digest, decision, accepted_at
+         ) VALUES (?, ?, ?, ?, ?, 'accepted', ?)`,
+      ).run(
+        proposalId,
+        snapshot.snapshotId,
+        proposal.kind,
+        JSON.stringify(proposal),
+        proposalDigest,
+        now,
+      );
+      const stored = this.db.prepare(
+        `SELECT route, proposal_json, proposal_digest, decision
+           FROM navigator_ticket_repair_proposals WHERE id = ?`,
+      ).get(proposalId) as {
+        route: string;
+        proposal_json: string;
+        proposal_digest: string;
+        decision: string;
+      } | undefined;
+      if (
+        stored?.route !== proposal.kind || stored.proposal_json !== JSON.stringify(proposal) ||
+        stored.proposal_digest !== proposalDigest || stored.decision !== "accepted"
+      ) throw new Error("navigator repair proposal changed during replay");
+      return { proposalId, decision: "accepted" as const, route: proposal.kind };
+    }).immediate();
+  }
+
   public scheduleRepair(input: Readonly<{
     jobId: string;
     ticketArtifactId: string;
-    taskEvidence: readonly string[];
-    evidenceRefs: readonly string[];
+    proposalId: string;
   }>): NavigatorTicketWorkerAttempt {
     return this.db.transaction(() => {
+      const replay = this.db.prepare(
+        "SELECT attempt_id FROM navigator_ticket_repair_dispatches WHERE proposal_id = ?",
+      ).get(input.proposalId) as { attempt_id: string } | undefined;
+      if (replay) return this.getAttempt(replay.attempt_id)!;
       const integration = this.requireWritableIntegration(input.jobId);
       const slice = this.requireSliceForTicket(input.jobId, input.ticketArtifactId);
       if (slice.state !== "repair_pending" || integration.active_slice_id !== slice.id) {
         throw new TypeError("ticket is not awaiting an agent-owned repair");
       }
+      const proposalRow = this.db.prepare(
+        `SELECT proposal.proposal_json, proposal.proposal_digest, snapshot.snapshot_json
+           FROM navigator_ticket_repair_proposals AS proposal
+           JOIN navigator_ticket_repair_snapshots AS snapshot ON snapshot.id = proposal.snapshot_id
+          WHERE proposal.id = ? AND proposal.decision = 'accepted'`,
+      ).get(input.proposalId) as {
+        proposal_json: string;
+        proposal_digest: string;
+        snapshot_json: string;
+      } | undefined;
+      if (!proposalRow) throw new TypeError("repair requires a newly accepted navigator proposal");
+      const proposal = navigatorTicketRepairProposalSchema.parse(JSON.parse(proposalRow.proposal_json));
+      const snapshot = parseRepairSnapshot(JSON.parse(proposalRow.snapshot_json));
+      if (
+        navigatorJsonDigest(proposal) !== proposalRow.proposal_digest ||
+        proposal.kind !== "implementation" || snapshot.jobId !== input.jobId || snapshot.sliceId !== slice.id ||
+        snapshot.ticket.artifactId !== input.ticketArtifactId ||
+        this.latestAttempt(slice.id, "review").id !== snapshot.reviewAttemptId
+      ) throw new TypeError("accepted navigator proposal does not select this exact-head repair");
       const ticket = this.requireTicket(input.jobId, input.ticketArtifactId);
       const ordinal = this.nextAttemptOrdinal(slice.id, "implementation");
       const priorReview = this.latestAttempt(slice.id, "review");
       const evidenceRefs = mergeEvidenceRefs(
         priorReview.workOrder.evidenceRefs,
-        boundedRefs(input.evidenceRefs),
+        proposal.evidenceRefs,
         [`navigator-result:${priorReview.id}`],
+        [`navigator-repair-proposal:${input.proposalId}`],
       );
       const now = this.dependencies.clock.now();
       const attempt = this.createAttempt({
@@ -496,7 +731,7 @@ export class NavigatorImplementationExecutor {
         ticket,
         kind: "implementation",
         ordinal,
-        taskEvidence: input.taskEvidence,
+        taskEvidence: proposal.taskEvidence,
         evidenceRefs,
         changedPaths: priorReview.workOrder.changedPaths,
         baseHeadSha: integration.current_head_sha,
@@ -506,6 +741,10 @@ export class NavigatorImplementationExecutor {
       this.db.prepare(
         "UPDATE navigator_ticket_slices SET state = 'implementation_pending', updated_at = ? WHERE id = ?",
       ).run(now, slice.id);
+      this.db.prepare(
+        `INSERT INTO navigator_ticket_repair_dispatches (proposal_id, attempt_id, dispatched_at)
+         VALUES (?, ?, ?)`,
+      ).run(input.proposalId, attempt.id, now);
       return attempt;
     }).immediate();
   }
@@ -521,6 +760,10 @@ export class NavigatorImplementationExecutor {
       return true;
     }
     const leaseMs = this.dependencies.leaseMs ?? 30_000;
+    if (!this.adoptAttemptClaim(attempt, fence, now, leaseMs)) {
+      this.settleClaimFenceFailure(attempt, effect, fence, now);
+      return true;
+    }
     const leaseAbort = new AbortController();
     const timeoutAbort = new AbortController();
     const runSignal = AbortSignal.any([signal, fence.signal, leaseAbort.signal, timeoutAbort.signal]);
@@ -538,7 +781,7 @@ export class NavigatorImplementationExecutor {
     }, attempt.stepContract.timeoutMs);
     const renewal = setInterval(() => {
       try {
-        const renewed = this.dependencies.store.renewJobOperationFences({
+        const operationRenewed = this.dependencies.store.renewJobOperationFences({
           jobId: effect.jobId,
           effectIdempotencyKey: effect.idempotencyKey,
           ownerId: fence.ownerId,
@@ -546,7 +789,8 @@ export class NavigatorImplementationExecutor {
           now: this.dependencies.clock.now(),
           leaseMs,
         });
-        if (!renewed && !leaseAbort.signal.aborted) {
+        const claimRenewed = this.renewAttemptClaim(attempt, fence, this.dependencies.clock.now(), leaseMs);
+        if ((!operationRenewed || !claimRenewed) && !leaseAbort.signal.aborted) {
           leaseAbort.abort(new Error("navigator ticket worker lease was lost"));
         }
       } catch (renewalError) {
@@ -567,23 +811,33 @@ export class NavigatorImplementationExecutor {
       if (!this.bindResource(attempt.id, effect.idempotencyKey, run.resource, fence, this.dependencies.clock.now())) {
         throw new Error("navigator ticket worker returned a different resource");
       }
-      this.settleAttempt(attempt.id, effect.idempotencyKey, run.result, fence, this.dependencies.clock.now());
+      const gitObservation = await this.observeAttemptGit(attempt, run.result);
+      this.settleAttempt(
+        attempt.id,
+        effect.idempotencyKey,
+        run.result,
+        gitObservation,
+        fence,
+        this.dependencies.clock.now(),
+      );
     } catch (error) {
       if (error instanceof NavigatorTicketWorkerUnavailableError) {
-        this.replaceUnavailableAttempt(
-          attempt,
-          effect.idempotencyKey,
-          error.reason,
-          fence,
-          this.dependencies.clock.now(),
-        );
+        try {
+          const observation = await this.reconcileUnavailableResource(attempt, error.reason, runSignal);
+          this.replaceUnavailableAttempt(
+            attempt,
+            effect.idempotencyKey,
+            error.reason,
+            observation,
+            fence,
+            this.dependencies.clock.now(),
+          );
+        } catch (reconciliationError) {
+          this.settleWorkerFailure(attempt, effect, reconciliationError, fence, this.dependencies.clock.now());
+        }
         return true;
       }
-      const summary = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-      const failedAt = this.dependencies.clock.now();
-      if (this.effectLeaseCurrent(effect.idempotencyKey, fence, failedAt)) {
-        this.finishEffect(effect, fence, failedAt, "failed", summary.slice(0, 500));
-      }
+      this.settleWorkerFailure(attempt, effect, error, fence, this.dependencies.clock.now());
     } finally {
       clearInterval(renewal);
       clearTimeout(timeout);
@@ -602,6 +856,7 @@ export class NavigatorImplementationExecutor {
       const resolution = this.dependencies.store.getWorkArtifactResolution(input.ticketArtifactId);
       if (
         outcome?.outcome !== "succeeded" ||
+        outcome.gitObservation?.headSha !== review.workOrder.baseHeadSha ||
         resolution?.outcome !== "resolved" ||
         resolution.snapshotId !== slice.ticket_snapshot_id ||
         !resolution.evidenceRefs.includes(`navigator-result:${review.id}`)
@@ -632,7 +887,7 @@ export class NavigatorImplementationExecutor {
     title: string;
     body: string;
   }>): Promise<NavigatorPullRequestRecord> {
-    const request = this.preparePullRequest(input);
+    const request = await this.preparePullRequest(input);
     const existing = this.pullRequestRow(input.jobId);
     if (existing?.status === "published") return this.publishedPullRequest(existing);
     const published = await this.dependencies.pullRequests.createOrRefresh(request);
@@ -759,16 +1014,108 @@ export class NavigatorImplementationExecutor {
       ticket.state === "pending" && this.ticketIsEligible(jobId, ticket)) ?? null;
   }
 
-  private assertClaim(claim: WorkArtifactClaim | null, jobId: string, ticket: TicketRow): void {
+  private assertClaim(input: Readonly<{
+    claim: WorkArtifactClaim | null;
+    jobId: string;
+    ticket: TicketRow;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): void {
     if (
-      !claim || claim.state !== "held" || claim.jobId !== jobId ||
-      claim.artifactId !== ticket.artifact_id || claim.snapshotId !== ticket.snapshot_id ||
+      !input.claim || input.claim.state !== "held" || input.claim.jobId !== input.jobId ||
+      input.claim.artifactId !== input.ticket.artifact_id || input.claim.snapshotId !== input.ticket.snapshot_id ||
+      input.claim.ownerId !== input.ownerId || input.claim.generation !== input.generation ||
+      input.claim.leaseExpiresAt <= input.now ||
       !this.bindingIsCurrent({
-        artifactId: ticket.artifact_id,
-        snapshotId: ticket.snapshot_id,
-        snapshotDigest: ticket.snapshot_digest,
+        artifactId: input.ticket.artifact_id,
+        snapshotId: input.ticket.snapshot_id,
+        snapshotDigest: input.ticket.snapshot_digest,
       })
     ) throw new TypeError("implementation ticket claim is stale or belongs to another lane");
+  }
+
+  private adoptAttemptClaim(
+    attempt: NavigatorTicketWorkerAttempt,
+    fence: EffectFence,
+    now: number,
+    leaseMs: number,
+  ): boolean {
+    const slice = this.requireSlice(attempt.sliceId);
+    const claim = this.dependencies.store.getWorkArtifactClaim(slice.claim_id);
+    return claim !== null && this.dependencies.store.adoptWorkArtifactClaim({
+      artifactId: claim.artifactId,
+      workflowStepId: claim.workflowStepId,
+      jobId: attempt.jobId,
+      externalAssignee: claim.externalAssignee,
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now,
+      leaseMs,
+    });
+  }
+
+  private renewAttemptClaim(
+    attempt: NavigatorTicketWorkerAttempt,
+    fence: EffectFence,
+    now: number,
+    leaseMs: number,
+  ): boolean {
+    return this.dependencies.store.renewWorkArtifactClaim({
+      claimId: this.requireSlice(attempt.sliceId).claim_id,
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now,
+      leaseMs,
+    });
+  }
+
+  private claimFenceIsCurrent(attempt: NavigatorTicketWorkerAttempt, fence: EffectFence, now: number): boolean {
+    const slice = this.requireSlice(attempt.sliceId);
+    const ticket = this.requireTicket(attempt.jobId, attempt.workOrder.ticket.artifactId);
+    try {
+      this.assertClaim({
+        claim: this.dependencies.store.getWorkArtifactClaim(slice.claim_id),
+        jobId: attempt.jobId,
+        ticket,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now,
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof TypeError) return false;
+      throw error;
+    }
+  }
+
+  private settleClaimFenceFailure(
+    attempt: NavigatorTicketWorkerAttempt,
+    effect: StoredEffect,
+    fence: EffectFence,
+    now: number,
+  ): void {
+    const settle = () => {
+      if (!this.effectLeaseCurrent(effect.idempotencyKey, fence, now) || this.getOutcome(attempt.id)) return;
+      const result = { kind: "policy_failure", reasonCode: "claim_fence_lost" } as const;
+      this.db.prepare(
+        `INSERT INTO navigator_ticket_worker_outcomes (
+           attempt_id, slice_id, outcome, reason_code, exact_head_sha,
+           result_json, result_digest, recorded_at
+         ) VALUES (?, ?, 'policy_failure', 'claim_fence_lost', ?, ?, ?, ?)`,
+      ).run(
+        attempt.id,
+        attempt.sliceId,
+        attempt.workOrder.baseHeadSha,
+        JSON.stringify(result),
+        navigatorJsonDigest(result),
+        now,
+      );
+      this.invalidateIntegration(this.integrationRow(attempt.jobId)!, "claim_fence_lost", now);
+      this.finishEffect(effect, fence, now, "done", null);
+    };
+    if (this.db.inTransaction) settle();
+    else this.db.transaction(settle).immediate();
   }
 
   private createAttempt(input: Readonly<{
@@ -835,9 +1182,9 @@ export class NavigatorImplementationExecutor {
       `INSERT INTO navigator_ticket_worker_attempts (
          id, job_id, slice_id, kind, ordinal, effect_idempotency_key,
          work_order_json, work_order_digest, step_contract_id, step_contract_revision,
-         step_contract_digest, profile_json, profile_digest, model_route_json,
+         step_contract_digest, step_contract_json, profile_json, profile_digest, model_route_json,
          resource_kind, resource_id, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
     ).run(
       attemptId,
       input.integration.job_id,
@@ -850,6 +1197,7 @@ export class NavigatorImplementationExecutor {
       stepContract.id,
       stepContract.revision,
       stepContract.digest,
+      JSON.stringify(stepContract),
       JSON.stringify(profile),
       profile.digest,
       JSON.stringify(route),
@@ -954,6 +1302,7 @@ export class NavigatorImplementationExecutor {
     attemptId: string,
     effectKey: string,
     rawResult: unknown,
+    rawGitObservation: unknown,
     fence: EffectFence,
     now: number,
   ): NavigatorTicketWorkerOutcome | null {
@@ -963,10 +1312,18 @@ export class NavigatorImplementationExecutor {
       if (!attempt || attempt.effectIdempotencyKey !== effectKey || attempt.resource === null) return null;
       const existing = this.getOutcome(attemptId);
       if (existing) return existing;
+      if (!this.claimFenceIsCurrent(attempt, fence, now)) {
+        const effect = this.parseEffect(this.db.prepare(
+          "SELECT * FROM effects WHERE idempotency_key = ?",
+        ).get(effectKey) as Parameters<typeof this.parseEffect>[0]);
+        this.settleClaimFenceFailure(attempt, effect, fence, now);
+        return this.getOutcome(attempt.id);
+      }
       const rawResultJson = JSON.stringify(rawResult);
       const resultTooLarge = rawResultJson !== undefined &&
         Buffer.byteLength(rawResultJson, "utf8") > attempt.stepContract.maximumResultBytes;
       const parsed = navigatorTicketWorkerResultSchema.safeParse(resultTooLarge ? undefined : rawResult);
+      const parsedGit = navigatorGitObservationSchema.safeParse(rawGitObservation);
       const integration = this.integrationRow(attempt.jobId)!;
       let outcome: NavigatorTicketWorkerOutcome["outcome"] = "succeeded";
       let reasonCode = "accepted";
@@ -987,6 +1344,9 @@ export class NavigatorImplementationExecutor {
       } else if (!resultCapabilitiesAreAccepted(parsed.data, attempt.profile)) {
         outcome = "policy_failure";
         reasonCode = "capability_outcome_missing";
+      } else if (!parsedGit.success || !this.gitObservationMatches(attempt, parsed.data, parsedGit.data)) {
+        outcome = "policy_failure";
+        reasonCode = "git_observation_rejected";
       } else if (parsed.data.kind === "implementation_result") {
         if (
           parsed.data.baseHeadSha !== attempt.workOrder.baseHeadSha ||
@@ -1006,15 +1366,19 @@ export class NavigatorImplementationExecutor {
         outcome = "findings";
         reasonCode = "review_findings";
       }
-      const exactHeadSha = parsed.success && parsed.data.kind === "implementation_result"
-        ? parsed.data.headSha
-        : attempt.workOrder.baseHeadSha;
       const resultDigest = navigatorJsonDigest(result);
+      const gitObservation = parsedGit.success ? parsedGit.data : null;
+      const gitObservationDigest = gitObservation === null ? null : navigatorJsonDigest(gitObservation);
+      const exactHeadSha = gitObservation?.headSha ?? (
+        parsed.success && parsed.data.kind === "implementation_result"
+          ? parsed.data.headSha
+          : attempt.workOrder.baseHeadSha
+      );
       this.db.prepare(
         `INSERT INTO navigator_ticket_worker_outcomes (
            attempt_id, slice_id, outcome, reason_code, exact_head_sha,
-           result_json, result_digest, recorded_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           result_json, result_digest, git_observation_json, git_observation_digest, recorded_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         attempt.id,
         attempt.sliceId,
@@ -1023,6 +1387,8 @@ export class NavigatorImplementationExecutor {
         exactHeadSha,
         JSON.stringify(result),
         resultDigest,
+        gitObservation === null ? null : JSON.stringify(gitObservation),
+        gitObservationDigest,
         now,
       );
       if (outcome === "policy_failure") {
@@ -1048,6 +1414,48 @@ export class NavigatorImplementationExecutor {
       this.finishEffectByKey(effectKey, fence, now, "done", null);
       return this.getOutcome(attempt.id);
     }).immediate();
+  }
+
+  private async observeAttemptGit(
+    attempt: NavigatorTicketWorkerAttempt,
+    rawResult: unknown,
+  ): Promise<unknown> {
+    const parsed = navigatorTicketWorkerResultSchema.safeParse(rawResult);
+    if (!parsed.success) return null;
+    const expectedHeadSha = parsed.data.kind === "implementation_result"
+      ? parsed.data.headSha
+      : parsed.data.reviewedHeadSha;
+    const expectedChangedPaths = parsed.data.kind === "implementation_result"
+      ? parsed.data.changedPaths
+      : attempt.workOrder.changedPaths;
+    return this.dependencies.gitObserver.observe({
+      purpose: attempt.kind,
+      worktreeId: attempt.workOrder.worktreeId,
+      integrationBranch: attempt.workOrder.integrationBranch,
+      expectedHeadSha,
+      baseHeadSha: attempt.workOrder.baseHeadSha,
+      comparisonBaseHeadSha: attempt.workOrder.comparisonBaseHeadSha,
+      expectedChangedPaths,
+    });
+  }
+
+  private gitObservationMatches(
+    attempt: NavigatorTicketWorkerAttempt,
+    result: NavigatorTicketWorkerResult,
+    observation: NavigatorGitObservation,
+  ): boolean {
+    const expectedHeadSha = result.kind === "implementation_result" ? result.headSha : result.reviewedHeadSha;
+    const expectedChangedPaths = result.kind === "implementation_result"
+      ? result.changedPaths
+      : attempt.workOrder.changedPaths;
+    return observation.worktreeId === attempt.workOrder.worktreeId &&
+      observation.branch === attempt.workOrder.integrationBranch &&
+      observation.headSha === expectedHeadSha &&
+      observation.baseHeadSha === attempt.workOrder.baseHeadSha &&
+      observation.baseHeadIsAncestor &&
+      observation.comparisonBaseHeadSha === attempt.workOrder.comparisonBaseHeadSha &&
+      observation.comparisonBaseHeadIsAncestor && observation.clean &&
+      JSON.stringify(observation.changedPaths) === JSON.stringify(expectedChangedPaths);
   }
 
   private acceptImplementation(
@@ -1084,6 +1492,12 @@ export class NavigatorImplementationExecutor {
     attempt: NavigatorTicketWorkerAttempt,
     effectKey: string,
     reason: "missing" | "stale",
+    resourceObservation: Readonly<{
+      resource: { kind: "bb_thread"; id: string } | null;
+      state: "terminal" | "missing";
+      evidenceRef: string;
+      observedAt: number;
+    }>,
     fence: EffectFence,
     now: number,
   ): void {
@@ -1116,7 +1530,7 @@ export class NavigatorImplementationExecutor {
         this.finishEffectByKey(effectKey, fence, now, "done", null);
         return;
       }
-      const result = { kind: "worker_unavailable", reason } as const;
+      const result = { kind: "worker_unavailable", reason, resourceObservation } as const;
       this.db.prepare(
         `INSERT INTO navigator_ticket_worker_outcomes (
            attempt_id, slice_id, outcome, reason_code, exact_head_sha,
@@ -1151,7 +1565,131 @@ export class NavigatorImplementationExecutor {
     }).immediate();
   }
 
-  private preparePullRequest(input: Readonly<{ jobId: string; title: string; body: string }>): NavigatorPullRequestRequest {
+  private async reconcileUnavailableResource(
+    attempt: NavigatorTicketWorkerAttempt,
+    reason: "missing" | "stale",
+    signal: AbortSignal,
+  ): Promise<Readonly<{
+    resource: { kind: "bb_thread"; id: string } | null;
+    state: "terminal" | "missing";
+    evidenceRef: string;
+    observedAt: number;
+  }>> {
+    if (attempt.resource === null) {
+      return {
+        resource: null,
+        state: "missing",
+        evidenceRef: `navigator-resource:${attempt.id}:unbound`,
+        observedAt: this.dependencies.clock.now(),
+      };
+    }
+    const observation = await this.dependencies.workerRunner.reconcileUnavailableResource(
+      attempt.resource,
+      reason,
+      signal,
+    );
+    if (
+      observation.resource.kind !== "bb_thread" ||
+      observation.resource.id !== attempt.resource.id ||
+      (observation.state !== "terminal" && observation.state !== "missing") ||
+      observation.evidenceRef.trim().length === 0 || observation.evidenceRef.length > 1_024 ||
+      !Number.isSafeInteger(observation.observedAt) || observation.observedAt < 0
+    ) throw new TypeError("unavailable worker reconciliation returned invalid terminal evidence");
+    return observation;
+  }
+
+  private settleWorkerFailure(
+    attempt: NavigatorTicketWorkerAttempt,
+    effect: StoredEffect,
+    error: unknown,
+    fence: EffectFence,
+    now: number,
+  ): void {
+    if (!this.effectLeaseCurrent(effect.idempotencyKey, fence, now)) return;
+    const rawSummary = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    const summary = rawSummary.replace(/\s+/gu, " ").trim().slice(0, 500) || "Navigator ticket worker failed";
+    const permanent = error instanceof NavigatorTicketWorkerPermanentError;
+    if (permanent || effect.attempts >= attempt.stepContract.maximumAttempts) {
+      this.deadLetterAttempt(
+        attempt,
+        effect,
+        permanent ? "permanent_failure" : "retry_exhausted",
+        summary,
+        fence,
+        now,
+      );
+      return;
+    }
+    const exponential = attempt.stepContract.backoffBaseMs * 2 ** Math.max(0, effect.attempts - 1);
+    const delay = Math.min(attempt.stepContract.backoffMaximumMs, exponential);
+    this.finishEffect(effect, fence, now, "failed", summary, now + delay);
+  }
+
+  private deadLetterAttempt(
+    attempt: NavigatorTicketWorkerAttempt,
+    effect: StoredEffect,
+    reasonCode: "permanent_failure" | "retry_exhausted",
+    summary: string,
+    fence: EffectFence,
+    now: number,
+  ): void {
+    this.db.transaction(() => {
+      if (!this.effectLeaseCurrent(effect.idempotencyKey, fence, now) || this.getOutcome(attempt.id)) return;
+      const result = {
+        kind: "worker_failure",
+        retryClass: attempt.stepContract.retryClass,
+        attempts: effect.attempts,
+        summary,
+      } as const;
+      this.db.prepare(
+        `INSERT INTO navigator_ticket_worker_outcomes (
+           attempt_id, slice_id, outcome, reason_code, exact_head_sha,
+           result_json, result_digest, recorded_at
+         ) VALUES (?, ?, 'dead_letter', ?, ?, ?, ?, ?)`,
+      ).run(
+        attempt.id,
+        attempt.sliceId,
+        reasonCode,
+        attempt.workOrder.baseHeadSha,
+        JSON.stringify(result),
+        navigatorJsonDigest(result),
+        now,
+      );
+      this.invalidateIntegration(this.integrationRow(attempt.jobId)!, reasonCode, now);
+      this.finishEffect(effect, fence, now, "dead", summary);
+    }).immediate();
+  }
+
+  private async preparePullRequest(
+    input: Readonly<{ jobId: string; title: string; body: string }>,
+  ): Promise<NavigatorPullRequestRequest> {
+    const observedIntegration = this.integrationRow(input.jobId);
+    if (!observedIntegration || !["ready_for_pull_request", "publishing_pull_request", "ready_for_release"].includes(observedIntegration.state)) {
+      throw new TypeError("navigator integration is not ready for one final pull request");
+    }
+    const existingRequest = this.pullRequestRow(input.jobId);
+    if (existingRequest) return navigatorPullRequestRequestSchema.parse(JSON.parse(existingRequest.request_json));
+    const expectedChangedPaths = this.acceptedGitObservations(input.jobId)
+      .flatMap((observation) => observation.changedPaths)
+      .filter((path, index, paths) => paths.indexOf(path) === index)
+      .sort((left, right) => left.localeCompare(right));
+    const rawGitObservation = await this.dependencies.gitObserver.observe({
+      purpose: "pull_request",
+      worktreeId: observedIntegration.worktree_id,
+      integrationBranch: observedIntegration.integration_branch,
+      expectedHeadSha: observedIntegration.current_head_sha,
+      baseHeadSha: observedIntegration.base_head_sha,
+      comparisonBaseHeadSha: observedIntegration.base_head_sha,
+      expectedChangedPaths,
+    });
+    const gitObservation = navigatorGitObservationSchema.parse(rawGitObservation);
+    if (!this.integrationGitObservationMatches({
+      integration: observedIntegration,
+      observation: gitObservation,
+      expectedChangedPaths,
+    })) {
+      throw new TypeError("pull request Git observation does not match the owned integration branch");
+    }
     return this.db.transaction(() => {
       let integration = this.integrationRow(input.jobId);
       if (!integration || !["ready_for_pull_request", "publishing_pull_request", "ready_for_release"].includes(integration.state)) {
@@ -1167,6 +1705,9 @@ export class NavigatorImplementationExecutor {
       }
       const existing = this.pullRequestRow(input.jobId);
       if (existing) return navigatorPullRequestRequestSchema.parse(JSON.parse(existing.request_json));
+      if (integration.current_head_sha !== observedIntegration.current_head_sha) {
+        throw new Error("integration head changed during pull request Git observation");
+      }
       const outcomeRefs = this.db.prepare(
         `SELECT 'navigator-result:' || outcome.attempt_id AS evidence_ref
            FROM navigator_ticket_worker_outcomes AS outcome
@@ -1182,7 +1723,13 @@ export class NavigatorImplementationExecutor {
         headSha: integration.current_head_sha,
         title: input.title,
         body: input.body,
-        evidenceRefs: outcomeRefs.map((row) => row.evidence_ref),
+        gitObservation,
+        gitObservationDigest: navigatorJsonDigest(gitObservation),
+        evidenceRefs: mergeEvidenceRefs(
+          outcomeRefs.map((row) => row.evidence_ref),
+          this.acceptedGitObservations(input.jobId).map((observation) => observation.evidenceRef),
+          [gitObservation.evidenceRef],
+        ),
       });
       const now = this.dependencies.clock.now();
       this.db.prepare(
@@ -1204,6 +1751,33 @@ export class NavigatorImplementationExecutor {
       integration = this.integrationRow(input.jobId)!;
       return request;
     }).immediate();
+  }
+
+  private acceptedGitObservations(jobId: string): NavigatorGitObservation[] {
+    const rows = this.db.prepare(
+      `SELECT outcome.git_observation_json
+         FROM navigator_ticket_worker_outcomes AS outcome
+         JOIN navigator_ticket_worker_attempts AS attempt ON attempt.id = outcome.attempt_id
+        WHERE attempt.job_id = ? AND outcome.outcome = 'succeeded'
+          AND outcome.git_observation_json IS NOT NULL
+        ORDER BY outcome.recorded_at, outcome.attempt_id`,
+    ).all(jobId) as Array<{ git_observation_json: string }>;
+    return rows.map((row) => navigatorGitObservationSchema.parse(JSON.parse(row.git_observation_json)));
+  }
+
+  private integrationGitObservationMatches(input: Readonly<{
+    integration: IntegrationRow;
+    observation: NavigatorGitObservation;
+    expectedChangedPaths: readonly string[];
+  }>): boolean {
+    const { integration, observation } = input;
+    return observation.worktreeId === integration.worktree_id &&
+      observation.branch === integration.integration_branch &&
+      observation.headSha === integration.current_head_sha &&
+      observation.baseHeadSha === integration.base_head_sha && observation.baseHeadIsAncestor &&
+      observation.comparisonBaseHeadSha === integration.base_head_sha &&
+      observation.comparisonBaseHeadIsAncestor && observation.clean &&
+      JSON.stringify(observation.changedPaths) === JSON.stringify(input.expectedChangedPaths);
   }
 
   private publishedPullRequest(row: Readonly<{
@@ -1348,8 +1922,9 @@ export class NavigatorImplementationExecutor {
     now: number,
     status: "done" | "failed" | "dead",
     error: string | null,
+    nextAttemptAt = now,
   ): void {
-    this.finishEffectByKey(effect.idempotencyKey, fence, now, status, error);
+    this.finishEffectByKey(effect.idempotencyKey, fence, now, status, error, nextAttemptAt);
   }
 
   private finishEffectByKey(
@@ -1358,13 +1933,14 @@ export class NavigatorImplementationExecutor {
     now: number,
     status: "done" | "failed" | "dead",
     error: string | null,
+    nextAttemptAt = now,
   ): void {
     const changed = this.db.prepare(
       `UPDATE effects SET status = ?, lease_owner = NULL, lease_generation = NULL,
            lease_expires_at = NULL, next_attempt_at = ?, last_error = ?, updated_at = ?
         WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
           AND lease_generation = ? AND lease_expires_at > ?`,
-    ).run(status, now, error, now, effectKey, fence.ownerId, fence.generation, now);
+    ).run(status, nextAttemptAt, error, now, effectKey, fence.ownerId, fence.generation, now);
     if (changed.changes !== 1) throw new Error("navigator ticket effect lease changed before settlement");
   }
 }

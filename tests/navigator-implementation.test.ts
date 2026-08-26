@@ -2,10 +2,13 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
+import { navigatorJsonDigest } from "../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
+  NavigatorTicketWorkerRetryableError,
   NavigatorTicketWorkerUnavailableError,
   type NavigatorTicketWorkerAttempt,
+  type NavigatorGitObserver,
   type NavigatorTicketWorkerRunner,
 } from "../src/navigator/implementation-executor";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -31,6 +34,7 @@ type Fixture = Readonly<{
   specificationId: string;
   ticketIds: readonly [string, string];
   now(): number;
+  advance(milliseconds: number): void;
   claim(ticketId: string): number;
   close(ticketId: string, reviewAttemptId: string): void;
 }>;
@@ -221,6 +225,9 @@ function fixture(): Fixture {
     specificationId,
     ticketIds: [firstTicketId, secondTicketId],
     now,
+    advance: (milliseconds) => {
+      currentTime += milliseconds;
+    },
     claim,
     close,
   };
@@ -266,14 +273,290 @@ function reviewResult(
   };
 }
 
+function validGitObserver(): NavigatorGitObserver {
+  return {
+    observe: vi.fn(async (request) => ({
+      kind: "navigator_git_observation" as const,
+      worktreeId: request.worktreeId,
+      branch: request.integrationBranch,
+      headSha: request.expectedHeadSha,
+      baseHeadSha: request.baseHeadSha,
+      baseHeadIsAncestor: true,
+      comparisonBaseHeadSha: request.comparisonBaseHeadSha,
+      comparisonBaseHeadIsAncestor: true,
+      clean: true,
+      changedPaths: request.expectedChangedPaths,
+      evidenceRef: `git-observation:${request.expectedHeadSha}:${request.purpose}`,
+      observedAt: 2_000,
+    })),
+  };
+}
+
 describe("navigator ticket integration executor", () => {
+  it("rejects worker-reported Git evidence that disagrees with the executor observation", async () => {
+    const value = fixture();
+    const workerRunner: NavigatorTicketWorkerRunner = {
+      run: vi.fn(async (attempt, hooks) => {
+        const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        await hooks.bindResource(resource);
+        return { resource, result: implementationResult(attempt, SHA.ticketOne) };
+      }),
+      reconcileUnavailableResource: vi.fn(),
+    };
+    const gitObserver = validGitObserver();
+    vi.mocked(gitObserver.observe).mockResolvedValueOnce({
+      kind: "navigator_git_observation",
+      worktreeId: "env_job_40",
+      branch: "hanoon/job-40",
+      headSha: SHA.repair,
+      baseHeadSha: SHA.base,
+      baseHeadIsAncestor: true,
+      comparisonBaseHeadSha: SHA.base,
+      comparisonBaseHeadIsAncestor: true,
+      clean: true,
+      changedPaths: ["src/navigator/implementation-executor.ts"],
+      evidenceRef: "git-observation:forged-worker-result",
+      observedAt: 2_000,
+    });
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner,
+      gitObserver,
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    await executor.processOne(
+      { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },
+      new AbortController().signal,
+    );
+
+    expect(executor.snapshot(value.jobId)).toMatchObject({
+      integration: { state: "invalidated", currentHeadSha: SHA.base },
+      outcomes: [expect.objectContaining({
+        outcome: "policy_failure",
+        reasonCode: "git_observation_rejected",
+      })],
+    });
+  });
+
+  it("reads a durable attempt from its immutable contract payload after the registry revision changes", () => {
+    const value = fixture();
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner: { run: vi.fn(), reconcileUnavailableResource: vi.fn() },
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    const current = executor.snapshot(value.jobId).attempts[0]!;
+    const unsignedHistorical = { ...current.stepContract, revision: 99, digest: undefined };
+    delete unsignedHistorical.digest;
+    const historical = { ...unsignedHistorical, digest: navigatorJsonDigest(unsignedHistorical) };
+    const historicalId = `${current.id}_historical`;
+    const historicalEffect = `${current.effectIdempotencyKey}:historical`;
+    value.database.prepare(
+      `INSERT INTO effects (
+         idempotency_key, job_id, kind, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, 'run_navigator_ticket_worker', ?, 'done', 0, ?, ?, ?)`,
+    ).run(historicalEffect, value.jobId, JSON.stringify({ attemptId: historicalId }), value.now(), value.now(), value.now());
+    value.database.prepare(
+      `INSERT INTO navigator_ticket_worker_attempts (
+         id, job_id, slice_id, kind, ordinal, effect_idempotency_key,
+         work_order_json, work_order_digest, step_contract_id, step_contract_revision,
+         step_contract_digest, step_contract_json, profile_json, profile_digest,
+         model_route_json, resource_kind, resource_id, created_at, updated_at
+       ) SELECT ?, job_id, slice_id, kind, 99, ?, work_order_json, work_order_digest,
+                ?, ?, ?, ?, profile_json, profile_digest, model_route_json,
+                NULL, NULL, ?, ?
+           FROM navigator_ticket_worker_attempts WHERE id = ?`,
+    ).run(
+      historicalId,
+      historicalEffect,
+      historical.id,
+      historical.revision,
+      historical.digest,
+      JSON.stringify(historical),
+      value.now(),
+      value.now(),
+      current.id,
+    );
+
+    expect(executor.snapshot(value.jobId).attempts.at(-1)?.stepContract).toEqual(historical);
+  });
+
+  it("backs off retryable worker failures and dead-letters after the contract ceiling", async () => {
+    const value = fixture();
+    const workerRunner: NavigatorTicketWorkerRunner = {
+      run: vi.fn(async () => {
+        throw new NavigatorTicketWorkerRetryableError("BB provider unavailable");
+      }),
+      reconcileUnavailableResource: vi.fn(),
+    };
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner,
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+
+    await executor.processOne(fence, new AbortController().signal);
+    expect(await executor.processOne(fence, new AbortController().signal)).toBe(false);
+    const contract = executor.snapshot(value.jobId).attempts[0]!.stepContract;
+    expect(contract).toMatchObject({
+      retryClass: "bounded_exponential",
+      maximumAttempts: 5,
+      backoffBaseMs: 500,
+      backoffMaximumMs: 30_000,
+    });
+    for (let attempt = 2; attempt <= contract.maximumAttempts; attempt += 1) {
+      value.advance(Math.min(contract.backoffMaximumMs, contract.backoffBaseMs * 2 ** (attempt - 2)));
+      await executor.processOne(fence, new AbortController().signal);
+    }
+
+    expect(workerRunner.run).toHaveBeenCalledTimes(contract.maximumAttempts);
+    expect(executor.snapshot(value.jobId)).toMatchObject({
+      integration: { state: "invalidated" },
+      outcomes: [expect.objectContaining({ outcome: "dead_letter", reasonCode: "retry_exhausted" })],
+    });
+  });
+
+  it("adopts the ticket claim and rejects settlement after its executor fence changes", async () => {
+    const value = fixture();
+    const claimId = value.claim(value.ticketIds[0]);
+    value.database.prepare(
+      "UPDATE work_artifact_claims SET owner_id = 'retired-executor', generation = 99 WHERE id = ?",
+    ).run(claimId);
+    const workerRunner: NavigatorTicketWorkerRunner = {
+      run: vi.fn(async (attempt, hooks) => {
+        const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        await hooks.bindResource(resource);
+        value.database.prepare(
+          "UPDATE work_artifact_claims SET owner_id = 'stolen-executor', generation = 100 WHERE id = ?",
+        ).run(claimId);
+        return { resource, result: implementationResult(attempt, SHA.ticketOne) };
+      }),
+      reconcileUnavailableResource: vi.fn(),
+    };
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner,
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    const claimInput = {
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId,
+      taskEvidence: ["behavioral-change"] as const,
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    };
+    executor.beginClaimedTicket(claimInput);
+
+    expect(value.store.getWorkArtifactClaim(claimId)).toMatchObject({
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    await executor.processOne(
+      { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },
+      new AbortController().signal,
+    );
+
+    expect(executor.snapshot(value.jobId)).toMatchObject({
+      integration: { state: "invalidated", currentHeadSha: SHA.base },
+      outcomes: [expect.objectContaining({ outcome: "policy_failure", reasonCode: "claim_fence_lost" })],
+    });
+  });
+
   it("sequentially integrates fresh ticket workers, repairs review findings, and publishes one pull request", async () => {
     const value = fixture();
     let firstAttemptInterrupted = true;
     let secondAttemptMissing = true;
+    const resourceEvents: string[] = [];
     const workerRunner: NavigatorTicketWorkerRunner = {
       run: vi.fn(async (attempt, hooks) => {
         const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        resourceEvents.push(`run:${resource.id}`);
         await hooks.bindResource(resource);
         if (attempt.kind === "implementation" && firstAttemptInterrupted) {
           firstAttemptInterrupted = false;
@@ -297,6 +580,15 @@ describe("navigator ticket integration executor", () => {
         const needsRepair = attempt.workOrder.ticket.artifactId === value.ticketIds[0] && attempt.ordinal === 1;
         return { resource, result: reviewResult(attempt, needsRepair ? "findings" : "passed") };
       }),
+      reconcileUnavailableResource: vi.fn(async (resource, reason) => {
+        resourceEvents.push(`reconcile:${resource.id}`);
+        return {
+          resource,
+          state: reason === "missing" ? "missing" as const : "terminal" as const,
+          evidenceRef: `bb-resource:${resource.id}:${reason}`,
+          observedAt: value.now(),
+        };
+      }),
     };
     let pullRequestCreated = false;
     const pullRequests = {
@@ -318,6 +610,7 @@ describe("navigator ticket integration executor", () => {
       store: value.store,
       database: value.database,
       workerRunner,
+      gitObserver: validGitObserver(),
       pullRequests,
       modelRoute: (kind) => ({
         pool: kind === "review" ? "strong" : "standard",
@@ -344,6 +637,8 @@ describe("navigator ticket integration executor", () => {
       claimId: firstClaimId,
       taskEvidence: ["reproducible-bug", "behavioral-change", "interface-design", "merge-conflict", "agent-instructions"],
       evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
     });
     expect(firstSlice.state).toBe("implementation_pending");
     const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
@@ -369,14 +664,34 @@ describe("navigator ticket integration executor", () => {
     ]);
 
     executor = newExecutor();
+    value.advance(500);
     await executor.processOne(fence, new AbortController().signal);
     await executor.processOne(fence, new AbortController().signal);
     expect(executor.snapshot(value.jobId).activeSlice?.state).toBe("repair_pending");
+    const repairSnapshot = executor.prepareRepairNavigation({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      evidenceRefs: ["review-finding:SPEC-40-RESTART"],
+    });
+    expect(repairSnapshot).toMatchObject({
+      reviewedHeadSha: SHA.ticketOne,
+      findings: [expect.objectContaining({ ruleId: "SPEC-40-RESTART" })],
+    });
+    const repairDecision = executor.recordRepairProposal({
+      snapshotId: repairSnapshot.snapshotId,
+      rawProposal: {
+        kind: "implementation",
+        basedOn: { snapshotId: repairSnapshot.snapshotId, digest: repairSnapshot.digest },
+        objective: "Repair the exact-head restart finding.",
+        taskEvidence: ["behavioral-change"],
+        evidenceRefs: ["review-finding:SPEC-40-RESTART"],
+      },
+    });
+    expect(repairDecision).toMatchObject({ decision: "accepted", route: "implementation" });
     const repair = executor.scheduleRepair({
       jobId: value.jobId,
       ticketArtifactId: value.ticketIds[0],
-      taskEvidence: ["behavioral-change"],
-      evidenceRefs: ["review-finding:SPEC-40-RESTART"],
+      proposalId: repairDecision.proposalId,
     });
     expect(repair.kind).toBe("implementation");
     await executor.processOne(fence, new AbortController().signal);
@@ -404,6 +719,8 @@ describe("navigator ticket integration executor", () => {
       claimId: secondClaimId,
       taskEvidence: ["behavioral-change"],
       evidenceRefs: ["ticket:40:second-claim"],
+      ownerId: "executor-40",
+      generation: 1,
     });
     await executor.processOne(fence, new AbortController().signal);
     await executor.processOne(fence, new AbortController().signal);
@@ -424,6 +741,22 @@ describe("navigator ticket integration executor", () => {
     const pullRequest = await executor.publishPullRequest(pullRequestInput);
     expect(pullRequest).toMatchObject({ number: 40, headSha: SHA.ticketTwo });
     expect(pullRequests.createOrRefresh).toHaveBeenCalledTimes(2);
+    expect(pullRequests.createOrRefresh.mock.calls.at(-1)?.[0]).toMatchObject({
+      headSha: SHA.ticketTwo,
+      gitObservation: {
+        branch: "hanoon/job-40",
+        headSha: SHA.ticketTwo,
+        baseHeadIsAncestor: true,
+        clean: true,
+      },
+      gitObservationDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      evidenceRefs: expect.arrayContaining([
+        `git-observation:${SHA.ticketOne}:implementation`,
+        `git-observation:${SHA.repair}:review`,
+        `git-observation:${SHA.ticketTwo}:review`,
+        `git-observation:${SHA.ticketTwo}:pull_request`,
+      ]),
+    });
     expect(executor.snapshot(value.jobId)).toMatchObject({
       integration: {
         state: "ready_for_release",
@@ -441,6 +774,11 @@ describe("navigator ticket integration executor", () => {
       outcome: "worker_unavailable",
       reasonCode: "worker_missing",
     }));
+    const unavailableAttempts = executor.snapshot(value.jobId).attempts.filter((attempt) =>
+      attempt.workOrder.ticket.artifactId === value.ticketIds[1] && attempt.kind === "implementation");
+    expect(resourceEvents.indexOf(`reconcile:${unavailableAttempts[0]!.resource!.id}`)).toBeLessThan(
+      resourceEvents.indexOf(`run:${unavailableAttempts[1]!.resource!.id}`),
+    );
   });
 
   it("invalidates a running ticket when its specification snapshot changes", async () => {
@@ -465,11 +803,13 @@ describe("navigator ticket integration executor", () => {
         });
         return { resource, result: implementationResult(attempt, SHA.ticketOne) };
       }),
+      reconcileUnavailableResource: vi.fn(),
     };
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
       database: value.database,
       workerRunner,
+      gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
       clock: { now: value.now },
@@ -490,6 +830,8 @@ describe("navigator ticket integration executor", () => {
       claimId: value.claim(value.ticketIds[0]),
       taskEvidence: ["behavioral-change"],
       evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
     });
     await executor.processOne(
       { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },

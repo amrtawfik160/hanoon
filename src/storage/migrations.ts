@@ -3108,6 +3108,7 @@ CREATE TABLE navigator_ticket_worker_attempts (
   step_contract_id TEXT NOT NULL,
   step_contract_revision INTEGER NOT NULL CHECK (step_contract_revision >= 1),
   step_contract_digest TEXT NOT NULL,
+  step_contract_json TEXT NOT NULL,
   profile_json TEXT NOT NULL,
   profile_digest TEXT NOT NULL,
   model_route_json TEXT NOT NULL,
@@ -3132,6 +3133,7 @@ WHEN NEW.id <> OLD.id
   OR NEW.step_contract_id <> OLD.step_contract_id
   OR NEW.step_contract_revision <> OLD.step_contract_revision
   OR NEW.step_contract_digest <> OLD.step_contract_digest
+  OR NEW.step_contract_json <> OLD.step_contract_json
   OR NEW.profile_json <> OLD.profile_json
   OR NEW.profile_digest <> OLD.profile_digest
   OR NEW.model_route_json <> OLD.model_route_json
@@ -3148,12 +3150,15 @@ BEGIN SELECT RAISE(ABORT, 'navigator ticket worker attempts cannot be deleted');
 CREATE TABLE navigator_ticket_worker_outcomes (
   attempt_id TEXT PRIMARY KEY REFERENCES navigator_ticket_worker_attempts(id),
   slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
-  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'findings', 'worker_unavailable', 'policy_failure')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'findings', 'worker_unavailable', 'policy_failure', 'dead_letter')),
   reason_code TEXT NOT NULL,
   exact_head_sha TEXT NOT NULL,
   result_json TEXT NOT NULL,
   result_digest TEXT NOT NULL,
-  recorded_at INTEGER NOT NULL
+  git_observation_json TEXT,
+  git_observation_digest TEXT,
+  recorded_at INTEGER NOT NULL,
+  CHECK ((git_observation_json IS NULL) = (git_observation_digest IS NULL))
 );
 
 CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_update
@@ -3162,6 +3167,53 @@ BEGIN SELECT RAISE(ABORT, 'navigator ticket worker outcomes are append-only'); E
 CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_delete
 BEFORE DELETE ON navigator_ticket_worker_outcomes
 BEGIN SELECT RAISE(ABORT, 'navigator ticket worker outcomes are append-only'); END;
+
+CREATE TABLE navigator_ticket_repair_snapshots (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  review_attempt_id TEXT NOT NULL UNIQUE REFERENCES navigator_ticket_worker_attempts(id),
+  snapshot_json TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TRIGGER navigator_ticket_repair_snapshots_append_only_update
+BEFORE UPDATE ON navigator_ticket_repair_snapshots
+BEGIN SELECT RAISE(ABORT, 'navigator ticket repair snapshots are append-only'); END;
+CREATE TRIGGER navigator_ticket_repair_snapshots_append_only_delete
+BEFORE DELETE ON navigator_ticket_repair_snapshots
+BEGIN SELECT RAISE(ABORT, 'navigator ticket repair snapshots are append-only'); END;
+
+CREATE TABLE navigator_ticket_repair_proposals (
+  id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL REFERENCES navigator_ticket_repair_snapshots(id),
+  route TEXT NOT NULL CHECK (route IN ('implementation', 'diagnosis', 'research', 'owner_boundary')),
+  proposal_json TEXT NOT NULL,
+  proposal_digest TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK (decision = 'accepted'),
+  accepted_at INTEGER NOT NULL
+);
+
+CREATE TRIGGER navigator_ticket_repair_proposals_append_only_update
+BEFORE UPDATE ON navigator_ticket_repair_proposals
+BEGIN SELECT RAISE(ABORT, 'navigator ticket repair proposals are append-only'); END;
+CREATE TRIGGER navigator_ticket_repair_proposals_append_only_delete
+BEFORE DELETE ON navigator_ticket_repair_proposals
+BEGIN SELECT RAISE(ABORT, 'navigator ticket repair proposals are append-only'); END;
+
+CREATE TABLE navigator_ticket_repair_dispatches (
+  proposal_id TEXT PRIMARY KEY REFERENCES navigator_ticket_repair_proposals(id),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES navigator_ticket_worker_attempts(id),
+  dispatched_at INTEGER NOT NULL
+);
+
+CREATE TRIGGER navigator_ticket_repair_dispatches_append_only_update
+BEFORE UPDATE ON navigator_ticket_repair_dispatches
+BEGIN SELECT RAISE(ABORT, 'navigator ticket repair dispatches are append-only'); END;
+CREATE TRIGGER navigator_ticket_repair_dispatches_append_only_delete
+BEFORE DELETE ON navigator_ticket_repair_dispatches
+BEGIN SELECT RAISE(ABORT, 'navigator ticket repair dispatches are append-only'); END;
 
 CREATE TABLE navigator_pull_requests (
   job_id TEXT PRIMARY KEY REFERENCES navigator_integrations(job_id),
