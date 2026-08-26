@@ -14,6 +14,10 @@ import type {
   NavigatorSnapshot,
 } from "../src/navigator/models";
 import { NAVIGATOR_RESEARCH_STEP_CONTRACT, NAVIGATOR_SKILL_CATALOG } from "../src/navigator/models";
+import {
+  NAVIGATOR_PLANNING_STEP_CONTRACTS,
+  selectNavigatorPlanningRoute,
+} from "../src/navigator/planning-contracts";
 import { runJobExecutorService } from "../src/services/job-executor-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
@@ -53,12 +57,25 @@ function artifactInput(artifactId: string): CaptureWorkArtifactInput {
   };
 }
 
-function fixture(mode: "shadow" | "deterministic" = "deterministic"): Fixture {
+function fixture(
+  mode: "shadow" | "deterministic" = "deterministic",
+  withSpecification = false,
+): Fixture {
   const fixtureId = fixtureNumber++;
   const { bb } = createFakePluginHost({ pluginId: `navigator-executor-${fixtureId}` });
   const store = openStore(bb.storage, bb.storage.kv, () => 1_100);
   const artifactId = stableWorkArtifactId("proj_1", "ticket-38");
   const artifact = store.captureWorkArtifact(artifactInput(artifactId));
+  const specificationId = stableWorkArtifactId("proj_1", "ticket-39-specification");
+  const specification = withSpecification ? store.captureWorkArtifact({
+    ...artifactInput(specificationId),
+    operationId: "ticket-39-specification",
+    kind: "specification",
+    externalId: "39-specification",
+    externalUrl: "https://github.com/acme/widgets/issues/39",
+    externalRevision: "ticket-39-specification-etag-1",
+    title: "Ticket 39 canonical specification",
+  }) : null;
   const draft = store.createJob({
     id: `job_navigator_${fixtureId}`,
     sourceUpdateId: 38_000 + fixtureId,
@@ -79,7 +96,11 @@ function fixture(mode: "shadow" | "deterministic" = "deterministic"): Fixture {
       artifactId,
       snapshotId: artifact.snapshot.id,
       snapshotDigest: artifact.snapshot.snapshotDigest,
-    }],
+    }, ...(specification ? [{
+      artifactId: specificationId,
+      snapshotId: specification.snapshot.id,
+      snapshotDigest: specification.snapshot.snapshotDigest,
+    }] : [])],
     now: 1_030,
   });
   return {
@@ -165,6 +186,54 @@ function executor(
 }
 
 describe("navigator-v1 durable executor slice", () => {
+  it("locks the ticket 39 planning contracts and pinned routing signals", () => {
+    expect(Object.keys(NAVIGATOR_PLANNING_STEP_CONTRACTS)).toEqual([
+      "setup-matt-pocock-skills",
+      "wayfinder",
+      "to-spec",
+      "to-tickets",
+      "research",
+      "prototype",
+      "handoff",
+      "ask-matt",
+    ]);
+    expect(NAVIGATOR_PLANNING_STEP_CONTRACTS.wayfinder).toMatchObject({
+      invocationClass: "user",
+      operationClass: "artifact_write",
+    });
+    expect(NAVIGATOR_PLANNING_STEP_CONTRACTS.research).toMatchObject({
+      invocationClass: "model",
+      operationClass: "read_only",
+    });
+    const baseSignals = {
+      trackerConfigured: true,
+      specificationReady: false,
+      hugeMultiSessionEffort: false,
+      routeToDestinationVisible: true,
+      needsPrimarySourceFacts: false,
+      runnableDesignQuestion: false,
+      workingDirectoryAvailable: true,
+      requirementsUnclear: false,
+    };
+    expect(selectNavigatorPlanningRoute({ ...baseSignals, trackerConfigured: false }))
+      .toBe("setup-matt-pocock-skills");
+    expect(selectNavigatorPlanningRoute({ ...baseSignals, specificationReady: true }))
+      .toBe("to-tickets");
+    expect(selectNavigatorPlanningRoute({ ...baseSignals, needsPrimarySourceFacts: true }))
+      .toBe("research");
+    expect(selectNavigatorPlanningRoute({
+      ...baseSignals,
+      hugeMultiSessionEffort: true,
+      routeToDestinationVisible: false,
+    })).toBe("wayfinder");
+    expect(selectNavigatorPlanningRoute({
+      ...baseSignals,
+      routeToDestinationVisible: false,
+      requirementsUnclear: true,
+    })).toBe("grill-with-docs");
+    expect(selectNavigatorPlanningRoute(baseSignals)).toBe("to-spec");
+  });
+
   it("keeps historical and newly created recipe jobs on recipe-v1", () => {
     const { bb } = createFakePluginHost({ pluginId: `navigator-recipe-${fixtureNumber++}` });
     const db = bb.storage.database();
@@ -445,6 +514,133 @@ describe("navigator-v1 durable executor slice", () => {
     expect(decision).toMatchObject({ decision: "rejected", reasonCode: "stale_artifact_snapshot" });
     expect(value.store.listEffectsForJob(value.job.id).filter((effect) => effect.kind === "run_navigator_skill"))
       .toEqual([]);
+  });
+
+  it("admits user-invoked planning skills only from an explicit navigator proposal", async () => {
+    const value = fixture();
+    const explicitWayfinder = executor(value, {
+      navigator: navigatorWith((snapshot) => ({
+        kind: "invoke_skill",
+        basedOn: snapshot.identity,
+        rationale: "This effort is too large and foggy for one session.",
+        evidenceRefs: ["owner-request:39"],
+        skillId: "wayfinder",
+        subjectArtifactIds: [value.artifactId],
+        objective: "Chart one canonical decision map.",
+      })),
+    });
+    const accepted = await explicitWayfinder.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    expect(accepted).toMatchObject({ decision: "accepted", reasonCode: "accepted" });
+    expect(value.store.getNavigatorSkillAttempt(accepted.attemptId!)).toMatchObject({
+      skillId: "wayfinder",
+      stepInput: { kind: "navigator_planning_input", skillId: "wayfinder" },
+    });
+  });
+
+  it("skips wayfinding once a canonical specification is already bound", async () => {
+    const value = fixture("deterministic", true);
+    const workflow = executor(value, {
+      navigator: navigatorWith((snapshot) => ({
+        kind: "invoke_skill",
+        basedOn: snapshot.identity,
+        rationale: "Try to map work that is already specified.",
+        evidenceRefs: ["owner-request:39"],
+        skillId: "wayfinder",
+        subjectArtifactIds: [value.artifactId],
+        objective: "Create a redundant map.",
+      })),
+    });
+    const decision = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    expect(decision).toMatchObject({ decision: "rejected", reasonCode: "unnecessary_wayfinding" });
+    expect(value.store.listEffectsForJob(value.job.id)
+      .filter((effect) => effect.kind === "run_navigator_skill")).toEqual([]);
+  });
+
+  it("stores one ask-matt consultation and blocks a second unchanged unresolved result", async () => {
+    const value = fixture();
+    const unresolved = (snapshot: NavigatorSnapshot): NavigatorProposal => ({
+      kind: "unresolved_next_step",
+      basedOn: snapshot.identity,
+      rationale: "The evidence admits two different planning routes.",
+      evidenceRefs: ["owner-request:39"],
+      question: "Should this task use research or wayfinder next?",
+      candidateSkillIds: ["research", "wayfinder"],
+    });
+    const runner: NavigatorSkillRunner = {
+      run: vi.fn(async (attempt, hooks) => {
+        const resource = { kind: "bb_thread" as const, id: "thr_ask_matt_39" };
+        await hooks.bindResource(resource);
+        if (attempt.stepInput.kind !== "navigator_planning_input") {
+          throw new Error("ask-matt received the wrong input contract");
+        }
+        return {
+          resource,
+          observedExternalStateDigest: "e".repeat(64),
+          result: {
+            kind: "ask_matt_result",
+            decisionDigest: attempt.stepInput.routingDecisionDigest,
+            advice: "Use research only when primary-source facts block the route.",
+            suggestedSkillIds: ["research"],
+            evidenceRefs: ["skill:ask-matt"],
+          },
+        };
+      }),
+    };
+    const workflow = executor(value, {
+      navigator: navigatorWith(unresolved),
+      skillRunner: runner,
+    });
+    const first = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    expect(first).toMatchObject({ decision: "accepted", reasonCode: "ask_matt_scheduled" });
+    const attempt = value.store.getNavigatorSkillAttempt(first.attemptId!);
+    if (attempt?.stepInput.kind !== "navigator_planning_input") {
+      throw new Error("ask-matt attempt was not persisted");
+    }
+    const decisionDigest = attempt.stepInput.routingDecisionDigest!;
+    expect(value.store.getNavigatorRoutingDecision(decisionDigest)).toMatchObject({
+      question: "Should this task use research or wayfinder next?",
+      candidateSkillIds: ["research", "wayfinder"],
+      advice: null,
+    });
+    const lease = value.store.acquireExecutorLease("executor-ask-matt", 1_100, 30_000);
+    if (!lease.acquired) throw new Error("ask-matt executor lease was unavailable");
+    await workflow.processOne({
+      ownerId: "executor-ask-matt",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal);
+    expect(value.store.getNavigatorRoutingDecision(decisionDigest)).toMatchObject({
+      advice: {
+        advice: "Use research only when primary-source facts block the route.",
+        suggestedSkillIds: ["research"],
+      },
+      blocked: false,
+    });
+
+    const second = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    expect(second).toMatchObject({
+      decision: "accepted",
+      reasonCode: "routing_blocked_after_consultation",
+      workflowStepId: null,
+    });
+    expect(value.store.getNavigatorRoutingDecision(decisionDigest)).toMatchObject({ blocked: true });
+    expect(value.store.getJob(value.job.id)).toMatchObject({ state: "blocked" });
   });
 
   it("SPEC-38-001: does not dispatch an accepted navigator step after its job is cancelled", async () => {
@@ -737,6 +933,7 @@ describe("navigator-v1 durable executor slice", () => {
       reasonCode: "unauthorized_artifact_evidence",
       artifactEvidence: [],
     });
+    expect(value.store.getNavigatorPlanningResult(accepted.attemptId!)).toBeNull();
   });
 
   it("enforces the skill contract result bound as a policy failure", async () => {

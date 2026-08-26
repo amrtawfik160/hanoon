@@ -49,7 +49,7 @@ export const navigatorProposalSchema = z.discriminatedUnion("kind", [
     ...proposalBase,
     kind: z.literal("invoke_skill"),
     skillId: identifierSchema,
-    subjectArtifactIds: z.array(identifierSchema).min(1).max(32),
+    subjectArtifactIds: z.array(identifierSchema).max(32),
     objective: boundedTextSchema,
   }).strict(),
   z.object({
@@ -165,14 +165,15 @@ export type NavigatorSkillStepContract = Readonly<{
   id: string;
   revision: number;
   skillId: string;
-  invocationClass: "model";
+  invocationClass: "model" | "user";
   allowedArtifactKinds: readonly string[];
-  operationClass: "read_only";
+  minimumSubjects: number;
+  operationClass: "read_only" | "artifact_write";
   resourceClass: "bb_thread_read_only";
-  inputSchema: "navigator-research-input-v1";
-  resultSchema: "navigator-research-result-v1";
+  inputSchema: "navigator-research-input-v1" | "navigator-planning-input-v1";
+  resultSchema: string;
   mandatoryEvidence: readonly string[];
-  modelPools: readonly ["strong"];
+  modelPools: readonly ("fast" | "standard" | "strong")[];
   timeoutMs: number;
   maximumResultBytes: number;
   retryClass: "resume_bound_resource";
@@ -189,6 +190,7 @@ const unsignedResearchContract = {
   skillId: "research",
   invocationClass: "model",
   allowedArtifactKinds: ["map", "specification", "decision_ticket", "implementation_ticket"],
+  minimumSubjects: 1,
   operationClass: "read_only",
   resourceClass: "bb_thread_read_only",
   inputSchema: "navigator-research-input-v1",
@@ -246,7 +248,7 @@ export function assertModelRouteForContract(
   contract: NavigatorSkillStepContract,
 ): ModelRoute {
   const parsed = modelRouteSchema.parse(route);
-  if (!contract.modelPools.includes(parsed.pool as "strong")) {
+  if (!contract.modelPools.includes(parsed.pool)) {
     throw new TypeError(`model pool ${parsed.pool} is outside the step contract`);
   }
   return parsed;
@@ -298,7 +300,14 @@ export type NavigatorSkillAttempt = Readonly<{
   stepContractRevision: number;
   stepContractDigest: string;
   catalogDigest: string;
-  stepInput: NavigatorResearchInput;
+  stepInput: NavigatorResearchInput | Readonly<{
+    kind: "navigator_planning_input";
+    skillId: string;
+    objective: string;
+    artifactBindings: readonly NavigatorArtifactBinding[];
+    evidenceRefs: readonly string[];
+    routingDecisionDigest: string | null;
+  }>;
   stepInputDigest: string;
   modelRoute: ModelRoute;
   artifactBindings: readonly NavigatorArtifactBinding[];
@@ -319,4 +328,34 @@ export type NavigatorWorkflowStepOutcome = Readonly<{
   artifactEvidence: readonly z.infer<typeof researchArtifactEvidenceSchema>[];
   resultDigest: string;
   recordedAt: number;
+}>;
+
+export type NavigatorPlanningResultRecord = Readonly<{
+  attemptId: string;
+  workflowStepId: string;
+  skillId: string;
+  result: unknown;
+  resultDigest: string;
+  observedExternalStateDigest: string;
+  recordedAt: number;
+}>;
+
+export type NavigatorRoutingDecision = Readonly<{
+  decisionDigest: string;
+  jobId: string;
+  question: string;
+  candidateSkillIds: readonly string[];
+  rationale: string;
+  evidenceRefs: readonly string[];
+  consultationStepId: string;
+  recordedAt: number;
+  advice: Readonly<{
+    attemptId: string;
+    advice: string;
+    suggestedSkillIds: readonly string[];
+    evidenceRefs: readonly string[];
+    resultDigest: string;
+    recordedAt: number;
+  }> | null;
+  blocked: boolean;
 }>;

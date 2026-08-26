@@ -1090,10 +1090,18 @@ export class WorkArtifactRepository {
 
   public isSnapshotValid(snapshotIdValue: string): boolean {
     assertBoundedString(snapshotIdValue, "snapshotId");
-    if (!this.getSnapshot(snapshotIdValue)) return false;
-    return this.db.prepare(
-      "SELECT 1 FROM work_artifact_snapshot_invalidations WHERE snapshot_id = ?",
-    ).get(snapshotIdValue) === undefined;
+    const pending = [snapshotIdValue];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const candidateId = pending.pop()!;
+      if (visited.has(candidateId)) continue;
+      visited.add(candidateId);
+      const snapshot = this.getSnapshot(candidateId);
+      if (!snapshot || this.getSnapshotInvalidation(candidateId)) return false;
+      if (this.requireArtifact(snapshot.artifactId).currentSnapshotId !== candidateId) return false;
+      pending.push(...this.snapshotDependencies(candidateId));
+    }
+    return true;
   }
 
   public getSnapshotInvalidation(snapshotIdValue: string): WorkArtifactSnapshotInvalidation | null {
@@ -1525,17 +1533,17 @@ export class WorkArtifactRepository {
       capturedAt: input.observedAt,
       ...normalized,
     });
+    const reason = current.contentDigest === snapshot.contentDigest &&
+      current.title === snapshot.title &&
+      JSON.stringify(current.acceptanceCriteria) === JSON.stringify(snapshot.acceptanceCriteria)
+      ? "relationship_change"
+      : "remote_edit";
+    this.db.prepare(
+      `INSERT INTO work_artifact_snapshot_invalidations (
+         snapshot_id, replacement_snapshot_id, reason, observed_at
+       ) VALUES (?, ?, ?, ?)`,
+    ).run(current.id, snapshot.id, reason, input.observedAt);
     if (heldClaim?.snapshotId === current.id) {
-      const reason = current.contentDigest === snapshot.contentDigest &&
-        current.title === snapshot.title &&
-        JSON.stringify(current.acceptanceCriteria) === JSON.stringify(snapshot.acceptanceCriteria)
-        ? "relationship_change"
-        : "remote_edit";
-      this.db.prepare(
-        `INSERT INTO work_artifact_snapshot_invalidations (
-           snapshot_id, replacement_snapshot_id, reason, observed_at
-         ) VALUES (?, ?, ?, ?)`,
-      ).run(current.id, snapshot.id, reason, input.observedAt);
       this.invalidateHeldClaim(artifact.id, input.observedAt, reason);
     } else if (visibleClaimChanged) {
       this.invalidateHeldClaim(artifact.id, input.observedAt, "visible_claim_changed");
@@ -1565,6 +1573,15 @@ export class WorkArtifactRepository {
       artifact.id,
     );
     return { artifact: this.requireArtifact(artifact.id), snapshot };
+  }
+
+  private snapshotDependencies(snapshotIdValue: string): readonly string[] {
+    const rows = this.db.prepare(
+      `SELECT upstream_snapshot_id
+         FROM work_artifact_snapshot_dependencies
+        WHERE snapshot_id = ?`,
+    ).all(snapshotIdValue) as readonly Readonly<{ upstream_snapshot_id: string }>[];
+    return rows.map((row) => row.upstream_snapshot_id);
   }
 
   private insertSnapshot(input: Readonly<{
@@ -1599,6 +1616,18 @@ export class WorkArtifactRepository {
       input.externalRevision,
       input.capturedAt,
     );
+    const dependencyIds = input.relationships
+      .filter((relationship) => relationship.kind === "parent" || relationship.kind === "derived_from")
+      .map((relationship) => relationship.targetArtifactId)
+      .filter((artifactId): artifactId is string => artifactId !== null)
+      .map((artifactId) => this.requireArtifact(artifactId).currentSnapshotId);
+    const insertDependency = this.db.prepare(
+      `INSERT INTO work_artifact_snapshot_dependencies (snapshot_id, upstream_snapshot_id)
+       VALUES (?, ?)`,
+    );
+    for (const upstreamSnapshotId of new Set(dependencyIds)) {
+      insertDependency.run(id, upstreamSnapshotId);
+    }
     return this.requireSnapshot(id);
   }
 
@@ -1695,6 +1724,16 @@ export class WorkArtifactRepository {
     const artifactSubject = `work-artifact:${artifact.id}`;
     const snapshotSubject = `work-artifact-snapshot:${artifact.currentSnapshotId}`;
     for (const evidenceRef of evidenceRefs) {
+      const navigatorMatch = /^navigator-result:([A-Za-z0-9_-]{1,256})$/u.exec(evidenceRef);
+      if (navigatorMatch) {
+        if (outcome !== "resolved" || !this.navigatorResultAuthorizesResolution(
+          navigatorMatch[1],
+          artifact,
+        )) {
+          throw new TypeError("artifact resolution requires authoritative evidence for its current snapshot");
+        }
+        continue;
+      }
       const match = /^evidence:([1-9][0-9]*)$/u.exec(evidenceRef);
       if (!match) throw new TypeError("artifact resolution requires authoritative evidence references");
       const evidenceId = Number(match[1]);
@@ -1725,6 +1764,20 @@ export class WorkArtifactRepository {
         throw new TypeError("artifact resolution requires authoritative evidence for its current snapshot");
       }
     }
+  }
+
+  private navigatorResultAuthorizesResolution(attemptId: string, artifact: WorkArtifact): boolean {
+    return this.db.prepare(
+      `SELECT 1
+         FROM navigator_planning_results AS result
+         JOIN navigator_skill_attempts AS attempt ON attempt.id = result.attempt_id
+         JOIN jobs AS job ON job.id = attempt.job_id
+         JOIN json_each(attempt.artifact_bindings_json) AS binding
+        WHERE result.attempt_id = ? AND result.skill_id IN ('research', 'prototype')
+          AND job.project_id = ?
+          AND json_extract(binding.value, '$.artifactId') = ?
+          AND json_extract(binding.value, '$.snapshotId') = ?`,
+    ).get(attemptId, artifact.projectId, artifact.id, artifact.currentSnapshotId) !== undefined;
   }
 
   private validateCapture(input: CaptureWorkArtifactInput) {

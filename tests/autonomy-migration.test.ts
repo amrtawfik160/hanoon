@@ -102,7 +102,7 @@ function insertRelationshipUpgradeArtifact(
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 61);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 62);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -166,12 +166,14 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
     .toContain("work_artifact_relationships_canonical_insert");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 60])
     .toContain("CREATE TABLE navigator_snapshots");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 61])
+    .toContain("CREATE TABLE navigator_planning_results");
 });
 
 it("strengthens relationship triggers after the original artifact migration was applied", () => {
   const { bb } = createFakePluginHost({ pluginId: "work-artifact-relationship-trigger-upgrade" });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -2));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -3));
   expect(db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_artifact_relationships'",
   ).get()).toEqual({ name: "work_artifact_relationships" });
@@ -251,7 +253,7 @@ it.each([
     pluginId: `work-artifact-invalid-relationship-upgrade-${String(relationship[1])}`,
   });
   const db = bb.storage.database();
-  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 3;
+  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 4;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
   const insertArtifact = db.prepare(
     `INSERT INTO work_artifacts (
@@ -394,7 +396,7 @@ it.each([
     pluginId: `work-artifact-canonical-relationship-${String(_scenario).replaceAll(" ", "-")}`,
   });
   const db = bb.storage.database();
-  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 2;
+  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 3;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
   arrange(db);
   const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();

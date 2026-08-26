@@ -2941,6 +2941,81 @@ BEFORE DELETE ON workflow_step_supersessions
 BEGIN SELECT RAISE(ABORT, 'workflow step supersessions are append-only'); END;
 `] as const;
 
+export const NAVIGATOR_PLANNING_MIGRATIONS = [String.raw`
+CREATE TABLE work_artifact_snapshot_dependencies (
+  snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  upstream_snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  PRIMARY KEY(snapshot_id, upstream_snapshot_id),
+  CHECK(snapshot_id <> upstream_snapshot_id)
+);
+CREATE TRIGGER work_artifact_snapshot_dependencies_append_only_update
+BEFORE UPDATE ON work_artifact_snapshot_dependencies
+BEGIN SELECT RAISE(ABORT, 'work artifact snapshot dependencies are append-only'); END;
+CREATE TRIGGER work_artifact_snapshot_dependencies_append_only_delete
+BEFORE DELETE ON work_artifact_snapshot_dependencies
+BEGIN SELECT RAISE(ABORT, 'work artifact snapshot dependencies are append-only'); END;
+
+CREATE TABLE navigator_planning_results (
+  attempt_id TEXT PRIMARY KEY REFERENCES navigator_skill_attempts(id),
+  workflow_step_id TEXT NOT NULL UNIQUE REFERENCES workflow_steps(id),
+  skill_id TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  observed_external_state_digest TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_planning_results_append_only_update
+BEFORE UPDATE ON navigator_planning_results
+BEGIN SELECT RAISE(ABORT, 'navigator planning results are append-only'); END;
+CREATE TRIGGER navigator_planning_results_append_only_delete
+BEFORE DELETE ON navigator_planning_results
+BEGIN SELECT RAISE(ABORT, 'navigator planning results are append-only'); END;
+
+CREATE TABLE navigator_routing_decisions (
+  decision_digest TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  question TEXT NOT NULL,
+  candidate_skill_ids_json TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL,
+  consultation_step_id TEXT NOT NULL UNIQUE REFERENCES workflow_steps(id),
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_routing_decisions_append_only_update
+BEFORE UPDATE ON navigator_routing_decisions
+BEGIN SELECT RAISE(ABORT, 'navigator routing decisions are append-only'); END;
+CREATE TRIGGER navigator_routing_decisions_append_only_delete
+BEFORE DELETE ON navigator_routing_decisions
+BEGIN SELECT RAISE(ABORT, 'navigator routing decisions are append-only'); END;
+
+CREATE TABLE navigator_routing_advice (
+  decision_digest TEXT PRIMARY KEY REFERENCES navigator_routing_decisions(decision_digest),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES navigator_skill_attempts(id),
+  advice_json TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_routing_advice_append_only_update
+BEFORE UPDATE ON navigator_routing_advice
+BEGIN SELECT RAISE(ABORT, 'navigator routing advice is append-only'); END;
+CREATE TRIGGER navigator_routing_advice_append_only_delete
+BEFORE DELETE ON navigator_routing_advice
+BEGIN SELECT RAISE(ABORT, 'navigator routing advice is append-only'); END;
+
+CREATE TABLE navigator_routing_blocks (
+  decision_digest TEXT PRIMARY KEY REFERENCES navigator_routing_decisions(decision_digest),
+  proposal_id TEXT NOT NULL UNIQUE REFERENCES navigator_proposals(id),
+  reason TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_routing_blocks_append_only_update
+BEFORE UPDATE ON navigator_routing_blocks
+BEGIN SELECT RAISE(ABORT, 'navigator routing blocks are append-only'); END;
+CREATE TRIGGER navigator_routing_blocks_append_only_delete
+BEFORE DELETE ON navigator_routing_blocks
+BEGIN SELECT RAISE(ABORT, 'navigator routing blocks are append-only'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3019,4 +3094,5 @@ export const ALL_MIGRATIONS = [
   ...WORK_ARTIFACT_RELATIONSHIP_IDENTITY_MIGRATIONS,
   ...WORK_ARTIFACT_RELATIONSHIP_CANONICAL_MIGRATIONS,
   ...NAVIGATOR_WORKFLOW_MIGRATIONS,
+  ...NAVIGATOR_PLANNING_MIGRATIONS,
 ] as const;
