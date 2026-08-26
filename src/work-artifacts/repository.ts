@@ -1729,10 +1729,10 @@ export class WorkArtifactRepository {
     for (const evidenceRef of evidenceRefs) {
       const navigatorMatch = /^navigator-result:([A-Za-z0-9_-]{1,256})$/u.exec(evidenceRef);
       if (navigatorMatch) {
-        if (outcome !== "resolved" || !this.navigatorResultAuthorizesResolution(
-          navigatorMatch[1],
-          artifact,
-        )) {
+        const authorized = outcome === "resolved"
+          ? this.navigatorResultAuthorizesResolution(navigatorMatch[1], artifact)
+          : this.navigatorResultAuthorizesPublicationSupersession(navigatorMatch[1], artifact);
+        if (!authorized) {
           throw new TypeError("artifact resolution requires authoritative evidence for its current snapshot");
         }
         continue;
@@ -1781,6 +1781,32 @@ export class WorkArtifactRepository {
           AND json_extract(binding.value, '$.artifactId') = ?
           AND json_extract(binding.value, '$.snapshotId') = ?`,
     ).get(attemptId, artifact.projectId, artifact.id, artifact.currentSnapshotId) !== undefined;
+  }
+
+  private navigatorResultAuthorizesPublicationSupersession(
+    attemptId: string,
+    artifact: WorkArtifact,
+  ): boolean {
+    const row = this.db.prepare(
+      `SELECT result.skill_id, attempt.workflow_step_id
+         FROM navigator_planning_results AS result
+         JOIN navigator_skill_attempts AS attempt ON attempt.id = result.attempt_id
+         JOIN jobs AS job ON job.id = attempt.job_id
+        WHERE result.attempt_id = ? AND job.id = ? AND job.project_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(job.artifact_bindings_json) AS binding
+             WHERE json_extract(binding.value, '$.artifactId') = ?
+          )`,
+    ).get(attemptId, artifact.effortId, artifact.projectId, artifact.id) as Readonly<{
+      skill_id: string;
+      workflow_step_id: string;
+    }> | undefined;
+    if (!row || artifact.id !== stableWorkArtifactId(artifact.projectId, artifact.operationId)) return false;
+    const operation = artifact.operationId.slice(`${row.workflow_step_id}:`.length);
+    if (!artifact.operationId.startsWith(`${row.workflow_step_id}:`)) return false;
+    if (row.skill_id === "wayfinder") return operation === "map" || /^decision:[0-9]+$/u.test(operation);
+    if (row.skill_id === "to-spec") return operation === "specification";
+    return row.skill_id === "to-tickets" && /^ticket:[0-9]+$/u.test(operation);
   }
 
   private validateCapture(input: CaptureWorkArtifactInput) {

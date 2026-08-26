@@ -142,26 +142,32 @@ export class NavigatorPlanningPublisher {
     rawResult: unknown,
     fence: PublicationFence,
   ): Promise<NavigatorPlanningPublication> {
-    this.assertAttemptBindingsCurrent(attempt, new Set());
-    if (attempt.skillId === "research") {
-      const reconciled = await this.resolveDecisionSubjects(attempt, rawResult as Record<string, unknown>, fence);
-      return this.currentBindings(attempt.jobId, reconciled, reconciled.map((binding) => binding.artifactId));
+    try {
+      this.assertAttemptBindingsCurrent(attempt, new Set());
+      if (attempt.skillId === "research") {
+        const reconciled = await this.resolveDecisionSubjects(attempt, rawResult as Record<string, unknown>, fence);
+        return this.currentBindings(attempt.jobId, reconciled, reconciled.map((binding) => binding.artifactId));
+      }
+      const planningOutcome = navigatorPlanningResultSchema.parse(rawResult);
+      if (planningOutcome.kind === "prototype_result") {
+        const reconciled = await this.resolveDecisionSubjects(attempt, planningOutcome, fence);
+        return this.currentBindings(attempt.jobId, reconciled, reconciled.map((binding) => binding.artifactId));
+      }
+      if (planningOutcome.kind === "wayfinder_result") {
+        return await this.publishWayfinder(attempt, planningOutcome, fence);
+      }
+      if (planningOutcome.kind === "to_spec_result") {
+        return await this.publishSpecification(attempt, planningOutcome, fence);
+      }
+      if (planningOutcome.kind === "to_tickets_result") {
+        return await this.publishTickets(attempt, planningOutcome, fence);
+      }
+      return this.currentBindings(attempt.jobId, [], []);
+    } catch (error) {
+      if (!(error instanceof NavigatorPublicationDriftError)) throw error;
+      await this.reconcileSupersededArtifacts(attempt, rawResult, fence);
+      throw error;
     }
-    const planningOutcome = navigatorPlanningResultSchema.parse(rawResult);
-    if (planningOutcome.kind === "prototype_result") {
-      const reconciled = await this.resolveDecisionSubjects(attempt, planningOutcome, fence);
-      return this.currentBindings(attempt.jobId, reconciled, reconciled.map((binding) => binding.artifactId));
-    }
-    if (planningOutcome.kind === "wayfinder_result") {
-      return this.publishWayfinder(attempt, planningOutcome, fence);
-    }
-    if (planningOutcome.kind === "to_spec_result") {
-      return this.publishSpecification(attempt, planningOutcome, fence);
-    }
-    if (planningOutcome.kind === "to_tickets_result") {
-      return this.publishTickets(attempt, planningOutcome, fence);
-    }
-    return this.currentBindings(attempt.jobId, [], []);
   }
 
   private async publishWayfinder(
@@ -343,6 +349,54 @@ export class NavigatorPlanningPublisher {
       effortId: job.id,
       ...fence,
     });
+  }
+
+  private plannedArtifactIds(
+    attempt: NavigatorSkillAttempt,
+    rawResult: unknown,
+  ): readonly string[] {
+    if (attempt.skillId === "research") return [];
+    const parsed = navigatorPlanningResultSchema.safeParse(rawResult);
+    if (!parsed.success) return [];
+    const projectId = this.requireJob(attempt.jobId).projectId!;
+    if (parsed.data.kind === "wayfinder_result") {
+      return [
+        stableWorkArtifactId(projectId, `${attempt.workflowStepId}:map`),
+        ...parsed.data.decisionTickets.map((_ticket, index) =>
+          stableWorkArtifactId(projectId, `${attempt.workflowStepId}:decision:${index}`)),
+      ];
+    }
+    if (parsed.data.kind === "to_tickets_result") {
+      return parsed.data.tickets.map((_ticket, index) =>
+        stableWorkArtifactId(projectId, `${attempt.workflowStepId}:ticket:${index}`));
+    }
+    const hasSpecification = parsed.data.kind === "to_spec_result" &&
+      this.boundArtifacts(attempt).some((artifact) => artifact.kind === "specification");
+    return parsed.data.kind === "to_spec_result" && !hasSpecification
+      ? [stableWorkArtifactId(projectId, `${attempt.workflowStepId}:specification`)]
+      : [];
+  }
+
+  private async reconcileSupersededArtifacts(
+    attempt: NavigatorSkillAttempt,
+    rawResult: unknown,
+    fence: PublicationFence,
+  ): Promise<void> {
+    const boundArtifactIds = new Set(
+      this.requireJob(attempt.jobId).artifactBindings.map((binding) => binding.artifactId),
+    );
+    for (const artifactId of [...this.plannedArtifactIds(attempt, rawResult)].reverse()) {
+      if (boundArtifactIds.has(artifactId)) continue;
+      const artifact = this.store.getWorkArtifact(artifactId);
+      if (!artifact || artifact.status === "cancelled") continue;
+      await this.coordinator.cancel({
+        artifactId,
+        evidenceRefs: [`navigator-result:${attempt.id}`],
+        reason: "Planning publication superseded after its subject artifact changed.",
+        operationId: `${attempt.workflowStepId}:supersede:${artifactId}`,
+        ...fence,
+      });
+    }
   }
 
   private currentBindings(

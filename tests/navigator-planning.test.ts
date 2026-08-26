@@ -19,6 +19,7 @@ import {
 } from "../src/work-artifacts/github-tracker";
 import { LocalMarkdownWorkTracker } from "../src/work-artifacts/local-markdown-tracker";
 import type { WorkArtifact, WorkArtifactKind } from "../src/work-artifacts/models";
+import { stableWorkArtifactId } from "../src/work-artifacts/repository";
 import { TrackerConflictError, type WorkTracker } from "../src/work-artifacts/tracker";
 import { policyFixture } from "./helpers";
 
@@ -30,15 +31,8 @@ class PlanningGitHubGateway implements GitHubIssueGateway {
   private nextNumber = 1;
   private revision = 1;
   private readonly issues = new Map<string, GitHubIssueRecord>();
-  private createPause: Readonly<{ started(): void; wait: Promise<void> }> | null = null;
 
   public async createIssue(input: Readonly<{ title: string; body: string }>): Promise<GitHubIssueRecord> {
-    if (this.createPause) {
-      const pause = this.createPause;
-      this.createPause = null;
-      pause.started();
-      await pause.wait;
-    }
     const externalId = String(this.nextNumber++);
     const issue: GitHubIssueRecord = {
       externalId,
@@ -144,19 +138,6 @@ class PlanningGitHubGateway implements GitHubIssueGateway {
 
   public count(): number {
     return this.issues.size;
-  }
-
-  public pauseNextCreate(): Readonly<{ started: Promise<void>; release(): void }> {
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      markStarted = resolve;
-    });
-    let release!: () => void;
-    const wait = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.createPause = { started: markStarted, wait };
-    return { started, release };
   }
 
   private async update(
@@ -346,6 +327,28 @@ function artifactsOfKind(
   return job.artifactBindings
     .map((binding) => store.getWorkArtifact(binding.artifactId))
     .filter((artifact): artifact is WorkArtifact => artifact?.kind === kind);
+}
+
+function pauseAfterNextCreate(tracker: WorkTracker): Readonly<{
+  started: Promise<void>;
+  release(): void;
+}> {
+  const create = tracker.create.bind(tracker);
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  vi.spyOn(tracker, "create").mockImplementationOnce(async (input) => {
+    const artifact = await create(input);
+    markStarted();
+    await wait;
+    return artifact;
+  });
+  return { started, release };
 }
 
 describe.each(["github", "local_markdown"] as const)("navigator planning through %s", (trackerKind) => {
@@ -646,93 +649,129 @@ describe.each(["github", "local_markdown"] as const)("navigator planning through
   });
 });
 
-it("STD-39-002: rejects drift that lands during asynchronous planning publication", async () => {
-  const fixture = await planningFixture("github");
-  const gateway = fixture.gateway!;
-  const pause = gateway.pauseNextCreate();
-  const navigator = {
-    propose: async (snapshot: NavigatorSnapshot): Promise<NavigatorProposal> => ({
-      kind: "invoke_skill",
-      basedOn: snapshot.identity,
-      rationale: "Publish a map from the exact owner ticket snapshot.",
-      evidenceRefs: ["ticket:39:STD-39-002"],
-      skillId: "wayfinder",
-      subjectArtifactIds: [fixture.rootArtifactId],
-      objective: "Publish the planning map.",
-    }),
-  };
-  const executor = new NavigatorWorkflowExecutor({
-    store: fixture.store,
-    navigator,
-    observeInference: async () => ({
-      nativeToolCalls: [],
-      claimedCodeWorktreeId: null,
-      dynamicEffectToolIds: [],
-      externalStateDigest: "e".repeat(64),
-    }),
-    skillRunner: {
-      run: vi.fn(async (attempt, hooks) => {
-        const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
-        await hooks.bindResource(resource);
-        return {
-          resource,
-          observedExternalStateDigest: "e".repeat(64),
-          result: {
-            kind: "wayfinder_result",
-            summary: "The old owner ticket snapshot produced a map.",
-            map: {
-              title: "Drifted map",
-              body: "## Destination\n\nReject stale publication.\n\n## Decisions so far\n\n## Not yet specified\n\nOne decision.",
-              acceptanceCriteria: ["Drift fails closed"],
-            },
-            decisionTickets: [{
-              title: "Resolve drift",
-              body: "## Question\n\nWhich snapshot is authoritative?",
-              acceptanceCriteria: ["Use the current snapshot"],
-              blockedBy: [],
-            }],
-            evidenceRefs: ["ticket:39:STD-39-002"],
-          },
-        };
+describe.each(["github", "local_markdown"] as const)("STD-39-002 through %s", (trackerKind) => {
+  it("reconciles a partially published artifact after subject drift and restart", async () => {
+    const fixture = await planningFixture(trackerKind);
+    const pause = pauseAfterNextCreate(fixture.tracker);
+    const navigator = {
+      propose: async (snapshot: NavigatorSnapshot): Promise<NavigatorProposal> => ({
+        kind: "invoke_skill",
+        basedOn: snapshot.identity,
+        rationale: "Publish a map from the exact owner ticket snapshot.",
+        evidenceRefs: ["ticket:39:STD-39-002"],
+        skillId: "wayfinder",
+        subjectArtifactIds: [fixture.rootArtifactId],
+        objective: "Publish the planning map.",
       }),
-    },
-    planningPublisher: fixture.publisher,
-    modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
-    clock: { now: fixture.advance },
-  });
-  const accepted = await executor.proposeNext({
-    jobId: fixture.jobId,
-    externalStateDigest: "e".repeat(64),
-    evidenceRefs: [],
-  });
-  const processing = executor.processOne({
-    ...fixture.fence,
-    signal: new AbortController().signal,
-  }, new AbortController().signal);
-  await pause.started;
-  const root = fixture.store.getWorkArtifact(fixture.rootArtifactId)!;
-  const externalRoot = await fixture.tracker.read(root.externalId);
-  await fixture.tracker.updateOwnedSection({
-    externalId: root.externalId,
-    sectionId: "revision-note",
-    content: "The owner changed the ticket while publication was awaiting the tracker.",
-    operationId: "ticket-39-drift-during-publication",
-    expectedRevision: externalRoot.revision,
-  });
-  await fixture.coordinator.observe({
-    artifactId: root.id,
-    ...fixture.fence,
-    now: fixture.advance(),
-  });
-  pause.release();
-  await processing;
+    };
+    const executor = new NavigatorWorkflowExecutor({
+      store: fixture.store,
+      navigator,
+      observeInference: async () => ({
+        nativeToolCalls: [],
+        claimedCodeWorktreeId: null,
+        dynamicEffectToolIds: [],
+        externalStateDigest: "e".repeat(64),
+      }),
+      skillRunner: {
+        run: vi.fn(async (attempt, hooks) => {
+          const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+          await hooks.bindResource(resource);
+          return {
+            resource,
+            observedExternalStateDigest: "e".repeat(64),
+            result: {
+              kind: "wayfinder_result",
+              summary: "The old owner ticket snapshot produced a map.",
+              map: {
+                title: "Drifted map",
+                body: "## Destination\n\nReject stale publication.\n\n## Decisions so far\n\n## Not yet specified\n\nOne decision.",
+                acceptanceCriteria: ["Drift fails closed"],
+              },
+              decisionTickets: [{
+                title: "Resolve drift",
+                body: "## Question\n\nWhich snapshot is authoritative?",
+                acceptanceCriteria: ["Use the current snapshot"],
+                blockedBy: [],
+              }],
+              evidenceRefs: ["ticket:39:STD-39-002"],
+            },
+          };
+        }),
+      },
+      planningPublisher: fixture.publisher,
+      modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
+      clock: { now: fixture.advance },
+    });
+    const accepted = await executor.proposeNext({
+      jobId: fixture.jobId,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const processing = executor.processOne({
+      ...fixture.fence,
+      signal: new AbortController().signal,
+    }, new AbortController().signal);
+    await pause.started;
+    const root = fixture.store.getWorkArtifact(fixture.rootArtifactId)!;
+    const externalRoot = await fixture.tracker.read(root.externalId);
+    await fixture.tracker.updateOwnedSection({
+      externalId: root.externalId,
+      sectionId: "revision-note",
+      content: "The owner changed the ticket while publication was awaiting the tracker.",
+      operationId: `ticket-39-drift-during-publication-${trackerKind}`,
+      expectedRevision: externalRoot.revision,
+    });
+    await fixture.coordinator.observe({
+      artifactId: root.id,
+      ...fixture.fence,
+      now: fixture.advance(),
+    });
+    pause.release();
+    await processing;
 
-  expect(fixture.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toMatchObject({
-    outcome: "policy_failure",
-    reasonCode: "stale_artifact_snapshot",
+    const attempt = fixture.store.getNavigatorSkillAttempt(accepted.attemptId!)!;
+    const mapId = stableWorkArtifactId("proj_39", `${attempt.workflowStepId}:map`);
+    const partialMap = fixture.store.getWorkArtifact(mapId)!;
+    expect(fixture.store.getJob(fixture.jobId)!.artifactBindings.map((binding) => binding.artifactId))
+      .not.toContain(mapId);
+    expect(partialMap).toMatchObject({ status: "cancelled", externalStatus: "cancelled" });
+    expect(fixture.store.getWorkArtifactResolution(mapId)).toMatchObject({
+      outcome: "cancelled",
+      evidenceRefs: [`navigator-result:${attempt.id}`],
+    });
+    await expect(fixture.tracker.read(partialMap.externalId)).resolves.toMatchObject({
+      state: "cancelled",
+    });
+    expect(fixture.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toMatchObject({
+      outcome: "policy_failure",
+      reasonCode: "stale_artifact_snapshot",
+    });
+    expect(fixture.store.getEffect(fixture.jobId, accepted.effectIdempotencyKey!)).toMatchObject({
+      status: "done",
+    });
+    expect(fixture.store.getJob(fixture.jobId)).toMatchObject({
+      currentWorkflowStepId: null,
+      artifactBindings: [expect.objectContaining({ artifactId: fixture.rootArtifactId })],
+    });
+
+    const durableResult = fixture.store.getNavigatorPlanningResult(attempt.id)!;
+    const restartedCoordinator = new WorkArtifactCoordinator(
+      fixture.store,
+      fixture.tracker,
+      fixture.now,
+    );
+    const restartedPublisher = new NavigatorPlanningPublisher(fixture.store, restartedCoordinator);
+    await expect(restartedPublisher.publish(attempt, durableResult.result, {
+      ...fixture.fence,
+      now: fixture.advance(),
+    })).rejects.toThrow("Navigator subject artifact changed during planning publication");
+    expect(fixture.store.getWorkArtifact(mapId)).toMatchObject({
+      externalId: partialMap.externalId,
+      status: "cancelled",
+    });
+    await expect(fixture.tracker.read(partialMap.externalId)).resolves.toMatchObject({
+      state: "cancelled",
+    });
   });
-  expect(fixture.store.getEffect(fixture.jobId, accepted.effectIdempotencyKey!)).toMatchObject({
-    status: "done",
-  });
-  expect(fixture.store.getJob(fixture.jobId)).toMatchObject({ currentWorkflowStepId: null });
 });
