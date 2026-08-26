@@ -14,6 +14,7 @@ import {
   emptyRecipePromotionEvidence,
 } from "../src/capabilities/promotion";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
 import { openStore } from "../src/storage/store";
 import { insertResolvedPromotionLedgerFixture } from "./promotion-evidence-fixture";
 
@@ -158,6 +159,7 @@ describe("trusted durable recipe promotion evidence", () => {
        )`,
     ).run();
 
+    registerWorkArtifactRelationshipValidation(db);
     bb.storage.migrate(db, [...ALL_MIGRATIONS]);
 
     expect(db.prepare("PRAGMA table_info(model_route_trials)").all()).toContainEqual(

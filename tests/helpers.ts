@@ -12,6 +12,7 @@ import type { ProjectPolicy } from "../src/domain/models";
 import type { TelegramAgentStore } from "../src/storage/store";
 import { AutonomyRepository } from "../src/storage/autonomy-repository";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
 import { vi } from "vitest";
 
 export type FileBackedAutonomyHarness = Readonly<{
@@ -32,10 +33,12 @@ export function fileBackedAutonomyHarness(): FileBackedAutonomyHarness {
   try {
     primary.pragma("journal_mode = WAL");
     primary.pragma("foreign_keys = ON");
+    registerWorkArtifactRelationshipValidation(primary);
     for (const migration of ALL_MIGRATIONS) primary.exec(migration);
     secondary = new Database(databasePath);
     secondary.pragma("journal_mode = WAL");
     secondary.pragma("foreign_keys = ON");
+    registerWorkArtifactRelationshipValidation(secondary);
     let closed = false;
     return {
       directory,

@@ -184,6 +184,35 @@ import {
   type SaveReferenceDocumentResult,
 } from "./reference-repository";
 import {
+  registerWorkArtifactRelationshipValidation,
+  WorkArtifactRepository,
+  type AdoptWorkArtifactClaimInput,
+  type AuthorizeWorkArtifactResolutionInput,
+  type CaptureWorkArtifactInput,
+  type ClaimWorkArtifactInput,
+  type FinalizeWorkArtifactResolutionInput,
+  type ObserveWorkArtifactInput,
+  type PrepareWorkArtifactCreateIntentInput,
+  type PreflightWorkArtifactCaptureInput,
+  type PrepareWorkArtifactTrackerMutationInput,
+  type ReleaseWorkArtifactClaimInput,
+  type RenewWorkArtifactClaimInput,
+  type ApplyWorkArtifactTrackerMutationInput,
+  type SettleWorkArtifactTrackerMutationInput,
+  type WorkArtifact,
+  type WorkArtifactCapture,
+  type WorkArtifactClaim,
+  type WorkArtifactClaimIdentity,
+  type WorkArtifactCreateIntent,
+  type WorkArtifactRelationship,
+  type WorkArtifactResolution,
+  type WorkArtifactResolutionIntent,
+  type WorkArtifactSnapshot,
+  type WorkArtifactSnapshotInvalidation,
+  type WorkArtifactTrackerMutation,
+  type WorkArtifactTrackerMutationKey,
+} from "../work-artifacts/repository";
+import {
   ControllerEvidenceRepository,
   type AcceptedControllerFinalization,
   type ControllerEvidenceInput,
@@ -328,6 +357,15 @@ export type ControllerMutationFence = ControllerLeaseFence & Readonly<{
 
 export type ControllerMutationResult<T> =
   | Readonly<{ outcome: "applied"; mutationValue: T }>
+  | Readonly<{ outcome: "stale" }>;
+
+export type ExecutorMutationFence = Readonly<{
+  ownerId: string;
+  generation: number;
+}>;
+
+export type ExecutorMutationResult<T> =
+  | Readonly<{ outcome: "applied"; mutationValue: T; now: number }>
   | Readonly<{ outcome: "stale" }>;
 
 export type ControllerVoiceWork = Readonly<{
@@ -2955,6 +2993,7 @@ export function migrateControllerInteractionStorage(
 ): void {
   assertNonNegativeInteger(now, "controller generation migration time");
   const db = storage.database();
+  registerWorkArtifactRelationshipValidation(db);
   storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
   if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
     storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
@@ -2976,6 +3015,10 @@ export function migrateControllerInteractionStorage(
 }
 
 export interface TelegramAgentStore {
+  runExecutorMutation<T>(
+    input: ExecutorMutationFence,
+    mutation: (now: number) => T,
+  ): ExecutorMutationResult<T>;
   runControllerMutation<T>(
     input: ControllerMutationFence,
     mutation: (now: number) => T,
@@ -2993,6 +3036,60 @@ export interface TelegramAgentStore {
   getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null;
   listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[];
   deleteReferenceDocument(id: string): boolean;
+  captureWorkArtifact(input: CaptureWorkArtifactInput): WorkArtifactCapture;
+  prepareWorkArtifactCreateIntent(
+    input: PrepareWorkArtifactCreateIntentInput,
+  ): WorkArtifactCreateIntent;
+  getWorkArtifactCreateIntent(artifactId: string): WorkArtifactCreateIntent | null;
+  preflightWorkArtifactCapture(input: PreflightWorkArtifactCaptureInput): void;
+  observeWorkArtifact(input: ObserveWorkArtifactInput): WorkArtifactCapture;
+  getWorkArtifact(id: string): WorkArtifact | null;
+  getWorkArtifactByExternalIdentity(
+    projectId: string,
+    trackerNamespace: string,
+    externalId: string,
+  ): WorkArtifact | null;
+  getWorkArtifactSnapshot(id: string): WorkArtifactSnapshot | null;
+  getCurrentWorkArtifactSnapshot(artifactId: string): WorkArtifactSnapshot | null;
+  isWorkArtifactSnapshotValid(snapshotId: string): boolean;
+  getWorkArtifactSnapshotInvalidation(snapshotId: string): WorkArtifactSnapshotInvalidation | null;
+  listWorkArtifactRelationships(artifactId: string): readonly WorkArtifactRelationship[];
+  listWorkArtifactFrontier(parentArtifactId: string, limit: number): readonly WorkArtifact[];
+  claimWorkArtifact(input: ClaimWorkArtifactInput): WorkArtifactClaim | null;
+  preflightWorkArtifactClaimIdentity(input: WorkArtifactClaimIdentity): void;
+  adoptWorkArtifactClaim(input: AdoptWorkArtifactClaimInput): boolean;
+  renewWorkArtifactClaim(input: RenewWorkArtifactClaimInput): boolean;
+  releaseWorkArtifactClaim(input: ReleaseWorkArtifactClaimInput): boolean;
+  getHeldWorkArtifactClaim(artifactId: string): WorkArtifactClaim | null;
+  getWorkArtifactClaim(claimId: number): WorkArtifactClaim | null;
+  prepareWorkArtifactTrackerMutation(
+    input: PrepareWorkArtifactTrackerMutationInput,
+  ): WorkArtifactTrackerMutation;
+  markWorkArtifactTrackerMutationApplying(
+    input: ApplyWorkArtifactTrackerMutationInput,
+  ): WorkArtifactTrackerMutation;
+  completeWorkArtifactTrackerMutation(
+    input: SettleWorkArtifactTrackerMutationInput & Readonly<{
+      ownerId: string;
+      generation: number;
+    }>,
+  ): WorkArtifactTrackerMutation;
+  markWorkArtifactTrackerMutationIndeterminate(
+    input: SettleWorkArtifactTrackerMutationInput & Readonly<{
+      reason: string;
+      ownerId: string;
+      generation: number;
+    }>,
+  ): WorkArtifactTrackerMutation;
+  getWorkArtifactTrackerMutation(
+    input: WorkArtifactTrackerMutationKey,
+  ): WorkArtifactTrackerMutation | null;
+  authorizeWorkArtifactResolution(
+    input: AuthorizeWorkArtifactResolutionInput,
+  ): WorkArtifactResolutionIntent | null;
+  finalizeWorkArtifactResolution(input: FinalizeWorkArtifactResolutionInput): WorkArtifact | null;
+  getWorkArtifactResolutionIntent(intentId: string): WorkArtifactResolutionIntent | null;
+  getWorkArtifactResolution(artifactId: string): WorkArtifactResolution | null;
   createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile;
   appendCapabilityReceipt(input: AppendCapabilityReceiptInput): CapabilityReceipt;
   appendCapabilityTerminalOutcome(input: AppendCapabilityTerminalInput): boolean;
@@ -5059,6 +5156,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly credentialAccessRepository: CredentialAccessRepository;
   private readonly stageExecutionRepository: StageExecutionRepository;
   private readonly referenceRepository: ReferenceRepository;
+  private readonly workArtifactRepository: WorkArtifactRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -5074,6 +5172,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.credentialAccessRepository = new CredentialAccessRepository(db);
     this.stageExecutionRepository = new StageExecutionRepository(db);
     this.referenceRepository = new ReferenceRepository(db);
+    this.workArtifactRepository = new WorkArtifactRepository(db);
   }
 
   public reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult {
@@ -5105,6 +5204,29 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         throw new TypeError("controller mutations must be synchronous");
       }
       return { outcome: "applied", mutationValue };
+    }).immediate();
+  }
+
+  /** Atomically fences a synchronous durable write by executor generation. */
+  public runExecutorMutation<T>(
+    input: ExecutorMutationFence,
+    mutation: (now: number) => T,
+  ): ExecutorMutationResult<T> {
+    assertBoundedString(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    return this.db.transaction((): ExecutorMutationResult<T> => {
+      const boundaryNow = this.currentNow();
+      if (!this.isExecutorLeaseCurrent(input.ownerId, input.generation, boundaryNow)) {
+        return { outcome: "stale" };
+      }
+      const mutationValue = mutation(boundaryNow);
+      if (
+        (typeof mutationValue === "object" && mutationValue !== null || typeof mutationValue === "function") &&
+        typeof (mutationValue as { then?: unknown }).then === "function"
+      ) {
+        throw new TypeError("executor mutations must be synchronous");
+      }
+      return { outcome: "applied", mutationValue, now: boundaryNow };
     }).immediate();
   }
 
@@ -5210,6 +5332,151 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public deleteReferenceDocument(id: string): boolean {
     return this.referenceRepository.deleteReferenceDocument(id);
+  }
+
+  public captureWorkArtifact(input: CaptureWorkArtifactInput): WorkArtifactCapture {
+    return this.workArtifactRepository.captureArtifact(input);
+  }
+
+  public prepareWorkArtifactCreateIntent(
+    input: PrepareWorkArtifactCreateIntentInput,
+  ): WorkArtifactCreateIntent {
+    return this.workArtifactRepository.prepareCreateIntent(input);
+  }
+
+  public getWorkArtifactCreateIntent(artifactId: string): WorkArtifactCreateIntent | null {
+    return this.workArtifactRepository.getCreateIntent(artifactId);
+  }
+
+  public preflightWorkArtifactCapture(input: PreflightWorkArtifactCaptureInput): void {
+    this.workArtifactRepository.preflightArtifactCapture(input);
+  }
+
+  public observeWorkArtifact(input: ObserveWorkArtifactInput): WorkArtifactCapture {
+    return this.workArtifactRepository.observeArtifact(input);
+  }
+
+  public getWorkArtifact(id: string): WorkArtifact | null {
+    return this.workArtifactRepository.getArtifact(id);
+  }
+
+  public getWorkArtifactByExternalIdentity(
+    projectId: string,
+    trackerNamespace: string,
+    externalId: string,
+  ): WorkArtifact | null {
+    return this.workArtifactRepository.getArtifactByExternalIdentity(
+      projectId,
+      trackerNamespace,
+      externalId,
+    );
+  }
+
+  public getWorkArtifactSnapshot(id: string): WorkArtifactSnapshot | null {
+    return this.workArtifactRepository.getSnapshot(id);
+  }
+
+  public getCurrentWorkArtifactSnapshot(artifactId: string): WorkArtifactSnapshot | null {
+    return this.workArtifactRepository.getCurrentSnapshot(artifactId);
+  }
+
+  public isWorkArtifactSnapshotValid(snapshotId: string): boolean {
+    return this.workArtifactRepository.isSnapshotValid(snapshotId);
+  }
+
+  public getWorkArtifactSnapshotInvalidation(snapshotId: string): WorkArtifactSnapshotInvalidation | null {
+    return this.workArtifactRepository.getSnapshotInvalidation(snapshotId);
+  }
+
+  public listWorkArtifactRelationships(artifactId: string): readonly WorkArtifactRelationship[] {
+    return this.workArtifactRepository.listRelationships(artifactId);
+  }
+
+  public listWorkArtifactFrontier(parentArtifactId: string, limit: number): readonly WorkArtifact[] {
+    return this.workArtifactRepository.listFrontier(parentArtifactId, limit);
+  }
+
+  public claimWorkArtifact(input: ClaimWorkArtifactInput): WorkArtifactClaim | null {
+    return this.workArtifactRepository.claimArtifact(input);
+  }
+
+  public preflightWorkArtifactClaimIdentity(input: WorkArtifactClaimIdentity): void {
+    this.workArtifactRepository.preflightClaimIdentity(input);
+  }
+
+  public adoptWorkArtifactClaim(input: AdoptWorkArtifactClaimInput): boolean {
+    return this.workArtifactRepository.adoptArtifactClaim(input);
+  }
+
+  public renewWorkArtifactClaim(input: RenewWorkArtifactClaimInput): boolean {
+    return this.workArtifactRepository.renewArtifactClaim(input);
+  }
+
+  public releaseWorkArtifactClaim(input: ReleaseWorkArtifactClaimInput): boolean {
+    return this.workArtifactRepository.releaseArtifactClaim(input);
+  }
+
+  public getHeldWorkArtifactClaim(artifactId: string): WorkArtifactClaim | null {
+    return this.workArtifactRepository.getHeldClaim(artifactId);
+  }
+
+  public getWorkArtifactClaim(claimId: number): WorkArtifactClaim | null {
+    return this.workArtifactRepository.getClaim(claimId);
+  }
+
+  public prepareWorkArtifactTrackerMutation(
+    input: PrepareWorkArtifactTrackerMutationInput,
+  ): WorkArtifactTrackerMutation {
+    return this.workArtifactRepository.prepareTrackerMutation(input);
+  }
+
+  public markWorkArtifactTrackerMutationApplying(
+    input: ApplyWorkArtifactTrackerMutationInput,
+  ): WorkArtifactTrackerMutation {
+    return this.workArtifactRepository.markTrackerMutationApplying(input);
+  }
+
+  public completeWorkArtifactTrackerMutation(
+    input: SettleWorkArtifactTrackerMutationInput & Readonly<{
+      ownerId: string;
+      generation: number;
+    }>,
+  ): WorkArtifactTrackerMutation {
+    return this.workArtifactRepository.completeTrackerMutation(input);
+  }
+
+  public markWorkArtifactTrackerMutationIndeterminate(
+    input: SettleWorkArtifactTrackerMutationInput & Readonly<{
+      reason: string;
+      ownerId: string;
+      generation: number;
+    }>,
+  ): WorkArtifactTrackerMutation {
+    return this.workArtifactRepository.markTrackerMutationIndeterminate(input);
+  }
+
+  public getWorkArtifactTrackerMutation(
+    input: WorkArtifactTrackerMutationKey,
+  ): WorkArtifactTrackerMutation | null {
+    return this.workArtifactRepository.getTrackerMutation(input);
+  }
+
+  public authorizeWorkArtifactResolution(
+    input: AuthorizeWorkArtifactResolutionInput,
+  ): WorkArtifactResolutionIntent | null {
+    return this.workArtifactRepository.authorizeArtifactResolution(input);
+  }
+
+  public finalizeWorkArtifactResolution(input: FinalizeWorkArtifactResolutionInput): WorkArtifact | null {
+    return this.workArtifactRepository.finalizeArtifactResolution(input);
+  }
+
+  public getWorkArtifactResolutionIntent(intentId: string): WorkArtifactResolutionIntent | null {
+    return this.workArtifactRepository.getResolutionIntent(intentId);
+  }
+
+  public getWorkArtifactResolution(artifactId: string): WorkArtifactResolution | null {
+    return this.workArtifactRepository.getResolution(artifactId);
   }
 
   public createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile {

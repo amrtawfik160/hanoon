@@ -1,3 +1,5 @@
+import { WORK_ARTIFACT_RELATIONSHIP_VALIDATOR_FUNCTION } from "../work-artifacts/models";
+
 export const INITIAL_MIGRATIONS = [String.raw`
 CREATE TABLE owners (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -2334,6 +2336,425 @@ export const MERGE_PRE_APPROVAL_MIGRATIONS = [String.raw`
 ALTER TABLE jobs ADD COLUMN merge_pre_approved_at INTEGER;
 `] as const;
 
+/**
+ * Editable tracker artifacts are mirrored separately from immutable execution
+ * snapshots. A remote close is only an observation on the artifact row;
+ * evidenced internal resolution is an append-only record of its own.
+ */
+export const WORK_ARTIFACT_MIGRATIONS = [String.raw`
+CREATE TABLE work_artifact_create_intents (
+  artifact_id TEXT PRIMARY KEY CHECK (length(artifact_id) BETWEEN 1 AND 256),
+  project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 256),
+  effort_id TEXT NOT NULL CHECK (length(effort_id) BETWEEN 1 AND 256),
+  operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+  tracker_kind TEXT NOT NULL CHECK (tracker_kind IN ('github', 'local_markdown')),
+  tracker_namespace TEXT NOT NULL CHECK (length(tracker_namespace) BETWEEN 1 AND 1024),
+  tracker_operation_id TEXT NOT NULL CHECK (length(tracker_operation_id) BETWEEN 1 AND 256),
+  create_digest TEXT NOT NULL CHECK (length(create_digest) = 64),
+  owner_id TEXT NOT NULL CHECK (length(owner_id) BETWEEN 1 AND 256),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE(project_id, operation_id),
+  UNIQUE(tracker_namespace, tracker_operation_id)
+);
+CREATE TRIGGER work_artifact_create_intents_append_only_update
+BEFORE UPDATE ON work_artifact_create_intents
+BEGIN SELECT RAISE(ABORT, 'work_artifact_create_intents are append-only'); END;
+CREATE TRIGGER work_artifact_create_intents_append_only_delete
+BEFORE DELETE ON work_artifact_create_intents
+BEGIN SELECT RAISE(ABORT, 'work_artifact_create_intents are append-only'); END;
+
+CREATE TABLE work_artifacts (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 256),
+  effort_id TEXT NOT NULL CHECK (length(effort_id) BETWEEN 1 AND 256),
+  operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'map', 'specification', 'decision_ticket', 'implementation_ticket'
+  )),
+  initial_status TEXT NOT NULL CHECK (initial_status IN ('open', 'ready')),
+  status TEXT NOT NULL CHECK (status IN ('open', 'ready', 'claimed', 'resolved', 'cancelled')),
+  tracker_kind TEXT NOT NULL CHECK (tracker_kind IN ('github', 'local_markdown')),
+  tracker_namespace TEXT NOT NULL CHECK (length(tracker_namespace) BETWEEN 1 AND 1024),
+  external_id TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 1024),
+  external_url TEXT CHECK (external_url IS NULL OR length(external_url) BETWEEN 1 AND 2048),
+  external_revision TEXT NOT NULL CHECK (length(external_revision) BETWEEN 1 AND 512),
+  external_status TEXT NOT NULL CHECK (external_status IN ('open', 'closed', 'cancelled')),
+  assignees_json TEXT NOT NULL CHECK (json_valid(assignees_json)),
+  title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 512),
+  tracker_order INTEGER NOT NULL CHECK (tracker_order >= 0),
+  current_revision INTEGER NOT NULL DEFAULT 0 CHECK (current_revision >= 0),
+  current_snapshot_id TEXT,
+  remote_closed_at INTEGER CHECK (remote_closed_at IS NULL OR remote_closed_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  UNIQUE(project_id, operation_id),
+  UNIQUE(project_id, tracker_namespace, external_id),
+  CHECK ((current_revision = 0) = (current_snapshot_id IS NULL))
+);
+CREATE INDEX work_artifacts_effort
+  ON work_artifacts(project_id, effort_id, tracker_order, created_at, id);
+CREATE INDEX work_artifacts_status
+  ON work_artifacts(project_id, effort_id, status, tracker_order, id);
+
+CREATE TABLE work_artifact_tracker_mutations (
+  tracker_namespace TEXT NOT NULL CHECK (length(tracker_namespace) BETWEEN 1 AND 1024),
+  external_id TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 1024),
+  operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+  artifact_id TEXT NOT NULL CHECK (length(artifact_id) BETWEEN 1 AND 256),
+  kind TEXT NOT NULL CHECK (kind IN ('parent', 'resolve', 'cancel')),
+  payload_digest TEXT NOT NULL CHECK (length(payload_digest) = 64),
+  requested_parent_external_id TEXT
+    CHECK (requested_parent_external_id IS NULL OR length(requested_parent_external_id) BETWEEN 1 AND 1024),
+  original_parent_external_id TEXT
+    CHECK (original_parent_external_id IS NULL OR length(original_parent_external_id) BETWEEN 1 AND 1024),
+  original_revision TEXT NOT NULL CHECK (length(original_revision) BETWEEN 1 AND 512),
+  owner_id TEXT NOT NULL CHECK (length(owner_id) BETWEEN 1 AND 256),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  phase TEXT NOT NULL CHECK (phase IN ('prepared', 'applying', 'completed', 'indeterminate')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'indeterminate')),
+  last_observed_parent_external_id TEXT
+    CHECK (last_observed_parent_external_id IS NULL OR length(last_observed_parent_external_id) BETWEEN 1 AND 1024),
+  last_observed_revision TEXT
+    CHECK (last_observed_revision IS NULL OR length(last_observed_revision) BETWEEN 1 AND 512),
+  reason TEXT CHECK (reason IS NULL OR length(reason) BETWEEN 1 AND 2048),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0),
+  PRIMARY KEY (tracker_namespace, external_id, operation_id),
+  CHECK ((kind = 'parent') = (requested_parent_external_id IS NOT NULL)),
+  CHECK (
+    (phase IN ('prepared', 'applying') AND status = 'pending' AND settled_at IS NULL) OR
+    (phase = 'completed' AND status = 'completed' AND settled_at IS NOT NULL) OR
+    (phase = 'indeterminate' AND status = 'indeterminate' AND settled_at IS NOT NULL)
+  )
+);
+CREATE INDEX work_artifact_tracker_mutations_artifact
+  ON work_artifact_tracker_mutations(artifact_id, status, updated_at);
+
+CREATE TABLE work_artifact_snapshots (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 512),
+  content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 1048576),
+  content_digest TEXT NOT NULL CHECK (length(content_digest) = 64),
+  snapshot_digest TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+  acceptance_criteria_json TEXT NOT NULL CHECK (json_valid(acceptance_criteria_json)),
+  relationships_json TEXT NOT NULL CHECK (json_valid(relationships_json)),
+  external_revision TEXT NOT NULL CHECK (length(external_revision) BETWEEN 1 AND 512),
+  captured_at INTEGER NOT NULL CHECK (captured_at >= 0),
+  UNIQUE(artifact_id, revision)
+);
+CREATE INDEX work_artifact_snapshots_artifact
+  ON work_artifact_snapshots(artifact_id, revision DESC);
+CREATE TRIGGER work_artifact_snapshots_append_only_update
+BEFORE UPDATE ON work_artifact_snapshots
+BEGIN SELECT RAISE(ABORT, 'work_artifact_snapshots are append-only'); END;
+CREATE TRIGGER work_artifact_snapshots_append_only_delete
+BEFORE DELETE ON work_artifact_snapshots
+BEGIN SELECT RAISE(ABORT, 'work_artifact_snapshots are append-only'); END;
+
+CREATE TABLE work_artifact_snapshot_invalidations (
+  snapshot_id TEXT PRIMARY KEY REFERENCES work_artifact_snapshots(id),
+  replacement_snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  reason TEXT NOT NULL CHECK (reason IN ('remote_edit', 'relationship_change')),
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  CHECK (snapshot_id <> replacement_snapshot_id)
+);
+CREATE TRIGGER work_artifact_invalidations_append_only_update
+BEFORE UPDATE ON work_artifact_snapshot_invalidations
+BEGIN SELECT RAISE(ABORT, 'work_artifact_snapshot_invalidations are append-only'); END;
+CREATE TRIGGER work_artifact_invalidations_append_only_delete
+BEFORE DELETE ON work_artifact_snapshot_invalidations
+BEGIN SELECT RAISE(ABORT, 'work_artifact_snapshot_invalidations are append-only'); END;
+
+CREATE TABLE work_artifact_relationships (
+  owner_artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'parent', 'blocks', 'derived_from', 'executed_by', 'delivered_by'
+  )),
+  source_artifact_id TEXT REFERENCES work_artifacts(id),
+  source_ref TEXT NOT NULL CHECK (length(source_ref) BETWEEN 1 AND 1024),
+  target_artifact_id TEXT REFERENCES work_artifacts(id),
+  target_ref TEXT NOT NULL CHECK (length(target_ref) BETWEEN 1 AND 1024),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (owner_artifact_id, kind, source_ref, target_ref),
+  UNIQUE(owner_artifact_id, ordinal)
+);
+CREATE INDEX work_artifact_relationships_source
+  ON work_artifact_relationships(kind, source_artifact_id, target_artifact_id);
+CREATE INDEX work_artifact_relationships_target
+  ON work_artifact_relationships(kind, target_artifact_id, source_artifact_id);
+CREATE TRIGGER work_artifact_relationships_same_effort
+BEFORE INSERT ON work_artifact_relationships
+WHEN EXISTS (
+  SELECT 1
+    FROM work_artifacts AS owner
+    JOIN work_artifacts AS related
+      ON related.id IN (NEW.source_artifact_id, NEW.target_artifact_id)
+   WHERE owner.id = NEW.owner_artifact_id
+     AND (related.project_id <> owner.project_id OR related.effort_id <> owner.effort_id)
+)
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships must stay in one effort'); END;
+CREATE TRIGGER work_artifact_relationships_touch_owner
+BEFORE INSERT ON work_artifact_relationships
+WHEN NEW.source_artifact_id IS NOT NEW.owner_artifact_id
+ AND NEW.target_artifact_id IS NOT NEW.owner_artifact_id
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships must touch their owner'); END;
+CREATE TRIGGER work_artifact_relationships_no_self_edge
+BEFORE INSERT ON work_artifact_relationships
+WHEN NEW.source_artifact_id IS NOT NULL
+ AND NEW.source_artifact_id IS NEW.target_artifact_id
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships cannot be self edges'); END;
+
+CREATE TABLE work_artifact_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  workflow_step_id TEXT NOT NULL CHECK (length(workflow_step_id) BETWEEN 1 AND 256),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  external_assignee TEXT NOT NULL CHECK (length(external_assignee) BETWEEN 1 AND 256),
+  state TEXT NOT NULL CHECK (state IN ('held', 'released', 'invalidated')),
+  owner_id TEXT NOT NULL CHECK (length(owner_id) BETWEEN 1 AND 256),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  lease_expires_at INTEGER NOT NULL CHECK (lease_expires_at >= 0),
+  acquired_at INTEGER NOT NULL CHECK (acquired_at >= 0),
+  renewed_at INTEGER NOT NULL CHECK (renewed_at >= 0),
+  released_at INTEGER CHECK (released_at IS NULL OR released_at >= 0),
+  release_reason TEXT CHECK (release_reason IS NULL OR length(release_reason) BETWEEN 1 AND 256)
+);
+CREATE UNIQUE INDEX one_held_work_artifact_claim
+  ON work_artifact_claims(artifact_id) WHERE state = 'held';
+CREATE INDEX work_artifact_claims_workflow
+  ON work_artifact_claims(workflow_step_id, state, artifact_id);
+
+CREATE TABLE work_artifact_resolution_intents (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+  outcome TEXT NOT NULL CHECK (outcome IN ('resolved', 'cancelled')),
+  snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  expected_external_revision TEXT NOT NULL CHECK (length(expected_external_revision) BETWEEN 1 AND 512),
+  evidence_refs_json TEXT NOT NULL CHECK (json_valid(evidence_refs_json)),
+  recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+  UNIQUE(artifact_id, operation_id)
+);
+CREATE TRIGGER work_artifact_resolution_intents_append_only_update
+BEFORE UPDATE ON work_artifact_resolution_intents
+BEGIN SELECT RAISE(ABORT, 'work_artifact_resolution_intents are append-only'); END;
+CREATE TRIGGER work_artifact_resolution_intents_append_only_delete
+BEFORE DELETE ON work_artifact_resolution_intents
+BEGIN SELECT RAISE(ABORT, 'work_artifact_resolution_intents are append-only'); END;
+
+CREATE TABLE work_artifact_resolutions (
+  artifact_id TEXT PRIMARY KEY REFERENCES work_artifacts(id),
+  intent_id TEXT NOT NULL UNIQUE REFERENCES work_artifact_resolution_intents(id),
+  operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+  outcome TEXT NOT NULL CHECK (outcome IN ('resolved', 'cancelled')),
+  snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  external_revision TEXT NOT NULL CHECK (length(external_revision) BETWEEN 1 AND 512),
+  evidence_refs_json TEXT NOT NULL CHECK (json_valid(evidence_refs_json)),
+  recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0)
+);
+CREATE TRIGGER work_artifact_resolutions_append_only_update
+BEFORE UPDATE ON work_artifact_resolutions
+BEGIN SELECT RAISE(ABORT, 'work_artifact_resolutions are append-only'); END;
+CREATE TRIGGER work_artifact_resolutions_append_only_delete
+BEFORE DELETE ON work_artifact_resolutions
+BEGIN SELECT RAISE(ABORT, 'work_artifact_resolutions are append-only'); END;
+`] as const;
+
+export const WORK_ARTIFACT_RELATIONSHIP_IDENTITY_MIGRATIONS = [String.raw`
+CREATE TEMP TABLE work_artifact_relationship_identity_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO work_artifact_relationship_identity_guard (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+    FROM work_artifact_relationships
+   WHERE (
+     source_artifact_id IS NOT NULL AND source_ref <> ('artifact:' || source_artifact_id)
+   ) OR (
+     source_artifact_id IS NULL AND substr(source_ref, 1, 9) = 'artifact:'
+   ) OR (
+     target_artifact_id IS NOT NULL AND target_ref <> ('artifact:' || target_artifact_id)
+   ) OR (
+     target_artifact_id IS NULL AND substr(target_ref, 1, 9) = 'artifact:'
+   ) OR (
+     source_artifact_id IS NOT NULL AND source_artifact_id IS target_artifact_id
+   ) OR source_ref = target_ref
+) THEN 0 ELSE 1 END;
+
+DROP TRIGGER IF EXISTS work_artifact_relationships_no_self_edge;
+DROP TRIGGER IF EXISTS work_artifact_relationships_internal_refs;
+CREATE TRIGGER work_artifact_relationships_internal_refs
+BEFORE INSERT ON work_artifact_relationships
+WHEN (
+  NEW.source_artifact_id IS NOT NULL AND NEW.source_ref <> ('artifact:' || NEW.source_artifact_id)
+) OR (
+  NEW.source_artifact_id IS NULL AND substr(NEW.source_ref, 1, 9) = 'artifact:'
+) OR (
+  NEW.target_artifact_id IS NOT NULL AND NEW.target_ref <> ('artifact:' || NEW.target_artifact_id)
+) OR (
+  NEW.target_artifact_id IS NULL AND substr(NEW.target_ref, 1, 9) = 'artifact:'
+)
+BEGIN SELECT RAISE(ABORT, 'work artifact relationship internal refs must match artifact ids'); END;
+CREATE TRIGGER work_artifact_relationships_no_self_edge
+BEFORE INSERT ON work_artifact_relationships
+WHEN (
+  NEW.source_artifact_id IS NOT NULL AND
+  NEW.source_artifact_id IS NEW.target_artifact_id
+) OR NEW.source_ref = NEW.target_ref
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships cannot be self edges'); END;
+
+CREATE TRIGGER work_artifact_relationships_internal_refs_update
+BEFORE UPDATE ON work_artifact_relationships
+WHEN (
+  NEW.source_artifact_id IS NOT NULL AND NEW.source_ref <> ('artifact:' || NEW.source_artifact_id)
+) OR (
+  NEW.source_artifact_id IS NULL AND substr(NEW.source_ref, 1, 9) = 'artifact:'
+) OR (
+  NEW.target_artifact_id IS NOT NULL AND NEW.target_ref <> ('artifact:' || NEW.target_artifact_id)
+) OR (
+  NEW.target_artifact_id IS NULL AND substr(NEW.target_ref, 1, 9) = 'artifact:'
+)
+BEGIN SELECT RAISE(ABORT, 'work artifact relationship internal refs must match artifact ids'); END;
+CREATE TRIGGER work_artifact_relationships_no_self_edge_update
+BEFORE UPDATE ON work_artifact_relationships
+WHEN (
+  NEW.source_artifact_id IS NOT NULL AND
+  NEW.source_artifact_id IS NEW.target_artifact_id
+) OR NEW.source_ref = NEW.target_ref
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships cannot be self edges'); END;
+CREATE TRIGGER work_artifact_relationships_same_effort_update
+BEFORE UPDATE ON work_artifact_relationships
+WHEN EXISTS (
+  SELECT 1
+    FROM work_artifacts AS owner
+    JOIN work_artifacts AS related
+      ON related.id IN (NEW.source_artifact_id, NEW.target_artifact_id)
+   WHERE owner.id = NEW.owner_artifact_id
+     AND (related.project_id <> owner.project_id OR related.effort_id <> owner.effort_id)
+)
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships must stay in one effort'); END;
+CREATE TRIGGER work_artifact_relationships_touch_owner_update
+BEFORE UPDATE ON work_artifact_relationships
+WHEN NEW.source_artifact_id IS NOT NEW.owner_artifact_id
+ AND NEW.target_artifact_id IS NOT NEW.owner_artifact_id
+BEGIN SELECT RAISE(ABORT, 'work artifact relationships must touch their owner'); END;
+
+DROP TABLE work_artifact_relationship_identity_guard;
+`] as const;
+
+export const WORK_ARTIFACT_RELATIONSHIP_CANONICAL_MIGRATIONS = [String.raw`
+CREATE TEMP TABLE work_artifact_relationship_canonical_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO work_artifact_relationship_canonical_guard (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+    FROM (
+      SELECT owner_artifact_id,
+             json_group_array(json(relationship_json)) AS relationships_json
+        FROM (
+          SELECT owner_artifact_id,
+                 json_object(
+                   'kind', kind,
+                   'sourceArtifactId', source_artifact_id,
+                   'sourceRef', source_ref,
+                   'targetArtifactId', target_artifact_id,
+                   'targetRef', target_ref
+                 ) AS relationship_json
+            FROM work_artifact_relationships
+           ORDER BY owner_artifact_id, ordinal
+        )
+       GROUP BY owner_artifact_id
+    ) AS current_relationships
+   WHERE ${WORK_ARTIFACT_RELATIONSHIP_VALIDATOR_FUNCTION}(
+     owner_artifact_id,
+     relationships_json
+   ) <> 1
+) OR EXISTS (
+  SELECT 1
+    FROM work_artifact_snapshots
+   WHERE ${WORK_ARTIFACT_RELATIONSHIP_VALIDATOR_FUNCTION}(
+     artifact_id,
+     relationships_json
+   ) <> 1
+) THEN 0 ELSE 1 END;
+
+CREATE TRIGGER work_artifact_relationships_canonical_insert
+BEFORE INSERT ON work_artifact_relationships
+WHEN ${WORK_ARTIFACT_RELATIONSHIP_VALIDATOR_FUNCTION}(
+  NEW.owner_artifact_id,
+  (
+    SELECT json_group_array(json(relationship_json))
+      FROM (
+        SELECT json_object(
+                 'kind', kind,
+                 'sourceArtifactId', source_artifact_id,
+                 'sourceRef', source_ref,
+                 'targetArtifactId', target_artifact_id,
+                 'targetRef', target_ref
+               ) AS relationship_json
+          FROM work_artifact_relationships
+         WHERE owner_artifact_id = NEW.owner_artifact_id
+        UNION ALL
+        SELECT json_object(
+                 'kind', NEW.kind,
+                 'sourceArtifactId', NEW.source_artifact_id,
+                 'sourceRef', NEW.source_ref,
+                 'targetArtifactId', NEW.target_artifact_id,
+                 'targetRef', NEW.target_ref
+               )
+      )
+  )
+) <> 1
+BEGIN SELECT RAISE(ABORT, 'work artifact relationship violates the canonical model'); END;
+
+CREATE TRIGGER work_artifact_relationships_canonical_update
+BEFORE UPDATE ON work_artifact_relationships
+WHEN ${WORK_ARTIFACT_RELATIONSHIP_VALIDATOR_FUNCTION}(
+  NEW.owner_artifact_id,
+  (
+    SELECT json_group_array(json(relationship_json))
+      FROM (
+        SELECT json_object(
+                 'kind', kind,
+                 'sourceArtifactId', source_artifact_id,
+                 'sourceRef', source_ref,
+                 'targetArtifactId', target_artifact_id,
+                 'targetRef', target_ref
+               ) AS relationship_json
+          FROM work_artifact_relationships
+         WHERE owner_artifact_id = NEW.owner_artifact_id
+           AND rowid <> OLD.rowid
+        UNION ALL
+        SELECT json_object(
+                 'kind', NEW.kind,
+                 'sourceArtifactId', NEW.source_artifact_id,
+                 'sourceRef', NEW.source_ref,
+                 'targetArtifactId', NEW.target_artifact_id,
+                 'targetRef', NEW.target_ref
+               )
+      )
+  )
+) <> 1
+BEGIN SELECT RAISE(ABORT, 'work artifact relationship violates the canonical model'); END;
+
+CREATE TRIGGER work_artifact_snapshots_relationships_canonical_insert
+BEFORE INSERT ON work_artifact_snapshots
+WHEN ${WORK_ARTIFACT_RELATIONSHIP_VALIDATOR_FUNCTION}(
+  NEW.artifact_id,
+  NEW.relationships_json
+) <> 1
+BEGIN SELECT RAISE(ABORT, 'work artifact snapshot relationships violate the canonical model'); END;
+
+DROP TABLE work_artifact_relationship_canonical_guard;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -2408,4 +2829,7 @@ export const ALL_MIGRATIONS = [
   ...CONSENSUS_REVIEW_MIGRATIONS,
   ...AUTONOMOUS_INTAKE_MIGRATIONS,
   ...MERGE_PRE_APPROVAL_MIGRATIONS,
+  ...WORK_ARTIFACT_MIGRATIONS,
+  ...WORK_ARTIFACT_RELATIONSHIP_IDENTITY_MIGRATIONS,
+  ...WORK_ARTIFACT_RELATIONSHIP_CANONICAL_MIGRATIONS,
 ] as const;

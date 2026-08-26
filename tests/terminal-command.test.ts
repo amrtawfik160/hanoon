@@ -1,11 +1,20 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { parseCommandJson, TerminalCommandRunner } from "../src/bb/terminal-command";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  parseCommandJson,
+  shellSingleQuote,
+  TerminalCommandRunner,
+} from "../src/bb/terminal-command";
 
 type TerminalSdk = {
   terminals: {
     create: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
     output: ReturnType<typeof vi.fn>;
+    input: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
   };
 };
@@ -18,6 +27,7 @@ function makeSdk(overrides: Partial<TerminalSdk["terminals"]> = {}): TerminalSdk
       create: vi.fn().mockResolvedValue({ id: "terminal-1" }),
       get: vi.fn().mockResolvedValue({ status: "exited", exitCode: 0 }),
       output: vi.fn().mockResolvedValue({ chunks: [] }),
+      input: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     },
@@ -113,6 +123,212 @@ describe("TerminalCommandRunner", () => {
 
     expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "ok" });
     expect(observations.at(-1)).toMatchObject({ id: "terminal-1", status: "exited", exitCode: 0 });
+  });
+
+  test("uses an explicit capture budget and reports provider tail truncation", async () => {
+    let marker: string | null = null;
+    const create = vi.fn().mockImplementation(async ({ start }: { start: { command: string } }) => {
+      marker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0] ?? null;
+      return { id: "terminal-capture" };
+    });
+    const output = vi.fn().mockImplementation(async () => ({
+      chunks: [{ seq: 0, dataBase64: encoded(`retained\n${marker}:0\n`) }],
+      nextSeq: 1,
+      truncated: true,
+    }));
+    const runner = new TerminalCommandRunner(makeSdk({
+      create,
+      get: vi.fn().mockResolvedValue({ status: "running", exitCode: null }),
+      output,
+    }) as never);
+
+    expect(await runner.run({
+      scope: { kind: "environment", environmentId: "env-1" },
+      title: "bounded provider response",
+      command: "gh issue view 7",
+      timeoutMs: 5_000,
+      maxOutputBytes: 131_072,
+    })).toEqual({
+      outcome: "exited",
+      exitCode: 0,
+      output: "retained",
+      outputTruncated: true,
+    });
+    expect(output).toHaveBeenCalledWith({
+      terminalId: "terminal-capture",
+      sinceSeq: 0,
+      tailBytes: 131_072,
+    });
+  });
+
+  test("streams exact-length raw stdin without putting it in the launch command", async () => {
+    const stdin = "# Issue body\n\nPrivate collaboration details.";
+    let resultMarker = "";
+    let readyMarker = "";
+    let outputRead = 0;
+    const create = vi.fn().mockImplementation(async ({ start }: { start: { command: string } }) => {
+      resultMarker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0] ?? "";
+      readyMarker = `${resultMarker}_STDIN_READY`;
+      expect(start.command).toContain("stty raw -echo");
+      expect(start.command).toContain(`head -c ${Buffer.byteLength(stdin, "utf8")}`);
+      expect(start.command).not.toContain(stdin);
+      return { id: "terminal-stdin" };
+    });
+    const output = vi.fn().mockImplementation(async () => {
+      outputRead += 1;
+      const text = outputRead === 1
+        ? `\n${readyMarker}\n`
+        : `created\n${resultMarker}:0\n`;
+      return {
+        chunks: [{ seq: outputRead, dataBase64: encoded(text) }],
+        nextSeq: outputRead,
+      };
+    });
+    const input = vi.fn().mockResolvedValue(undefined);
+    const runner = new TerminalCommandRunner(makeSdk({
+      create,
+      get: vi.fn().mockResolvedValue({ status: "running", exitCode: null }),
+      output,
+      input,
+    }) as never);
+
+    const result = await runner.run({
+      scope: { kind: "environment", environmentId: "env-1" },
+      title: "stdin command",
+      command: "gh issue create --body-file -",
+      stdin,
+      timeoutMs: 5_000,
+    });
+
+    expect(input).toHaveBeenCalledWith({
+      terminalId: "terminal-stdin",
+      dataBase64: encoded(stdin),
+    });
+    expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "created" });
+  });
+
+  test("preserves a command result coalesced with stdin readiness", async () => {
+    let resultMarker = "";
+    let readyMarker = "";
+    const create = vi.fn().mockImplementation(async ({ start }: { start: { command: string } }) => {
+      resultMarker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0] ?? "";
+      readyMarker = `${resultMarker}_STDIN_READY`;
+      return { id: "terminal-empty-stdin" };
+    });
+    const output = vi.fn().mockImplementation(async ({ sinceSeq }: { sinceSeq: number }) => sinceSeq === 0
+      ? {
+          chunks: [{ seq: 0, dataBase64: encoded(`\n${readyMarker}\ncreated\n${resultMarker}:0\n`) }],
+          nextSeq: 1,
+        }
+      : { chunks: [], nextSeq: 1 });
+    const runner = new TerminalCommandRunner(makeSdk({
+      create,
+      get: vi.fn().mockResolvedValue({ status: "running", exitCode: null }),
+      output,
+    }) as never);
+
+    const result = await runner.run({
+      scope: { kind: "environment", environmentId: "env-1" },
+      title: "empty stdin command",
+      command: "gh issue create --body-file -",
+      stdin: "",
+      timeoutMs: 100,
+    });
+
+    expect(result).toEqual({ outcome: "exited", exitCode: 0, output: "created" });
+  });
+
+  test("preserves long lines and terminal control bytes on a real raw PTY", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "terminal-stdin-pty-"));
+    const path = join(directory, "body.md");
+    const body = `${"x".repeat(5_000)}\u0015def\u0004\u0000tail`;
+    const bytes = Buffer.byteLength(body, "utf8");
+    const child = spawn("script", [
+      "-qfec",
+      `stty raw -echo; printf __RAW_READY__; head -c ${bytes} > ${shellSingleQuote(path)}`,
+      "/dev/null",
+    ], { stdio: ["pipe", "pipe", "ignore"] });
+    const ready = new Promise<void>((resolveReady, rejectReady) => {
+      const timer = setTimeout(() => rejectReady(new Error("raw PTY did not become ready")), 5_000);
+      let observed = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        observed += chunk.toString("utf8");
+        if (!observed.includes("__RAW_READY__")) return;
+        clearTimeout(timer);
+        resolveReady();
+      });
+    });
+    const exit = new Promise<number | null>((resolveExit, rejectExit) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        rejectExit(new Error("raw PTY did not receive the exact byte count"));
+      }, 5_000);
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        rejectExit(error);
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolveExit(code);
+      });
+    });
+    try {
+      await ready;
+      child.stdin.end(body);
+      expect(await exit).toBe(0);
+      expect(await readFile(path, "utf8")).toBe(body);
+    } finally {
+      child.stdin.destroy();
+      child.kill("SIGKILL");
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds a terminal stdin write that never settles", async () => {
+    vi.useFakeTimers();
+    let readyMarker = "";
+    const create = vi.fn().mockImplementation(async ({ start }: { start: { command: string } }) => {
+      const resultMarker = start.command.match(/__BB_TELEGRAM_AGENT_RESULT_[0-9a-f]+__/)?.[0] ?? "";
+      readyMarker = `${resultMarker}_STDIN_READY`;
+      return { id: "terminal-stdin-timeout" };
+    });
+    const close = vi.fn().mockResolvedValue(undefined);
+    const runner = new TerminalCommandRunner(makeSdk({
+      create,
+      output: vi.fn().mockImplementation(async () => ({
+        chunks: [{ seq: 1, dataBase64: encoded(`\n${readyMarker}\n`) }],
+        nextSeq: 1,
+      })),
+      input: vi.fn().mockImplementation(() => new Promise<never>(() => undefined)),
+      close,
+    }) as never);
+    const pending = runner.run({
+      scope: { kind: "environment", environmentId: "env-1" },
+      title: "stdin timeout",
+      command: "gh issue create --body-file -",
+      stdin: "body",
+      timeoutMs: 100,
+    });
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(await pending).toEqual({ outcome: "timed_out" });
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("rejects terminal stdin larger than one MiB before creating a session", async () => {
+    const sdk = makeSdk();
+    const runner = new TerminalCommandRunner(sdk as never);
+    const stdin = "🙂".repeat(262_145);
+
+    await expect(runner.run({
+      scope: { kind: "environment", environmentId: "env-1" },
+      title: "invalid stdin",
+      command: "gh issue create --body-file -",
+      stdin,
+      timeoutMs: 1_000,
+    })).rejects.toThrow(/stdin.*1048576 UTF-8 bytes/iu);
+    expect(sdk.terminals.create).not.toHaveBeenCalled();
   });
 
   test.each([

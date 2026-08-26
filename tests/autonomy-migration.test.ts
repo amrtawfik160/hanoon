@@ -1,6 +1,7 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
 
 const LEGACY_MIGRATION_COUNT = 16;
 const LEGACY_PROJECT_ID = "proj_legacy";
@@ -77,11 +78,31 @@ function insertLegacyJob(
 }
 
 function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): void {
-  bb.storage.migrate(bb.storage.database(), [...ALL_MIGRATIONS]);
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+}
+
+function insertRelationshipUpgradeArtifact(
+  db: ReturnType<typeof legacyDatabase>["db"],
+  id: string,
+  operationId: string,
+  externalId: string,
+): void {
+  db.prepare(
+    `INSERT INTO work_artifacts (
+       id, project_id, effort_id, operation_id, kind, initial_status, status,
+       tracker_kind, tracker_namespace, external_id, external_url, external_revision,
+       external_status, assignees_json, title, tracker_order, current_revision,
+       current_snapshot_id, remote_closed_at, created_at, updated_at
+     ) VALUES (?, 'proj_1', 'effort_1', ?, 'implementation_ticket', 'ready', 'ready',
+       'github', 'github:acme/widgets', ?, NULL, 'etag-1', 'open', '[]', ?, 0, 0,
+       NULL, NULL, 1000, 1000)`,
+  ).run(id, operationId, externalId, operationId);
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 57);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 60);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -129,6 +150,279 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 52]).toContain("CREATE TABLE project_admission_pause_clear_history");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 53]).toContain("CREATE TABLE controller_voice_inbox");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 55]).toContain("CREATE TABLE audit_intake_findings");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 56]).toContain("merge_pre_approved_at");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 57]).toContain("CREATE TABLE work_artifacts");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 57])
+    .toContain("CREATE TABLE work_artifact_create_intents");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 57])
+    .toContain("CREATE TABLE work_artifact_tracker_mutations");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 57])
+    .toContain("workflow_step_id TEXT NOT NULL");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 57])
+    .toContain("job_id TEXT NOT NULL REFERENCES jobs(id)");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 58])
+    .toContain("work_artifact_relationships_internal_refs");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 59])
+    .toContain("work_artifact_relationships_canonical_insert");
+});
+
+it("strengthens relationship triggers after the original artifact migration was applied", () => {
+  const { bb } = createFakePluginHost({ pluginId: "work-artifact-relationship-trigger-upgrade" });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -1));
+  expect(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_artifact_relationships'",
+  ).get()).toEqual({ name: "work_artifact_relationships" });
+  const insertArtifact = db.prepare(
+    `INSERT INTO work_artifacts (
+       id, project_id, effort_id, operation_id, kind, initial_status, status,
+       tracker_kind, tracker_namespace, external_id, external_url, external_revision,
+       external_status, assignees_json, title, tracker_order, current_revision,
+       current_snapshot_id, remote_closed_at, created_at, updated_at
+     ) VALUES (?, 'proj_1', 'effort_1', ?, 'implementation_ticket', 'ready', 'ready',
+       'github', 'github:acme/widgets', ?, NULL, 'etag-1', 'open', '[]', ?, 0, 0,
+       NULL, NULL, 1000, 1000)`,
+  );
+  insertArtifact.run("artifact_upgrade_owner", "upgrade-owner", "501", "Upgrade owner");
+  insertArtifact.run("artifact_upgrade_parent", "upgrade-parent", "502", "Upgrade parent");
+  db.prepare(
+    `INSERT INTO work_artifact_relationships (
+       owner_artifact_id, ordinal, kind, source_artifact_id, source_ref,
+       target_artifact_id, target_ref, created_at
+     ) VALUES (?, 0, 'parent', ?, ?, ?, ?, 1000)`,
+  ).run(
+    "artifact_upgrade_owner",
+    "artifact_upgrade_owner",
+    "artifact:artifact_upgrade_owner",
+    "artifact_upgrade_parent",
+    "artifact:artifact_upgrade_parent",
+  );
+
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND name IN (
+        'work_artifact_relationships_internal_refs',
+        'work_artifact_relationships_internal_refs_update',
+        'work_artifact_relationships_no_self_edge',
+        'work_artifact_relationships_no_self_edge_update',
+        'work_artifact_relationships_same_effort',
+        'work_artifact_relationships_same_effort_update',
+        'work_artifact_relationships_touch_owner',
+        'work_artifact_relationships_touch_owner_update'
+      ) ORDER BY name`,
+  ).all()).toEqual([
+    { name: "work_artifact_relationships_internal_refs" },
+    { name: "work_artifact_relationships_internal_refs_update" },
+    { name: "work_artifact_relationships_no_self_edge" },
+    { name: "work_artifact_relationships_no_self_edge_update" },
+    { name: "work_artifact_relationships_same_effort" },
+    { name: "work_artifact_relationships_same_effort_update" },
+    { name: "work_artifact_relationships_touch_owner" },
+    { name: "work_artifact_relationships_touch_owner_update" },
+  ]);
+  expect(db.prepare("SELECT COUNT(*) AS count FROM work_artifact_relationships").get())
+    .toEqual({ count: 1 });
+});
+
+it.each([
+  ["source artifact ID with an external ref", [
+    "artifact_upgrade_owner", "external:owner", null, "external:source",
+  ]],
+  ["target artifact ID with an external ref", [
+    null, "external:source", "artifact_upgrade_owner", "external:owner",
+  ]],
+  ["reserved source ref without an artifact ID", [
+    null, "artifact:artifact_upgrade_owner", "artifact_upgrade_owner",
+    "artifact:artifact_upgrade_owner",
+  ]],
+  ["ref self edge", [
+    "artifact_upgrade_owner", "external:same", null, "external:same",
+  ]],
+] as const)("atomically rejects a relationship migration with a preexisting %s", (
+  _scenario,
+  relationship,
+) => {
+  const { bb } = createFakePluginHost({
+    pluginId: `work-artifact-invalid-relationship-upgrade-${String(relationship[1])}`,
+  });
+  const db = bb.storage.database();
+  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 2;
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
+  const insertArtifact = db.prepare(
+    `INSERT INTO work_artifacts (
+       id, project_id, effort_id, operation_id, kind, initial_status, status,
+       tracker_kind, tracker_namespace, external_id, external_url, external_revision,
+       external_status, assignees_json, title, tracker_order, current_revision,
+       current_snapshot_id, remote_closed_at, created_at, updated_at
+     ) VALUES (?, 'proj_1', 'effort_1', ?, 'implementation_ticket', 'ready', 'ready',
+       'github', 'github:acme/widgets', ?, NULL, 'etag-1', 'open', '[]', ?, 0, 0,
+       NULL, NULL, 1000, 1000)`,
+  );
+  insertArtifact.run("artifact_upgrade_owner", "upgrade-owner", "501", "Upgrade owner");
+  db.prepare(
+    `INSERT INTO work_artifact_relationships (
+       owner_artifact_id, ordinal, kind, source_artifact_id, source_ref,
+       target_artifact_id, target_ref, created_at
+     ) VALUES ('artifact_upgrade_owner', 0, 'derived_from', ?, ?, ?, ?, 1000)`,
+  ).run(...relationship);
+  const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();
+  const triggersBefore = db.prepare(
+    `SELECT name, sql FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name = 'work_artifact_relationships'
+      ORDER BY name`,
+  ).all();
+  const rowsBefore = db.prepare(
+    "SELECT * FROM work_artifact_relationships ORDER BY owner_artifact_id, ordinal",
+  ).all();
+
+  registerWorkArtifactRelationshipValidation(db);
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all()).toEqual(ledgerBefore);
+  expect(ledgerBefore).toHaveLength(migrationsBeforeUpgrade);
+  expect(db.prepare(
+    `SELECT name, sql FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name = 'work_artifact_relationships'
+      ORDER BY name`,
+  ).all()).toEqual(triggersBefore);
+  expect(db.prepare(
+    "SELECT * FROM work_artifact_relationships ORDER BY owner_artifact_id, ordinal",
+  ).all()).toEqual(rowsBefore);
+  expect(db.prepare(
+    "SELECT name FROM sqlite_temp_master WHERE name = 'work_artifact_relationship_identity_guard'",
+  ).get()).toBeUndefined();
+});
+
+it.each([
+  ["whitespace-prefixed reserved ref", (db: ReturnType<typeof legacyDatabase>["db"]) => {
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_owner", "canonical-owner", "601");
+    db.prepare(
+      `INSERT INTO work_artifact_relationships (
+         owner_artifact_id, ordinal, kind, source_artifact_id, source_ref,
+         target_artifact_id, target_ref, created_at
+       ) VALUES (?, 0, 'derived_from', ?, ?, NULL, ?, 1000)`,
+    ).run(
+      "artifact_canonical_owner",
+      "artifact_canonical_owner",
+      "artifact:artifact_canonical_owner",
+      " artifact:external-target",
+    );
+  }],
+  ["NFKC-equivalent reserved ref", (db: ReturnType<typeof legacyDatabase>["db"]) => {
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_owner", "canonical-owner", "602");
+    db.prepare(
+      `INSERT INTO work_artifact_relationships (
+         owner_artifact_id, ordinal, kind, source_artifact_id, source_ref,
+         target_artifact_id, target_ref, created_at
+       ) VALUES (?, 0, 'derived_from', ?, ?, NULL, ?, 1000)`,
+    ).run(
+      "artifact_canonical_owner",
+      "artifact_canonical_owner",
+      "artifact:artifact_canonical_owner",
+      "ａｒｔｉｆａｃｔ:external-target",
+    );
+  }],
+  ["directionally invalid relationship", (db: ReturnType<typeof legacyDatabase>["db"]) => {
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_owner", "canonical-owner", "603");
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_related", "canonical-related", "604");
+    db.prepare(
+      `INSERT INTO work_artifact_relationships (
+         owner_artifact_id, ordinal, kind, source_artifact_id, source_ref,
+         target_artifact_id, target_ref, created_at
+       ) VALUES (?, 0, 'parent', ?, ?, ?, ?, 1000)`,
+    ).run(
+      "artifact_canonical_owner",
+      "artifact_canonical_related",
+      "artifact:artifact_canonical_related",
+      "artifact_canonical_owner",
+      "artifact:artifact_canonical_owner",
+    );
+  }],
+  ["multiple parent relationships", (db: ReturnType<typeof legacyDatabase>["db"]) => {
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_owner", "canonical-owner", "605");
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_parent_a", "canonical-parent-a", "606");
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_parent_b", "canonical-parent-b", "607");
+    const insert = db.prepare(
+      `INSERT INTO work_artifact_relationships (
+         owner_artifact_id, ordinal, kind, source_artifact_id, source_ref,
+         target_artifact_id, target_ref, created_at
+       ) VALUES (?, ?, 'parent', ?, ?, ?, ?, 1000)`,
+    );
+    for (const [ordinal, parent] of [
+      [0, "artifact_canonical_parent_a"],
+      [1, "artifact_canonical_parent_b"],
+    ] as const) {
+      insert.run(
+        "artifact_canonical_owner",
+        ordinal,
+        "artifact_canonical_owner",
+        "artifact:artifact_canonical_owner",
+        parent,
+        `artifact:${parent}`,
+      );
+    }
+  }],
+  ["corrupted immutable snapshot relationships", (db: ReturnType<typeof legacyDatabase>["db"]) => {
+    insertRelationshipUpgradeArtifact(db, "artifact_canonical_owner", "canonical-owner", "608");
+    db.prepare(
+      `INSERT INTO work_artifact_snapshots (
+         id, artifact_id, revision, title, content, content_digest, snapshot_digest,
+         acceptance_criteria_json, relationships_json, external_revision, captured_at
+       ) VALUES (?, ?, 1, ?, ?, ?, ?, '[]', ?, 'etag-snapshot', 1000)`,
+    ).run(
+      "snapshot_canonical_invalid",
+      "artifact_canonical_owner",
+      "Invalid relationship snapshot",
+      "# Goal\n\nReject corrupted immutable relationships.",
+      "a".repeat(64),
+      "b".repeat(64),
+      JSON.stringify([{
+        kind: "parent",
+        sourceArtifactId: null,
+        sourceRef: "external:source",
+        targetArtifactId: "artifact_canonical_owner",
+        targetRef: "artifact:artifact_canonical_owner",
+      }]),
+    );
+  }],
+] as const)("atomically rejects canonical relationship migration with %s", (_scenario, arrange) => {
+  const { bb } = createFakePluginHost({
+    pluginId: `work-artifact-canonical-relationship-${String(_scenario).replaceAll(" ", "-")}`,
+  });
+  const db = bb.storage.database();
+  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 1;
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
+  arrange(db);
+  const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();
+  const triggersBefore = db.prepare(
+    `SELECT name, sql FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name IN (
+        'work_artifact_relationships', 'work_artifact_snapshots'
+      ) ORDER BY name`,
+  ).all();
+  const relationshipsBefore = db.prepare(
+    "SELECT * FROM work_artifact_relationships ORDER BY owner_artifact_id, ordinal",
+  ).all();
+  const snapshotsBefore = db.prepare(
+    "SELECT * FROM work_artifact_snapshots ORDER BY id",
+  ).all();
+
+  registerWorkArtifactRelationshipValidation(db);
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all()).toEqual(ledgerBefore);
+  expect(db.prepare(
+    `SELECT name, sql FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name IN (
+        'work_artifact_relationships', 'work_artifact_snapshots'
+      ) ORDER BY name`,
+  ).all()).toEqual(triggersBefore);
+  expect(db.prepare(
+    "SELECT * FROM work_artifact_relationships ORDER BY owner_artifact_id, ordinal",
+  ).all()).toEqual(relationshipsBefore);
+  expect(db.prepare("SELECT * FROM work_artifact_snapshots ORDER BY id").all())
+    .toEqual(snapshotsBefore);
 });
 
 it("creates the autonomy schema and removes one_active_job only after migration backfill", () => {
