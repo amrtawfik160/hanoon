@@ -658,9 +658,20 @@ export class NavigatorRepository {
         `SELECT effect.*
            FROM effects AS effect
            JOIN navigator_skill_attempts AS attempt ON attempt.effect_idempotency_key = effect.idempotency_key
+           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
            JOIN jobs AS job ON job.id = effect.job_id
           WHERE effect.kind = 'run_navigator_skill'
             AND job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
+            AND job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+            AND job.cancel_requested_at IS NULL
+            AND effect.job_id = attempt.job_id AND attempt.job_id = step.job_id
+            AND step.job_id = snapshot.job_id
+            AND attempt.job_version = step.job_version AND step.job_version = snapshot.job_version
+            AND attempt.workflow_revision = step.workflow_revision
+            AND step.workflow_revision = snapshot.workflow_revision
+            AND attempt.snapshot_digest = snapshot.digest
+            AND job.workflow_revision = step.workflow_revision
             AND job.current_workflow_step_id = attempt.workflow_step_id
             AND NOT EXISTS (
               SELECT 1 FROM workflow_step_outcomes AS outcome
@@ -749,6 +760,13 @@ export class NavigatorRepository {
       ).get(attempt.workflowStepId) as SnapshotRow | undefined;
       if (!snapshotRow) throw new Error("navigator attempt snapshot disappeared");
       const snapshot = parseSnapshot(snapshotRow);
+      const job = this.acceptedSettlementJob(attempt, input.effectIdempotencyKey, snapshot);
+      if (!job) return null;
+      if (job.cancelRequestedAt !== null || job.state === "cancelled") {
+        this.supersedeCancelledAttempt({ attempt, ...input });
+        return null;
+      }
+      if (["merged", "cancelled", "blocked", "complete", "production_failed"].includes(job.state)) return null;
       let reasonCode = input.policyFailureReason ?? "succeeded";
       let outcome: NavigatorWorkflowStepOutcome["outcome"] = input.policyFailureReason ? "policy_failure" : "succeeded";
       const parsedResult = navigatorResearchResultSchema.safeParse(input.result);
@@ -838,6 +856,84 @@ export class NavigatorRepository {
       if (effectUpdate.changes !== 1) throw new Error("navigator effect lease changed before settlement");
       return this.getOutcome(attempt.workflowStepId);
     }).immediate();
+  }
+
+  private acceptedSettlementJob(
+    attempt: NavigatorSkillAttempt,
+    effectIdempotencyKey: string,
+    snapshot: NavigatorSnapshot,
+  ): Job | null {
+    const acceptedIdentity = this.db.prepare(
+      `SELECT 1 FROM effects AS effect
+        JOIN navigator_skill_attempts AS attempt ON attempt.effect_idempotency_key = effect.idempotency_key
+        JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+        JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
+       WHERE effect.idempotency_key = ? AND attempt.id = ? AND snapshot.id = ?
+         AND effect.job_id = attempt.job_id AND attempt.job_id = step.job_id AND step.job_id = snapshot.job_id
+         AND attempt.job_version = step.job_version AND step.job_version = snapshot.job_version
+         AND attempt.workflow_revision = step.workflow_revision
+         AND step.workflow_revision = snapshot.workflow_revision
+         AND attempt.snapshot_digest = snapshot.digest`,
+    ).get(effectIdempotencyKey, attempt.id, snapshot.snapshotId);
+    if (!acceptedIdentity) return null;
+    const job = readJobById(this.db, attempt.jobId);
+    if (
+      !job || job.workflowEngine !== "navigator-v1" || job.workflowMode !== "deterministic" ||
+      job.currentWorkflowStepId !== attempt.workflowStepId || job.workflowRevision !== attempt.workflowRevision
+    ) return null;
+    return job;
+  }
+
+  private supersedeCancelledAttempt(input: Readonly<{
+    attempt: NavigatorSkillAttempt;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): void {
+    const reason = this.cancellationSupersessionReason(input.attempt.workflowStepId, input.now);
+    this.db.prepare(
+      `UPDATE jobs SET current_workflow_step_id = NULL, version = version + 1, updated_at = ?
+        WHERE id = ? AND current_workflow_step_id = ?
+          AND (cancel_requested_at IS NOT NULL OR state = 'cancelled')`,
+    ).run(input.now, input.attempt.jobId, input.attempt.workflowStepId);
+    this.finishSupersededEffect({ ...input, reason });
+  }
+
+  private cancellationSupersessionReason(workflowStepId: string, now: number): string {
+    const existing = this.db.prepare(
+      "SELECT reason FROM workflow_step_supersessions WHERE workflow_step_id = ?",
+    ).get(workflowStepId) as { reason: string } | undefined;
+    if (existing) return existing.reason;
+    this.db.prepare(
+      `INSERT INTO workflow_step_supersessions (
+         workflow_step_id, superseded_by_step_id, reason, recorded_at
+       ) VALUES (?, NULL, 'job_cancelled', ?)`,
+    ).run(workflowStepId, now);
+    return "job_cancelled";
+  }
+
+  private finishSupersededEffect(input: Readonly<{
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+    reason: string;
+  }>): void {
+    const effectUpdate = this.db.prepare(
+      `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
+           lease_expires_at = NULL, last_error = ?, updated_at = ?
+        WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+          AND lease_generation = ? AND lease_expires_at > ?`,
+    ).run(
+      `superseded:${input.reason}`,
+      input.now,
+      input.effectIdempotencyKey,
+      input.ownerId,
+      input.generation,
+      input.now,
+    );
+    if (effectUpdate.changes !== 1) throw new Error("navigator effect lease changed before cancellation settlement");
   }
 
   private insertDecision(

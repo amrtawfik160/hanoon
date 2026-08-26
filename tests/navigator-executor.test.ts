@@ -447,6 +447,115 @@ describe("navigator-v1 durable executor slice", () => {
       .toEqual([]);
   });
 
+  it("SPEC-38-001: does not dispatch an accepted navigator step after its job is cancelled", async () => {
+    const value = fixture();
+    const skillRun = vi.fn();
+    const workflow = executor(value, { skillRunner: { run: skillRun } });
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const acceptedJob = value.store.getJob(value.job.id);
+    if (!acceptedJob) throw new Error("accepted navigator job disappeared");
+    const cancelled = value.store.applyJobEvent(acceptedJob.id, acceptedJob.version, {
+      type: "CANCEL_REQUESTED",
+      activeWorkers: [],
+    }, 1_090);
+    expect(cancelled).toMatchObject({ state: "cancelled", cancelRequestedAt: 1_090 });
+
+    const lease = value.store.acquireExecutorLease("executor-cancelled-before-dispatch", 1_100, 30_000);
+    if (!lease.acquired) throw new Error("cancelled-before-dispatch executor lease was unavailable");
+    await expect(workflow.processOne({
+      ownerId: "executor-cancelled-before-dispatch",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal)).resolves.toBe(false);
+
+    expect(skillRun).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({
+      status: "pending",
+      attempts: 0,
+    });
+    expect(value.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toBeNull();
+  });
+
+  it("SPEC-38-001: supersedes an in-flight navigator step when cancellation interrupts its result", async () => {
+    const value = fixture();
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let releaseResult!: () => void;
+    const resultReleased = new Promise<void>((resolve) => {
+      releaseResult = resolve;
+    });
+    const skillRun = vi.fn(async (_attempt, hooks) => {
+      const resource = { kind: "bb_thread" as const, id: "thr_cancelled_in_flight" };
+      await hooks.bindResource(resource);
+      signalStarted();
+      await resultReleased;
+      return {
+        resource,
+        observedExternalStateDigest: "e".repeat(64),
+        result: {
+          kind: "research_result",
+          summary: "This result arrived after cancellation.",
+          artifactEvidence: [{
+            artifactId: value.artifactId,
+            snapshotId: value.snapshotId,
+            snapshotDigest: value.snapshotDigest,
+            finding: "A late result must not revive cancelled work.",
+            evidenceRefs: ["bb:thr_cancelled_in_flight"],
+          }],
+        },
+      };
+    });
+    let now = 1_100;
+    const workflow = executor(value, { skillRunner: { run: skillRun }, now: () => now });
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const lease = value.store.acquireExecutorLease("executor-cancelled-in-flight", now, 30_000);
+    if (!lease.acquired) throw new Error("cancelled-in-flight executor lease was unavailable");
+    const processing = workflow.processOne({
+      ownerId: "executor-cancelled-in-flight",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal);
+    await started;
+
+    now = 1_110;
+    const runningJob = value.store.getJob(value.job.id);
+    if (!runningJob) throw new Error("running navigator job disappeared");
+    const cancellationRequested = value.store.applyJobEvent(runningJob.id, runningJob.version, {
+      type: "CANCEL_REQUESTED",
+    }, now);
+    expect(cancellationRequested.cancelRequestedAt).toBe(now);
+    releaseResult();
+    await expect(processing).resolves.toBe(true);
+
+    expect(value.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toBeNull();
+    expect(value.db.prepare(
+      `SELECT superseded_by_step_id, reason FROM workflow_step_supersessions
+        WHERE workflow_step_id = ?`,
+    ).get(accepted.workflowStepId)).toEqual({
+      superseded_by_step_id: null,
+      reason: "job_cancelled",
+    });
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({
+      status: "done",
+      lastError: "superseded:job_cancelled",
+    });
+    expect(value.store.getJob(value.job.id)).toMatchObject({
+      cancelRequestedAt: now,
+      currentWorkflowStepId: null,
+      workflowRevision: value.job.workflowRevision,
+    });
+  });
+
   it("settles a structured result with exact artifact evidence through the highest executor seam", async () => {
     const value = fixture();
     const workflow = executor(value);
