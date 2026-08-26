@@ -9,7 +9,10 @@ import type {
   NavigatorSnapshot,
 } from "./models";
 import { NAVIGATOR_RESEARCH_STEP_CONTRACT } from "./models";
-import type { NavigatorPlanningPublication } from "./planning-publisher";
+import {
+  NavigatorPublicationDriftError,
+  type NavigatorPlanningPublication,
+} from "./planning-publisher";
 import { navigatorStepContract } from "./planning-contracts";
 
 export interface WorkflowNavigator {
@@ -207,6 +210,7 @@ export class NavigatorWorkflowExecutor {
         observedExternalStateDigest: skillRun.observedExternalStateDigest,
         result: durableResult?.result ?? skillRun.result,
         ...(publication === null ? {} : { publishedArtifactBindings: publication.artifactBindings }),
+        ...(publication === null ? {} : { reconciledArtifactIds: publication.reconciledArtifactIds }),
         ...(policyFailureReason === undefined ? {} : { policyFailureReason }),
         ownerId: fence.ownerId,
         generation: fence.generation,
@@ -215,6 +219,21 @@ export class NavigatorWorkflowExecutor {
       if (!settled) throw new Error("navigator skill settlement fence was lost");
       return true;
     } catch (error) {
+      const durableResult = this.dependencies.store.getNavigatorPlanningResult(attempt.id);
+      if (error instanceof NavigatorPublicationDriftError && durableResult) {
+        const settled = this.dependencies.store.settleNavigatorSkillAttempt({
+          attemptId: attempt.id,
+          effectIdempotencyKey: effect.idempotencyKey,
+          observedExternalStateDigest: durableResult.observedExternalStateDigest,
+          result: durableResult.result,
+          policyFailureReason: error.reasonCode,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: this.dependencies.clock.now(),
+        });
+        if (!settled) throw new Error("navigator publication drift settlement fence was lost");
+        return true;
+      }
       this.dependencies.store.failEffect(
         effect.idempotencyKey,
         fence.ownerId,

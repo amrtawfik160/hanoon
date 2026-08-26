@@ -189,7 +189,7 @@ export type FinalizeWorkArtifactResolutionInput = Readonly<{
   now: number;
 }>;
 
-export type WorkArtifactTrackerMutationKind = "parent" | "resolve" | "cancel";
+export type WorkArtifactTrackerMutationKind = "parent" | "owned_section" | "resolve" | "cancel";
 export type WorkArtifactTrackerMutationPhase =
   | "prepared"
   | "applying"
@@ -903,7 +903,10 @@ export class WorkArtifactRepository {
   ): WorkArtifactTrackerMutation {
     this.validateTrackerMutationKey(input);
     assertBoundedString(input.artifactId, "artifactId");
-    if (input.kind !== "parent" && input.kind !== "resolve" && input.kind !== "cancel") {
+    if (
+      input.kind !== "parent" && input.kind !== "owned_section" &&
+      input.kind !== "resolve" && input.kind !== "cancel"
+    ) {
       throw new TypeError("work artifact tracker mutation kind is invalid");
     }
     if (!/^[0-9a-f]{64}$/u.test(input.payloadDigest)) {
@@ -1617,7 +1620,7 @@ export class WorkArtifactRepository {
       input.capturedAt,
     );
     const dependencyIds = input.relationships
-      .filter((relationship) => relationship.kind === "parent" || relationship.kind === "derived_from")
+      .filter((relationship) => relationship.kind === "derived_from")
       .map((relationship) => relationship.targetArtifactId)
       .filter((artifactId): artifactId is string => artifactId !== null)
       .map((artifactId) => this.requireArtifact(artifactId).currentSnapshotId);

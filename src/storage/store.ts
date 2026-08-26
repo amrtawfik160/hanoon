@@ -3826,6 +3826,7 @@ export interface TelegramAgentStore {
     observedExternalStateDigest: string;
     result: unknown;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
     ownerId: string;
     generation: number;
@@ -12013,6 +12014,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     observedExternalStateDigest: string;
     result: unknown;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
     ownerId: string;
     generation: number;

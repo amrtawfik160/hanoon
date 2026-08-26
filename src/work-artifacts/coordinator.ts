@@ -19,6 +19,7 @@ import {
 import {
   blockersPayloadDigest,
   claimPayloadDigest,
+  ownedSectionPayloadDigest,
   parentPayloadDigest,
   TrackerConflictError,
   TrackerIdentityConflictError,
@@ -381,6 +382,41 @@ export class WorkArtifactCoordinator {
       if (!snapshot) throw new Error(`Work artifact ${artifact.id} has no current snapshot`);
       return { artifact, snapshot };
     }
+    return this.captureObservationFenced(artifact, external, input);
+  }
+
+  public async updateOwnedSection(input: TrackerEffectFence & Readonly<{
+    artifactId: string;
+    sectionId: string;
+    content: string;
+    operationId: string;
+    now: number;
+  }>): Promise<WorkArtifactCapture> {
+    const artifact = await this.observeCurrentRevision(input);
+    const payloadDigest = ownedSectionPayloadDigest(input);
+    const mutation = this.prepareTrackerMutation({
+      artifactId: artifact.id,
+      kind: "owned_section",
+      operationId: input.operationId,
+      payloadDigest,
+      requestedParentExternalId: null,
+      originalParentExternalId: null,
+      originalRevision: artifact.externalRevision,
+      externalId: artifact.externalId,
+      fence: input,
+      now: input.now,
+    });
+    const reconciliation = await this.reconcileOrBeginBoundTrackerMutation(mutation, artifact, input);
+    const external = reconciliation.shouldApply
+      ? await this.runBoundTrackerEffect(artifact, input, () => this.tracker.updateOwnedSection({
+        externalId: artifact.externalId,
+        sectionId: input.sectionId,
+        content: input.content,
+        operationId: input.operationId,
+        expectedRevision: artifact.externalRevision,
+      }))
+      : reconciliation.artifact ?? await this.readBoundTrackerArtifact(artifact);
+    if (reconciliation.shouldApply) this.completeTrackerMutation(mutation, external, input);
     return this.captureObservationFenced(artifact, external, input);
   }
 
@@ -1014,7 +1050,9 @@ export class WorkArtifactCoordinator {
         ? evidenceArtifact.parentExternalId === mutation.requestedParentExternalId
         : mutation.kind === "resolve"
           ? evidenceArtifact.state === "closed"
-          : evidenceArtifact.state === "cancelled";
+          : mutation.kind === "cancel"
+            ? evidenceArtifact.state === "cancelled"
+            : true;
       if (operationEvidence.status === "completed" && nativeStateMatches) {
         this.completeTrackerMutation(mutation, evidenceArtifact, fence);
         return { shouldApply: false, artifact: evidenceArtifact };

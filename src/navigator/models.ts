@@ -342,6 +342,7 @@ export type NavigatorPlanningResultRecord = Readonly<{
 
 export type NavigatorRoutingDecision = Readonly<{
   decisionDigest: string;
+  scopeDigest: string;
   jobId: string;
   question: string;
   candidateSkillIds: readonly string[];

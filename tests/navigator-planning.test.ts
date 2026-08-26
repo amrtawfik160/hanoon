@@ -30,8 +30,15 @@ class PlanningGitHubGateway implements GitHubIssueGateway {
   private nextNumber = 1;
   private revision = 1;
   private readonly issues = new Map<string, GitHubIssueRecord>();
+  private createPause: Readonly<{ started(): void; wait: Promise<void> }> | null = null;
 
   public async createIssue(input: Readonly<{ title: string; body: string }>): Promise<GitHubIssueRecord> {
+    if (this.createPause) {
+      const pause = this.createPause;
+      this.createPause = null;
+      pause.started();
+      await pause.wait;
+    }
     const externalId = String(this.nextNumber++);
     const issue: GitHubIssueRecord = {
       externalId,
@@ -137,6 +144,19 @@ class PlanningGitHubGateway implements GitHubIssueGateway {
 
   public count(): number {
     return this.issues.size;
+  }
+
+  public pauseNextCreate(): Readonly<{ started: Promise<void>; release(): void }> {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.createPause = { started: markStarted, wait };
+    return { started, release };
   }
 
   private async update(
@@ -307,9 +327,12 @@ async function runPlanningStep(
   }, new AbortController().signal)).resolves.toBe(true);
   const attempt = fixture.store.getNavigatorSkillAttempt(decision.attemptId!);
   if (!attempt || rawResult === undefined) throw new Error("planning attempt did not run");
-  expect(fixture.store.getNavigatorWorkflowStepOutcome(attempt.workflowStepId)).toMatchObject({
-    outcome: "succeeded",
-  });
+  const outcome = fixture.store.getNavigatorWorkflowStepOutcome(attempt.workflowStepId);
+  if (!outcome) {
+    const effect = fixture.store.getEffect(fixture.jobId, attempt.effectIdempotencyKey);
+    throw new Error(`planning outcome was not recorded: ${effect?.lastError ?? "no effect error"}`);
+  }
+  expect(outcome).toMatchObject({ outcome: "succeeded" });
   return { attempt, rawResult };
 }
 
@@ -380,6 +403,17 @@ describe.each(["github", "local_markdown"] as const)("navigator planning through
     expect(fixture.store.listWorkArtifactFrontier(map.id, 10)).toEqual([]);
     expect(decisions.map((decision) => fixture.store.getWorkArtifact(decision.id)?.status))
       .toEqual(["resolved", "resolved"]);
+    for (const decision of decisions) {
+      const trackedDecision = await fixture.tracker.read(decision.externalId);
+      expect(trackedDecision.comments.join("\n"))
+        .toContain(`Durable answer for ${decision.title}.`);
+    }
+    const indexedMap = await fixture.tracker.read(map.externalId);
+    for (const decision of decisions) {
+      const link = decision.externalUrl ?? decision.externalId;
+      expect(indexedMap.body)
+        .toContain(`- [${decision.title}](${link}): Durable answer for ${decision.title}.`);
+    }
 
     await runPlanningStep(fixture, {
       skillId: "to-spec",
@@ -476,8 +510,229 @@ describe.each(["github", "local_markdown"] as const)("navigator planning through
       reason: "remote_edit",
     });
     expect(reconsidered.artifactBindings.map((binding) => binding.artifactId))
-      .toEqual([fixture.rootArtifactId, map.id]);
+      .toEqual([fixture.rootArtifactId, map.id, ...decisions.map((decision) => decision.id), specification.id]);
     expect(fixture.store.getJob(fixture.jobId)!.workflowRevision)
       .toBe(revisionBeforeReconsideration + 1);
+
+    await runPlanningStep(fixture, {
+      skillId: "to-spec",
+      subjectArtifactIds: [map.id, specification.id],
+      result: () => ({
+        kind: "to_spec_result",
+        summary: "The canonical specification is revised after map drift.",
+        specification: {
+          title: "Ticket 39 canonical specification",
+          body: "## Problem Statement\n\nThe owner revised the map.\n\n## Solution\n\nReconcile the existing specification identity.",
+          acceptanceCriteria: ["The original specification artifact is revised"],
+        },
+        evidenceRefs: ["tracker-edit:ticket-39-map"],
+      }),
+    });
+    const reconsideredSpecifications = artifactsOfKind(fixture.store, fixture.jobId, "specification");
+    expect(reconsideredSpecifications).toHaveLength(1);
+    expect(reconsideredSpecifications[0]!.id).toBe(specification.id);
+    await expect(fixture.tracker.read(specification.externalId)).resolves.toMatchObject({
+      body: expect.stringContaining("Reconcile the existing specification identity."),
+    });
   });
+
+  it("SPEC-39-004: resolves prototype decisions from the matched verdict", async () => {
+    const fixture = await planningFixture(trackerKind);
+    await runPlanningStep(fixture, {
+      skillId: "wayfinder",
+      subjectArtifactIds: [fixture.rootArtifactId],
+      result: () => ({
+        kind: "wayfinder_result",
+        summary: "One prototype decision is required.",
+        map: {
+          title: "Prototype decision map",
+          body: "## Destination\n\nChoose behavior.\n\n## Decisions so far\n\n## Not yet specified\n\nPrototype behavior.",
+          acceptanceCriteria: ["The prototype decision is resolved"],
+        },
+        decisionTickets: [{
+          title: "Choose prototype behavior",
+          body: "## Question\n\nWhich behavior should the implementation keep?",
+          acceptanceCriteria: ["The verdict is durable"],
+          blockedBy: [],
+        }],
+        evidenceRefs: ["skill:wayfinder"],
+      }),
+    });
+    const map = artifactsOfKind(fixture.store, fixture.jobId, "map")[0]!;
+    const decision = artifactsOfKind(fixture.store, fixture.jobId, "decision_ticket")[0]!;
+    const decisionSnapshot = fixture.store.getCurrentWorkArtifactSnapshot(decision.id)!;
+    const navigator = {
+      propose: async (snapshot: NavigatorSnapshot): Promise<NavigatorProposal> => ({
+        kind: "invoke_skill",
+        basedOn: snapshot.identity,
+        rationale: "Persist authoritative evidence before prototype publication.",
+        evidenceRefs: ["ticket:39:SPEC-39-004"],
+        skillId: "research",
+        subjectArtifactIds: [decision.id],
+        objective: "Bind the decision snapshot.",
+      }),
+    };
+    const executor = new NavigatorWorkflowExecutor({
+      store: fixture.store,
+      navigator,
+      observeInference: async () => ({
+        nativeToolCalls: [],
+        claimedCodeWorktreeId: null,
+        dynamicEffectToolIds: [],
+        externalStateDigest: "e".repeat(64),
+      }),
+      skillRunner: {
+        run: vi.fn(async (attempt, hooks) => {
+          const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+          await hooks.bindResource(resource);
+          return {
+            resource,
+            observedExternalStateDigest: "e".repeat(64),
+            result: {
+              kind: "research_result",
+              summary: "The accepted snapshot is bound for publication.",
+              artifactEvidence: [{
+                artifactId: decision.id,
+                snapshotId: decisionSnapshot.id,
+                snapshotDigest: decisionSnapshot.snapshotDigest,
+                finding: "Research placeholder superseded by the prototype verdict.",
+                evidenceRefs: ["source:prototype-session"],
+              }],
+            },
+          };
+        }),
+      },
+      modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
+      clock: { now: fixture.advance },
+    });
+    const accepted = await executor.proposeNext({
+      jobId: fixture.jobId,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    await executor.processOne({
+      ...fixture.fence,
+      signal: new AbortController().signal,
+    }, new AbortController().signal);
+    const attempt = fixture.store.getNavigatorSkillAttempt(accepted.attemptId!);
+    if (!attempt) throw new Error("prototype publication attempt disappeared");
+    await fixture.publisher.publish({
+      ...attempt,
+      skillId: "prototype",
+      workflowStepId: `${attempt.workflowStepId}:prototype-publication`,
+    }, {
+      kind: "prototype_result",
+      summary: "The prototype produced a concrete answer.",
+      verdict: "Keep the immediate feedback behavior.",
+      assetRef: "prototype:feedback-behavior",
+      artifactEvidence: [{
+        artifactId: decision.id,
+        snapshotId: decisionSnapshot.id,
+        snapshotDigest: decisionSnapshot.snapshotDigest,
+        finding: "The prototype supports immediate feedback.",
+        evidenceRefs: ["prototype:feedback-behavior"],
+      }],
+    }, { ...fixture.fence, now: fixture.advance() });
+
+    await expect(fixture.tracker.read(decision.externalId)).resolves.toMatchObject({
+      comments: expect.arrayContaining([expect.stringContaining("Keep the immediate feedback behavior.")]),
+    });
+    const link = decision.externalUrl ?? decision.externalId;
+    await expect(fixture.tracker.read(map.externalId)).resolves.toMatchObject({
+      body: expect.stringContaining(
+        `- [${decision.title}](${link}): Keep the immediate feedback behavior.`,
+      ),
+    });
+  });
+});
+
+it("STD-39-002: rejects drift that lands during asynchronous planning publication", async () => {
+  const fixture = await planningFixture("github");
+  const gateway = fixture.gateway!;
+  const pause = gateway.pauseNextCreate();
+  const navigator = {
+    propose: async (snapshot: NavigatorSnapshot): Promise<NavigatorProposal> => ({
+      kind: "invoke_skill",
+      basedOn: snapshot.identity,
+      rationale: "Publish a map from the exact owner ticket snapshot.",
+      evidenceRefs: ["ticket:39:STD-39-002"],
+      skillId: "wayfinder",
+      subjectArtifactIds: [fixture.rootArtifactId],
+      objective: "Publish the planning map.",
+    }),
+  };
+  const executor = new NavigatorWorkflowExecutor({
+    store: fixture.store,
+    navigator,
+    observeInference: async () => ({
+      nativeToolCalls: [],
+      claimedCodeWorktreeId: null,
+      dynamicEffectToolIds: [],
+      externalStateDigest: "e".repeat(64),
+    }),
+    skillRunner: {
+      run: vi.fn(async (attempt, hooks) => {
+        const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        await hooks.bindResource(resource);
+        return {
+          resource,
+          observedExternalStateDigest: "e".repeat(64),
+          result: {
+            kind: "wayfinder_result",
+            summary: "The old owner ticket snapshot produced a map.",
+            map: {
+              title: "Drifted map",
+              body: "## Destination\n\nReject stale publication.\n\n## Decisions so far\n\n## Not yet specified\n\nOne decision.",
+              acceptanceCriteria: ["Drift fails closed"],
+            },
+            decisionTickets: [{
+              title: "Resolve drift",
+              body: "## Question\n\nWhich snapshot is authoritative?",
+              acceptanceCriteria: ["Use the current snapshot"],
+              blockedBy: [],
+            }],
+            evidenceRefs: ["ticket:39:STD-39-002"],
+          },
+        };
+      }),
+    },
+    planningPublisher: fixture.publisher,
+    modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
+    clock: { now: fixture.advance },
+  });
+  const accepted = await executor.proposeNext({
+    jobId: fixture.jobId,
+    externalStateDigest: "e".repeat(64),
+    evidenceRefs: [],
+  });
+  const processing = executor.processOne({
+    ...fixture.fence,
+    signal: new AbortController().signal,
+  }, new AbortController().signal);
+  await pause.started;
+  const root = fixture.store.getWorkArtifact(fixture.rootArtifactId)!;
+  const externalRoot = await fixture.tracker.read(root.externalId);
+  await fixture.tracker.updateOwnedSection({
+    externalId: root.externalId,
+    sectionId: "revision-note",
+    content: "The owner changed the ticket while publication was awaiting the tracker.",
+    operationId: "ticket-39-drift-during-publication",
+    expectedRevision: externalRoot.revision,
+  });
+  await fixture.coordinator.observe({
+    artifactId: root.id,
+    ...fixture.fence,
+    now: fixture.advance(),
+  });
+  pause.release();
+  await processing;
+
+  expect(fixture.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toMatchObject({
+    outcome: "policy_failure",
+    reasonCode: "stale_artifact_snapshot",
+  });
+  expect(fixture.store.getEffect(fixture.jobId, accepted.effectIdempotencyKey!)).toMatchObject({
+    status: "done",
+  });
+  expect(fixture.store.getJob(fixture.jobId)).toMatchObject({ currentWorkflowStepId: null });
 });

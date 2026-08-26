@@ -1,7 +1,10 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
-import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
+import {
+  WorkArtifactRepository,
+  registerWorkArtifactRelationshipValidation,
+} from "../src/work-artifacts/repository";
 
 const LEGACY_MIGRATION_COUNT = 16;
 const LEGACY_PROJECT_ID = "proj_legacy";
@@ -229,6 +232,139 @@ it("strengthens relationship triggers after the original artifact migration was 
   ]);
   expect(db.prepare("SELECT COUNT(*) AS count FROM work_artifact_relationships").get())
     .toEqual({ count: 1 });
+});
+
+it("SPEC-39-002: backfills preexisting snapshot dependencies for recursive invalidation", () => {
+  const { bb } = createFakePluginHost({ pluginId: "navigator-dependency-backfill-upgrade" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -1));
+  const insertArtifact = db.prepare(
+    `INSERT INTO work_artifacts (
+       id, project_id, effort_id, operation_id, kind, initial_status, status,
+       tracker_kind, tracker_namespace, external_id, external_url, external_revision,
+       external_status, assignees_json, title, tracker_order, current_revision,
+       current_snapshot_id, remote_closed_at, created_at, updated_at
+     ) VALUES (?, 'proj_1', 'effort_1', ?, ?, 'ready', 'ready',
+       'github', 'github:acme/widgets', ?, NULL, 'etag-1', 'open', '[]', ?, ?, 1,
+       ?, NULL, ?, ?)`,
+  );
+  const insertSnapshot = db.prepare(
+    `INSERT INTO work_artifact_snapshots (
+       id, artifact_id, revision, title, content, content_digest, snapshot_digest,
+       acceptance_criteria_json, relationships_json, external_revision, captured_at
+     ) VALUES (?, ?, 1, ?, ?, ?, ?, '[]', ?, 'etag-1', ?)`,
+  );
+  const artifacts = [
+    {
+      id: "artifact_upgrade_map",
+      operationId: "upgrade-map",
+      kind: "map",
+      externalId: "701",
+      title: "Upgrade map",
+      order: 0,
+      snapshotId: "snapshot_upgrade_map",
+      capturedAt: 1_000,
+      relationships: [],
+    },
+    {
+      id: "artifact_upgrade_specification",
+      operationId: "upgrade-specification",
+      kind: "specification",
+      externalId: "702",
+      title: "Upgrade specification",
+      order: 1,
+      snapshotId: "snapshot_upgrade_specification",
+      capturedAt: 1_010,
+      relationships: [{
+        kind: "derived_from",
+        sourceArtifactId: "artifact_upgrade_specification",
+        sourceRef: "artifact:artifact_upgrade_specification",
+        targetArtifactId: "artifact_upgrade_map",
+        targetRef: "artifact:artifact_upgrade_map",
+      }],
+    },
+    {
+      id: "artifact_upgrade_ticket",
+      operationId: "upgrade-ticket",
+      kind: "implementation_ticket",
+      externalId: "703",
+      title: "Upgrade ticket",
+      order: 2,
+      snapshotId: "snapshot_upgrade_ticket",
+      capturedAt: 1_020,
+      relationships: [{
+        kind: "derived_from",
+        sourceArtifactId: "artifact_upgrade_ticket",
+        sourceRef: "artifact:artifact_upgrade_ticket",
+        targetArtifactId: "artifact_upgrade_specification",
+        targetRef: "artifact:artifact_upgrade_specification",
+      }],
+    },
+  ] as const;
+  for (const artifact of artifacts) {
+    insertArtifact.run(
+      artifact.id,
+      artifact.operationId,
+      artifact.kind,
+      artifact.externalId,
+      artifact.title,
+      artifact.order,
+      artifact.snapshotId,
+      artifact.capturedAt,
+      artifact.capturedAt,
+    );
+    insertSnapshot.run(
+      artifact.snapshotId,
+      artifact.id,
+      artifact.title,
+      `# ${artifact.title}`,
+      artifact.id === "artifact_upgrade_map" ? "a".repeat(64) :
+        artifact.id === "artifact_upgrade_specification" ? "b".repeat(64) : "c".repeat(64),
+      artifact.id === "artifact_upgrade_map" ? "d".repeat(64) :
+        artifact.id === "artifact_upgrade_specification" ? "e".repeat(64) : "f".repeat(64),
+      JSON.stringify(artifact.relationships),
+      artifact.capturedAt,
+    );
+  }
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    `SELECT snapshot_id, upstream_snapshot_id
+       FROM work_artifact_snapshot_dependencies
+      ORDER BY snapshot_id, upstream_snapshot_id`,
+  ).all()).toEqual([
+    {
+      snapshot_id: "snapshot_upgrade_specification",
+      upstream_snapshot_id: "snapshot_upgrade_map",
+    },
+    {
+      snapshot_id: "snapshot_upgrade_ticket",
+      upstream_snapshot_id: "snapshot_upgrade_specification",
+    },
+  ]);
+  db.prepare(
+    `INSERT INTO work_artifact_snapshots (
+       id, artifact_id, revision, title, content, content_digest, snapshot_digest,
+       acceptance_criteria_json, relationships_json, external_revision, captured_at
+     ) VALUES ('snapshot_upgrade_map_2', 'artifact_upgrade_map', 2, 'Upgrade map',
+       '# Upgrade map revised', ?, ?, '[]', '[]', 'etag-2', 1100)`,
+  ).run("1".repeat(64), "2".repeat(64));
+  db.prepare(
+    `INSERT INTO work_artifact_snapshot_invalidations (
+       snapshot_id, replacement_snapshot_id, reason, observed_at
+     ) VALUES ('snapshot_upgrade_map', 'snapshot_upgrade_map_2', 'remote_edit', 1100)`,
+  ).run();
+  db.prepare(
+    `UPDATE work_artifacts
+        SET current_revision = 2, current_snapshot_id = 'snapshot_upgrade_map_2',
+            external_revision = 'etag-2', updated_at = 1100
+      WHERE id = 'artifact_upgrade_map'`,
+  ).run();
+  const repository = new WorkArtifactRepository(db);
+  expect(repository.isSnapshotValid("snapshot_upgrade_specification")).toBe(false);
+  expect(repository.isSnapshotValid("snapshot_upgrade_ticket")).toBe(false);
 });
 
 it.each([

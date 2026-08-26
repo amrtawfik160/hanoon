@@ -116,6 +116,11 @@ type PlanningSkillId =
   | "handoff"
   | "ask-matt";
 
+type SchedulablePlanningSkillId = Exclude<
+  PlanningSkillId,
+  "setup-matt-pocock-skills" | "prototype" | "handoff"
+>;
+
 const RESULT_KIND_BY_SKILL: Readonly<Record<
   Exclude<PlanningSkillId, "research">,
   NavigatorPlanningResult["kind"]
@@ -147,19 +152,10 @@ const sharedContract = {
   retryClass: "resume_bound_resource" as const,
 };
 
-export const NAVIGATOR_PLANNING_STEP_CONTRACTS: Readonly<Record<PlanningSkillId, NavigatorSkillStepContract>> =
+export const NAVIGATOR_PLANNING_STEP_CONTRACTS: Readonly<
+  Record<SchedulablePlanningSkillId, NavigatorSkillStepContract>
+> =
   Object.freeze({
-    "setup-matt-pocock-skills": planningContract({
-      ...sharedContract,
-      id: "navigator-setup",
-      skillId: "setup-matt-pocock-skills",
-      invocationClass: "user",
-      allowedArtifactKinds: [],
-      minimumSubjects: 0,
-      operationClass: "read_only",
-      resourceClass: "bb_thread_read_only",
-      resultSchema: "navigator-setup-result-v1",
-    }),
     wayfinder: planningContract({
       ...sharedContract,
       id: "navigator-wayfinder",
@@ -194,28 +190,6 @@ export const NAVIGATOR_PLANNING_STEP_CONTRACTS: Readonly<Record<PlanningSkillId,
       resultSchema: "navigator-to-tickets-result-v1",
     }),
     research: NAVIGATOR_RESEARCH_STEP_CONTRACT,
-    prototype: planningContract({
-      ...sharedContract,
-      id: "navigator-prototype",
-      skillId: "prototype",
-      invocationClass: "model",
-      allowedArtifactKinds: ["map", "decision_ticket", "specification"],
-      minimumSubjects: 1,
-      operationClass: "read_only",
-      resourceClass: "bb_thread_read_only",
-      resultSchema: "navigator-prototype-result-v1",
-    }),
-    handoff: planningContract({
-      ...sharedContract,
-      id: "navigator-handoff",
-      skillId: "handoff",
-      invocationClass: "user",
-      allowedArtifactKinds: ["map", "decision_ticket", "specification", "implementation_ticket"],
-      minimumSubjects: 1,
-      operationClass: "read_only",
-      resourceClass: "bb_thread_read_only",
-      resultSchema: "navigator-handoff-result-v1",
-    }),
     "ask-matt": planningContract({
       ...sharedContract,
       id: "navigator-ask-matt",
@@ -231,7 +205,7 @@ export const NAVIGATOR_PLANNING_STEP_CONTRACTS: Readonly<Record<PlanningSkillId,
 
 export function navigatorStepContract(skillId: string): NavigatorSkillStepContract | null {
   return Object.prototype.hasOwnProperty.call(NAVIGATOR_PLANNING_STEP_CONTRACTS, skillId)
-    ? NAVIGATOR_PLANNING_STEP_CONTRACTS[skillId as PlanningSkillId]
+    ? NAVIGATOR_PLANNING_STEP_CONTRACTS[skillId as SchedulablePlanningSkillId]
     : null;
 }
 

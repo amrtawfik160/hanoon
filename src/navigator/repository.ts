@@ -236,13 +236,29 @@ function parseAttempt(row: AttemptRow): NavigatorSkillAttempt {
   };
 }
 
-function routingDecisionDigest(proposal: Extract<NavigatorProposal, { kind: "unresolved_next_step" }>): string {
-  return createHash("sha256").update(JSON.stringify({
+function routingDecisionIdentity(
+  job: Job,
+  snapshot: NavigatorSnapshot,
+  proposal: Extract<NavigatorProposal, { kind: "unresolved_next_step" }>,
+): Readonly<{ decisionDigest: string; scopeDigest: string }> {
+  const boundScope = {
+    jobId: job.id,
+    workflowRevision: job.workflowRevision,
+    artifactBindings: snapshot.artifactBindings,
     question: proposal.question,
     candidateSkillIds: proposal.candidateSkillIds,
     rationale: proposal.rationale,
     evidenceRefs: proposal.evidenceRefs,
+  };
+  const scopeDigest = createHash("sha256")
+    .update(JSON.stringify(boundScope), "utf8")
+    .digest("hex");
+  const decisionDigest = createHash("sha256").update(JSON.stringify({
+    ...boundScope,
+    navigatorSnapshotId: snapshot.snapshotId,
+    navigatorSnapshotDigest: snapshot.identity.digest,
   }), "utf8").digest("hex");
+  return { decisionDigest, scopeDigest };
 }
 
 function artifactEvidenceMatchesBindings(
@@ -292,12 +308,18 @@ function proposalReason(
     proposal.basedOn.jobId !== job.id ||
     proposal.basedOn.digest !== snapshot.identity.digest
   ) return "snapshot_digest_mismatch";
+  const revisableSpecificationIds = proposal.kind === "invoke_skill" && proposal.skillId === "to-spec"
+    ? new Set(proposal.subjectArtifactIds.filter((artifactId) =>
+      artifacts.getArtifact(artifactId)?.kind === "specification"))
+    : new Set<string>();
   for (const binding of job.artifactBindings) {
     const current = artifacts.getCurrentSnapshot(binding.artifactId);
     if (
       current?.id !== binding.snapshotId ||
-      current.snapshotDigest !== binding.snapshotDigest ||
-      !artifacts.isSnapshotValid(binding.snapshotId)
+      current.snapshotDigest !== binding.snapshotDigest || (
+        !artifacts.isSnapshotValid(binding.snapshotId) &&
+        !revisableSpecificationIds.has(binding.artifactId)
+      )
     ) return "stale_artifact_snapshot";
   }
   if (observation.nativeToolCalls.length > 0) return "policy_native_tool_use";
@@ -337,7 +359,9 @@ function proposalReason(
   ) return "unnecessary_wayfinding";
   if (
     proposal.skillId === "to-spec" &&
-    job.artifactBindings.some((binding) => artifacts.getArtifact(binding.artifactId)?.kind === "specification")
+    job.artifactBindings.some((binding) =>
+      artifacts.getArtifact(binding.artifactId)?.kind === "specification" &&
+      !revisableSpecificationIds.has(binding.artifactId))
   ) return "canonical_specification_exists";
   for (const artifactId of proposal.subjectArtifactIds) {
     const artifact = artifacts.getArtifact(artifactId);
@@ -425,7 +449,8 @@ export class NavigatorRepository {
       const refreshedBindings: NavigatorArtifactBinding[] = [];
       for (const binding of job.artifactBindings) {
         const snapshot = this.artifacts.getCurrentSnapshot(binding.artifactId);
-        if (snapshot && this.artifacts.isSnapshotValid(snapshot.id)) {
+        const artifact = this.artifacts.getArtifact(binding.artifactId);
+        if (snapshot && (this.artifacts.isSnapshotValid(snapshot.id) || artifact?.kind === "specification")) {
           refreshedBindings.push({
             artifactId: binding.artifactId,
             snapshotId: snapshot.id,
@@ -554,17 +579,18 @@ export class NavigatorRepository {
       if (proposal?.kind !== "invoke_skill" && proposal?.kind !== "unresolved_next_step") {
         throw new Error("deterministic proposal validation was inconsistent");
       }
-      const unresolvedDigest = proposal.kind === "unresolved_next_step"
-        ? routingDecisionDigest(proposal)
+      const routingIdentity = proposal.kind === "unresolved_next_step"
+        ? routingDecisionIdentity(job, snapshot, proposal)
         : null;
-      if (unresolvedDigest !== null) {
-        const existingRouting = this.getRoutingDecision(unresolvedDigest);
+      const unresolvedDigest = routingIdentity?.decisionDigest ?? null;
+      if (routingIdentity !== null) {
+        const existingRouting = this.getRoutingDecisionByScope(routingIdentity.scopeDigest);
         if (existingRouting) {
           this.db.prepare(
             `INSERT OR IGNORE INTO navigator_routing_blocks (
                decision_digest, proposal_id, reason, recorded_at
              ) VALUES (?, ?, 'unchanged_routing_unresolved_after_consultation', ?)`,
-          ).run(unresolvedDigest, proposalId, input.now);
+          ).run(existingRouting.decisionDigest, proposalId, input.now);
           this.db.prepare(
             `UPDATE jobs SET state = 'blocked', last_error = ?, version = version + 1, updated_at = ?
               WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
@@ -661,11 +687,12 @@ export class NavigatorRepository {
       if (proposal.kind === "unresolved_next_step") {
         this.db.prepare(
           `INSERT INTO navigator_routing_decisions (
-             decision_digest, job_id, question, candidate_skill_ids_json,
+             decision_digest, scope_digest, job_id, question, candidate_skill_ids_json,
              rationale, evidence_refs_json, consultation_step_id, recorded_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           unresolvedDigest,
+          routingIdentity!.scopeDigest,
           job.id,
           proposal.question,
           JSON.stringify(proposal.candidateSkillIds),
@@ -834,8 +861,10 @@ export class NavigatorRepository {
         input.observedExternalStateDigest !== snapshot.externalStateDigest ||
         attempt.artifactBindings.some((binding) => {
           const current = this.artifacts.getCurrentSnapshot(binding.artifactId);
+          const revisableSpecification = attempt.skillId === "to-spec" &&
+            this.artifacts.getArtifact(binding.artifactId)?.kind === "specification";
           return current?.id !== binding.snapshotId || current.snapshotDigest !== binding.snapshotDigest ||
-            !this.artifacts.isSnapshotValid(binding.snapshotId);
+            (!revisableSpecification && !this.artifacts.isSnapshotValid(binding.snapshotId));
         })
       ) return null;
       const existing = this.getPlanningResult(input.attemptId);
@@ -917,6 +946,7 @@ export class NavigatorRepository {
         WHERE decision.decision_digest = ?`,
     ).get(decisionDigest) as Readonly<{
       decision_digest: string;
+      scope_digest: string;
       job_id: string;
       question: string;
       candidate_skill_ids_json: string;
@@ -938,6 +968,7 @@ export class NavigatorRepository {
     }>;
     return {
       decisionDigest: row.decision_digest,
+      scopeDigest: row.scope_digest,
       jobId: row.job_id,
       question: row.question,
       candidateSkillIds: JSON.parse(row.candidate_skill_ids_json) as readonly string[],
@@ -953,6 +984,14 @@ export class NavigatorRepository {
       },
       blocked: row.blocked_digest !== null,
     };
+  }
+
+  private getRoutingDecisionByScope(scopeDigest: string): NavigatorRoutingDecision | null {
+    if (!/^[0-9a-f]{64}$/u.test(scopeDigest)) throw new TypeError("scopeDigest must be a SHA-256 digest");
+    const row = this.db.prepare(
+      "SELECT decision_digest FROM navigator_routing_decisions WHERE scope_digest = ?",
+    ).get(scopeDigest) as { decision_digest: string } | undefined;
+    return row ? this.getRoutingDecision(row.decision_digest) : null;
   }
 
   public leaseSkillEffect(input: Readonly<{
@@ -1050,6 +1089,7 @@ export class NavigatorRepository {
     observedExternalStateDigest: string;
     result: unknown;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
     ownerId: string;
     generation: number;
@@ -1130,6 +1170,17 @@ export class NavigatorRepository {
       const publishedBindings = input.publishedArtifactBindings === undefined
         ? null
         : artifactBindingSchema.array().max(128).parse(input.publishedArtifactBindings);
+      const reconciledArtifactIds = new Set(input.reconciledArtifactIds ?? []);
+      if (reconciledArtifactIds.size !== (input.reconciledArtifactIds?.length ?? 0)) {
+        throw new TypeError("reconciled navigator artifacts contain duplicates");
+      }
+      if (
+        outcome === "succeeded" &&
+        !this.attemptBindingsAreCurrent(attempt, publishedBindings, reconciledArtifactIds)
+      ) {
+        outcome = "policy_failure";
+        reasonCode = "stale_artifact_snapshot";
+      }
       if (outcome === "succeeded" && contract?.operationClass === "artifact_write") {
         if (publishedBindings === null || publishedBindings.length === 0) {
           outcome = "policy_failure";
@@ -1212,10 +1263,11 @@ export class NavigatorRepository {
         : job.artifactBindings;
       const jobUpdate = this.db.prepare(
         `UPDATE jobs SET current_workflow_step_id = NULL,
-             artifact_bindings_json = ?, workflow_revision = workflow_revision + 1,
+             artifact_bindings_json = ?,
+             workflow_revision = workflow_revision + CASE WHEN ? = 'ask_matt_result' THEN 0 ELSE 1 END,
              version = version + 1, updated_at = ?
           WHERE id = ? AND current_workflow_step_id = ?`,
-      ).run(JSON.stringify(nextBindings), input.now, attempt.jobId, attempt.workflowStepId);
+      ).run(JSON.stringify(nextBindings), resultKind, input.now, attempt.jobId, attempt.workflowStepId);
       if (jobUpdate.changes !== 1) throw new Error("navigator workflow step changed before settlement");
       const effectUpdate = this.db.prepare(
         `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
@@ -1226,6 +1278,25 @@ export class NavigatorRepository {
       if (effectUpdate.changes !== 1) throw new Error("navigator effect lease changed before settlement");
       return this.getOutcome(attempt.workflowStepId);
     }).immediate();
+  }
+
+  private attemptBindingsAreCurrent(
+    attempt: NavigatorSkillAttempt,
+    publishedBindings: readonly NavigatorArtifactBinding[] | null,
+    reconciledArtifactIds: ReadonlySet<string>,
+  ): boolean {
+    return attempt.artifactBindings.every((binding) => {
+      const current = this.artifacts.getCurrentSnapshot(binding.artifactId);
+      const exact = current?.id === binding.snapshotId &&
+        current.snapshotDigest === binding.snapshotDigest &&
+        this.artifacts.isSnapshotValid(binding.snapshotId);
+      if (exact) return true;
+      return current !== null && this.artifacts.isSnapshotValid(current.id) &&
+        reconciledArtifactIds.has(binding.artifactId) &&
+        publishedBindings?.some((published) =>
+          published.artifactId === binding.artifactId && published.snapshotId === current.id &&
+          published.snapshotDigest === current.snapshotDigest) === true;
+    });
   }
 
   private acceptedSettlementJob(
