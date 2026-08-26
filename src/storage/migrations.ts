@@ -3034,6 +3034,164 @@ BEFORE DELETE ON navigator_routing_blocks
 BEGIN SELECT RAISE(ABORT, 'navigator routing blocks are append-only'); END;
 `] as const;
 
+export const NAVIGATOR_IMPLEMENTATION_MIGRATIONS = [String.raw`
+CREATE TABLE navigator_integrations (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  specification_artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  specification_snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  specification_snapshot_digest TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  integration_branch TEXT NOT NULL UNIQUE,
+  worktree_id TEXT NOT NULL UNIQUE,
+  project_policy_version INTEGER NOT NULL CHECK (project_policy_version >= 1),
+  project_policy_json TEXT NOT NULL,
+  project_policy_digest TEXT NOT NULL,
+  base_head_sha TEXT NOT NULL,
+  current_head_sha TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'implementing', 'invalidated', 'ready_for_pull_request', 'publishing_pull_request', 'ready_for_release'
+  )),
+  active_slice_id TEXT,
+  pull_request_number INTEGER,
+  pull_request_url TEXT,
+  evidence_refs_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK ((pull_request_number IS NULL) = (pull_request_url IS NULL))
+);
+
+CREATE TABLE navigator_integration_tickets (
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  snapshot_digest TEXT NOT NULL,
+  ticket_order INTEGER NOT NULL CHECK (ticket_order >= 0),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'accepted', 'resolved', 'invalidated')),
+  accepted_head_sha TEXT,
+  resolved_at INTEGER,
+  PRIMARY KEY(job_id, artifact_id),
+  UNIQUE(job_id, ticket_order),
+  CHECK ((state = 'resolved') = (resolved_at IS NOT NULL))
+);
+
+CREATE TABLE navigator_ticket_slices (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  ticket_artifact_id TEXT NOT NULL REFERENCES work_artifacts(id),
+  ticket_snapshot_id TEXT NOT NULL REFERENCES work_artifact_snapshots(id),
+  ticket_snapshot_digest TEXT NOT NULL,
+  claim_id INTEGER NOT NULL REFERENCES work_artifact_claims(id),
+  integration_base_head_sha TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'implementation_pending', 'implementation_running', 'review_pending', 'review_running',
+    'repair_pending', 'accepted', 'resolved', 'invalidated'
+  )),
+  accepted_head_sha TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(job_id, ticket_artifact_id)
+);
+
+CREATE UNIQUE INDEX navigator_ticket_slices_one_active_writer
+  ON navigator_ticket_slices(job_id)
+  WHERE state IN ('implementation_pending', 'implementation_running', 'review_pending', 'review_running', 'repair_pending');
+
+CREATE TABLE navigator_ticket_worker_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  kind TEXT NOT NULL CHECK (kind IN ('implementation', 'review')),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+  effect_idempotency_key TEXT NOT NULL UNIQUE REFERENCES effects(idempotency_key),
+  work_order_json TEXT NOT NULL,
+  work_order_digest TEXT NOT NULL,
+  step_contract_id TEXT NOT NULL,
+  step_contract_revision INTEGER NOT NULL CHECK (step_contract_revision >= 1),
+  step_contract_digest TEXT NOT NULL,
+  profile_json TEXT NOT NULL,
+  profile_digest TEXT NOT NULL,
+  model_route_json TEXT NOT NULL,
+  resource_kind TEXT CHECK (resource_kind IS NULL OR resource_kind = 'bb_thread'),
+  resource_id TEXT UNIQUE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(slice_id, kind, ordinal),
+  CHECK ((resource_kind IS NULL) = (resource_id IS NULL))
+);
+
+CREATE TRIGGER navigator_ticket_worker_attempts_immutable_identity
+BEFORE UPDATE ON navigator_ticket_worker_attempts
+WHEN NEW.id <> OLD.id
+  OR NEW.job_id <> OLD.job_id
+  OR NEW.slice_id <> OLD.slice_id
+  OR NEW.kind <> OLD.kind
+  OR NEW.ordinal <> OLD.ordinal
+  OR NEW.effect_idempotency_key <> OLD.effect_idempotency_key
+  OR NEW.work_order_json <> OLD.work_order_json
+  OR NEW.work_order_digest <> OLD.work_order_digest
+  OR NEW.step_contract_id <> OLD.step_contract_id
+  OR NEW.step_contract_revision <> OLD.step_contract_revision
+  OR NEW.step_contract_digest <> OLD.step_contract_digest
+  OR NEW.profile_json <> OLD.profile_json
+  OR NEW.profile_digest <> OLD.profile_digest
+  OR NEW.model_route_json <> OLD.model_route_json
+  OR NEW.created_at <> OLD.created_at
+  OR (OLD.resource_kind IS NOT NULL AND (
+    NEW.resource_kind IS NOT OLD.resource_kind OR NEW.resource_id IS NOT OLD.resource_id
+  ))
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker attempt identity is immutable'); END;
+
+CREATE TRIGGER navigator_ticket_worker_attempts_no_delete
+BEFORE DELETE ON navigator_ticket_worker_attempts
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker attempts cannot be deleted'); END;
+
+CREATE TABLE navigator_ticket_worker_outcomes (
+  attempt_id TEXT PRIMARY KEY REFERENCES navigator_ticket_worker_attempts(id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'findings', 'worker_unavailable', 'policy_failure')),
+  reason_code TEXT NOT NULL,
+  exact_head_sha TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+
+CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_update
+BEFORE UPDATE ON navigator_ticket_worker_outcomes
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker outcomes are append-only'); END;
+CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_delete
+BEFORE DELETE ON navigator_ticket_worker_outcomes
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker outcomes are append-only'); END;
+
+CREATE TABLE navigator_pull_requests (
+  job_id TEXT PRIMARY KEY REFERENCES navigator_integrations(job_id),
+  operation_id TEXT NOT NULL UNIQUE,
+  request_json TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'published')),
+  number INTEGER,
+  url TEXT,
+  head_sha TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  CHECK ((status = 'published') = (number IS NOT NULL AND url IS NOT NULL AND settled_at IS NOT NULL))
+);
+
+CREATE TRIGGER navigator_pull_requests_immutable_request
+BEFORE UPDATE ON navigator_pull_requests
+WHEN NEW.job_id <> OLD.job_id
+  OR NEW.operation_id <> OLD.operation_id
+  OR NEW.request_json <> OLD.request_json
+  OR NEW.request_digest <> OLD.request_digest
+  OR NEW.head_sha <> OLD.head_sha
+  OR NEW.created_at <> OLD.created_at
+  OR OLD.status = 'published'
+BEGIN SELECT RAISE(ABORT, 'navigator pull request identity is immutable'); END;
+CREATE TRIGGER navigator_pull_requests_no_delete
+BEFORE DELETE ON navigator_pull_requests
+BEGIN SELECT RAISE(ABORT, 'navigator pull requests cannot be deleted'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3113,4 +3271,5 @@ export const ALL_MIGRATIONS = [
   ...WORK_ARTIFACT_RELATIONSHIP_CANONICAL_MIGRATIONS,
   ...NAVIGATOR_WORKFLOW_MIGRATIONS,
   ...NAVIGATOR_PLANNING_MIGRATIONS,
+  ...NAVIGATOR_IMPLEMENTATION_MIGRATIONS,
 ] as const;

@@ -1770,7 +1770,7 @@ export class WorkArtifactRepository {
   }
 
   private navigatorResultAuthorizesResolution(attemptId: string, artifact: WorkArtifact): boolean {
-    return this.db.prepare(
+    const planningResult = this.db.prepare(
       `SELECT 1
          FROM navigator_planning_results AS result
          JOIN navigator_skill_attempts AS attempt ON attempt.id = result.attempt_id
@@ -1780,6 +1780,18 @@ export class WorkArtifactRepository {
           AND job.project_id = ?
           AND json_extract(binding.value, '$.artifactId') = ?
           AND json_extract(binding.value, '$.snapshotId') = ?`,
+    ).get(attemptId, artifact.projectId, artifact.id, artifact.currentSnapshotId);
+    if (planningResult !== undefined) return true;
+    return this.db.prepare(
+      `SELECT 1
+         FROM navigator_ticket_worker_outcomes AS outcome
+         JOIN navigator_ticket_worker_attempts AS attempt ON attempt.id = outcome.attempt_id
+         JOIN navigator_ticket_slices AS slice ON slice.id = attempt.slice_id
+         JOIN jobs AS job ON job.id = attempt.job_id
+        WHERE outcome.attempt_id = ? AND outcome.outcome = 'succeeded'
+          AND attempt.kind = 'review' AND slice.state = 'accepted'
+          AND job.project_id = ? AND slice.ticket_artifact_id = ?
+          AND slice.ticket_snapshot_id = ?`,
     ).get(attemptId, artifact.projectId, artifact.id, artifact.currentSnapshotId) !== undefined;
   }
 

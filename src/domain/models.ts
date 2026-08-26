@@ -588,6 +588,7 @@ export interface JobEffect {
     | "stop_thread"
     | "steer_implementation"
     | "run_navigator_skill"
+    | "run_navigator_ticket_worker"
     | "reconcile_job";
   payload: Record<string, unknown>;
 }

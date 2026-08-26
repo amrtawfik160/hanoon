@@ -224,6 +224,7 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "stop_thread": return [];
     case "steer_implementation": return ["implementing", "remediating"];
     case "run_navigator_skill": return [];
+    case "run_navigator_ticket_worker": return [];
     case "reconcile_job": return [];
     default: {
       const unreachable: never = kind;
@@ -255,6 +256,7 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "stop_thread",
   "steer_implementation",
   "run_navigator_skill",
+  "run_navigator_ticket_worker",
   "reconcile_job",
 ]);
 
@@ -2485,6 +2487,8 @@ export class EffectRunner {
       }
       case "run_navigator_skill":
         throw new PermanentEffectError("navigator skill effects require the navigator executor");
+      case "run_navigator_ticket_worker":
+        throw new PermanentEffectError("navigator ticket effects require the navigator implementation executor");
       case "reconcile_job":
         await this.reconcile(effect, job);
         return;
