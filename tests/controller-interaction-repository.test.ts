@@ -489,7 +489,7 @@ async function runInteractionRace(
 }
 
 it("pins the shipped migration bytes and appends the runtime repair migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(79);
+  expect(ALL_MIGRATIONS).toHaveLength(80);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );
@@ -514,6 +514,7 @@ it("pins the shipped migration bytes and appends the runtime repair migrations",
   expect(ALL_MIGRATIONS[69]).toContain("CREATE TABLE controller_voice_inbox");
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[78]).toContain("CREATE TABLE navigator_integrations");
+  expect(ALL_MIGRATIONS[79]).toContain("step_contract_json");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");
   expect(ALL_MIGRATIONS[72]).toContain("merge_pre_approved_at");
   expect(ALL_MIGRATIONS[73]).toContain("CREATE TABLE work_artifacts");

@@ -209,7 +209,7 @@ export type NavigatorPullRequestRecord = Readonly<{
   headSha: string;
 }>;
 
-export const navigatorTicketStepContractSchema = z.object({
+const navigatorTicketStepContractBase = {
   id: identifierSchema,
   revision: z.number().int().positive(),
   skillId: z.enum(["implement", "code-review"]),
@@ -221,6 +221,15 @@ export const navigatorTicketStepContractSchema = z.object({
   modelPools: z.array(z.enum(["standard", "strong"])).min(1).max(2),
   timeoutMs: z.number().int().positive(),
   maximumResultBytes: z.number().int().positive(),
+} as const;
+
+const navigatorTicketStepContractV1Schema = z.object({
+  ...navigatorTicketStepContractBase,
+  digest: sha256Schema,
+}).strict();
+
+export const navigatorTicketStepContractSchema = z.object({
+  ...navigatorTicketStepContractBase,
   retryClass: z.literal("bounded_exponential"),
   maximumAttempts: z.number().int().min(1).max(20),
   backoffBaseMs: z.number().int().positive().max(30_000),
@@ -228,7 +237,13 @@ export const navigatorTicketStepContractSchema = z.object({
   digest: sha256Schema,
 }).strict();
 
+export const navigatorPersistedTicketStepContractSchema = z.union([
+  navigatorTicketStepContractSchema,
+  navigatorTicketStepContractV1Schema,
+]);
+
 export type NavigatorTicketStepContract = Readonly<z.infer<typeof navigatorTicketStepContractSchema>>;
+export type NavigatorPersistedTicketStepContract = Readonly<z.infer<typeof navigatorPersistedTicketStepContractSchema>>;
 
 const DISCIPLINE_BY_EVIDENCE: Readonly<Record<NavigatorTicketTaskEvidence[number], string>> = {
   "reproducible-bug": "diagnosing-bugs",

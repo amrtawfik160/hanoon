@@ -2,7 +2,10 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
-import { navigatorJsonDigest } from "../src/navigator/implementation-contracts";
+import {
+  navigatorJsonDigest,
+  navigatorPersistedTicketStepContractSchema,
+} from "../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
   NavigatorTicketWorkerRetryableError,
@@ -12,7 +15,9 @@ import {
   type NavigatorTicketWorkerRunner,
 } from "../src/navigator/implementation-executor";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import {
+  registerWorkArtifactRelationshipValidation,
   stableWorkArtifactId,
   type CaptureWorkArtifactInput,
 } from "../src/work-artifacts/repository";
@@ -70,9 +75,17 @@ function artifactInput(input: Readonly<{
   };
 }
 
-function fixture(): Fixture {
+function fixture(
+  migrationCount: number = ALL_MIGRATIONS.length,
+  beforeOpen?: (database: Database.Database) => void,
+): Fixture {
   fixtureSequence += 1;
   const { bb } = createFakePluginHost({ pluginId: `navigator-implementation-${fixtureSequence}` });
+  if (migrationCount !== ALL_MIGRATIONS.length) {
+    registerWorkArtifactRelationshipValidation(bb.storage.database());
+    bb.storage.migrate(bb.storage.database(), [...ALL_MIGRATIONS].slice(0, migrationCount));
+  }
+  beforeOpen?.(bb.storage.database());
   const store = openStore(bb.storage, bb.storage.kv, () => 1_000);
   let currentTime = 1_100;
   const now = () => currentTime++;
@@ -293,6 +306,78 @@ function validGitObserver(): NavigatorGitObserver {
 }
 
 describe("navigator ticket integration executor", () => {
+  it("appends the navigator persistence upgrade after the shipped implementation migration", () => {
+    expect(ALL_MIGRATIONS).toHaveLength(80);
+    expect(ALL_MIGRATIONS[78]).not.toContain("step_contract_json");
+    expect(ALL_MIGRATIONS[78]).not.toContain("navigator_ticket_repair_snapshots");
+    expect(ALL_MIGRATIONS[78]).not.toContain("git_observation_json");
+    expect(ALL_MIGRATIONS[79]).toContain("step_contract_json");
+    expect(ALL_MIGRATIONS[79]).toContain("navigator_ticket_repair_snapshots");
+    expect(ALL_MIGRATIONS[79]).toContain("git_observation_json");
+  });
+
+  it("backfills an existing v1 navigator attempt before enabling repair and Git evidence", () => {
+    const legacyEffect = "legacy-navigator-effect";
+    const legacyAttempt = "legacy-navigator-attempt";
+    const value = fixture(ALL_MIGRATIONS.length - 1, (database) => {
+      database.pragma("foreign_keys = OFF");
+      database.prepare(
+        `INSERT INTO effects (
+           idempotency_key, job_id, kind, payload_json, status, attempts,
+           next_attempt_at, created_at, updated_at
+         ) VALUES (?, 'legacy-job', 'run_navigator_ticket_worker', ?, 'done', 1, 1000, 1000, 1000)`,
+      ).run(legacyEffect, JSON.stringify({ attemptId: legacyAttempt }));
+      database.prepare(
+        `INSERT INTO navigator_ticket_slices (
+           id, job_id, ticket_artifact_id, ticket_snapshot_id, ticket_snapshot_digest,
+           claim_id, integration_base_head_sha, state, accepted_head_sha, created_at, updated_at
+         ) VALUES ('legacy-slice', 'legacy-job', 'legacy-ticket', 'legacy-snapshot', ?, 1, ?, 'invalidated', NULL, 1000, 1000)`,
+      ).run("a".repeat(64), SHA.base);
+      database.prepare(
+        `INSERT INTO navigator_ticket_worker_attempts (
+           id, job_id, slice_id, kind, ordinal, effect_idempotency_key,
+           work_order_json, work_order_digest, step_contract_id, step_contract_revision,
+           step_contract_digest, profile_json, profile_digest, model_route_json,
+           resource_kind, resource_id, created_at, updated_at
+         ) VALUES (?, 'legacy-job', 'legacy-slice', 'implementation', 1, ?, '{}', ?,
+           'navigator-ticket-implementation', 1,
+           'c3d183d0b7c961ad1cbc223aa38a025f6ec8b52496e40137ce5e7bd6ae77f851',
+           '{}', ?, '{}', NULL, NULL, 1000, 1000)`,
+      ).run(legacyAttempt, legacyEffect, navigatorJsonDigest({}), navigatorJsonDigest({}));
+      database.prepare(
+        `INSERT INTO navigator_ticket_worker_outcomes (
+           attempt_id, slice_id, outcome, reason_code, exact_head_sha,
+           result_json, result_digest, recorded_at
+         ) VALUES (?, 'legacy-slice', 'worker_unavailable', 'worker_missing', ?, '{}', ?, 1000)`,
+      ).run(legacyAttempt, SHA.base, navigatorJsonDigest({}));
+      database.pragma("foreign_keys = ON");
+    });
+
+    const attempt = value.database.prepare(
+      "SELECT step_contract_json FROM navigator_ticket_worker_attempts WHERE id = ?",
+    ).get(legacyAttempt) as { step_contract_json: string };
+    const contract = navigatorPersistedTicketStepContractSchema.parse(JSON.parse(attempt.step_contract_json));
+    expect(contract).toMatchObject({
+      id: "navigator-ticket-implementation",
+      revision: 1,
+      maximumResultBytes: 256_000,
+    });
+    expect(value.database.prepare(
+      "SELECT outcome, git_observation_json, git_observation_digest FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(legacyAttempt)).toEqual({
+      outcome: "worker_unavailable",
+      git_observation_json: null,
+      git_observation_digest: null,
+    });
+    expect(value.database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+    ).all(
+      "navigator_ticket_repair_snapshots",
+      "navigator_ticket_repair_proposals",
+      "navigator_ticket_repair_dispatches",
+    )).toHaveLength(3);
+  });
+
   it("rejects worker-reported Git evidence that disagrees with the executor observation", async () => {
     const value = fixture();
     const workerRunner: NavigatorTicketWorkerRunner = {
@@ -474,23 +559,102 @@ describe("navigator ticket integration executor", () => {
       backoffBaseMs: 500,
       backoffMaximumMs: 30_000,
     });
-    for (let attempt = 2; attempt <= contract.maximumAttempts; attempt += 1) {
-      value.advance(Math.min(contract.backoffMaximumMs, contract.backoffBaseMs * 2 ** (attempt - 2)));
+    const maximumAttempts = "maximumAttempts" in contract ? contract.maximumAttempts : 0;
+    const backoffBaseMs = "backoffBaseMs" in contract ? contract.backoffBaseMs : 0;
+    const backoffMaximumMs = "backoffMaximumMs" in contract ? contract.backoffMaximumMs : 0;
+    for (let attempt = 2; attempt <= maximumAttempts; attempt += 1) {
+      value.advance(Math.min(backoffMaximumMs, backoffBaseMs * 2 ** (attempt - 2)));
       await executor.processOne(fence, new AbortController().signal);
     }
 
-    expect(workerRunner.run).toHaveBeenCalledTimes(contract.maximumAttempts);
-    expect(executor.snapshot(value.jobId)).toMatchObject({
-      integration: { state: "invalidated" },
-      outcomes: [expect.objectContaining({ outcome: "dead_letter", reasonCode: "retry_exhausted" })],
+    expect(workerRunner.run).toHaveBeenCalledTimes(maximumAttempts);
+    const exhausted = executor.snapshot(value.jobId);
+    expect(exhausted.integration.state).toBe("invalidated");
+    expect(exhausted.outcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ outcome: "dead_letter", reasonCode: "retry_exhausted" }),
+    ]));
+  });
+
+  it("preserves retry attempts and backoff across repeated unavailable worker replacements", async () => {
+    const value = fixture();
+    const workerRunner: NavigatorTicketWorkerRunner = {
+      run: vi.fn(async (attempt, hooks) => {
+        await hooks.bindResource({ kind: "bb_thread", id: `thr_${attempt.id}` });
+        throw new NavigatorTicketWorkerUnavailableError("missing");
+      }),
+      reconcileUnavailableResource: vi.fn(async (resource) => ({
+        resource,
+        state: "missing" as const,
+        evidenceRef: `reconciled:${resource.id}`,
+        observedAt: value.now(),
+      })),
+    };
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner,
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
     });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+    const contract = executor.snapshot(value.jobId).attempts[0]!.stepContract;
+    const maximumAttempts = "maximumAttempts" in contract ? contract.maximumAttempts : 0;
+    const backoffBaseMs = "backoffBaseMs" in contract ? contract.backoffBaseMs : 0;
+    const backoffMaximumMs = "backoffMaximumMs" in contract ? contract.backoffMaximumMs : 0;
+
+    for (let attemptNumber = 1; attemptNumber <= maximumAttempts; attemptNumber += 1) {
+      await executor.processOne(fence, new AbortController().signal);
+      const current = executor.snapshot(value.jobId);
+      if (attemptNumber < maximumAttempts) {
+        const replacement = current.attempts.at(-1)!;
+        expect(value.database.prepare(
+          "SELECT attempts, next_attempt_at FROM effects WHERE idempotency_key = ?",
+        ).get(replacement.effectIdempotencyKey)).toMatchObject({
+          attempts: attemptNumber,
+          next_attempt_at: expect.any(Number),
+        });
+        expect(await executor.processOne(fence, new AbortController().signal)).toBe(false);
+        value.advance(Math.min(
+          backoffMaximumMs,
+          backoffBaseMs * 2 ** (attemptNumber - 1),
+        ));
+      }
+    }
+
+    expect(workerRunner.run).toHaveBeenCalledTimes(maximumAttempts);
+    const exhausted = executor.snapshot(value.jobId);
+    expect(exhausted.integration.state).toBe("invalidated");
+    expect(exhausted.outcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ outcome: "dead_letter", reasonCode: "retry_exhausted" }),
+    ]));
   });
 
   it("adopts the ticket claim and rejects settlement after its executor fence changes", async () => {
     const value = fixture();
     const claimId = value.claim(value.ticketIds[0]);
     value.database.prepare(
-      "UPDATE work_artifact_claims SET owner_id = 'retired-executor', generation = 99 WHERE id = ?",
+      "UPDATE work_artifact_claims SET owner_id = 'retired-executor', generation = 99, lease_expires_at = 0 WHERE id = ?",
     ).run(claimId);
     const workerRunner: NavigatorTicketWorkerRunner = {
       run: vi.fn(async (attempt, hooks) => {
@@ -549,7 +713,7 @@ describe("navigator ticket integration executor", () => {
   });
 
   it("sequentially integrates fresh ticket workers, repairs review findings, and publishes one pull request", async () => {
-    const value = fixture();
+    const value = fixture(ALL_MIGRATIONS.length - 1);
     let firstAttemptInterrupted = true;
     let secondAttemptMissing = true;
     const resourceEvents: string[] = [];
@@ -723,6 +887,7 @@ describe("navigator ticket integration executor", () => {
       generation: 1,
     });
     await executor.processOne(fence, new AbortController().signal);
+    value.advance(500);
     await executor.processOne(fence, new AbortController().signal);
     await executor.processOne(fence, new AbortController().signal);
     const secondAccepted = executor.snapshot(value.jobId);

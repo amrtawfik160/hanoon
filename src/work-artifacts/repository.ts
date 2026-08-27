@@ -153,6 +153,9 @@ export type AdoptWorkArtifactClaimInput = Readonly<{
   externalAssignee: string;
   ownerId: string;
   generation: number;
+  expectedOwnerId: string;
+  expectedGeneration: number;
+  expectedLeaseExpiresAt: number;
   now: number;
   leaseMs: number;
 }>;
@@ -1255,7 +1258,7 @@ export class WorkArtifactRepository {
   }
 
   public adoptArtifactClaim(input: AdoptWorkArtifactClaimInput): boolean {
-    this.validateClaimFence(input);
+    this.validateAdoptionFence(input);
     return this.db.transaction((): boolean => {
       if (!currentExecutorLease(this.db, input.ownerId, input.generation, input.now)) return false;
       const artifact = this.requireArtifact(input.artifactId);
@@ -1269,16 +1272,29 @@ export class WorkArtifactRepository {
         artifact.assignees.length !== 1 || artifact.assignees[0] !== input.externalAssignee ||
         !this.isSnapshotValid(claim.snapshotId)
       ) return false;
+      if (
+        claim.ownerId !== input.expectedOwnerId ||
+        claim.generation !== input.expectedGeneration ||
+        claim.leaseExpiresAt !== input.expectedLeaseExpiresAt
+      ) return false;
+      if (
+        (claim.ownerId !== input.ownerId || claim.generation !== input.generation) &&
+        claim.leaseExpiresAt > input.now
+      ) return false;
       return this.db.prepare(
         `UPDATE work_artifact_claims
             SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
-          WHERE id = ? AND state = 'held'`,
+          WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+            AND lease_expires_at = ?`,
       ).run(
         input.ownerId,
         input.generation,
         input.now + input.leaseMs,
         input.now,
         claim.id,
+        input.expectedOwnerId,
+        input.expectedGeneration,
+        input.expectedLeaseExpiresAt,
       ).changes === 1;
     }).immediate();
   }
@@ -1889,6 +1905,13 @@ export class WorkArtifactRepository {
     assertPositiveInteger(input.generation, "generation");
     assertNonNegativeInteger(input.now, "now");
     assertPositiveInteger(input.leaseMs, "leaseMs");
+  }
+
+  private validateAdoptionFence(input: AdoptWorkArtifactClaimInput): void {
+    this.validateClaimFence(input);
+    assertBoundedString(input.expectedOwnerId, "expectedOwnerId");
+    assertPositiveInteger(input.expectedGeneration, "expectedGeneration");
+    assertNonNegativeInteger(input.expectedLeaseExpiresAt, "expectedLeaseExpiresAt");
   }
 
   private validateClaimLeaseInput(input: RenewWorkArtifactClaimInput): void {

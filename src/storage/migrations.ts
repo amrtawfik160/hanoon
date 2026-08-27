@@ -3108,7 +3108,6 @@ CREATE TABLE navigator_ticket_worker_attempts (
   step_contract_id TEXT NOT NULL,
   step_contract_revision INTEGER NOT NULL CHECK (step_contract_revision >= 1),
   step_contract_digest TEXT NOT NULL,
-  step_contract_json TEXT NOT NULL,
   profile_json TEXT NOT NULL,
   profile_digest TEXT NOT NULL,
   model_route_json TEXT NOT NULL,
@@ -3133,7 +3132,6 @@ WHEN NEW.id <> OLD.id
   OR NEW.step_contract_id <> OLD.step_contract_id
   OR NEW.step_contract_revision <> OLD.step_contract_revision
   OR NEW.step_contract_digest <> OLD.step_contract_digest
-  OR NEW.step_contract_json <> OLD.step_contract_json
   OR NEW.profile_json <> OLD.profile_json
   OR NEW.profile_digest <> OLD.profile_digest
   OR NEW.model_route_json <> OLD.model_route_json
@@ -3150,6 +3148,97 @@ BEGIN SELECT RAISE(ABORT, 'navigator ticket worker attempts cannot be deleted');
 CREATE TABLE navigator_ticket_worker_outcomes (
   attempt_id TEXT PRIMARY KEY REFERENCES navigator_ticket_worker_attempts(id),
   slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'findings', 'worker_unavailable', 'policy_failure')),
+  reason_code TEXT NOT NULL,
+  exact_head_sha TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+
+CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_update
+BEFORE UPDATE ON navigator_ticket_worker_outcomes
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker outcomes are append-only'); END;
+CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_delete
+BEFORE DELETE ON navigator_ticket_worker_outcomes
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker outcomes are append-only'); END;
+
+CREATE TABLE navigator_pull_requests (
+  job_id TEXT PRIMARY KEY REFERENCES navigator_integrations(job_id),
+  operation_id TEXT NOT NULL UNIQUE,
+  request_json TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'published')),
+  number INTEGER,
+  url TEXT,
+  head_sha TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  CHECK ((status = 'published') = (number IS NOT NULL AND url IS NOT NULL AND settled_at IS NOT NULL))
+);
+
+CREATE TRIGGER navigator_pull_requests_immutable_request
+BEFORE UPDATE ON navigator_pull_requests
+WHEN NEW.job_id <> OLD.job_id
+  OR NEW.operation_id <> OLD.operation_id
+  OR NEW.request_json <> OLD.request_json
+  OR NEW.request_digest <> OLD.request_digest
+  OR NEW.head_sha <> OLD.head_sha
+  OR NEW.created_at <> OLD.created_at
+  OR OLD.status = 'published'
+BEGIN SELECT RAISE(ABORT, 'navigator pull request identity is immutable'); END;
+CREATE TRIGGER navigator_pull_requests_no_delete
+BEFORE DELETE ON navigator_pull_requests
+BEGIN SELECT RAISE(ABORT, 'navigator pull requests cannot be deleted'); END;
+`] as const;
+
+export const NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS = [String.raw`
+ALTER TABLE navigator_ticket_worker_attempts
+  ADD COLUMN step_contract_json TEXT NOT NULL DEFAULT '';
+
+UPDATE navigator_ticket_worker_attempts
+   SET step_contract_json = CASE
+     WHEN step_contract_id = 'navigator-ticket-implementation' AND step_contract_revision = 1 THEN
+       '{"id":"navigator-ticket-implementation","revision":1,"skillId":"implement","freshContext":true,"codeWriting":true,"resourceClass":"managed_integration_worktree","resultSchema":"navigator-implementation-result-v1","mandatoryEvidence":["ticket_snapshot","specification_snapshot","focused_verification","full_verification"],"modelPools":["standard","strong"],"timeoutMs":14400000,"maximumResultBytes":256000,"digest":"c3d183d0b7c961ad1cbc223aa38a025f6ec8b52496e40137ce5e7bd6ae77f851"}'
+     WHEN step_contract_id = 'navigator-ticket-code-review' AND step_contract_revision = 1 THEN
+       '{"id":"navigator-ticket-code-review","revision":1,"skillId":"code-review","freshContext":true,"codeWriting":false,"resourceClass":"managed_integration_worktree","resultSchema":"navigator-code-review-result-v1","mandatoryEvidence":["ticket_snapshot","specification_snapshot","exact_head_review"],"modelPools":["strong"],"timeoutMs":3600000,"maximumResultBytes":256000,"digest":"cd460fc7ac1f32321ff9a9072332fbadec39b235e02f5a4e0894367b74199329"}'
+     WHEN step_contract_id = 'navigator-ticket-implementation' AND step_contract_revision = 2 THEN
+       '{"id":"navigator-ticket-implementation","revision":2,"skillId":"implement","freshContext":true,"codeWriting":true,"resourceClass":"managed_integration_worktree","resultSchema":"navigator-implementation-result-v1","mandatoryEvidence":["ticket_snapshot","specification_snapshot","focused_verification","full_verification"],"modelPools":["standard","strong"],"timeoutMs":14400000,"maximumResultBytes":256000,"retryClass":"bounded_exponential","maximumAttempts":5,"backoffBaseMs":500,"backoffMaximumMs":30000,"digest":"265975681ea5dbd57a9bf428532400ea72fd9f5a96110cf47fcb4da2de19987b"}'
+     WHEN step_contract_id = 'navigator-ticket-code-review' AND step_contract_revision = 2 THEN
+       '{"id":"navigator-ticket-code-review","revision":2,"skillId":"code-review","freshContext":true,"codeWriting":false,"resourceClass":"managed_integration_worktree","resultSchema":"navigator-code-review-result-v1","mandatoryEvidence":["ticket_snapshot","specification_snapshot","exact_head_review"],"modelPools":["strong"],"timeoutMs":3600000,"maximumResultBytes":256000,"retryClass":"bounded_exponential","maximumAttempts":5,"backoffBaseMs":500,"backoffMaximumMs":30000,"digest":"b32624e6c687619ad840747a023b9f918108b8a409308f935723eb99de5f2f3c"}'
+     ELSE NULL
+   END;
+
+DROP TRIGGER navigator_ticket_worker_attempts_immutable_identity;
+CREATE TRIGGER navigator_ticket_worker_attempts_immutable_identity
+BEFORE UPDATE ON navigator_ticket_worker_attempts
+WHEN NEW.id <> OLD.id
+  OR NEW.job_id <> OLD.job_id
+  OR NEW.slice_id <> OLD.slice_id
+  OR NEW.kind <> OLD.kind
+  OR NEW.ordinal <> OLD.ordinal
+  OR NEW.effect_idempotency_key <> OLD.effect_idempotency_key
+  OR NEW.work_order_json <> OLD.work_order_json
+  OR NEW.work_order_digest <> OLD.work_order_digest
+  OR NEW.step_contract_id <> OLD.step_contract_id
+  OR NEW.step_contract_revision <> OLD.step_contract_revision
+  OR NEW.step_contract_digest <> OLD.step_contract_digest
+  OR NEW.step_contract_json <> OLD.step_contract_json
+  OR NEW.profile_json <> OLD.profile_json
+  OR NEW.profile_digest <> OLD.profile_digest
+  OR NEW.model_route_json <> OLD.model_route_json
+  OR NEW.created_at <> OLD.created_at
+  OR (OLD.resource_kind IS NOT NULL AND (
+    NEW.resource_kind IS NOT OLD.resource_kind OR NEW.resource_id IS NOT OLD.resource_id
+  ))
+BEGIN SELECT RAISE(ABORT, 'navigator ticket worker attempt identity is immutable'); END;
+
+DROP TRIGGER navigator_ticket_worker_outcomes_append_only_update;
+DROP TRIGGER navigator_ticket_worker_outcomes_append_only_delete;
+ALTER TABLE navigator_ticket_worker_outcomes RENAME TO navigator_ticket_worker_outcomes_before_upgrade;
+CREATE TABLE navigator_ticket_worker_outcomes (
+  attempt_id TEXT PRIMARY KEY REFERENCES navigator_ticket_worker_attempts(id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
   outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'findings', 'worker_unavailable', 'policy_failure', 'dead_letter')),
   reason_code TEXT NOT NULL,
   exact_head_sha TEXT NOT NULL,
@@ -3160,6 +3249,14 @@ CREATE TABLE navigator_ticket_worker_outcomes (
   recorded_at INTEGER NOT NULL,
   CHECK ((git_observation_json IS NULL) = (git_observation_digest IS NULL))
 );
+INSERT INTO navigator_ticket_worker_outcomes (
+  attempt_id, slice_id, outcome, reason_code, exact_head_sha,
+  result_json, result_digest, git_observation_json, git_observation_digest, recorded_at
+)
+SELECT attempt_id, slice_id, outcome, reason_code, exact_head_sha,
+       result_json, result_digest, NULL, NULL, recorded_at
+  FROM navigator_ticket_worker_outcomes_before_upgrade;
+DROP TABLE navigator_ticket_worker_outcomes_before_upgrade;
 
 CREATE TRIGGER navigator_ticket_worker_outcomes_append_only_update
 BEFORE UPDATE ON navigator_ticket_worker_outcomes
@@ -3214,34 +3311,6 @@ BEGIN SELECT RAISE(ABORT, 'navigator ticket repair dispatches are append-only');
 CREATE TRIGGER navigator_ticket_repair_dispatches_append_only_delete
 BEFORE DELETE ON navigator_ticket_repair_dispatches
 BEGIN SELECT RAISE(ABORT, 'navigator ticket repair dispatches are append-only'); END;
-
-CREATE TABLE navigator_pull_requests (
-  job_id TEXT PRIMARY KEY REFERENCES navigator_integrations(job_id),
-  operation_id TEXT NOT NULL UNIQUE,
-  request_json TEXT NOT NULL,
-  request_digest TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'published')),
-  number INTEGER,
-  url TEXT,
-  head_sha TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  settled_at INTEGER,
-  CHECK ((status = 'published') = (number IS NOT NULL AND url IS NOT NULL AND settled_at IS NOT NULL))
-);
-
-CREATE TRIGGER navigator_pull_requests_immutable_request
-BEFORE UPDATE ON navigator_pull_requests
-WHEN NEW.job_id <> OLD.job_id
-  OR NEW.operation_id <> OLD.operation_id
-  OR NEW.request_json <> OLD.request_json
-  OR NEW.request_digest <> OLD.request_digest
-  OR NEW.head_sha <> OLD.head_sha
-  OR NEW.created_at <> OLD.created_at
-  OR OLD.status = 'published'
-BEGIN SELECT RAISE(ABORT, 'navigator pull request identity is immutable'); END;
-CREATE TRIGGER navigator_pull_requests_no_delete
-BEFORE DELETE ON navigator_pull_requests
-BEGIN SELECT RAISE(ABORT, 'navigator pull requests cannot be deleted'); END;
 `] as const;
 
 export const ALL_MIGRATIONS = [
@@ -3324,4 +3393,5 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_WORKFLOW_MIGRATIONS,
   ...NAVIGATOR_PLANNING_MIGRATIONS,
   ...NAVIGATOR_IMPLEMENTATION_MIGRATIONS,
+  ...NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS,
 ] as const;

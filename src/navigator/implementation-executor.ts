@@ -11,11 +11,11 @@ import {
   navigatorGitObservationSchema,
   navigatorImplementationResultSchema,
   navigatorJsonDigest,
+  navigatorPersistedTicketStepContractSchema,
   navigatorPullRequestRequestSchema,
   navigatorTicketWorkerProfile,
   navigatorTicketWorkerProfileSchema,
   navigatorTicketWorkerResultSchema,
-  navigatorTicketStepContractSchema,
   navigatorTicketRepairProposalSchema,
   navigatorTicketRepairSnapshotSchema,
   navigatorTicketWorkOrderSchema,
@@ -23,7 +23,7 @@ import {
   type NavigatorPullRequestRecord,
   type NavigatorPullRequestRequest,
   type NavigatorGitObservation,
-  type NavigatorTicketStepContract,
+  type NavigatorPersistedTicketStepContract,
   type NavigatorTicketRepairSnapshot,
   type NavigatorTicketTaskEvidence,
   type NavigatorTicketWorkerProfile,
@@ -44,7 +44,7 @@ export type NavigatorTicketWorkerAttempt = Readonly<{
   effectIdempotencyKey: string;
   workOrder: NavigatorTicketWorkOrder;
   workOrderDigest: string;
-  stepContract: NavigatorTicketStepContract;
+  stepContract: NavigatorPersistedTicketStepContract;
   profile: NavigatorTicketWorkerProfile;
   modelRoute: ModelRoute;
   resource: { kind: "bb_thread"; id: string } | null;
@@ -266,6 +266,41 @@ function mergeEvidenceRefs(...groups: readonly (readonly string[])[]): readonly 
   return boundedRefs([...new Set(groups.flat())]);
 }
 
+type NavigatorTicketRetryPolicy = Readonly<{
+  retryClass: "bounded_exponential";
+  maximumAttempts: number;
+  backoffBaseMs: number;
+  backoffMaximumMs: number;
+}>;
+
+function retryPolicy(contract: NavigatorPersistedTicketStepContract): NavigatorTicketRetryPolicy {
+  if (
+    "retryClass" in contract &&
+    contract.retryClass !== undefined && contract.maximumAttempts !== undefined &&
+    contract.backoffBaseMs !== undefined && contract.backoffMaximumMs !== undefined
+  ) return {
+    retryClass: contract.retryClass,
+    maximumAttempts: contract.maximumAttempts,
+    backoffBaseMs: contract.backoffBaseMs,
+    backoffMaximumMs: contract.backoffMaximumMs,
+  };
+  return {
+    retryClass: "bounded_exponential",
+    maximumAttempts: 1,
+    backoffBaseMs: 1,
+    backoffMaximumMs: 1,
+  };
+}
+
+function retryDelay(
+  contract: NavigatorPersistedTicketStepContract,
+  attempts: number,
+): number {
+  const policy = retryPolicy(contract);
+  const exponential = policy.backoffBaseMs * 2 ** Math.max(0, attempts - 1);
+  return Math.min(policy.backoffMaximumMs, exponential);
+}
+
 function stableId(prefix: string, ...parts: readonly string[]): string {
   return `${prefix}_${createHash("sha256").update(parts.join("\0"), "utf8").digest("base64url").slice(0, 24)}`;
 }
@@ -283,7 +318,7 @@ function parseRepairSnapshot(rawSnapshot: unknown): NavigatorTicketRepairSnapsho
 function parseAttempt(row: AttemptRow): NavigatorTicketWorkerAttempt {
   const workOrder = navigatorTicketWorkOrderSchema.parse(JSON.parse(row.work_order_json));
   const profile = navigatorTicketWorkerProfileSchema.parse(JSON.parse(row.profile_json));
-  const stepContract = navigatorTicketStepContractSchema.parse(JSON.parse(row.step_contract_json));
+  const stepContract = navigatorPersistedTicketStepContractSchema.parse(JSON.parse(row.step_contract_json));
   const { digest: _digest, ...unsignedContract } = stepContract;
   if (
     navigatorJsonDigest(workOrder) !== row.work_order_digest ||
@@ -492,6 +527,9 @@ export class NavigatorImplementationExecutor {
         externalAssignee: claim.externalAssignee,
         ownerId: input.ownerId,
         generation: input.generation,
+        expectedOwnerId: claim.ownerId,
+        expectedGeneration: claim.generation,
+        expectedLeaseExpiresAt: claim.leaseExpiresAt,
         now: this.dependencies.clock.now(),
         leaseMs,
       })
@@ -826,7 +864,7 @@ export class NavigatorImplementationExecutor {
           const observation = await this.reconcileUnavailableResource(attempt, error.reason, runSignal);
           this.replaceUnavailableAttempt(
             attempt,
-            effect.idempotencyKey,
+            effect,
             error.reason,
             observation,
             fence,
@@ -1050,6 +1088,9 @@ export class NavigatorImplementationExecutor {
       externalAssignee: claim.externalAssignee,
       ownerId: fence.ownerId,
       generation: fence.generation,
+      expectedOwnerId: claim.ownerId,
+      expectedGeneration: claim.generation,
+      expectedLeaseExpiresAt: claim.leaseExpiresAt,
       now,
       leaseMs,
     });
@@ -1130,6 +1171,8 @@ export class NavigatorImplementationExecutor {
     baseHeadSha: string;
     comparisonBaseHeadSha: string;
     now: number;
+    effectAttempts?: number;
+    nextAttemptAt?: number;
   }>): NavigatorTicketWorkerAttempt {
     const workOrder = navigatorTicketWorkOrderSchema.parse({
       kind: "navigator_ticket_work_order",
@@ -1169,12 +1212,13 @@ export class NavigatorImplementationExecutor {
       `INSERT INTO effects (
          idempotency_key, job_id, kind, payload_json, status, attempts,
          next_attempt_at, created_at, updated_at
-       ) VALUES (?, ?, 'run_navigator_ticket_worker', ?, 'pending', 0, ?, ?, ?)`,
+       ) VALUES (?, ?, 'run_navigator_ticket_worker', ?, 'pending', ?, ?, ?, ?)`,
     ).run(
       effectKey,
       input.integration.job_id,
       JSON.stringify({ attemptId, sliceId: input.sliceId }),
-      input.now,
+      input.effectAttempts ?? 0,
+      input.nextAttemptAt ?? input.now,
       input.now,
       input.now,
     );
@@ -1490,7 +1534,7 @@ export class NavigatorImplementationExecutor {
 
   private replaceUnavailableAttempt(
     attempt: NavigatorTicketWorkerAttempt,
-    effectKey: string,
+    effect: StoredEffect,
     reason: "missing" | "stale",
     resourceObservation: Readonly<{
       resource: { kind: "bb_thread"; id: string } | null;
@@ -1502,7 +1546,7 @@ export class NavigatorImplementationExecutor {
     now: number,
   ): void {
     this.db.transaction(() => {
-      if (!this.effectLeaseCurrent(effectKey, fence, now) || this.getOutcome(attempt.id) !== null) return;
+      if (!this.effectLeaseCurrent(effect.idempotencyKey, fence, now) || this.getOutcome(attempt.id) !== null) return;
       const integration = this.integrationRow(attempt.jobId);
       if (!integration || integration.state !== "implementing") return;
       const staleReason = !this.bindingIsCurrent(attempt.workOrder.specification)
@@ -1527,7 +1571,19 @@ export class NavigatorImplementationExecutor {
           now,
         );
         this.invalidateIntegration(integration, staleReason, now);
-        this.finishEffectByKey(effectKey, fence, now, "done", null);
+        this.finishEffect(effect, fence, now, "done", null);
+        return;
+      }
+      if (effect.attempts >= retryPolicy(attempt.stepContract).maximumAttempts) {
+        this.deadLetterAttempt(
+          attempt,
+          effect,
+          "retry_exhausted",
+          `Navigator ticket worker remained unavailable (${reason})`,
+          fence,
+          now,
+          { reason, resourceObservation },
+        );
         return;
       }
       const result = { kind: "worker_unavailable", reason, resourceObservation } as const;
@@ -1545,7 +1601,7 @@ export class NavigatorImplementationExecutor {
         navigatorJsonDigest(result),
         now,
       );
-      this.finishEffectByKey(effectKey, fence, now, "done", null);
+      this.finishEffect(effect, fence, now, "done", null);
       this.createAttempt({
         integration,
         sliceId: attempt.sliceId,
@@ -1558,6 +1614,8 @@ export class NavigatorImplementationExecutor {
         baseHeadSha: attempt.workOrder.baseHeadSha,
         comparisonBaseHeadSha: attempt.workOrder.comparisonBaseHeadSha,
         now,
+        effectAttempts: effect.attempts,
+        nextAttemptAt: now + retryDelay(attempt.stepContract, effect.attempts),
       });
       this.db.prepare(
         "UPDATE navigator_ticket_slices SET state = ?, updated_at = ? WHERE id = ?",
@@ -1609,7 +1667,7 @@ export class NavigatorImplementationExecutor {
     const rawSummary = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     const summary = rawSummary.replace(/\s+/gu, " ").trim().slice(0, 500) || "Navigator ticket worker failed";
     const permanent = error instanceof NavigatorTicketWorkerPermanentError;
-    if (permanent || effect.attempts >= attempt.stepContract.maximumAttempts) {
+    if (permanent || effect.attempts >= retryPolicy(attempt.stepContract).maximumAttempts) {
       this.deadLetterAttempt(
         attempt,
         effect,
@@ -1620,9 +1678,7 @@ export class NavigatorImplementationExecutor {
       );
       return;
     }
-    const exponential = attempt.stepContract.backoffBaseMs * 2 ** Math.max(0, effect.attempts - 1);
-    const delay = Math.min(attempt.stepContract.backoffMaximumMs, exponential);
-    this.finishEffect(effect, fence, now, "failed", summary, now + delay);
+    this.finishEffect(effect, fence, now, "failed", summary, now + retryDelay(attempt.stepContract, effect.attempts));
   }
 
   private deadLetterAttempt(
@@ -1632,15 +1688,17 @@ export class NavigatorImplementationExecutor {
     summary: string,
     fence: EffectFence,
     now: number,
+    details: Readonly<Record<string, unknown>> = {},
   ): void {
-    this.db.transaction(() => {
+    const settle = () => {
       if (!this.effectLeaseCurrent(effect.idempotencyKey, fence, now) || this.getOutcome(attempt.id)) return;
       const result = {
         kind: "worker_failure",
-        retryClass: attempt.stepContract.retryClass,
+        retryClass: retryPolicy(attempt.stepContract).retryClass,
         attempts: effect.attempts,
         summary,
-      } as const;
+        ...details,
+      };
       this.db.prepare(
         `INSERT INTO navigator_ticket_worker_outcomes (
            attempt_id, slice_id, outcome, reason_code, exact_head_sha,
@@ -1657,7 +1715,9 @@ export class NavigatorImplementationExecutor {
       );
       this.invalidateIntegration(this.integrationRow(attempt.jobId)!, reasonCode, now);
       this.finishEffect(effect, fence, now, "dead", summary);
-    }).immediate();
+    };
+    if (this.db.inTransaction) settle();
+    else this.db.transaction(settle).immediate();
   }
 
   private async preparePullRequest(

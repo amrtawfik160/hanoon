@@ -1088,6 +1088,27 @@ describe("WorkArtifactRepository", () => {
     })?.id).toBe(claim?.id);
 
     expect(store.releaseExecutorLease("executor-a", first.generation, 1_020)).toBe(true);
+    const liveTakeover = store.acquireExecutorLease("executor-b", 1_030, 100);
+    if (!liveTakeover.acquired) throw new Error("live takeover executor lease was not acquired");
+    expect(repository.adoptArtifactClaim({
+      artifactId: created.artifact.id,
+      workflowStepId: "workflow_1",
+      jobId: "job_1",
+      externalAssignee: "hanoon-bot",
+      ownerId: "executor-b",
+      generation: liveTakeover.generation,
+      expectedOwnerId: claim!.ownerId,
+      expectedGeneration: claim!.generation,
+      expectedLeaseExpiresAt: claim!.leaseExpiresAt,
+      now: 1_035,
+      leaseMs: 100,
+    })).toBe(false);
+    expect(repository.getHeldClaim(created.artifact.id)).toMatchObject({
+      ownerId: "executor-a",
+      generation: first.generation,
+      leaseExpiresAt: claim!.leaseExpiresAt,
+    });
+    expect(store.releaseExecutorLease("executor-b", liveTakeover.generation, 1_040)).toBe(true);
     const second = store.acquireExecutorLease("executor-b", 1_200, 100);
     if (!second.acquired) throw new Error("second executor lease was not acquired");
     expect(repository.adoptArtifactClaim({
@@ -1097,6 +1118,9 @@ describe("WorkArtifactRepository", () => {
       externalAssignee: "hanoon-bot",
       ownerId: "executor-b",
       generation: second.generation,
+      expectedOwnerId: claim!.ownerId,
+      expectedGeneration: claim!.generation,
+      expectedLeaseExpiresAt: claim!.leaseExpiresAt,
       now: 1_210,
       leaseMs: 100,
     })).toBe(false);
@@ -1107,6 +1131,9 @@ describe("WorkArtifactRepository", () => {
       externalAssignee: "hanoon-bot",
       ownerId: "executor-b",
       generation: second.generation,
+      expectedOwnerId: claim!.ownerId,
+      expectedGeneration: claim!.generation,
+      expectedLeaseExpiresAt: claim!.leaseExpiresAt,
       now: 1_210,
       leaseMs: 100,
     })).toBe(true);
