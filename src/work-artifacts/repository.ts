@@ -1343,12 +1343,21 @@ export class WorkArtifactRepository {
           claim.releaseReason === reason;
       }
       if (claim.state !== "held") return false;
+      if (claim.leaseExpiresAt <= input.now) return false;
       if (!currentExecutorLease(this.db, input.ownerId, input.generation, input.now)) return false;
       const updated = this.db.prepare(
         `UPDATE work_artifact_claims
             SET state = 'released', released_at = ?, release_reason = ?
-          WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?`,
-      ).run(input.now, reason, input.claimId, input.ownerId, input.generation);
+          WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+            AND lease_expires_at > ?`,
+      ).run(
+        input.now,
+        reason,
+        input.claimId,
+        input.ownerId,
+        input.generation,
+        input.now,
+      );
       if (updated.changes !== 1) return false;
       this.db.prepare(
         `UPDATE work_artifacts SET status = 'ready', updated_at = ?

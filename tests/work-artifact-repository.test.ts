@@ -1181,6 +1181,39 @@ describe("WorkArtifactRepository", () => {
     expect(repository.getArtifact(created.artifact.id)?.status).toBe("ready");
   });
 
+  it("STD-40-001: transactional release refuses an expired claim", () => {
+    const { repository, store } = fixture();
+    const created = repository.captureArtifact(artifactInput("expired-release", "63", {
+      assignees: ["hanoon-bot"],
+    }));
+    const executor = store.acquireExecutorLease("expired-release-executor", 1_000, 1_000);
+    if (!executor.acquired) throw new Error("executor lease was not acquired");
+    const claim = repository.claimArtifact({
+      artifactId: created.artifact.id,
+      workflowStepId: "workflow_expired_release",
+      jobId: "job_1",
+      snapshotId: created.snapshot.id,
+      externalAssignee: "hanoon-bot",
+      ownerId: "expired-release-executor",
+      generation: executor.generation,
+      now: 1_010,
+      leaseMs: 50,
+    });
+    if (!claim) throw new Error("artifact was not claimed");
+
+    expect(repository.releaseArtifactClaim({
+      claimId: claim.id,
+      ownerId: "expired-release-executor",
+      generation: executor.generation,
+      now: 1_061,
+      reason: "expired claim",
+    })).toBe(false);
+    expect(repository.getClaim(claim.id)).toMatchObject({
+      state: "held",
+      leaseExpiresAt: 1_060,
+    });
+  });
+
   it("persists immutable tracker mutation identity and a stable indeterminate outcome", () => {
     const { store } = fixture();
     const first = store.acquireExecutorLease("mutation-a", 1_000, 100);

@@ -693,6 +693,7 @@ export class WorkArtifactCoordinator {
     }
     if (claim.state !== "held") return false;
     if (!this.store.isExecutorLeaseCurrent(input.ownerId, input.generation, input.now)) return false;
+    if (claim.leaseExpiresAt <= input.now) return false;
     const artifact = this.requireArtifact(claim.artifactId);
     let observed = await this.readBoundTrackerArtifact(artifact);
     const releaseEvidence = await this.tracker.operationStatus({
