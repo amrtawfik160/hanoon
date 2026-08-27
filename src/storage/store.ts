@@ -5348,10 +5348,69 @@ function jobNeedsPolicyBoundary(
 function sourceEffectSupportsPolicyBoundary(
   sourceEffect: StoredEffect,
   input: PolicyBoundaryObservationInput,
+  job: Job,
+  authority: TaskAuthority,
 ): boolean {
   return sourceEffect.kind === "issue_approval" && sourceEffect.status === "leased" &&
     sourceEffect.leaseOwner === input.ownerId && sourceEffect.leaseGeneration === input.generation &&
-    sourceEffect.leaseExpiresAt !== null && sourceEffect.leaseExpiresAt > input.now;
+    sourceEffect.leaseExpiresAt !== null && sourceEffect.leaseExpiresAt > input.now &&
+    policyApprovalIntentMatches(sourceEffect.payload, job, authority, input.affectedEffectIdempotencyKey);
+}
+
+const POLICY_APPROVAL_INTENT_KEYS = [
+  "affectedEffectIdempotencyKey", "affectedEffectKind", "artifactGraphDigest", "controllerKey",
+  "headSha", "intentVersion", "jobId", "operation", "policyDigest", "projectId",
+].join("\u0000");
+
+function policyApprovalIntentMatches(
+  payload: Readonly<Record<string, unknown>>,
+  job: Job,
+  authority: TaskAuthority,
+  affectedEffectIdempotencyKey: string,
+): boolean {
+  if (Object.keys(payload).sort().join("\u0000") !== POLICY_APPROVAL_INTENT_KEYS) return false;
+  return payload.intentVersion === 1 && payload.jobId === job.id &&
+    payload.projectId === authority.projectId && payload.controllerKey === authority.controllerKey &&
+    payload.policyDigest === authority.policyDigest &&
+    payload.artifactGraphDigest === authority.artifactGraphDigest &&
+    payload.affectedEffectIdempotencyKey === affectedEffectIdempotencyKey &&
+    payload.affectedEffectKind === "merge_pr" && payload.headSha === job.prHeadSha &&
+    payload.operation === "merge";
+}
+
+function policyApprovalIntent(
+  job: Job,
+  authority: TaskAuthority,
+  affectedEffectIdempotencyKey: string,
+): Readonly<Record<string, unknown>> {
+  return {
+    intentVersion: 1,
+    jobId: job.id,
+    projectId: authority.projectId,
+    controllerKey: authority.controllerKey,
+    policyDigest: authority.policyDigest,
+    artifactGraphDigest: authority.artifactGraphDigest,
+    affectedEffectIdempotencyKey,
+    affectedEffectKind: "merge_pr",
+    headSha: job.prHeadSha,
+    operation: "merge",
+  };
+}
+
+function policyApprovalIntentForLease(
+  effect: StoredEffect,
+  job: Job,
+  authority: TaskAuthority,
+): Readonly<Record<string, unknown>> | null {
+  const affectedEffectIdempotencyKey = `${job.id}:${job.version + 1}:merge_pr`;
+  const intent = policyApprovalIntent(job, authority, affectedEffectIdempotencyKey);
+  const proposalKeys = Object.keys(effect.payload);
+  if (proposalKeys.length === 1 && proposalKeys[0] === "headSha" && effect.payload.headSha === job.prHeadSha) {
+    return intent;
+  }
+  return policyApprovalIntentMatches(effect.payload, job, authority, affectedEffectIdempotencyKey)
+    ? intent
+    : null;
 }
 
 type AcceptedMergeLease = Readonly<{
@@ -12786,6 +12845,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     );
   }
 
+  private bindPolicyApprovalIntent(effect: StoredEffect, now: number): StoredEffect | null {
+    if (effect.kind !== "issue_approval") return effect;
+    const job = this.readJobById(effect.jobId);
+    const authority = this.taskAuthorityRepository.get(effect.jobId);
+    if (!job || !authority || authority.outcome !== "shipped_change" || job.policy?.production ||
+      job.policy?.autonomy?.mergeWithoutProduction === true) return effect;
+    const payload = policyApprovalIntentForLease(effect, job, authority);
+    if (!payload) return null;
+    if (policyApprovalIntentMatches(effect.payload, job, authority, `${job.id}:${job.version + 1}:merge_pr`)) {
+      return effect;
+    }
+    const payloadJson = JSON.stringify(payload);
+    const updated = this.db.prepare(
+      `UPDATE effects SET payload_json = ?, updated_at = ?
+        WHERE idempotency_key = ? AND status IN ('pending', 'failed')`,
+    ).run(payloadJson, now, effect.idempotencyKey);
+    return updated.changes === 1 ? { ...effect, payload } : null;
+  }
+
   private taskAuthorityNarrowingEffects(jobId: string, revision: number): JobEffect[] {
     const workerRows = this.db.prepare(
       `SELECT job_id, worker_kind, resource_kind, resource_id, generation, state,
@@ -12969,7 +13047,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const sourceEffect = this.getEffect(input.jobId, input.sourceEffectIdempotencyKey);
     if (!job || !authority || !sourceEffect || !authoritySupportsPolicyBoundary(authority, input) ||
       !jobNeedsPolicyBoundary(job, authority, input.affectedEffectIdempotencyKey) ||
-      !sourceEffectSupportsPolicyBoundary(sourceEffect, input)) return null;
+      !this.taskAuthorityRepository.effectAdmissionIsCurrent(
+        sourceEffect.jobId,
+        sourceEffect.idempotencyKey,
+        "read",
+      ) || !sourceEffectSupportsPolicyBoundary(sourceEffect, input, job, authority)) return null;
     return { job, authority };
   }
 
@@ -14277,7 +14359,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .all(input.jobId, input.now, input.now) as EffectRow[];
       const worker = this.getWorkerLiveness(input.jobId);
       for (const row of rows) {
-        const effect = parseEffect(row);
+        const effect = this.bindPolicyApprovalIntent(parseEffect(row), input.now);
+        if (!effect) continue;
         if (!admissionAllowsEffect(admission, effect, worker)) continue;
         const authorityEffects = taskAuthorityEffectsForJobEffect(effect);
         if (authorityEffects === null || authorityEffects.length === 0 || !authorityEffects.every((authorityEffect) => this.taskAuthorityRepository.admitEffect(

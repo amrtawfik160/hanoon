@@ -117,6 +117,27 @@ function prepareApprovalEffect(
   return key;
 }
 
+function policyApprovalPayload(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  policy: ReturnType<typeof policyFixture>,
+  headSha: string,
+) {
+  const authority = fixture.store.getTaskAuthority(fixture.job.id);
+  if (!authority) throw new Error("approval task authority is missing");
+  return {
+    intentVersion: 1,
+    jobId: fixture.job.id,
+    projectId: policy.projectId,
+    controllerKey: authority.controllerKey,
+    policyDigest: authority.policyDigest,
+    artifactGraphDigest: authority.artifactGraphDigest,
+    affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+    affectedEffectKind: "merge_pr",
+    headSha,
+    operation: "merge",
+  };
+}
+
 async function runApprovalEffect(
   fixture: ReturnType<typeof ownerJobFixture>,
   key: string,
@@ -158,20 +179,22 @@ function boundaryInput(jobId: string, authorityRevision = 1) {
 }
 
 function preparePolicyBoundaryObservation(fixture: ReturnType<typeof ownerJobFixture>) {
-  const db = fixture.bb.storage.database();
-  db.prepare("UPDATE jobs SET state = 'awaiting_merge_approval' WHERE id = ?").run(fixture.job.id);
+  const policy = fixture.store.getJob(fixture.job.id)?.policy;
+  if (!policy) throw new Error("policy boundary policy is missing");
+  const sourceEffectIdempotencyKey = prepareApprovalEffect(fixture, policy, sha("d"));
+  const sourceEffect = fixture.store.leaseNextJobEffect({
+    jobId: fixture.job.id,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now: 10_004,
+    leaseMs: 30_000,
+  });
+  if (!sourceEffect || sourceEffect.idempotencyKey !== sourceEffectIdempotencyKey) {
+    throw new Error("policy boundary source was not leased");
+  }
   const current = fixture.store.getJob(fixture.job.id);
   if (!current) throw new Error("policy boundary job is missing");
-  const sourceEffectIdempotencyKey = `${current.id}:test:issue_approval`;
   const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
-  db.prepare(
-    `INSERT INTO effects (
-       idempotency_key, job_id, kind, payload_json, status, attempts,
-       lease_owner, lease_generation, lease_expires_at,
-       next_attempt_at, created_at, updated_at
-     ) VALUES (?, ?, 'issue_approval', '{}', 'leased', 1,
-       'executor', ?, 40002, 10002, 10002, 10002)`,
-  ).run(sourceEffectIdempotencyKey, current.id, fixture.leaseGeneration);
   expect(fixture.store.recordExecutorPolicyBoundaryObservation({
     jobId: current.id,
     authorityRevision: 1,
@@ -179,7 +202,7 @@ function preparePolicyBoundaryObservation(fixture: ReturnType<typeof ownerJobFix
     affectedEffectIdempotencyKey,
     ownerId: "executor",
     generation: fixture.leaseGeneration,
-    now: 10_002,
+    now: 10_005,
   })).toBe(true);
   return { sourceEffectIdempotencyKey, affectedEffectIdempotencyKey };
 }
@@ -1161,6 +1184,183 @@ describe("owner task authority intake", () => {
     })).toBe(false);
   });
 
+  it("rejects a leased policy approval source without current task-authority admission", () => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const db = fixture.bb.storage.database();
+    const headSha = sha("e");
+    const key = prepareApprovalEffect(fixture, policy, headSha);
+    db.prepare(
+      `UPDATE effects SET status = 'leased', attempts = 1, lease_owner = 'executor',
+         lease_generation = ?, lease_expires_at = 40004, updated_at = 10004
+       WHERE idempotency_key = ?`,
+    ).run(fixture.leaseGeneration, key);
+
+    expect(fixture.store.recordExecutorPolicyBoundaryObservation({
+      jobId: fixture.job.id,
+      authorityRevision: 1,
+      sourceEffectIdempotencyKey: key,
+      affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_005,
+    })).toBe(false);
+    expect(db.prepare("SELECT * FROM policy_boundary_observations WHERE job_id = ?").all(fixture.job.id)).toEqual([]);
+  });
+
+  it.each([
+    ["empty", () => ({})],
+    ["wrong job", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, jobId: "job_other" })],
+    ["wrong project", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, projectId: "proj_other" })],
+    ["wrong controller", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, controllerKey: "controller_other" })],
+    ["wrong policy digest", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, policyDigest: "f".repeat(64) })],
+    ["wrong artifact graph", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, artifactGraphDigest: "f".repeat(64) })],
+    ["wrong paused effect", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, affectedEffectIdempotencyKey: "effect_other" })],
+    ["wrong paused effect kind", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, affectedEffectKind: "deploy_production" })],
+    ["wrong reviewed head", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, headSha: sha("f") })],
+    ["wrong operation", (payload: ReturnType<typeof policyApprovalPayload>) => ({ ...payload, operation: "deploy" })],
+  ] as const)("rejects an admitted policy approval source with %s payload", (_scenario, alterPayload) => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("e"));
+    const source = fixture.store.leaseNextJobEffect({
+      jobId: fixture.job.id,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_004,
+      leaseMs: 30_000,
+    });
+    if (!source || source.idempotencyKey !== key) throw new Error("policy approval source was not leased");
+    fixture.bb.storage.database().prepare("UPDATE effects SET payload_json = ? WHERE idempotency_key = ?")
+      .run(JSON.stringify(alterPayload(policyApprovalPayload(fixture, policy, sha("e")))), key);
+
+    expect(fixture.store.recordExecutorPolicyBoundaryObservation({
+      jobId: fixture.job.id,
+      authorityRevision: 1,
+      sourceEffectIdempotencyKey: key,
+      affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_005,
+    })).toBe(false);
+    expect(fixture.bb.storage.database().prepare(
+      "SELECT * FROM policy_boundary_observations WHERE job_id = ?",
+    ).all(fixture.job.id)).toEqual([]);
+  });
+
+  it("rejects a malformed admitted policy approval payload before observation insertion", () => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("e"));
+    const source = fixture.store.leaseNextJobEffect({
+      jobId: fixture.job.id,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_004,
+      leaseMs: 30_000,
+    });
+    if (!source || source.idempotencyKey !== key) throw new Error("policy approval source was not leased");
+    fixture.bb.storage.database().prepare("UPDATE effects SET payload_json = '[' WHERE idempotency_key = ?").run(key);
+
+    expect(() => fixture.store.recordExecutorPolicyBoundaryObservation({
+      jobId: fixture.job.id,
+      authorityRevision: 1,
+      sourceEffectIdempotencyKey: key,
+      affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_005,
+    })).toThrow();
+    expect(fixture.bb.storage.database().prepare(
+      "SELECT * FROM policy_boundary_observations WHERE job_id = ?",
+    ).all(fixture.job.id)).toEqual([]);
+  });
+
+  it("prevents direct SQL from linking an observation to an unadmitted policy approval", () => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("e"));
+    const authority = fixture.store.getTaskAuthority(fixture.job.id);
+    if (!authority) throw new Error("policy approval authority is missing");
+
+    expect(() => fixture.bb.storage.database().prepare(
+      `INSERT INTO policy_boundary_observations (
+         observation_id, job_id, authority_id, authority_revision, artifact_graph_digest, policy_digest,
+         source_effect_idempotency_key, affected_effect_idempotency_key, observed_job_version, observed_at
+       ) VALUES ('forged_observation', ?, ?, 1, ?, ?, ?, ?, 2, 10005)`,
+    ).run(
+      fixture.job.id,
+      authority.authorityId,
+      authority.artifactGraphDigest,
+      authority.policyDigest,
+      key,
+      `${fixture.job.id}:3:merge_pr`,
+    )).toThrow(/admitted policy approval source/u);
+  });
+
+  it.each([
+    ["wrong authority revision", { authorityRevision: 2 }],
+    ["wrong executor generation", { generationOffset: 1 }],
+  ] as const)("rejects a policy approval observation with %s", (_scenario, mismatch) => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("e"));
+    const source = fixture.store.leaseNextJobEffect({
+      jobId: fixture.job.id,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_004,
+      leaseMs: 30_000,
+    });
+    if (!source || source.idempotencyKey !== key) throw new Error("policy approval source was not leased");
+
+    expect(fixture.store.recordExecutorPolicyBoundaryObservation({
+      jobId: fixture.job.id,
+      authorityRevision: "authorityRevision" in mismatch ? mismatch.authorityRevision : 1,
+      sourceEffectIdempotencyKey: key,
+      affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration + ("generationOffset" in mismatch ? mismatch.generationOffset : 0),
+      now: 10_005,
+    })).toBe(false);
+  });
+
+  it("rejects a policy approval admitted under a superseded authority revision", () => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("e"));
+    const source = fixture.store.leaseNextJobEffect({
+      jobId: fixture.job.id,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_004,
+      leaseMs: 30_000,
+    });
+    if (!source || source.idempotencyKey !== key) throw new Error("policy approval source was not leased");
+    expect(fixture.store.narrowTaskAuthority({
+      jobId: fixture.job.id,
+      ownerUserId: "7",
+      ownerChatId: "7",
+      controllerKey: "owner-7-controller",
+      sourceUpdateId: 702,
+      ...claimNarrowingUpdate(fixture.store, 702, 10_006),
+      authorityRevision: 1,
+      outcome: "reviewed_change",
+      constraints: ["no_merge"],
+      now: 10_006,
+    })).toMatchObject({ outcome: "recorded", authority: { revision: 2 } });
+
+    expect(fixture.store.recordExecutorPolicyBoundaryObservation({
+      jobId: fixture.job.id,
+      authorityRevision: 1,
+      sourceEffectIdempotencyKey: key,
+      affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: 10_007,
+    })).toBe(false);
+  });
+
   it.each([
     "product_decision_required",
     "scope_expansion_required",
@@ -1400,5 +1600,7 @@ describe("owner task authority intake", () => {
       affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
     });
     expect(fixture.store.listEffectsForJob(fixture.job.id).some((effect) => effect.kind === "merge_pr")).toBe(false);
+    const reopened = openStore(fixture.bb.storage, fixture.bb.storage.kv, () => 10_000);
+    expect(reopened.listOwnerBoundaries(fixture.job.id)).toEqual(boundaries);
   });
 });

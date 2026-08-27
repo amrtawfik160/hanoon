@@ -4,6 +4,7 @@ import {
   ALL_MIGRATIONS,
   OWNER_BOUNDARY_SOURCE_MIGRATIONS,
   OWNER_BOUNDARY_MIGRATIONS,
+  POLICY_APPROVAL_INTENT_MIGRATIONS,
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_CLOSURE_MIGRATIONS,
@@ -53,7 +54,8 @@ const LEGACY_MIGRATION_MARKERS = [
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
   TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length;
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+  POLICY_APPROVAL_INTENT_MIGRATIONS.length;
 
 const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
 
@@ -107,7 +109,10 @@ function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
   registerWorkArtifactRelationshipValidation(db);
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
     0,
-    -(TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length),
+    -(
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+    ),
   ));
   db.prepare(
     `INSERT INTO controller_threads (
@@ -249,14 +254,16 @@ it("upgrades publisher admissions without losing grants and enforces exact durab
   ).all()).toEqual([{ effect: "commit" }]);
   db.prepare(
     `INSERT INTO task_authority_effect_admissions (
-       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
-     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'push', 1001)`,
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+       effect_payload_json, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'push', '{}', 1001)`,
   ).run();
   expect(() => db.prepare(
     `INSERT INTO task_authority_effect_admissions (
-       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
-     ) VALUES ('job_1:publish', 'job_2', 'authority_1', 1, 'pull_request', 1002)`,
-  ).run()).toThrow(/job identity mismatch/u);
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+       effect_payload_json, admitted_at
+     ) VALUES ('job_1:publish', 'job_2', 'authority_1', 1, 'pull_request', '{}', 1002)`,
+  ).run()).toThrow(/source identity mismatch/u);
   expect(() => db.prepare(
     `INSERT INTO task_authority_narrowings (
        source_update_id, controller_key, owner_user_id, owner_chat_id, job_id,
@@ -268,7 +275,10 @@ it("upgrades publisher admissions without losing grants and enforces exact durab
 
 it("rolls back the boundary-source upgrade when active legacy evidence cannot be proven", () => {
   const { bb, db } = admissionUpgradeDatabase("owner-boundary-source-upgrade");
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -OWNER_BOUNDARY_SOURCE_MIGRATIONS.length));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(OWNER_BOUNDARY_SOURCE_MIGRATIONS.length + POLICY_APPROVAL_INTENT_MIGRATIONS.length),
+  ));
   db.prepare(
     `INSERT INTO task_authorities (
        authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
@@ -326,7 +336,8 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
     0,
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -378,7 +389,8 @@ it("fails the authority upgrade when an older bound revision cannot be reconstru
     0,
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -438,7 +450,8 @@ it("reconstructs an older shipped revision from its authoritative release bindin
     0,
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
     ),
   ));
   db.prepare(

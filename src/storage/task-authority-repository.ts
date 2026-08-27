@@ -304,35 +304,46 @@ export class TaskAuthorityRepository {
   ): boolean {
     const authority = readAuthority(this.db, jobId);
     const job = this.db.prepare(
-      "SELECT task_outcome, task_constraints_json FROM jobs WHERE id = ?",
-    ).get(jobId) as { task_outcome: string | null; task_constraints_json: string } | undefined;
+      `SELECT job.task_outcome, job.task_constraints_json, effect.payload_json
+         FROM jobs AS job
+         JOIN effects AS effect ON effect.idempotency_key = ? AND effect.job_id = job.id
+        WHERE job.id = ?`,
+    ).get(effectIdempotencyKey, jobId) as {
+      task_outcome: string | null;
+      task_constraints_json: string;
+      payload_json: string;
+    } | undefined;
     if (!job) return false;
     if (!authority) return job.task_outcome === null;
     if (job.task_outcome !== authority.outcome ||
       job.task_constraints_json !== JSON.stringify(authority.constraints) ||
       !taskAuthorityAllowsEffect(authority, effect)) return false;
     const existing = this.db.prepare(
-      `SELECT authority_id, authority_revision, effect FROM task_authority_effect_admissions
+      `SELECT authority_id, authority_revision, effect, effect_payload_json FROM task_authority_effect_admissions
         WHERE effect_idempotency_key = ? AND effect = ?`,
     ).get(effectIdempotencyKey, effect) as {
       authority_id: string;
       authority_revision: number;
       effect: string;
+      effect_payload_json: string;
     } | undefined;
     if (existing) {
       return existing.authority_id === authority.authorityId &&
-        existing.authority_revision === authority.revision && existing.effect === effect;
+        existing.authority_revision === authority.revision && existing.effect === effect &&
+        existing.effect_payload_json === job.payload_json;
     }
     return this.db.prepare(
       `INSERT INTO task_authority_effect_admissions (
-         effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
+         effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+         effect_payload_json, admitted_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       effectIdempotencyKey,
       jobId,
       authority.authorityId,
       authority.revision,
       effect,
+      job.payload_json,
       now,
     ).changes === 1;
   }
@@ -344,20 +355,29 @@ export class TaskAuthorityRepository {
   ): boolean {
     const authority = readAuthority(this.db, jobId);
     const job = this.db.prepare(
-      "SELECT task_outcome, task_constraints_json FROM jobs WHERE id = ?",
-    ).get(jobId) as { task_outcome: string | null; task_constraints_json: string } | undefined;
+      `SELECT job.task_outcome, job.task_constraints_json, effect.payload_json
+         FROM jobs AS job
+         JOIN effects AS effect ON effect.idempotency_key = ? AND effect.job_id = job.id
+        WHERE job.id = ?`,
+    ).get(effectIdempotencyKey, jobId) as {
+      task_outcome: string | null;
+      task_constraints_json: string;
+      payload_json: string;
+    } | undefined;
     if (!job) return false;
     if (!authority) return job.task_outcome === null;
     const admission = this.db.prepare(
-      `SELECT authority_id, authority_revision, effect FROM task_authority_effect_admissions
+      `SELECT authority_id, authority_revision, effect, effect_payload_json FROM task_authority_effect_admissions
         WHERE effect_idempotency_key = ? AND job_id = ? AND effect = ?`,
     ).get(effectIdempotencyKey, jobId, effect) as {
       authority_id: string;
       authority_revision: number;
       effect: string;
+      effect_payload_json: string;
     } | undefined;
     return admission?.authority_id === authority.authorityId &&
       admission.authority_revision === authority.revision && admission.effect === effect &&
+      admission.effect_payload_json === job.payload_json &&
       job.task_outcome === authority.outcome &&
       job.task_constraints_json === JSON.stringify(authority.constraints) &&
       taskAuthorityAllowsEffect(authority, effect);

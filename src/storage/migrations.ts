@@ -3768,6 +3768,163 @@ WHEN NEW.code <> 'policy_change_required' OR NOT EXISTS (
 BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
 `] as const;
 
+export const POLICY_APPROVAL_INTENT_MIGRATIONS = [String.raw`
+UPDATE effects
+   SET payload_json = (
+     SELECT json_object(
+       'intentVersion', 1,
+       'jobId', job.id,
+       'projectId', revision.project_id,
+       'controllerKey', revision.controller_key,
+       'policyDigest', revision.policy_digest,
+       'artifactGraphDigest', revision.artifact_graph_digest,
+       'affectedEffectIdempotencyKey', job.id || ':' || (job.version + 1) || ':merge_pr',
+       'affectedEffectKind', 'merge_pr',
+       'headSha', job.pr_head_sha,
+       'operation', 'merge'
+     )
+       FROM jobs AS job
+       JOIN task_authority_current AS current ON current.job_id = job.id
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = current.authority_id
+        AND revision.revision = current.revision
+      WHERE job.id = effects.job_id
+   )
+ WHERE effects.kind = 'issue_approval'
+   AND json_valid(effects.payload_json)
+   AND json_type(effects.payload_json) = 'object'
+   AND (SELECT COUNT(*) FROM json_each(effects.payload_json)) = 1
+   AND json_type(effects.payload_json, '$.headSha') = 'text'
+   AND EXISTS (
+     SELECT 1
+       FROM jobs AS job
+       JOIN task_authority_current AS current ON current.job_id = job.id
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = current.authority_id
+        AND revision.revision = current.revision
+      WHERE job.id = effects.job_id
+        AND job.state = 'awaiting_merge_approval'
+        AND job.pr_head_sha = json_extract(effects.payload_json, '$.headSha')
+        AND revision.status = 'active'
+        AND revision.task_outcome = 'shipped_change'
+        AND json_extract(job.policy_json, '$.production') IS NULL
+        AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+   );
+
+ALTER TABLE task_authority_effect_admissions RENAME TO task_authority_effect_admissions_without_payload;
+
+CREATE TABLE task_authority_effect_admissions (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  effect TEXT NOT NULL CHECK (effect IN (
+    'read', 'artifact_write', 'prototype_write', 'worktree_write', 'commit',
+    'push', 'pull_request', 'merge', 'deploy', 'rollback'
+  )),
+  effect_payload_json TEXT NOT NULL,
+  admitted_at INTEGER NOT NULL,
+  PRIMARY KEY (effect_idempotency_key, effect),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_effect_admissions (
+  effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+  effect_payload_json, admitted_at
+)
+SELECT admission.effect_idempotency_key, admission.job_id, admission.authority_id,
+       admission.authority_revision, admission.effect, effect.payload_json, admission.admitted_at
+  FROM task_authority_effect_admissions_without_payload AS admission
+  JOIN effects AS effect ON effect.idempotency_key = admission.effect_idempotency_key;
+
+DROP TABLE task_authority_effect_admissions_without_payload;
+
+CREATE TRIGGER task_authority_effect_admissions_exact_source_insert
+BEFORE INSERT ON task_authority_effect_admissions
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM effects AS effect
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = NEW.authority_id
+     AND revision.revision = NEW.authority_revision
+   WHERE effect.idempotency_key = NEW.effect_idempotency_key
+     AND effect.job_id = NEW.job_id
+     AND effect.payload_json = NEW.effect_payload_json
+     AND revision.job_id = NEW.job_id
+)
+BEGIN SELECT RAISE(ABORT, 'task authority admission source identity mismatch'); END;
+
+CREATE TRIGGER task_authority_effect_admissions_immutable_update
+BEFORE UPDATE ON task_authority_effect_admissions
+BEGIN SELECT RAISE(ABORT, 'task authority admissions are immutable'); END;
+CREATE TRIGGER task_authority_effect_admissions_immutable_delete
+BEFORE DELETE ON task_authority_effect_admissions
+BEGIN SELECT RAISE(ABORT, 'task authority admissions are immutable'); END;
+
+CREATE TRIGGER policy_boundary_observations_require_admitted_source
+BEFORE INSERT ON policy_boundary_observations
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM effects AS source_effect
+    JOIN task_authority_effect_admissions AS admission
+      ON admission.effect_idempotency_key = source_effect.idempotency_key
+     AND admission.job_id = source_effect.job_id
+     AND admission.effect = 'read'
+     AND admission.effect_payload_json = source_effect.payload_json
+    JOIN task_authority_current AS current
+      ON current.job_id = admission.job_id
+     AND current.authority_id = admission.authority_id
+     AND current.revision = admission.authority_revision
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = admission.authority_id
+     AND revision.revision = admission.authority_revision
+    JOIN jobs AS job ON job.id = source_effect.job_id
+   WHERE source_effect.idempotency_key = NEW.source_effect_idempotency_key
+     AND source_effect.job_id = NEW.job_id
+     AND source_effect.kind = 'issue_approval'
+     AND admission.authority_id = NEW.authority_id
+     AND admission.authority_revision = NEW.authority_revision
+     AND revision.status = 'active'
+     AND revision.task_outcome = 'shipped_change'
+     AND revision.artifact_graph_digest = NEW.artifact_graph_digest
+     AND revision.policy_digest = NEW.policy_digest
+     AND job.version = NEW.observed_job_version
+     AND json_valid(source_effect.payload_json)
+     AND json_type(source_effect.payload_json) = 'object'
+     AND (SELECT COUNT(*) FROM json_each(source_effect.payload_json)) = 10
+     AND json_extract(source_effect.payload_json, '$.intentVersion') = 1
+     AND json_extract(source_effect.payload_json, '$.jobId') = NEW.job_id
+     AND json_extract(source_effect.payload_json, '$.projectId') = revision.project_id
+     AND json_extract(source_effect.payload_json, '$.controllerKey') = revision.controller_key
+     AND json_extract(source_effect.payload_json, '$.policyDigest') = NEW.policy_digest
+     AND json_extract(source_effect.payload_json, '$.artifactGraphDigest') = NEW.artifact_graph_digest
+     AND json_extract(source_effect.payload_json, '$.affectedEffectIdempotencyKey') = NEW.affected_effect_idempotency_key
+     AND json_extract(source_effect.payload_json, '$.affectedEffectKind') = 'merge_pr'
+     AND json_extract(source_effect.payload_json, '$.headSha') = job.pr_head_sha
+     AND json_extract(source_effect.payload_json, '$.operation') = 'merge'
+)
+BEGIN SELECT RAISE(ABORT, 'policy observation lacks an admitted policy approval source'); END;
+
+INSERT OR IGNORE INTO policy_boundary_observations (
+  observation_id, job_id, authority_id, authority_revision, artifact_graph_digest,
+  policy_digest, source_effect_idempotency_key, affected_effect_idempotency_key,
+  observed_job_version, observed_at
+)
+SELECT observation.observation_id, observation.job_id, observation.authority_id,
+       observation.authority_revision, observation.artifact_graph_digest,
+       observation.policy_digest, observation.source_effect_idempotency_key,
+       observation.affected_effect_idempotency_key, observation.observed_job_version,
+       observation.observed_at
+  FROM policy_boundary_observations AS observation
+  JOIN owner_boundaries AS boundary
+    ON boundary.job_id = observation.job_id
+   AND boundary.authority_id = observation.authority_id
+   AND boundary.authority_revision = observation.authority_revision
+   AND boundary.affected_effect_idempotency_key = observation.affected_effect_idempotency_key
+ WHERE boundary.status <> 'revoked';
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3856,4 +4013,5 @@ export const ALL_MIGRATIONS = [
   ...TASK_AUTHORITY_CLOSURE_MIGRATIONS,
   ...TASK_AUTHORITY_PUBLISH_MIGRATIONS,
   ...OWNER_BOUNDARY_SOURCE_MIGRATIONS,
+  ...POLICY_APPROVAL_INTENT_MIGRATIONS,
 ] as const;
