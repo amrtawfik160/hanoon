@@ -828,6 +828,8 @@ it("atomically narrows the exact owner task from an authenticated status reply",
   const statusMessageId = fixture.store.getJob(jobId)?.statusMessageId;
   if (statusMessageId === null || statusMessageId === undefined) throw new Error("missing status message");
 
+  expect(fixture.store.beginTelegramUpdate(44, 4_399)).toBe("process");
+
   await fixture.ingress.handleClaimed(messageUpdate(44, 7, 70, "Do not merge it and do not deploy it", {
     reply_to_message: { message_id: statusMessageId },
   }), 4_400);

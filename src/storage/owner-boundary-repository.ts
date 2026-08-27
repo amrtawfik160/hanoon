@@ -197,6 +197,7 @@ function readByDigest(db: SqliteDatabase, digest: string, jobId?: string): Owner
 function authorityMatches(
   db: SqliteDatabase,
   input: Pick<CreateOwnerBoundaryInput, "jobId" | "authorityId" | "authorityRevision" | "ownerUserId" | "ownerChatId">,
+  code?: OwnerBoundaryCode,
 ): boolean {
   const row = db.prepare(
     `SELECT revision.authority_id, revision.job_id, revision.revision,
@@ -213,7 +214,9 @@ function authorityMatches(
     owner_chat_id: string;
     status: string;
   } | undefined;
-  return row !== undefined && row.status === "active" && row.revision === input.authorityRevision &&
+  const statusMatches = row?.status === "active" ||
+    (code === "production_recovery_required" && row?.status === "suspended");
+  return row !== undefined && statusMatches && row.revision === input.authorityRevision &&
     row.owner_user_id === input.ownerUserId && row.owner_chat_id === input.ownerChatId;
 }
 
@@ -265,24 +268,139 @@ function policyRequiresOwnerDecision(db: SqliteDatabase, jobId: string): boolean
   return policy.production === undefined && policy.autonomy?.mergeWithoutProduction !== true;
 }
 
+type BoundarySourceValidator = (db: SqliteDatabase, input: CreateOwnerBoundaryInput) => boolean;
+
+function productDecisionSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  const artifactId = input.affectedArtifactId ?? null;
+  if (artifactId === null) return false;
+  return db.prepare(
+    `SELECT 1 FROM work_artifacts AS artifact
+      JOIN jobs AS job ON job.id = ? AND job.project_id = artifact.project_id
+     WHERE artifact.id = ? AND artifact.kind = 'decision_ticket'
+       AND artifact.status IN ('open', 'ready', 'claimed')
+     LIMIT 1`,
+  ).get(input.jobId, artifactId) !== undefined;
+}
+
+function scopeExpansionSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  const artifactId = input.affectedArtifactId ?? null;
+  if (artifactId === null) return false;
+  return db.prepare(
+    `SELECT 1 FROM work_artifacts AS artifact
+      JOIN jobs AS job ON job.id = ? AND job.project_id = artifact.project_id
+     WHERE artifact.id = ? AND NOT EXISTS (
+         SELECT 1 FROM json_each(job.artifact_bindings_json) AS binding
+          WHERE json_extract(binding.value, '$.artifactId') = artifact.id
+       )
+     LIMIT 1`,
+  ).get(input.jobId, artifactId) !== undefined;
+}
+
+function credentialSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  if (!input.affectedEffectIdempotencyKey) return false;
+  return db.prepare(
+    `SELECT 1 FROM effects AS effect
+      JOIN credential_bindings AS binding
+        ON binding.installation_id = json_extract(effect.payload_json, '$.credentialInstallationId')
+       AND binding.binding_id = json_extract(effect.payload_json, '$.credentialBindingId')
+     WHERE effect.idempotency_key = ? AND effect.job_id = ?
+       AND binding.state IN ('pending', 'degraded', 'revoked', 'compromised')
+     LIMIT 1`,
+  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
+}
+
+function spendSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  if (!input.affectedEffectIdempotencyKey) return false;
+  return db.prepare(
+    `SELECT 1 FROM effects AS effect
+      JOIN stage_executions AS execution
+        ON execution.job_id = effect.job_id
+       AND execution.attempt_id = json_extract(effect.payload_json, '$.attemptId')
+     WHERE effect.idempotency_key = ? AND effect.job_id = ?
+       AND execution.outcome = 'failed' AND execution.total_tokens > 0
+       AND effect.status = 'dead' AND effect.attempts >= 20
+     LIMIT 1`,
+  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
+}
+
+function irreversibleEffectSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  if (!input.affectedEffectIdempotencyKey) return false;
+  return db.prepare(
+    `SELECT 1 FROM effects AS effect
+     WHERE effect.idempotency_key = ? AND effect.job_id = ?
+       AND effect.kind IN ('merge_pr', 'deploy_production')
+       AND NOT EXISTS (
+         SELECT 1 FROM task_authority_effect_admissions AS admission
+          JOIN task_authority_current AS current
+            ON current.job_id = admission.job_id
+           AND current.authority_id = admission.authority_id
+           AND current.revision = admission.authority_revision
+          WHERE admission.effect_idempotency_key = effect.idempotency_key
+            AND admission.effect = CASE effect.kind WHEN 'merge_pr' THEN 'merge' ELSE 'deploy' END
+       )
+     LIMIT 1`,
+  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
+}
+
+function exhaustedTechnicalSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  if (!input.affectedEffectIdempotencyKey) return false;
+  return db.prepare(
+    `SELECT 1 FROM effects AS effect
+     WHERE effect.idempotency_key = ? AND effect.job_id = ?
+       AND effect.status = 'dead' AND effect.attempts >= 20
+       AND EXISTS (
+         SELECT 1 FROM worker_recoveries AS recovery
+          WHERE recovery.job_id = effect.job_id AND recovery.action = 'owner_required'
+            AND recovery.state = 'owner_required'
+       )
+       AND EXISTS (
+         SELECT 1 FROM attempts AS attempt, json_each(attempt.result_json, '$.findings') AS finding
+          WHERE attempt.job_id = effect.job_id AND attempt.kind = 'review'
+            AND attempt.completed_at IS NOT NULL
+            AND json_extract(finding.value, '$.severity') IN ('critical', 'high')
+       )
+     LIMIT 1`,
+  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
+}
+
+function failedProductionSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  if (!input.affectedEffectIdempotencyKey) return false;
+  return db.prepare(
+    `SELECT 1 FROM effects AS effect
+      JOIN jobs AS job ON job.id = effect.job_id
+     WHERE effect.idempotency_key = ? AND effect.job_id = ? AND job.state = 'production_failed'
+       AND effect.kind IN ('deploy_production', 'verify_production')
+       AND effect.status = 'dead' AND effect.attempts >= 20
+       AND EXISTS (
+         SELECT 1 FROM worker_recoveries AS recovery
+          WHERE recovery.job_id = job.id AND recovery.action = 'owner_required'
+            AND recovery.state = 'owner_required'
+       )
+       AND EXISTS (
+         SELECT 1 FROM release_authority_receipts AS receipt
+          WHERE receipt.job_id = job.id AND receipt.status = 'consumed'
+       )
+       AND EXISTS (
+         SELECT 1 FROM pipeline_stage_attempts AS attempt
+          WHERE attempt.job_id = job.id AND attempt.role IN ('DEPLOY', 'CANARY') AND attempt.state = 'failed'
+       )
+     LIMIT 1`,
+  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
+}
+
+const BOUNDARY_SOURCE_VALIDATORS = {
+  product_decision_required: productDecisionSource,
+  scope_expansion_required: scopeExpansionSource,
+  credential_or_access_required: credentialSource,
+  spend_authority_required: spendSource,
+  irreversible_effect_required: irreversibleEffectSource,
+  policy_change_required: (db, input) => policyRequiresOwnerDecision(db, input.jobId),
+  technical_tradeoff_required: exhaustedTechnicalSource,
+  production_recovery_required: failedProductionSource,
+} satisfies Record<OwnerBoundaryCode, BoundarySourceValidator>;
+
 function durableBoundaryFacts(db: SqliteDatabase, input: CreateOwnerBoundaryInput): readonly string[] {
-  const requiredFacts = OWNER_BOUNDARY_REQUIRED_FACTS[input.code];
-  if (input.code === "policy_change_required" && policyRequiresOwnerDecision(db, input.jobId)) {
-    return requiredFacts;
-  }
-  const rows = db.prepare(
-    `SELECT fact FROM owner_boundary_fact_records
-      WHERE job_id = ? AND code = ?
-        AND affected_artifact_id IS ?
-        AND affected_effect_idempotency_key IS ?`,
-  ).all(
-    input.jobId,
-    input.code,
-    input.affectedArtifactId ?? null,
-    input.affectedEffectIdempotencyKey ?? null,
-  ) as Array<{ fact: string }>;
-  const persistedFacts = new Set(rows.map((row) => row.fact));
-  return requiredFacts.every((fact) => persistedFacts.has(fact)) ? requiredFacts : [];
+  return BOUNDARY_SOURCE_VALIDATORS[input.code](db, input) ? OWNER_BOUNDARY_REQUIRED_FACTS[input.code] : [];
 }
 
 export class OwnerBoundaryRepository {
@@ -295,7 +413,7 @@ export class OwnerBoundaryRepository {
     assertIdentifier(input.ownerChatId, "ownerChatId");
     assertPositiveInteger(input.authorityRevision, "authorityRevision");
     assertNonNegativeInteger(input.now, "now");
-    if (!authorityMatches(this.db, input)) return null;
+    if (!authorityMatches(this.db, input, input.code)) return null;
     const evidenceFacts = durableBoundaryFacts(this.db, input);
     if (!ownerBoundaryFactsSupport(input.code, evidenceFacts)) return null;
     const draft = normalizeOwnerBoundary({ ...input, evidenceFacts });

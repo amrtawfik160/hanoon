@@ -1488,13 +1488,13 @@ const TASK_AUTHORITY_EFFECT_REQUIREMENTS: Readonly<Record<JobEffect["kind"], rea
   render_status: ["read"],
   spawn_plan: ["artifact_write"],
   spawn_critique: ["artifact_write"],
-  spawn_implementation: ["worktree_write", "commit", "pull_request"],
-  inspect_implementation: ["commit"],
-  resolve_pr_head: ["pull_request"],
+  spawn_implementation: ["worktree_write", "commit", "push", "pull_request"],
+  inspect_implementation: ["commit", "push", "pull_request"],
+  resolve_pr_head: ["commit", "push", "pull_request"],
   spawn_review: ["read"],
-  send_remediation: ["worktree_write", "commit", "pull_request"],
+  send_remediation: ["worktree_write", "commit", "push", "pull_request"],
   run_validation: ["read"],
-  spawn_docs: ["worktree_write", "commit", "pull_request"],
+  spawn_docs: ["worktree_write", "commit", "push", "pull_request"],
   run_final_validation: ["read"],
   spawn_final_review: ["read"],
   spawn_consensus_review: ["read"],
@@ -1505,9 +1505,9 @@ const TASK_AUTHORITY_EFFECT_REQUIREMENTS: Readonly<Record<JobEffect["kind"], rea
   verify_production: ["deploy", "rollback"],
   recover_worker: ["read"],
   stop_thread: ["read"],
-  steer_implementation: ["worktree_write", "commit", "pull_request"],
+  steer_implementation: ["worktree_write", "commit", "push", "pull_request"],
   run_navigator_skill: ["artifact_write"],
-  run_navigator_ticket_worker: ["worktree_write", "commit", "pull_request"],
+  run_navigator_ticket_worker: ["worktree_write", "commit", "push", "pull_request"],
   reconcile_job: ["read"],
 };
 
@@ -3849,11 +3849,15 @@ export interface TelegramAgentStore {
     ownerChatId: string;
     controllerKey: string;
     sourceUpdateId: number;
+    sourceMessageId: number;
+    replyToMessageId: number;
+    instructionDigest: string;
     authorityRevision: number;
     outcome: TaskOutcome;
     constraints: readonly TaskConstraint[];
     now: number;
   }>): Readonly<{ outcome: "recorded"; authority: TaskAuthority }> | Readonly<{ outcome: "rejected" }>;
+  getTaskAuthorityNarrowingSourceRevision(sourceUpdateId: number): number | null;
   recordOwnerBoundary(input: OwnerBoundaryDraft & { jobId: string; authorityRevision: number; now: number }): OwnerBoundaryRecord | null;
   getOwnerBoundary(digest: string, jobId?: string): OwnerBoundaryRecord | null;
   listOwnerBoundaries(jobId: string): readonly OwnerBoundaryRecord[];
@@ -12782,6 +12786,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ownerChatId: string;
     controllerKey: string;
     sourceUpdateId: number;
+    sourceMessageId: number;
+    replyToMessageId: number;
+    instructionDigest: string;
     authorityRevision: number;
     outcome: TaskOutcome;
     constraints: readonly TaskConstraint[];
@@ -12789,11 +12796,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }>): Readonly<{ outcome: "recorded"; authority: TaskAuthority }> | Readonly<{ outcome: "rejected" }> {
     assertNonNegativeInteger(input.now, "now");
     assertNonNegativeInteger(input.sourceUpdateId, "sourceUpdateId");
+    assertPositiveInteger(input.sourceMessageId, "sourceMessageId");
+    assertPositiveInteger(input.replyToMessageId, "replyToMessageId");
+    if (!/^[0-9a-f]{64}$/u.test(input.instructionDigest)) {
+      throw new TypeError("instructionDigest must be a SHA-256 digest");
+    }
     assertPositiveInteger(input.authorityRevision, "authorityRevision");
-    return this.db.transaction(() => {
+    const claimGeneration = this.claimedUpdates.get(input.sourceUpdateId);
+    const narrowing = this.db.transaction(() => {
       const replay = this.db.prepare(
         `SELECT controller_key, owner_user_id, owner_chat_id, job_id, authority_id,
-                source_revision, target_revision, task_outcome, constraints_json
+                source_revision, target_revision, task_outcome, constraints_json,
+                source_message_id, reply_to_message_id, instruction_digest
            FROM task_authority_narrowings WHERE source_update_id = ?`,
       ).get(input.sourceUpdateId) as {
         controller_key: string;
@@ -12805,16 +12819,32 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         target_revision: number;
         task_outcome: string;
         constraints_json: string;
+        source_message_id: number | null;
+        reply_to_message_id: number | null;
+        instruction_digest: string | null;
       } | undefined;
       if (replay) {
         const replayedAuthority = this.taskAuthorityRepository.getRevision(replay.job_id, replay.target_revision);
         return replay.controller_key === input.controllerKey && replay.owner_user_id === input.ownerUserId &&
           replay.owner_chat_id === input.ownerChatId && replay.job_id === input.jobId &&
           replay.source_revision === input.authorityRevision &&
+          replay.source_message_id === input.sourceMessageId &&
+          replay.reply_to_message_id === input.replyToMessageId &&
+          replay.instruction_digest === input.instructionDigest &&
           replay.task_outcome === input.outcome && replay.constraints_json === JSON.stringify(input.constraints) &&
           replayedAuthority?.authorityId === replay.authority_id
           ? { outcome: "recorded" as const, authority: replayedAuthority }
           : { outcome: "rejected" as const };
+      }
+      if (claimGeneration === undefined) return { outcome: "rejected" as const };
+      const claimedUpdate = this.db.prepare(
+        `SELECT status, claim_owner, claim_generation, claim_expires_at
+           FROM telegram_updates WHERE update_id = ?`,
+      ).get(input.sourceUpdateId) as TelegramUpdateRow | undefined;
+      if (!claimedUpdate || claimedUpdate.status !== "processing" ||
+        claimedUpdate.claim_owner !== this.claimOwner || claimedUpdate.claim_generation !== claimGeneration ||
+        claimedUpdate.claim_expires_at === null || claimedUpdate.claim_expires_at <= input.now) {
+        return { outcome: "rejected" as const };
       }
       const current = this.taskAuthorityRepository.get(input.jobId);
       const job = this.readJobById(input.jobId);
@@ -12845,8 +12875,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         `INSERT INTO task_authority_narrowings (
            source_update_id, controller_key, owner_user_id, owner_chat_id, job_id,
            authority_id, source_revision, target_revision, task_outcome,
-           constraints_json, recorded_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           constraints_json, recorded_at, source_message_id, reply_to_message_id,
+           instruction_digest
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         input.sourceUpdateId,
         input.controllerKey,
@@ -12859,6 +12890,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         narrowed.outcome,
         JSON.stringify(narrowed.constraints),
         input.now,
+        input.sourceMessageId,
+        input.replyToMessageId,
+        input.instructionDigest,
       );
       this.releaseAuthorityRepository.revokeForJob(input.jobId, "authority_narrowed", input.now);
       this.ownerBoundaryRepository.revokeForJob(input.jobId, "authority_narrowed", input.now);
@@ -12867,8 +12901,27 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         this.taskAuthorityNarrowingEffects(input.jobId, narrowed.revision),
         input.now,
       );
+      const settled = this.db.prepare(
+        `UPDATE telegram_updates
+            SET status = 'processed', outcome = 'task_authority_narrowed', last_error = NULL,
+                processed_at = ?, claim_owner = NULL, claim_expires_at = NULL
+          WHERE update_id = ? AND status = 'processing' AND claim_owner = ?
+            AND claim_generation = ? AND claim_expires_at > ?`,
+      ).run(input.now, input.sourceUpdateId, this.claimOwner, claimGeneration, input.now);
+      if (settled.changes !== 1) throw new UpdateClaimConflictError(input.sourceUpdateId);
+      advanceTelegramCursor(this.db);
       return { outcome: "recorded" as const, authority: narrowed };
     }).immediate();
+    if (narrowing.outcome === "recorded") this.claimedUpdates.delete(input.sourceUpdateId);
+    return narrowing;
+  }
+
+  public getTaskAuthorityNarrowingSourceRevision(sourceUpdateId: number): number | null {
+    assertNonNegativeInteger(sourceUpdateId, "sourceUpdateId");
+    const row = this.db.prepare(
+      "SELECT source_revision FROM task_authority_narrowings WHERE source_update_id = ?",
+    ).get(sourceUpdateId) as { source_revision: number } | undefined;
+    return row?.source_revision ?? null;
   }
 
   public recordOwnerBoundary(

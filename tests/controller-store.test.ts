@@ -10,6 +10,7 @@ import {
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS,
   TASK_AUTHORITY_REVISION_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
@@ -66,7 +67,8 @@ const PRESERVED_FINALIZATION_PAYLOAD = JSON.stringify({
 });
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
-  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length;
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length;
 
 function seedDuplicateControllerGenerations(
   bb: ReturnType<typeof createFakePluginHost>["bb"],

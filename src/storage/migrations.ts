@@ -3625,6 +3625,82 @@ SELECT CASE WHEN NOT EXISTS (
 DROP TABLE task_authority_history_guard;
 `] as const;
 
+export const TASK_AUTHORITY_PUBLISH_MIGRATIONS = [String.raw`
+CREATE TEMP TABLE task_authority_admission_identity_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO task_authority_admission_identity_guard(valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1
+    FROM task_authority_effect_admissions AS admission
+    JOIN effects AS effect ON effect.idempotency_key = admission.effect_idempotency_key
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = admission.authority_id
+     AND revision.revision = admission.authority_revision
+   WHERE admission.job_id <> effect.job_id OR admission.job_id <> revision.job_id
+) THEN 1 ELSE 0 END;
+DROP TABLE task_authority_admission_identity_guard;
+
+ALTER TABLE task_authority_effect_admissions RENAME TO task_authority_effect_admissions_without_push;
+
+CREATE TABLE task_authority_effect_admissions (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  effect TEXT NOT NULL CHECK (effect IN (
+    'read', 'artifact_write', 'prototype_write', 'worktree_write', 'commit',
+    'push', 'pull_request', 'merge', 'deploy', 'rollback'
+  )),
+  admitted_at INTEGER NOT NULL,
+  PRIMARY KEY (effect_idempotency_key, effect),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_effect_admissions (
+  effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+)
+SELECT effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+FROM task_authority_effect_admissions_without_push;
+
+DROP TABLE task_authority_effect_admissions_without_push;
+
+CREATE TRIGGER task_authority_effect_admissions_exact_job_insert
+BEFORE INSERT ON task_authority_effect_admissions
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM effects AS effect
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = NEW.authority_id
+     AND revision.revision = NEW.authority_revision
+   WHERE effect.idempotency_key = NEW.effect_idempotency_key
+     AND effect.job_id = NEW.job_id
+     AND revision.job_id = NEW.job_id
+)
+BEGIN SELECT RAISE(ABORT, 'task authority admission job identity mismatch'); END;
+
+CREATE TRIGGER task_authority_effect_admissions_exact_job_update
+BEFORE UPDATE ON task_authority_effect_admissions
+BEGIN SELECT RAISE(ABORT, 'task authority admissions are immutable'); END;
+
+ALTER TABLE task_authority_narrowings ADD COLUMN source_message_id INTEGER;
+ALTER TABLE task_authority_narrowings ADD COLUMN reply_to_message_id INTEGER;
+ALTER TABLE task_authority_narrowings ADD COLUMN instruction_digest TEXT;
+
+CREATE TRIGGER task_authority_narrowings_require_payload_identity
+BEFORE INSERT ON task_authority_narrowings
+WHEN NEW.source_message_id IS NULL OR NEW.source_message_id < 1
+  OR NEW.reply_to_message_id IS NULL OR NEW.reply_to_message_id < 1
+  OR NEW.instruction_digest IS NULL OR length(NEW.instruction_digest) <> 64
+  OR NEW.instruction_digest NOT GLOB '[0-9a-f]*'
+BEGIN SELECT RAISE(ABORT, 'task authority narrowing payload identity is required'); END;
+
+CREATE TRIGGER owner_boundary_fact_records_no_insert
+BEFORE INSERT ON owner_boundary_fact_records
+BEGIN SELECT RAISE(ABORT, 'owner boundary facts are derived from authoritative records'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3711,4 +3787,5 @@ export const ALL_MIGRATIONS = [
   ...OWNER_BOUNDARY_MIGRATIONS,
   ...TASK_AUTHORITY_REVISION_MIGRATIONS,
   ...TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  ...TASK_AUTHORITY_PUBLISH_MIGRATIONS,
 ] as const;

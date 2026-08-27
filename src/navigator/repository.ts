@@ -630,7 +630,10 @@ export class NavigatorRepository {
       if (proposal.kind === "owner_boundary") {
         const authority = this.taskAuthorities.get(job.id);
         const draft = ownerBoundaryDraftFromProposal(proposal);
-        if (!authority || authority.status !== "active" || authority.jobId !== job.id) {
+        if (!authority || (
+          authority.status !== "active" &&
+          !(proposal.boundaryCode === "production_recovery_required" && authority.status === "suspended")
+        ) || authority.jobId !== job.id) {
           this.insertDecision(proposalId, job.id, input.snapshotId, "rejected", "owner_boundary_requires_live_task_authority", input.now);
           return this.requireDecision(proposalId);
         }

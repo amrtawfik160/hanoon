@@ -24,6 +24,7 @@ export type TaskAuthorityEffect =
   | "prototype_write"
   | "worktree_write"
   | "commit"
+  | "push"
   | "pull_request"
   | "merge"
   | "deploy"
@@ -35,6 +36,7 @@ export const TASK_AUTHORITY_EFFECTS: readonly TaskAuthorityEffect[] = [
   "prototype_write",
   "worktree_write",
   "commit",
+  "push",
   "pull_request",
   "merge",
   "deploy",
@@ -46,6 +48,7 @@ export const TASK_AUTHORITY_OPERATIONS = [
   "prototype",
   "worktree",
   "commit",
+  "push",
   "pull_request",
   "merge",
   "deploy",
@@ -64,7 +67,7 @@ export function taskAuthorityAllows(outcome: TaskOutcome, effect: TaskAuthorityE
   if (effect === "read" || effect === "artifact_write") return true;
   if (effect === "prototype_write") return outcome === "artifact";
   if (outcome === "artifact") return false;
-  if (effect === "worktree_write" || effect === "commit" || effect === "pull_request") return true;
+  if (effect === "worktree_write" || effect === "commit" || effect === "push" || effect === "pull_request") return true;
   return outcome === "shipped_change";
 }
 

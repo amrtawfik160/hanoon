@@ -6,6 +6,7 @@ import {
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS,
   TASK_AUTHORITY_REVISION_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
@@ -50,7 +51,8 @@ const LEGACY_MIGRATION_MARKERS = [
 ] as const;
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
-  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length;
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length;
 
 const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
 
@@ -96,6 +98,47 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
   const db = bb.storage.database();
   registerWorkArtifactRelationshipValidation(db);
   bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+}
+
+function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
+  const { bb } = createFakePluginHost({ pluginId });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -TASK_AUTHORITY_PUBLISH_MIGRATIONS.length));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES
+       ('job_1', 1, 'First task', 'cancelled', 1000, 1000),
+       ('job_2', 2, 'Second task', 'cancelled', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES ('job_1:publish', 'job_1', 'inspect_implementation', '{}', 'pending', 0, 1000, 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authority_revisions (
+       authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 1, ?, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '[]', 1, ?, ?, 'active', 1000, 1000
+     )`,
+  ).run(revisionJobId, "a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'commit', 1000)`,
+  ).run();
+  return { bb, db };
 }
 
 function insertRelationshipUpgradeArtifact(
@@ -192,13 +235,58 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
     .toContain("CREATE TABLE navigator_pull_requests");
 });
 
+it("upgrades publisher admissions without losing grants and enforces exact durable identities", () => {
+  const { bb, db } = admissionUpgradeDatabase("task-authority-publish-upgrade");
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    "SELECT effect FROM task_authority_effect_admissions ORDER BY effect",
+  ).all()).toEqual([{ effect: "commit" }]);
+  db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'push', 1001)`,
+  ).run();
+  expect(() => db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+     ) VALUES ('job_1:publish', 'job_2', 'authority_1', 1, 'pull_request', 1002)`,
+  ).run()).toThrow(/job identity mismatch/u);
+  expect(() => db.prepare(
+    `INSERT INTO task_authority_narrowings (
+       source_update_id, controller_key, owner_user_id, owner_chat_id, job_id,
+       authority_id, source_revision, target_revision, task_outcome, constraints_json, recorded_at
+     ) VALUES (3, 'controller_1', '7', '7', 'job_1', 'authority_1', 1, 2,
+       'artifact', '[]', 1003)`,
+  ).run()).toThrow(/payload identity is required/u);
+});
+
+it("rolls back the publisher migration when a legacy admission crosses job identity", () => {
+  const { bb, db } = admissionUpgradeDatabase("task-authority-publish-rollback", "job_2");
+
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare("SELECT effect FROM task_authority_effect_admissions").all())
+    .toEqual([{ effect: "commit" }]);
+  expect(() => db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'push', 1001)`,
+  ).run()).toThrow();
+  const narrowingColumns = db.prepare("PRAGMA table_info(task_authority_narrowings)").all() as Array<{ name: string }>;
+  expect(narrowingColumns.map((column) => column.name)).not.toContain("source_message_id");
+});
+
 it("backfills the mutable ticket-41 authority row into immutable revision history", () => {
   const { bb } = createFakePluginHost({ pluginId: "task-authority-revision-backfill" });
   const db = bb.storage.database();
   registerWorkArtifactRelationshipValidation(db);
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
     0,
-    -(TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length),
+    -(
+      TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length
+    ),
   ));
   db.prepare(
     `INSERT INTO controller_threads (
@@ -247,7 +335,10 @@ it("fails the authority upgrade when an older bound revision cannot be reconstru
   registerWorkArtifactRelationshipValidation(db);
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
     0,
-    -(TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length),
+    -(
+      TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length
+    ),
   ));
   db.prepare(
     `INSERT INTO controller_threads (
@@ -304,7 +395,10 @@ it("reconstructs an older shipped revision from its authoritative release bindin
   registerWorkArtifactRelationshipValidation(db);
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
     0,
-    -(TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length),
+    -(
+      TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length
+    ),
   ));
   db.prepare(
     `INSERT INTO controller_threads (

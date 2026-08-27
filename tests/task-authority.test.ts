@@ -1,11 +1,12 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { projectResourceKey } from "../src/autonomy/models";
 import { deriveTaskOutcome, taskAuthorityEffectForOperation } from "../src/domain/task-authority";
 import { ownerBoundaryDigest } from "../src/domain/owner-boundary";
 import { transition } from "../src/domain/state-machine";
-import { EffectRunner } from "../src/services/effect-runner";
+import { EffectRunner, type EffectRunnerDependencies } from "../src/services/effect-runner";
 import { resolveMergeGrant } from "../src/services/merge-authority";
 import { openStore } from "../src/storage/store";
 import { jobFixture, policyFixture, sha } from "./helpers";
@@ -114,24 +115,210 @@ function boundaryInput(jobId: string, authorityRevision = 1) {
   };
 }
 
-function persistBoundaryFacts(
-  fixture: ReturnType<typeof ownerJobFixture>,
-  code: string,
-  facts: readonly string[],
-  affectedEffectIdempotencyKey = `${fixture.job.id}:merge_pr`,
-): void {
-  const insert = fixture.bb.storage.database().prepare(
-    `INSERT INTO owner_boundary_fact_records (
-       job_id, code, fact, source_kind, source_id,
-       affected_artifact_id, affected_effect_idempotency_key, recorded_at
-     ) VALUES (?, ?, ?, 'policy', ?, NULL, ?, 10002)`,
-  );
-  for (const fact of facts) insert.run(fixture.job.id, code, fact, `${code}:${fact}`, affectedEffectIdempotencyKey);
+function recordPolicyBoundary(fixture: ReturnType<typeof ownerJobFixture>) {
+  fixture.bb.storage.database().prepare(
+    "UPDATE jobs SET state = 'awaiting_merge_approval', policy_json = ? WHERE id = ?",
+  ).run(JSON.stringify(policyFixture({ production: undefined })), fixture.job.id);
+  return fixture.store.recordOwnerBoundary(boundaryInput(fixture.job.id));
 }
 
-function recordPolicyBoundary(fixture: ReturnType<typeof ownerJobFixture>) {
-  persistBoundaryFacts(fixture, "policy_change_required", ["policy:change-required"]);
-  return fixture.store.recordOwnerBoundary(boundaryInput(fixture.job.id));
+function insertBoundaryEffect(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  key: string,
+  kind: string,
+  payload: Record<string, unknown> = {},
+  status = "pending",
+  attempts = 0,
+): void {
+  fixture.bb.storage.database().prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, 10002, 10002, 10002)`,
+  ).run(key, fixture.job.id, kind, JSON.stringify(payload), status, attempts);
+}
+
+function recordExhaustedRecovery(fixture: ReturnType<typeof ownerJobFixture>): void {
+  const job = fixture.store.getJob(fixture.job.id);
+  if (!job || !job.projectId) throw new Error("recovery job source is missing");
+  const recovery = fixture.store.registerExecutorWorkerRecovery({
+    id: `recovery_${fixture.job.id}`,
+    jobId: job.id,
+    expectedVersion: job.version,
+    projectId: job.projectId,
+    jobState: job.state,
+    workerKind: "implementation",
+    resourceId: `thr_${job.id}`,
+    workerGeneration: 1,
+    classification: "crash",
+    signature: `signature_${job.id}`,
+    retryLimit: job.policy?.workerRecoveryLimit ?? 2,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now: 10_002,
+  });
+  if (recovery?.record.state !== "owner_required") throw new Error("recovery exhaustion was not recorded");
+}
+
+function authoritativeBoundarySource(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  code: ReturnType<typeof boundaryInput>["code"] | "product_decision_required" | "scope_expansion_required" |
+    "credential_or_access_required" | "spend_authority_required" | "irreversible_effect_required" |
+    "technical_tradeoff_required" | "production_recovery_required",
+): Readonly<{ affectedArtifactId?: string; affectedEffectIdempotencyKey?: string }> {
+  const { store, job, bb } = fixture;
+  const db = bb.storage.database();
+  if (code === "product_decision_required" || code === "scope_expansion_required") {
+    const artifactId = `artifact_${code}_${job.id}`;
+    store.captureWorkArtifact({
+      artifactId,
+      projectId: "proj_1",
+      effortId: job.id,
+      operationId: `operation_${code}_${job.id}`,
+      kind: code === "product_decision_required" ? "decision_ticket" : "implementation_ticket",
+      status: "ready",
+      trackerKind: "github",
+      trackerNamespace: "github:acme/cyndra",
+      externalId: `${code}_${job.id}`,
+      externalUrl: `https://github.com/acme/cyndra/issues/${code}_${job.id}`,
+      externalRevision: "revision-1",
+      externalStatus: "open",
+      assignees: [],
+      title: code,
+      content: `# ${code}`,
+      acceptanceCriteria: ["The owner decision is recorded"],
+      relationships: [],
+      capturedAt: 10_002,
+    });
+    return { affectedArtifactId: artifactId };
+  }
+  const effectKey = `${job.id}:boundary:${code}`;
+  if (code === "credential_or_access_required") {
+    store.reconcileCredentialHealth({
+      installationId: "install_1",
+      health: {
+        protocolVersion: 1,
+        brokerVersion: "0.1.0",
+        adapter: "onepassword",
+        adapterState: "ready",
+        auditWritable: true,
+        bindingCount: 1,
+        topologyReceiptDigest: "a".repeat(64),
+        topologyReceiptExpiresAt: 99_999,
+      },
+      bindings: [{
+        bindingId: "binding_1",
+        label: "Required deployment credential",
+        provider: "onepassword",
+        state: "pending",
+        generation: 1,
+        capabilityIds: ["deploy"],
+        risk: "high",
+        mfaMode: "none",
+        approvalMode: "owner_confirmation",
+        lastVerifiedAt: null,
+      }],
+      responseSha256: "b".repeat(64),
+      now: 10_002,
+    });
+    insertBoundaryEffect(fixture, effectKey, "deploy_production", {
+      credentialInstallationId: "install_1",
+      credentialBindingId: "binding_1",
+    });
+  } else if (code === "spend_authority_required") {
+    const attemptId = `attempt_${job.id}`;
+    store.recordStageExecution({
+      jobId: job.id,
+      attemptId,
+      stage: "implementation",
+      attemptOrdinal: 1,
+      baseTier: "standard",
+      tier: "standard",
+      escalationSteps: 0,
+      source: "default",
+      providerId: "codex",
+      modelId: "gpt-5.6-terra",
+      reasoningLevel: "medium",
+      serviceTier: "default",
+      now: 10_000,
+    });
+    store.settleStageExecution({
+      jobId: job.id,
+      attemptId,
+      stage: "implementation",
+      outcome: "failed",
+      usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 5, totalTokens: 115 },
+      now: 10_001,
+    });
+    insertBoundaryEffect(fixture, effectKey, "run_navigator_ticket_worker", { attemptId }, "dead", 20);
+  } else if (code === "irreversible_effect_required") {
+    insertBoundaryEffect(fixture, effectKey, "merge_pr");
+  } else if (code === "policy_change_required") {
+    db.prepare("UPDATE jobs SET state = 'awaiting_merge_approval', policy_json = ? WHERE id = ?")
+      .run(JSON.stringify(policyFixture({ production: undefined })), job.id);
+  } else if (code === "technical_tradeoff_required") {
+    insertBoundaryEffect(fixture, effectKey, "send_remediation", {}, "dead", 20);
+    recordExhaustedRecovery(fixture);
+    db.prepare(
+      `INSERT INTO attempts (
+         id, job_id, kind, review_lens, review_stage, ordinal, thread_id, head_sha,
+         result_json, created_at, completed_at
+       ) VALUES (?, ?, 'review', 'quality', 'review', 1, 'thr_review', ?, ?, 10001, 10002)`,
+    ).run(
+      `review_${job.id}`,
+      job.id,
+      sha("a"),
+      JSON.stringify({ findings: [{ severity: "high", ruleId: "tradeoff", summary: "Two safe designs conflict" }] }),
+    );
+  } else if (code === "production_recovery_required") {
+    db.prepare("UPDATE jobs SET state = 'production_failed' WHERE id = ?").run(job.id);
+    insertBoundaryEffect(fixture, effectKey, "verify_production", {}, "dead", 20);
+    recordExhaustedRecovery(fixture);
+    db.prepare(
+      `INSERT INTO pipeline_stage_attempts (
+         id, job_id, role, ordinal, state, input_sha256, last_error,
+         created_at, completed_at, updated_at
+       ) VALUES (?, ?, 'CANARY', 1, 'failed', ?, 'canary failed', 10000, 10001, 10001)`,
+    ).run(`canary_${job.id}`, job.id, "c".repeat(64));
+    const releaseEffectKey = `${job.id}:production-release`;
+    insertActiveTaskReleaseReceipt(fixture, releaseEffectKey);
+    db.prepare(
+      "UPDATE release_authority_receipts SET status = 'consumed', consumed_at = 10001 WHERE effect_idempotency_key = ?",
+    ).run(releaseEffectKey);
+  }
+  return { affectedEffectIdempotencyKey: effectKey };
+}
+
+function staleAuthoritativeBoundarySource(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  code: Parameters<typeof authoritativeBoundarySource>[1],
+  affected: ReturnType<typeof authoritativeBoundarySource>,
+): void {
+  const db = fixture.bb.storage.database();
+  if (code === "product_decision_required") {
+    db.prepare("UPDATE work_artifacts SET status = 'resolved' WHERE id = ?").run(affected.affectedArtifactId);
+  } else if (code === "scope_expansion_required") {
+    db.prepare("UPDATE jobs SET artifact_bindings_json = ? WHERE id = ?").run(
+      JSON.stringify([{ artifactId: affected.affectedArtifactId, snapshotId: "snapshot", snapshotDigest: "a".repeat(64) }]),
+      fixture.job.id,
+    );
+  } else if (code === "credential_or_access_required") {
+    db.prepare("UPDATE credential_bindings SET state = 'active' WHERE installation_id = 'install_1' AND binding_id = 'binding_1'").run();
+  } else if (code === "spend_authority_required") {
+    db.prepare("UPDATE stage_executions SET total_tokens = 0 WHERE job_id = ?").run(fixture.job.id);
+  } else if (code === "irreversible_effect_required") {
+    const effect = fixture.store.getEffect(fixture.job.id, affected.affectedEffectIdempotencyKey!);
+    if (!effect) throw new Error("irreversible effect source is missing");
+    expect(fixture.store.admitTaskAuthorityOperation(effect, "merge", 10_003)).toBe(true);
+  } else if (code === "policy_change_required") {
+    db.prepare("UPDATE jobs SET policy_json = ? WHERE id = ?")
+      .run(JSON.stringify(policyFixture()), fixture.job.id);
+  } else if (code === "technical_tradeoff_required") {
+    db.prepare("UPDATE effects SET attempts = 19 WHERE idempotency_key = ?")
+      .run(affected.affectedEffectIdempotencyKey);
+  } else {
+    db.prepare("UPDATE jobs SET state = 'complete' WHERE id = ?").run(fixture.job.id);
+  }
 }
 
 function insertActiveTaskReleaseReceipt(
@@ -163,12 +350,83 @@ function insertActiveTaskReleaseReceipt(
   );
 }
 
+function publisherEffectFixture(kind: "inspect_implementation" | "resolve_pr_head") {
+  const fixture = ownerJobFixture("Fix and ship the retry loop");
+  const { bb, store, job } = fixture;
+  const db = bb.storage.database();
+  const state = kind === "inspect_implementation" ? "locating_pr" : "resolving_pr_head";
+  db.prepare("UPDATE effects SET status = 'done' WHERE job_id = ?").run(job.id);
+  db.prepare(
+    `UPDATE jobs SET state = ?, environment_id = 'env_1', pr_number = 4,
+       pr_url = 'https://github.com/acme/cyndra/pull/4', version = 2
+     WHERE id = ?`,
+  ).run(state, job.id);
+  const idempotencyKey = `${job.id}:2:${kind}`;
+  db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       lease_owner, lease_generation, lease_expires_at,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, ?, '{}', 'leased', 0, 'executor', ?, 40002, 10002, 10002, 10002)`,
+  ).run(idempotencyKey, job.id, kind, fixture.leaseGeneration);
+  const effect = store.getEffect(job.id, idempotencyKey);
+  if (!effect) throw new Error("publisher effect was not stored");
+  const terminal = {
+    run: vi.fn(async () => ({
+      outcome: "exited" as const,
+      exitCode: 0,
+      output: '{"number":4,"url":"https://github.com/acme/cyndra/pull/4"}',
+    })),
+  };
+  const runner = new EffectRunner({
+    store,
+    fence: {
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      signal: new AbortController().signal,
+    },
+    now: () => 10_002,
+    bb: {
+      getEnvironmentSnapshot: async () => ({
+        status: {
+          outcome: "available",
+          checkout: { kind: "branch", branchName: "bb/fix-it" },
+          worktree: { clean: false },
+        },
+      }),
+      getPullRequestSnapshot: async () => ({
+        outcome: "available",
+        pullRequest: { number: 4, url: "https://github.com/acme/cyndra/pull/4" },
+      }),
+    },
+    terminal,
+    resolvePrHead: async () => ({
+      event: "PR_HEAD_RESOLVED" as const,
+      headSha: sha("a"),
+      originRepository: "acme/cyndra",
+    }),
+  } as unknown as EffectRunnerDependencies);
+  return { ...fixture, effect, runner, terminal };
+}
+
+function claimNarrowingUpdate(store: ReturnType<typeof ownerJobFixture>["store"], sourceUpdateId: number, now: number) {
+  expect(store.beginTelegramUpdate(sourceUpdateId, now - 1)).toBe("process");
+  return {
+    sourceMessageId: sourceUpdateId + 1_000,
+    replyToMessageId: 900,
+    instructionDigest: createHash("sha256")
+      .update(`narrow:${sourceUpdateId}`, "utf8")
+      .digest("hex"),
+  };
+}
+
 describe("task outcome derivation", () => {
   it.each([
     ["artifact", "artifact_write"],
     ["prototype", "prototype_write"],
     ["worktree", "worktree_write"],
     ["commit", "commit"],
+    ["push", "push"],
     ["pull_request", "pull_request"],
     ["merge", "merge"],
     ["deploy", "deploy"],
@@ -211,6 +469,38 @@ describe("task outcome derivation", () => {
 });
 
 describe("owner task authority intake", () => {
+  it.each([
+    ["inspect_implementation", "commit"],
+    ["inspect_implementation", "push"],
+    ["inspect_implementation", "pull_request"],
+    ["resolve_pr_head", "commit"],
+    ["resolve_pr_head", "push"],
+    ["resolve_pr_head", "pull_request"],
+  ] as const)("rejects %s before publisher invocation without current %s authority", async (kind, missing) => {
+    const fixture = publisherEffectFixture(kind);
+    for (const operation of ["commit", "push", "pull_request"] as const) {
+      if (operation !== missing) {
+        expect(fixture.store.admitTaskAuthorityOperation(fixture.effect, operation, 10_002)).toBe(true);
+      }
+    }
+
+    await expect(fixture.runner.run(fixture.effect)).rejects.toThrow(/authority effect admission/i);
+    expect(fixture.terminal.run).not.toHaveBeenCalled();
+  });
+
+  it.each(["inspect_implementation", "resolve_pr_head"] as const)(
+    "executes %s publisher only with the complete current authority revision",
+    async (kind) => {
+      const fixture = publisherEffectFixture(kind);
+      for (const operation of ["commit", "push", "pull_request"] as const) {
+        expect(fixture.store.admitTaskAuthorityOperation(fixture.effect, operation, 10_002)).toBe(true);
+      }
+
+      await fixture.runner.run(fixture.effect);
+      expect(fixture.terminal.run).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("fails closed when an effect kind has no declared authority requirements", () => {
     const { store, job } = ownerJobFixture("Fix and ship the retry loop");
     expect(store.taskAuthorityEffectIsCurrent({
@@ -238,6 +528,7 @@ describe("owner task authority intake", () => {
       expect(store.admitTaskAuthorityOperation(effect, "worktree", 10_002)).toBe(true);
       expect(store.taskAuthorityEffectIsCurrent(effect)).toBe(false);
       expect(store.admitTaskAuthorityOperation(effect, "commit", 10_002)).toBe(true);
+      expect(store.admitTaskAuthorityOperation(effect, "push", 10_002)).toBe(true);
       expect(store.admitTaskAuthorityOperation(effect, "pull_request", 10_002)).toBe(true);
       expect(store.taskAuthorityEffectIsCurrent(effect)).toBe(true);
     },
@@ -263,6 +554,7 @@ describe("owner task authority intake", () => {
       ownerChatId: "7",
       controllerKey: "owner-7-controller",
       sourceUpdateId: 702,
+      ...claimNarrowingUpdate(store, 702, 10_003),
       authorityRevision: 1,
       outcome: "reviewed_change",
       constraints: ["no_merge"],
@@ -507,6 +799,7 @@ describe("owner task authority intake", () => {
       ownerChatId: "7",
       controllerKey: "owner-7-controller",
       sourceUpdateId: 702,
+      ...claimNarrowingUpdate(store, 702, 10_003),
       authorityRevision: 1,
       outcome: "reviewed_change",
       constraints: ["no_merge"],
@@ -559,6 +852,7 @@ describe("owner task authority intake", () => {
       jobId: job.id,
       controllerKey: "owner-7-controller",
       sourceUpdateId: 702,
+      ...claimNarrowingUpdate(store, 702, 10_003),
       authorityRevision: 1,
       outcome: "shipped_change" as const,
       constraints: [] as const,
@@ -586,6 +880,7 @@ describe("owner task authority intake", () => {
       ownerChatId: "7",
       controllerKey: "owner-7-controller",
       sourceUpdateId: 702,
+      ...claimNarrowingUpdate(store, 702, 10_003),
       authorityRevision: 1,
       outcome: "reviewed_change" as const,
       constraints: ["no_merge"] as const,
@@ -610,6 +905,46 @@ describe("owner task authority intake", () => {
       controllerKey: "owner-other-controller",
       now: 10_004,
     })).toEqual({ outcome: "rejected" });
+    expect(store.narrowTaskAuthority({
+      ...instruction,
+      sourceMessageId: instruction.sourceMessageId + 1,
+      now: 10_004,
+    })).toEqual({ outcome: "rejected" });
+    expect(store.narrowTaskAuthority({
+      ...instruction,
+      replyToMessageId: instruction.replyToMessageId + 1,
+      now: 10_004,
+    })).toEqual({ outcome: "rejected" });
+    expect(store.narrowTaskAuthority({
+      ...instruction,
+      instructionDigest: "f".repeat(64),
+      now: 10_004,
+    })).toEqual({ outcome: "rejected" });
+    expect(store.narrowTaskAuthority({
+      ...instruction,
+      authorityRevision: 2,
+      now: 10_004,
+    })).toEqual({ outcome: "rejected" });
+  });
+
+  it("rejects owner narrowing without the exact durable Telegram claim", () => {
+    const { store, job } = ownerJobFixture("Fix and ship the retry loop");
+
+    expect(store.narrowTaskAuthority({
+      jobId: job.id,
+      ownerUserId: "7",
+      ownerChatId: "7",
+      controllerKey: "owner-7-controller",
+      sourceUpdateId: 702,
+      sourceMessageId: 1_702,
+      replyToMessageId: 900,
+      instructionDigest: "e".repeat(64),
+      authorityRevision: 1,
+      outcome: "reviewed_change",
+      constraints: ["no_merge"],
+      now: 10_003,
+    })).toEqual({ outcome: "rejected" });
+    expect(store.getTaskAuthority(job.id)).toMatchObject({ revision: 1 });
   });
 
   it("persists one evidence-backed owner boundary, anchors the reply, and replays it", () => {
@@ -680,9 +1015,10 @@ describe("owner task authority intake", () => {
   ] as const)("records %s only with its durable fact set", (code, evidenceFacts) => {
     const fixture = ownerJobFixture("Fix and ship the retry loop");
     const { store, job } = fixture;
-    persistBoundaryFacts(fixture, code, evidenceFacts);
+    const affected = authoritativeBoundarySource(fixture, code);
     expect(store.recordOwnerBoundary({
       ...boundaryInput(job.id),
+      ...affected,
       code,
       evidenceFacts: ["caller:self-attested"],
     })).toMatchObject({ code, evidenceFacts });
@@ -705,6 +1041,59 @@ describe("owner task authority intake", () => {
       evidenceFacts,
     })).toBeNull();
     expect(store.listOwnerBoundaries(job.id)).toEqual([]);
+  });
+
+  it.each([
+    "product_decision_required",
+    "scope_expansion_required",
+    "credential_or_access_required",
+    "spend_authority_required",
+    "irreversible_effect_required",
+    "policy_change_required",
+    "technical_tradeoff_required",
+    "production_recovery_required",
+  ] as const)("rejects %s after its authoritative source becomes stale", (code) => {
+    const fixture = ownerJobFixture("Fix and ship the retry loop");
+    const affected = authoritativeBoundarySource(fixture, code);
+    staleAuthoritativeBoundarySource(fixture, code, affected);
+
+    expect(fixture.store.recordOwnerBoundary({
+      ...boundaryInput(fixture.job.id),
+      ...affected,
+      code,
+      evidenceFacts: ["caller:self-attested"],
+    })).toBeNull();
+  });
+
+  it("rejects invented and cross-job source identities", () => {
+    const sourceFixture = ownerJobFixture("Fix and ship the retry loop");
+    const otherFixture = ownerJobFixture("Fix and ship a different retry loop");
+    const affected = authoritativeBoundarySource(sourceFixture, "product_decision_required");
+
+    expect(sourceFixture.store.recordOwnerBoundary({
+      ...boundaryInput(sourceFixture.job.id),
+      code: "product_decision_required",
+      evidenceFacts: ["caller:self-attested"],
+      affectedArtifactId: "artifact_invented",
+      affectedEffectIdempotencyKey: null,
+    })).toBeNull();
+    expect(otherFixture.store.recordOwnerBoundary({
+      ...boundaryInput(otherFixture.job.id),
+      ...affected,
+      code: "product_decision_required",
+      evidenceFacts: ["caller:self-attested"],
+    })).toBeNull();
+  });
+
+  it("refuses direct caller-authored boundary fact rows", () => {
+    const fixture = ownerJobFixture("Fix and ship the retry loop");
+    expect(() => fixture.bb.storage.database().prepare(
+      `INSERT INTO owner_boundary_fact_records (
+         job_id, code, fact, source_kind, source_id,
+         affected_artifact_id, affected_effect_idempotency_key, recorded_at
+       ) VALUES (?, 'technical_tradeoff_required', 'retry:exhausted', 'retry',
+                 'invented', NULL, ?, 10002)`,
+    ).run(fixture.job.id, `${fixture.job.id}:invented`)).toThrow(/derived from authoritative records/i);
   });
 
   it("revokes a pending owner boundary and task authority when the owner cancels", () => {

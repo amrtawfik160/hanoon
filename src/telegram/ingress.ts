@@ -99,6 +99,15 @@ function stableControllerKey(userId: string, chatId: string): string {
     .slice(0, 32);
 }
 
+function narrowingInstructionDigest(input: Readonly<{
+  updateId: number;
+  messageId: number;
+  replyToMessageId: number;
+  text: string;
+}>): string {
+  return createHash("sha256").update(JSON.stringify(input), "utf8").digest("hex");
+}
+
 function numericIdentity(value: number): string | null {
   if (!Number.isSafeInteger(value) || value < 1) return null;
   const identity = String(value);
@@ -412,13 +421,22 @@ export class TelegramIngress {
       const authority = repliedJob ? this.store.getTaskAuthority(repliedJob.id) : null;
       if (repliedJob && authority) {
         const narrowed = deriveTaskOutcome(normalized);
+        const authorityRevision = this.store.getTaskAuthorityNarrowingSourceRevision(updateId) ?? authority.revision;
         const narrowing = this.store.narrowTaskAuthority({
           jobId: repliedJob.id,
           ownerUserId: identity.userId,
           ownerChatId: identity.chatId,
           controllerKey: stableControllerKey(identity.userId, identity.chatId),
           sourceUpdateId: updateId,
-          authorityRevision: authority.revision,
+          sourceMessageId: message.message_id,
+          replyToMessageId: replyMessageId,
+          instructionDigest: narrowingInstructionDigest({
+            updateId,
+            messageId: message.message_id,
+            replyToMessageId: replyMessageId,
+            text: normalized,
+          }),
+          authorityRevision,
           outcome: narrowed.outcome,
           constraints: narrowed.constraints,
           now,

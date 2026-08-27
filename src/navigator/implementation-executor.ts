@@ -797,7 +797,7 @@ export class NavigatorImplementationExecutor {
       this.finishEffect(effect, fence, now, "dead", "navigator ticket attempt identity is unavailable");
       return true;
     }
-    if (!(["worktree", "commit", "pull_request"] as const).every((operation) =>
+    if (!(["worktree", "commit", "push", "pull_request"] as const).every((operation) =>
       this.dependencies.store.taskAuthorityOperationIsCurrent(effect, operation))) {
       this.finishEffect(effect, fence, now, "dead", "task authority effect admission is absent, stale, or denied");
       return true;
@@ -1276,7 +1276,7 @@ export class NavigatorImplementationExecutor {
       ).get(now, now) as Parameters<typeof this.parseEffect>[0] | undefined;
       if (!row) return null;
       const pendingEffect = this.parseEffect(row);
-      if (!(["worktree", "commit", "pull_request"] as const).every((operation) =>
+      if (!(["worktree", "commit", "push", "pull_request"] as const).every((operation) =>
         this.dependencies.store.admitTaskAuthorityOperation(
           pendingEffect,
           operation,
