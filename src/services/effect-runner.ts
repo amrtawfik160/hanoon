@@ -1924,7 +1924,7 @@ export class EffectRunner {
    * set in motion, so an unattended merge always has an audit row explaining
    * who authorised it — never the other way round.
    */
-  private issueApproval(job: Job): void {
+  private issueApproval(effect: StoredEffect, job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("approval requires an authoritative pull-request head");
     const taskAuthority = this.dependencies.store.getTaskAuthority(job.id);
     const evidence = job.projectId === null
@@ -1948,6 +1948,14 @@ export class EffectRunner {
       const current = this.dependencies.store.getJob(job.id);
       if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
       const boundaryNow = this.now();
+      const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
+      if (!this.dependencies.store.recordExecutorPolicyBoundaryObservation({
+        jobId: current.id,
+        authorityRevision: taskAuthority.revision,
+        sourceEffectIdempotencyKey: effect.idempotencyKey,
+        affectedEffectIdempotencyKey,
+        ...this.executorFence(),
+      })) throw new Error("executor refused the policy boundary observation");
       const boundary = this.dependencies.store.recordOwnerBoundary({
         jobId: current.id,
         authorityRevision: taskAuthority.revision,
@@ -1971,7 +1979,7 @@ export class EffectRunner {
         recommendation: "Configure production because it preserves the requested shipped outcome",
         pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
         evidenceFacts: ["policy:change-required"],
-        affectedEffectIdempotencyKey: `${current.id}:${current.version + 1}:merge_pr`,
+        affectedEffectIdempotencyKey,
         now: boundaryNow,
       });
       if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
@@ -2527,7 +2535,7 @@ export class EffectRunner {
         await this.spawnConsensusReview(effect, job);
         return;
       case "issue_approval":
-        this.issueApproval(job);
+        this.issueApproval(effect, job);
         return;
       case "revoke_approvals":
         if (this.dependencies.store.revokeExecutorApprovals({

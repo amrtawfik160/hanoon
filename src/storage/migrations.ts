@@ -3701,6 +3701,73 @@ BEFORE INSERT ON owner_boundary_fact_records
 BEGIN SELECT RAISE(ABORT, 'owner boundary facts are derived from authoritative records'); END;
 `] as const;
 
+export const OWNER_BOUNDARY_SOURCE_MIGRATIONS = [String.raw`
+CREATE TEMP TABLE owner_boundary_source_upgrade_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO owner_boundary_source_upgrade_guard(valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1 FROM owner_boundaries WHERE status <> 'revoked'
+) THEN 1 ELSE 0 END;
+DROP TABLE owner_boundary_source_upgrade_guard;
+
+CREATE TABLE policy_boundary_observations (
+  observation_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  artifact_graph_digest TEXT NOT NULL CHECK (length(artifact_graph_digest) = 64),
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  source_effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  affected_effect_idempotency_key TEXT NOT NULL,
+  observed_job_version INTEGER NOT NULL CHECK (observed_job_version >= 0),
+  observed_at INTEGER NOT NULL,
+  UNIQUE(job_id, authority_revision, affected_effect_idempotency_key),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+CREATE TRIGGER policy_boundary_observations_append_only_update
+BEFORE UPDATE ON policy_boundary_observations
+BEGIN SELECT RAISE(ABORT, 'policy boundary observations are append-only'); END;
+CREATE TRIGGER policy_boundary_observations_append_only_delete
+BEFORE DELETE ON policy_boundary_observations
+BEGIN SELECT RAISE(ABORT, 'policy boundary observations are append-only'); END;
+
+CREATE TRIGGER owner_boundaries_require_authoritative_source
+BEFORE INSERT ON owner_boundaries
+WHEN NEW.code <> 'policy_change_required' OR NOT EXISTS (
+  SELECT 1
+    FROM policy_boundary_observations AS observation
+    JOIN task_authority_current AS current
+      ON current.job_id = observation.job_id
+     AND current.authority_id = observation.authority_id
+     AND current.revision = observation.authority_revision
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = observation.authority_id
+     AND revision.revision = observation.authority_revision
+    JOIN jobs AS job ON job.id = observation.job_id
+    JOIN effects AS source_effect
+      ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+     AND source_effect.job_id = observation.job_id
+   WHERE observation.job_id = NEW.job_id
+     AND observation.authority_id = NEW.authority_id
+     AND observation.authority_revision = NEW.authority_revision
+     AND observation.affected_effect_idempotency_key = NEW.affected_effect_idempotency_key
+     AND NEW.affected_artifact_id IS NULL
+     AND revision.status = 'active'
+     AND revision.task_outcome = 'shipped_change'
+     AND revision.artifact_graph_digest = observation.artifact_graph_digest
+     AND revision.policy_digest = observation.policy_digest
+     AND job.version = observation.observed_job_version
+     AND job.state = 'awaiting_merge_approval'
+     AND json_extract(job.policy_json, '$.production') IS NULL
+     AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+     AND source_effect.kind = 'issue_approval'
+)
+BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3788,4 +3855,5 @@ export const ALL_MIGRATIONS = [
   ...TASK_AUTHORITY_REVISION_MIGRATIONS,
   ...TASK_AUTHORITY_CLOSURE_MIGRATIONS,
   ...TASK_AUTHORITY_PUBLISH_MIGRATIONS,
+  ...OWNER_BOUNDARY_SOURCE_MIGRATIONS,
 ] as const;

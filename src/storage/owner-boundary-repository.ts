@@ -256,147 +256,51 @@ function persistReconcileEffect(db: SqliteDatabase, boundary: OwnerBoundaryRecor
   ).run(key, boundary.jobId, payload, now, now, now);
 }
 
-function policyRequiresOwnerDecision(db: SqliteDatabase, jobId: string): boolean {
-  const row = db.prepare(
-    "SELECT policy_json FROM jobs WHERE id = ? AND state = 'awaiting_merge_approval'",
-  ).get(jobId) as { policy_json: string | null } | undefined;
-  if (!row?.policy_json) return false;
-  const policy = JSON.parse(row.policy_json) as {
-    production?: unknown;
-    autonomy?: { mergeWithoutProduction?: unknown };
-  };
-  return policy.production === undefined && policy.autonomy?.mergeWithoutProduction !== true;
-}
-
 type BoundarySourceValidator = (db: SqliteDatabase, input: CreateOwnerBoundaryInput) => boolean;
 
-function productDecisionSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
-  const artifactId = input.affectedArtifactId ?? null;
-  if (artifactId === null) return false;
-  return db.prepare(
-    `SELECT 1 FROM work_artifacts AS artifact
-      JOIN jobs AS job ON job.id = ? AND job.project_id = artifact.project_id
-     WHERE artifact.id = ? AND artifact.kind = 'decision_ticket'
-       AND artifact.status IN ('open', 'ready', 'claimed')
-     LIMIT 1`,
-  ).get(input.jobId, artifactId) !== undefined;
-}
-
-function scopeExpansionSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
-  const artifactId = input.affectedArtifactId ?? null;
-  if (artifactId === null) return false;
-  return db.prepare(
-    `SELECT 1 FROM work_artifacts AS artifact
-      JOIN jobs AS job ON job.id = ? AND job.project_id = artifact.project_id
-     WHERE artifact.id = ? AND NOT EXISTS (
-         SELECT 1 FROM json_each(job.artifact_bindings_json) AS binding
-          WHERE json_extract(binding.value, '$.artifactId') = artifact.id
-       )
-     LIMIT 1`,
-  ).get(input.jobId, artifactId) !== undefined;
-}
-
-function credentialSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+function policySource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
   if (!input.affectedEffectIdempotencyKey) return false;
   return db.prepare(
-    `SELECT 1 FROM effects AS effect
-      JOIN credential_bindings AS binding
-        ON binding.installation_id = json_extract(effect.payload_json, '$.credentialInstallationId')
-       AND binding.binding_id = json_extract(effect.payload_json, '$.credentialBindingId')
-     WHERE effect.idempotency_key = ? AND effect.job_id = ?
-       AND binding.state IN ('pending', 'degraded', 'revoked', 'compromised')
+    `SELECT 1
+       FROM policy_boundary_observations AS observation
+       JOIN task_authority_current AS current
+         ON current.job_id = observation.job_id
+        AND current.authority_id = observation.authority_id
+        AND current.revision = observation.authority_revision
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = observation.authority_id
+        AND revision.revision = observation.authority_revision
+       JOIN jobs AS job ON job.id = observation.job_id
+       JOIN effects AS source_effect
+         ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+        AND source_effect.job_id = observation.job_id
+      WHERE observation.job_id = ?
+        AND observation.authority_id = ?
+        AND observation.authority_revision = ?
+        AND observation.affected_effect_idempotency_key = ?
+        AND revision.status = 'active' AND revision.task_outcome = 'shipped_change'
+        AND revision.artifact_graph_digest = observation.artifact_graph_digest
+        AND revision.policy_digest = observation.policy_digest
+        AND job.version = observation.observed_job_version
+        AND job.state = 'awaiting_merge_approval'
+        AND json_extract(job.policy_json, '$.production') IS NULL
+        AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+        AND source_effect.kind = 'issue_approval'
      LIMIT 1`,
-  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
+  ).get(input.jobId, input.authorityId, input.authorityRevision, input.affectedEffectIdempotencyKey) !== undefined;
 }
 
-function spendSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
-  if (!input.affectedEffectIdempotencyKey) return false;
-  return db.prepare(
-    `SELECT 1 FROM effects AS effect
-      JOIN stage_executions AS execution
-        ON execution.job_id = effect.job_id
-       AND execution.attempt_id = json_extract(effect.payload_json, '$.attemptId')
-     WHERE effect.idempotency_key = ? AND effect.job_id = ?
-       AND execution.outcome = 'failed' AND execution.total_tokens > 0
-       AND effect.status = 'dead' AND effect.attempts >= 20
-     LIMIT 1`,
-  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
-}
-
-function irreversibleEffectSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
-  if (!input.affectedEffectIdempotencyKey) return false;
-  return db.prepare(
-    `SELECT 1 FROM effects AS effect
-     WHERE effect.idempotency_key = ? AND effect.job_id = ?
-       AND effect.kind IN ('merge_pr', 'deploy_production')
-       AND NOT EXISTS (
-         SELECT 1 FROM task_authority_effect_admissions AS admission
-          JOIN task_authority_current AS current
-            ON current.job_id = admission.job_id
-           AND current.authority_id = admission.authority_id
-           AND current.revision = admission.authority_revision
-          WHERE admission.effect_idempotency_key = effect.idempotency_key
-            AND admission.effect = CASE effect.kind WHEN 'merge_pr' THEN 'merge' ELSE 'deploy' END
-       )
-     LIMIT 1`,
-  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
-}
-
-function exhaustedTechnicalSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
-  if (!input.affectedEffectIdempotencyKey) return false;
-  return db.prepare(
-    `SELECT 1 FROM effects AS effect
-     WHERE effect.idempotency_key = ? AND effect.job_id = ?
-       AND effect.status = 'dead' AND effect.attempts >= 20
-       AND EXISTS (
-         SELECT 1 FROM worker_recoveries AS recovery
-          WHERE recovery.job_id = effect.job_id AND recovery.action = 'owner_required'
-            AND recovery.state = 'owner_required'
-       )
-       AND EXISTS (
-         SELECT 1 FROM attempts AS attempt, json_each(attempt.result_json, '$.findings') AS finding
-          WHERE attempt.job_id = effect.job_id AND attempt.kind = 'review'
-            AND attempt.completed_at IS NOT NULL
-            AND json_extract(finding.value, '$.severity') IN ('critical', 'high')
-       )
-     LIMIT 1`,
-  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
-}
-
-function failedProductionSource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
-  if (!input.affectedEffectIdempotencyKey) return false;
-  return db.prepare(
-    `SELECT 1 FROM effects AS effect
-      JOIN jobs AS job ON job.id = effect.job_id
-     WHERE effect.idempotency_key = ? AND effect.job_id = ? AND job.state = 'production_failed'
-       AND effect.kind IN ('deploy_production', 'verify_production')
-       AND effect.status = 'dead' AND effect.attempts >= 20
-       AND EXISTS (
-         SELECT 1 FROM worker_recoveries AS recovery
-          WHERE recovery.job_id = job.id AND recovery.action = 'owner_required'
-            AND recovery.state = 'owner_required'
-       )
-       AND EXISTS (
-         SELECT 1 FROM release_authority_receipts AS receipt
-          WHERE receipt.job_id = job.id AND receipt.status = 'consumed'
-       )
-       AND EXISTS (
-         SELECT 1 FROM pipeline_stage_attempts AS attempt
-          WHERE attempt.job_id = job.id AND attempt.role IN ('DEPLOY', 'CANARY') AND attempt.state = 'failed'
-       )
-     LIMIT 1`,
-  ).get(input.affectedEffectIdempotencyKey, input.jobId) !== undefined;
-}
+const unavailableSource: BoundarySourceValidator = () => false;
 
 const BOUNDARY_SOURCE_VALIDATORS = {
-  product_decision_required: productDecisionSource,
-  scope_expansion_required: scopeExpansionSource,
-  credential_or_access_required: credentialSource,
-  spend_authority_required: spendSource,
-  irreversible_effect_required: irreversibleEffectSource,
-  policy_change_required: (db, input) => policyRequiresOwnerDecision(db, input.jobId),
-  technical_tradeoff_required: exhaustedTechnicalSource,
-  production_recovery_required: failedProductionSource,
+  product_decision_required: unavailableSource,
+  scope_expansion_required: unavailableSource,
+  credential_or_access_required: unavailableSource,
+  spend_authority_required: unavailableSource,
+  irreversible_effect_required: unavailableSource,
+  policy_change_required: policySource,
+  technical_tradeoff_required: unavailableSource,
+  production_recovery_required: unavailableSource,
 } satisfies Record<OwnerBoundaryCode, BoundarySourceValidator>;
 
 function durableBoundaryFacts(db: SqliteDatabase, input: CreateOwnerBoundaryInput): readonly string[] {

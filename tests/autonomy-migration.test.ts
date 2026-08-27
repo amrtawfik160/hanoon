@@ -2,6 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import {
   ALL_MIGRATIONS,
+  OWNER_BOUNDARY_SOURCE_MIGRATIONS,
   OWNER_BOUNDARY_MIGRATIONS,
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
@@ -52,7 +53,7 @@ const LEGACY_MIGRATION_MARKERS = [
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
   TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length;
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length;
 
 const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
 
@@ -104,7 +105,10 @@ function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
   const { bb } = createFakePluginHost({ pluginId });
   const db = bb.storage.database();
   registerWorkArtifactRelationshipValidation(db);
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -TASK_AUTHORITY_PUBLISH_MIGRATIONS.length));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length),
+  ));
   db.prepare(
     `INSERT INTO controller_threads (
        controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
@@ -262,6 +266,43 @@ it("upgrades publisher admissions without losing grants and enforces exact durab
   ).run()).toThrow(/payload identity is required/u);
 });
 
+it("rolls back the boundary-source upgrade when active legacy evidence cannot be proven", () => {
+  const { bb, db } = admissionUpgradeDatabase("owner-boundary-source-upgrade");
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -OWNER_BOUNDARY_SOURCE_MIGRATIONS.length));
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 1, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '[]', 1, ?, ?, 'active', 1000, 1000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO owner_boundaries (
+       boundary_id, job_id, digest, authority_id, authority_revision, code,
+       goal, blocker, prior_checks_json, options_json, recommendation, paused_effect,
+       evidence_facts_json, affected_artifact_id, affected_effect_idempotency_key,
+       owner_user_id, owner_chat_id, status, created_at, updated_at
+     ) VALUES (
+       'boundary_legacy', 'job_1', ?, 'authority_1', 1, 'policy_change_required',
+       'Ship safely', 'Policy is unresolved', '["Checked policy"]',
+       '[{"label":"Configure","consequence":"Continue safely"}]',
+       'Configure policy', 'Merge is paused', '["policy:change-required"]',
+       NULL, 'job_1:publish', '7', '7', 'pending', 1000, 1000
+     )`,
+  ).run("e".repeat(64));
+  const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();
+
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all()).toEqual(ledgerBefore);
+  expect(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'policy_boundary_observations'",
+  ).get()).toBeUndefined();
+});
+
 it("rolls back the publisher migration when a legacy admission crosses job identity", () => {
   const { bb, db } = admissionUpgradeDatabase("task-authority-publish-rollback", "job_2");
 
@@ -285,7 +326,7 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
     0,
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -337,7 +378,7 @@ it("fails the authority upgrade when an older bound revision cannot be reconstru
     0,
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -397,7 +438,7 @@ it("reconstructs an older shipped revision from its authoritative release bindin
     0,
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
-      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length
     ),
   ));
   db.prepare(

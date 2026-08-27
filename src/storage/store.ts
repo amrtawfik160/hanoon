@@ -812,6 +812,13 @@ export type ExecutorFence = Readonly<{
   now: number;
 }>;
 
+export type PolicyBoundaryObservationInput = ExecutorFence & Readonly<{
+  jobId: string;
+  authorityRevision: number;
+  sourceEffectIdempotencyKey: string;
+  affectedEffectIdempotencyKey: string;
+}>;
+
 export type OutboxDeliveryFailureNoticeInput = ExecutorFence & Readonly<{
   logicalKey: string;
   error: string;
@@ -3858,6 +3865,7 @@ export interface TelegramAgentStore {
     now: number;
   }>): Readonly<{ outcome: "recorded"; authority: TaskAuthority }> | Readonly<{ outcome: "rejected" }>;
   getTaskAuthorityNarrowingSourceRevision(sourceUpdateId: number): number | null;
+  recordExecutorPolicyBoundaryObservation(input: PolicyBoundaryObservationInput): boolean;
   recordOwnerBoundary(input: OwnerBoundaryDraft & { jobId: string; authorityRevision: number; now: number }): OwnerBoundaryRecord | null;
   getOwnerBoundary(digest: string, jobId?: string): OwnerBoundaryRecord | null;
   listOwnerBoundaries(jobId: string): readonly OwnerBoundaryRecord[];
@@ -5317,6 +5325,34 @@ type HeldMergeClaim = Readonly<{
   generation: number;
   lease_expires_at: number;
 }>;
+
+function authoritySupportsPolicyBoundary(
+  authority: TaskAuthority,
+  input: PolicyBoundaryObservationInput,
+): boolean {
+  return authority.revision === input.authorityRevision && authority.status === "active" &&
+    authority.outcome === "shipped_change";
+}
+
+function jobNeedsPolicyBoundary(
+  job: Job,
+  authority: TaskAuthority,
+  affectedEffectIdempotencyKey: string,
+): boolean {
+  return job.state === "awaiting_merge_approval" && job.policy !== null &&
+    job.policy.production === undefined && job.policy.autonomy?.mergeWithoutProduction !== true &&
+    taskPolicyDigest(JSON.stringify(job.policy)) === authority.policyDigest &&
+    affectedEffectIdempotencyKey === `${job.id}:${job.version + 1}:merge_pr`;
+}
+
+function sourceEffectSupportsPolicyBoundary(
+  sourceEffect: StoredEffect,
+  input: PolicyBoundaryObservationInput,
+): boolean {
+  return sourceEffect.kind === "issue_approval" && sourceEffect.status === "leased" &&
+    sourceEffect.leaseOwner === input.ownerId && sourceEffect.leaseGeneration === input.generation &&
+    sourceEffect.leaseExpiresAt !== null && sourceEffect.leaseExpiresAt > input.now;
+}
 
 type AcceptedMergeLease = Readonly<{
   headSha: string;
@@ -12922,6 +12958,58 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       "SELECT source_revision FROM task_authority_narrowings WHERE source_update_id = ?",
     ).get(sourceUpdateId) as { source_revision: number } | undefined;
     return row?.source_revision ?? null;
+  }
+
+  private currentPolicyBoundaryContext(input: PolicyBoundaryObservationInput): Readonly<{
+    job: Job;
+    authority: TaskAuthority;
+  }> | null {
+    const job = this.readJobById(input.jobId);
+    const authority = this.taskAuthorityRepository.get(input.jobId);
+    const sourceEffect = this.getEffect(input.jobId, input.sourceEffectIdempotencyKey);
+    if (!job || !authority || !sourceEffect || !authoritySupportsPolicyBoundary(authority, input) ||
+      !jobNeedsPolicyBoundary(job, authority, input.affectedEffectIdempotencyKey) ||
+      !sourceEffectSupportsPolicyBoundary(sourceEffect, input)) return null;
+    return { job, authority };
+  }
+
+  private persistPolicyBoundaryObservation(
+    input: PolicyBoundaryObservationInput,
+    context: Readonly<{ job: Job; authority: TaskAuthority }>,
+  ): boolean {
+    const identity = [
+      context.job.id,
+      context.authority.authorityId,
+      String(context.authority.revision),
+      input.sourceEffectIdempotencyKey,
+      input.affectedEffectIdempotencyKey,
+    ].join("\u0000");
+    const observationId = `policy_boundary_${createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 32)}`;
+    this.db.prepare(
+      `INSERT OR IGNORE INTO policy_boundary_observations (
+         observation_id, job_id, authority_id, authority_revision, artifact_graph_digest, policy_digest,
+         source_effect_idempotency_key, affected_effect_idempotency_key, observed_job_version, observed_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(observationId, context.job.id, context.authority.authorityId, context.authority.revision,
+      context.authority.artifactGraphDigest, context.authority.policyDigest, input.sourceEffectIdempotencyKey,
+      input.affectedEffectIdempotencyKey, context.job.version, input.now);
+    return this.db.prepare(
+      `SELECT 1 FROM policy_boundary_observations
+        WHERE observation_id = ? AND source_effect_idempotency_key = ?`,
+    ).get(observationId, input.sourceEffectIdempotencyKey) !== undefined;
+  }
+
+  public recordExecutorPolicyBoundaryObservation(input: PolicyBoundaryObservationInput): boolean {
+    this.assertExecutorFence(input);
+    assertControllerIdentifier(input.jobId, "policy boundary job id");
+    assertControllerIdentifier(input.sourceEffectIdempotencyKey, "policy boundary source effect");
+    assertControllerIdentifier(input.affectedEffectIdempotencyKey, "policy boundary affected effect");
+    assertPositiveInteger(input.authorityRevision, "authorityRevision");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const context = this.currentPolicyBoundaryContext(input);
+      return context !== null && this.persistPolicyBoundaryObservation(input, context);
+    }).immediate();
   }
 
   public recordOwnerBoundary(
