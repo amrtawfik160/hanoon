@@ -5,6 +5,7 @@ import {
   OWNER_BOUNDARY_MIGRATIONS,
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_CLOSURE_MIGRATIONS,
   TASK_AUTHORITY_REVISION_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
@@ -49,7 +50,8 @@ const LEGACY_MIGRATION_MARKERS = [
 ] as const;
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
-  TASK_AUTHORITY_REVISION_MIGRATIONS.length;
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length;
+
 const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
 
 function legacyDatabase(pluginId: string) {
@@ -194,7 +196,10 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
   const { bb } = createFakePluginHost({ pluginId: "task-authority-revision-backfill" });
   const db = bb.storage.database();
   registerWorkArtifactRelationshipValidation(db);
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -TASK_AUTHORITY_REVISION_MIGRATIONS.length));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length),
+  ));
   db.prepare(
     `INSERT INTO controller_threads (
        controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
@@ -234,6 +239,129 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
   expect(() => db.prepare(
     "UPDATE task_authority_revisions SET task_outcome = 'shipped_change' WHERE authority_id = 'authority_1'",
   ).run()).toThrow(/append-only/u);
+});
+
+it("fails the authority upgrade when an older bound revision cannot be reconstructed", () => {
+  const { bb } = createFakePluginHost({ pluginId: "task-authority-history-guard" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length),
+  ));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES ('job_1', 1, 'Fix the retry loop', 'cancelled', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 3, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '["no_merge"]', 1, ?, ?, 'active', 1000, 3000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO task_authority_events (
+       authority_id, job_id, revision, action, reason, occurred_at
+     ) VALUES
+       ('authority_1', 'job_1', 2, 'revised', 'artifact_graph_advanced', 2000),
+       ('authority_1', 'job_1', 3, 'revised', 'artifact_graph_advanced', 3000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO owner_boundaries (
+       boundary_id, job_id, digest, authority_id, authority_revision, code,
+       goal, blocker, prior_checks_json, options_json, recommendation,
+       paused_effect, affected_artifact_id, affected_effect_idempotency_key,
+       owner_user_id, owner_chat_id, status, created_at, updated_at
+     ) VALUES (
+       'boundary_1', 'job_1', ?, 'authority_1', 1, 'policy_change_required',
+       'Ship the fix', 'Policy is missing', '["Checked policy"]',
+       '[{"label":"Configure","consequence":"Continue"},{"label":"Stop","consequence":"Remain paused"}]',
+       'Configure policy', 'Merge remains paused', 'artifact_1', NULL,
+       '7', '7', 'pending', 1000, 1000
+     )`,
+  ).run("e".repeat(64));
+
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name IN ('task_authority_revisions', 'task_authority_narrowings')`,
+  ).get()).toBeUndefined();
+});
+
+it("reconstructs an older shipped revision from its authoritative release binding", () => {
+  const { bb } = createFakePluginHost({ pluginId: "task-authority-release-reconstruction" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length),
+  ));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES ('job_1', 1, 'Ship the retry fix', 'merged', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES ('job_1:merge', 'job_1', 'merge_pr', '{}', 'done', 1, 1000, 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 3, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'shipped_change', ?, '[]', 1, ?, ?, 'active', 1000, 3000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO task_authority_events (
+       authority_id, job_id, revision, action, reason, occurred_at
+     ) VALUES
+       ('authority_1', 'job_1', 2, 'revised', 'artifact_graph_advanced', 2000),
+       ('authority_1', 'job_1', 3, 'revised', 'artifact_graph_advanced', 3000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO release_authority_receipts (
+       receipt_id, job_id, effect_idempotency_key, authority_id, authority_revision,
+       authority_source, project_id, repository, base_branch, environment_id,
+       pr_number, head_sha, artifact_graph_digest, review_attempt_id,
+       validation_completed_at, required_check_names_json, merge_method,
+       production_policy_digest, gate_receipt_digest, status, created_at, updated_at
+     ) VALUES (
+       'receipt_1', 'job_1', 'job_1:merge', 'authority_1', 1, 'task', 'proj_1',
+       'acme/repo', 'main', 'env_1', 1, ?, ?, 'review_1', 1000, '[]', 'squash',
+       ?, ?, 'active', 1000, 1000
+     )`,
+  ).run("1".repeat(40), "e".repeat(64), "f".repeat(64), "0".repeat(64));
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    `SELECT revision, task_outcome, constraints_json, artifact_graph_digest
+       FROM task_authority_revisions WHERE authority_id = 'authority_1' ORDER BY revision`,
+  ).all()).toEqual([
+    { revision: 1, task_outcome: "shipped_change", constraints_json: "[]", artifact_graph_digest: "e".repeat(64) },
+    { revision: 3, task_outcome: "shipped_change", constraints_json: "[]", artifact_graph_digest: "d".repeat(64) },
+  ]);
 });
 
 it("strengthens relationship triggers after the original artifact migration was applied", () => {

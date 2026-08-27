@@ -1484,18 +1484,35 @@ const PIPELINE_STAGE_ROLES: ReadonlySet<PipelineStageRole> = new Set([
   "FINAL_TEST", "FINAL_REVIEW", "DEPLOY", "CANARY",
 ]);
 
-function taskAuthorityEffectsForJobEffect(effect: JobEffect): readonly TaskAuthorityEffect[] {
-  if (["spawn_plan", "spawn_critique", "spawn_docs", "run_navigator_skill"].includes(effect.kind)) {
-    return ["artifact_write"];
-  }
-  if (["spawn_implementation", "steer_implementation", "run_navigator_ticket_worker"].includes(effect.kind)) {
-    return ["worktree_write", "commit", "pull_request"];
-  }
-  if (effect.kind === "inspect_implementation") return ["commit"];
-  if (effect.kind === "resolve_pr_head") return ["pull_request"];
-  if (effect.kind === "merge_pr") return ["merge"];
-  if (effect.kind === "deploy_production" || effect.kind === "verify_production") return ["deploy", "rollback"];
-  return [];
+const TASK_AUTHORITY_EFFECT_REQUIREMENTS: Readonly<Record<JobEffect["kind"], readonly TaskAuthorityEffect[]>> = {
+  render_status: ["read"],
+  spawn_plan: ["artifact_write"],
+  spawn_critique: ["artifact_write"],
+  spawn_implementation: ["worktree_write", "commit", "pull_request"],
+  inspect_implementation: ["commit"],
+  resolve_pr_head: ["pull_request"],
+  spawn_review: ["read"],
+  send_remediation: ["worktree_write", "commit", "pull_request"],
+  run_validation: ["read"],
+  spawn_docs: ["worktree_write", "commit", "pull_request"],
+  run_final_validation: ["read"],
+  spawn_final_review: ["read"],
+  spawn_consensus_review: ["read"],
+  issue_approval: ["read"],
+  revoke_approvals: ["read"],
+  merge_pr: ["merge"],
+  deploy_production: ["deploy", "rollback"],
+  verify_production: ["deploy", "rollback"],
+  recover_worker: ["read"],
+  stop_thread: ["read"],
+  steer_implementation: ["worktree_write", "commit", "pull_request"],
+  run_navigator_skill: ["artifact_write"],
+  run_navigator_ticket_worker: ["worktree_write", "commit", "pull_request"],
+  reconcile_job: ["read"],
+};
+
+function taskAuthorityEffectsForJobEffect(effect: JobEffect): readonly TaskAuthorityEffect[] | null {
+  return TASK_AUTHORITY_EFFECT_REQUIREMENTS[effect.kind] ?? null;
 }
 
 function taskAuthorityWorkerStopPayload(worker: WorkerLiveness): Record<string, unknown> {
@@ -3830,6 +3847,9 @@ export interface TelegramAgentStore {
     jobId: string;
     ownerUserId: string;
     ownerChatId: string;
+    controllerKey: string;
+    sourceUpdateId: number;
+    authorityRevision: number;
     outcome: TaskOutcome;
     constraints: readonly TaskConstraint[];
     now: number;
@@ -12696,7 +12716,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   public taskAuthorityEffectIsCurrent(effect: JobEffect): boolean {
-    return taskAuthorityEffectsForJobEffect(effect).every((authorityEffect) =>
+    const requiredEffects = taskAuthorityEffectsForJobEffect(effect);
+    return requiredEffects !== null && requiredEffects.length > 0 && requiredEffects.every((authorityEffect) =>
       this.taskAuthorityRepository.effectAdmissionIsCurrent(
         effect.jobId,
         effect.idempotencyKey,
@@ -12759,16 +12780,47 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     jobId: string;
     ownerUserId: string;
     ownerChatId: string;
+    controllerKey: string;
+    sourceUpdateId: number;
+    authorityRevision: number;
     outcome: TaskOutcome;
     constraints: readonly TaskConstraint[];
     now: number;
   }>): Readonly<{ outcome: "recorded"; authority: TaskAuthority }> | Readonly<{ outcome: "rejected" }> {
     assertNonNegativeInteger(input.now, "now");
+    assertNonNegativeInteger(input.sourceUpdateId, "sourceUpdateId");
+    assertPositiveInteger(input.authorityRevision, "authorityRevision");
     return this.db.transaction(() => {
+      const replay = this.db.prepare(
+        `SELECT controller_key, owner_user_id, owner_chat_id, job_id, authority_id,
+                source_revision, target_revision, task_outcome, constraints_json
+           FROM task_authority_narrowings WHERE source_update_id = ?`,
+      ).get(input.sourceUpdateId) as {
+        controller_key: string;
+        owner_user_id: string;
+        owner_chat_id: string;
+        job_id: string;
+        authority_id: string;
+        source_revision: number;
+        target_revision: number;
+        task_outcome: string;
+        constraints_json: string;
+      } | undefined;
+      if (replay) {
+        const replayedAuthority = this.taskAuthorityRepository.getRevision(replay.job_id, replay.target_revision);
+        return replay.controller_key === input.controllerKey && replay.owner_user_id === input.ownerUserId &&
+          replay.owner_chat_id === input.ownerChatId && replay.job_id === input.jobId &&
+          replay.source_revision === input.authorityRevision &&
+          replay.task_outcome === input.outcome && replay.constraints_json === JSON.stringify(input.constraints) &&
+          replayedAuthority?.authorityId === replay.authority_id
+          ? { outcome: "recorded" as const, authority: replayedAuthority }
+          : { outcome: "rejected" as const };
+      }
       const current = this.taskAuthorityRepository.get(input.jobId);
       const job = this.readJobById(input.jobId);
       if (!current || !job || current.status !== "active" ||
         current.ownerUserId !== input.ownerUserId || current.ownerChatId !== input.ownerChatId ||
+        current.controllerKey !== input.controllerKey || current.revision !== input.authorityRevision ||
         job.cancelRequestedAt !== null) return { outcome: "rejected" as const };
       const narrowed = this.taskAuthorityRepository.narrow(
         input.jobId,
@@ -12789,6 +12841,25 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         JSON.stringify(current.constraints),
       );
       if (projected.changes !== 1) throw new Error("Task authority projection changed during narrowing");
+      this.db.prepare(
+        `INSERT INTO task_authority_narrowings (
+           source_update_id, controller_key, owner_user_id, owner_chat_id, job_id,
+           authority_id, source_revision, target_revision, task_outcome,
+           constraints_json, recorded_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.sourceUpdateId,
+        input.controllerKey,
+        input.ownerUserId,
+        input.ownerChatId,
+        input.jobId,
+        narrowed.authorityId,
+        current.revision,
+        narrowed.revision,
+        narrowed.outcome,
+        JSON.stringify(narrowed.constraints),
+        input.now,
+      );
       this.releaseAuthorityRepository.revokeForJob(input.jobId, "authority_narrowed", input.now);
       this.ownerBoundaryRepository.revokeForJob(input.jobId, "authority_narrowed", input.now);
       persistPendingEffects(
@@ -14068,7 +14139,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         const effect = parseEffect(row);
         if (!admissionAllowsEffect(admission, effect, worker)) continue;
         const authorityEffects = taskAuthorityEffectsForJobEffect(effect);
-        if (!authorityEffects.every((authorityEffect) => this.taskAuthorityRepository.admitEffect(
+        if (authorityEffects === null || authorityEffects.length === 0 || !authorityEffects.every((authorityEffect) => this.taskAuthorityRepository.admitEffect(
           effect.jobId,
           effect.idempotencyKey,
           authorityEffect,

@@ -20,6 +20,7 @@ import {
 } from "../storage/store";
 import { detectStandingInstruction } from "../controller/context";
 import { containsCredentialLikeText } from "../domain/state-machine";
+import { deriveTaskOutcome } from "../domain/task-authority";
 import type { HealthReport } from "../services/health-report";
 import { activationSummary } from "../services/runtime-identity";
 import {
@@ -408,6 +409,25 @@ export class TelegramIngress {
     }
     if (replyMessageId !== undefined) {
       const repliedJob = this.store.findJobByStatusMessageId(replyMessageId);
+      const authority = repliedJob ? this.store.getTaskAuthority(repliedJob.id) : null;
+      if (repliedJob && authority) {
+        const narrowed = deriveTaskOutcome(normalized);
+        const narrowing = this.store.narrowTaskAuthority({
+          jobId: repliedJob.id,
+          ownerUserId: identity.userId,
+          ownerChatId: identity.chatId,
+          controllerKey: stableControllerKey(identity.userId, identity.chatId),
+          sourceUpdateId: updateId,
+          authorityRevision: authority.revision,
+          outcome: narrowed.outcome,
+          constraints: narrowed.constraints,
+          now,
+        });
+        if (narrowing.outcome === "recorded") {
+          this.onWorkAvailable();
+          return { updateSettled: true };
+        }
+      }
       if (repliedJob && this.canSteer(repliedJob, replyMessageId)) {
         this.steer(repliedJob, normalized, updateId, now);
         return;

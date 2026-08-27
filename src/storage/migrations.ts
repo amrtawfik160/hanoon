@@ -3524,6 +3524,107 @@ CREATE TABLE task_authority_effect_admissions (
 );
 `] as const;
 
+export const TASK_AUTHORITY_CLOSURE_MIGRATIONS = [String.raw`
+CREATE TABLE owner_boundary_fact_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  code TEXT NOT NULL CHECK (code IN (
+    'product_decision_required', 'scope_expansion_required',
+    'credential_or_access_required', 'spend_authority_required',
+    'irreversible_effect_required', 'policy_change_required',
+    'technical_tradeoff_required', 'production_recovery_required'
+  )),
+  fact TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (source_kind IN (
+    'artifact', 'access', 'budget', 'policy', 'production', 'retry', 'effect'
+  )),
+  source_id TEXT NOT NULL,
+  affected_artifact_id TEXT,
+  affected_effect_idempotency_key TEXT,
+  recorded_at INTEGER NOT NULL,
+  UNIQUE (job_id, code, fact, source_kind, source_id),
+  CHECK (affected_artifact_id IS NOT NULL OR affected_effect_idempotency_key IS NOT NULL)
+);
+CREATE TRIGGER owner_boundary_fact_records_append_only_update
+BEFORE UPDATE ON owner_boundary_fact_records
+BEGIN SELECT RAISE(ABORT, 'owner boundary fact records are append-only'); END;
+CREATE TRIGGER owner_boundary_fact_records_append_only_delete
+BEFORE DELETE ON owner_boundary_fact_records
+BEGIN SELECT RAISE(ABORT, 'owner boundary fact records are append-only'); END;
+
+CREATE TABLE task_authority_narrowings (
+  source_update_id INTEGER PRIMARY KEY,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  target_revision INTEGER NOT NULL CHECK (target_revision = source_revision + 1),
+  task_outcome TEXT NOT NULL CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change')),
+  constraints_json TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  UNIQUE (authority_id, target_revision),
+  FOREIGN KEY (authority_id, source_revision)
+    REFERENCES task_authority_revisions(authority_id, revision),
+  FOREIGN KEY (authority_id, target_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_revisions (
+  authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+  source_update_id, request_digest, project_id, task_outcome, scope_digest,
+  constraints_json, policy_version, policy_digest, artifact_graph_digest,
+  status, created_at, updated_at, revoked_at, revoked_reason, superseded_at, superseded_reason
+)
+SELECT authority.authority_id, receipt.authority_revision, authority.job_id,
+       authority.owner_user_id, authority.owner_chat_id, authority.controller_key,
+       authority.source_update_id, authority.request_digest, authority.project_id,
+       authority.task_outcome, authority.scope_digest, authority.constraints_json,
+       authority.policy_version, authority.policy_digest, receipt.artifact_graph_digest,
+       'active', authority.created_at, receipt.created_at, NULL, NULL, NULL, NULL
+  FROM task_authorities AS authority
+  JOIN release_authority_receipts AS receipt
+    ON receipt.authority_id = authority.authority_id
+   AND receipt.job_id = authority.job_id
+   AND receipt.authority_source = 'task'
+  LEFT JOIN task_authority_revisions AS revision
+    ON revision.authority_id = receipt.authority_id
+   AND revision.revision = receipt.authority_revision
+ WHERE revision.authority_id IS NULL
+   AND receipt.authority_revision < authority.revision
+   AND authority.task_outcome = 'shipped_change'
+   AND (
+     SELECT COUNT(*) FROM task_authority_events AS event
+      WHERE event.authority_id = authority.authority_id
+        AND event.revision > receipt.authority_revision
+        AND event.revision <= authority.revision
+        AND event.action = 'revised'
+        AND event.reason = 'artifact_graph_advanced'
+   ) = authority.revision - receipt.authority_revision
+ GROUP BY authority.authority_id, receipt.authority_revision
+HAVING COUNT(DISTINCT receipt.artifact_graph_digest) = 1;
+
+CREATE TEMP TABLE task_authority_history_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO task_authority_history_guard(valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT referenced.authority_id, referenced.authority_revision
+    FROM (
+      SELECT authority_id, authority_revision FROM release_authority_receipts
+       WHERE authority_id IS NOT NULL AND authority_revision IS NOT NULL
+      UNION
+      SELECT authority_id, authority_revision FROM owner_boundaries
+    ) AS referenced
+    LEFT JOIN task_authority_revisions AS revision
+      ON revision.authority_id = referenced.authority_id
+     AND revision.revision = referenced.authority_revision
+   WHERE revision.authority_id IS NULL
+) THEN 1 ELSE 0 END;
+DROP TABLE task_authority_history_guard;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3609,4 +3710,5 @@ export const ALL_MIGRATIONS = [
   ...RELEASE_AUTHORITY_MIGRATIONS,
   ...OWNER_BOUNDARY_MIGRATIONS,
   ...TASK_AUTHORITY_REVISION_MIGRATIONS,
+  ...TASK_AUTHORITY_CLOSURE_MIGRATIONS,
 ] as const;

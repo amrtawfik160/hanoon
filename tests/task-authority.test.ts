@@ -114,6 +114,26 @@ function boundaryInput(jobId: string, authorityRevision = 1) {
   };
 }
 
+function persistBoundaryFacts(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  code: string,
+  facts: readonly string[],
+  affectedEffectIdempotencyKey = `${fixture.job.id}:merge_pr`,
+): void {
+  const insert = fixture.bb.storage.database().prepare(
+    `INSERT INTO owner_boundary_fact_records (
+       job_id, code, fact, source_kind, source_id,
+       affected_artifact_id, affected_effect_idempotency_key, recorded_at
+     ) VALUES (?, ?, ?, 'policy', ?, NULL, ?, 10002)`,
+  );
+  for (const fact of facts) insert.run(fixture.job.id, code, fact, `${code}:${fact}`, affectedEffectIdempotencyKey);
+}
+
+function recordPolicyBoundary(fixture: ReturnType<typeof ownerJobFixture>) {
+  persistBoundaryFacts(fixture, "policy_change_required", ["policy:change-required"]);
+  return fixture.store.recordOwnerBoundary(boundaryInput(fixture.job.id));
+}
+
 function insertActiveTaskReleaseReceipt(
   fixture: ReturnType<typeof ownerJobFixture>,
   effectIdempotencyKey: string,
@@ -191,6 +211,38 @@ describe("task outcome derivation", () => {
 });
 
 describe("owner task authority intake", () => {
+  it("fails closed when an effect kind has no declared authority requirements", () => {
+    const { store, job } = ownerJobFixture("Fix and ship the retry loop");
+    expect(store.taskAuthorityEffectIsCurrent({
+      idempotencyKey: `${job.id}:unknown`,
+      jobId: job.id,
+      kind: "unknown_effect",
+      payload: {},
+    } as never)).toBe(false);
+  });
+
+  it.each(["send_remediation", "spawn_docs"] as const)(
+    "rejects %s execution when part of its change grant was omitted",
+    (kind) => {
+      const { bb, store, job } = ownerJobFixture("Fix and ship the retry loop");
+      const effectKey = `${job.id}:${kind}`;
+      bb.storage.database().prepare(
+        `INSERT INTO effects (
+           idempotency_key, job_id, kind, payload_json, status, attempts,
+           next_attempt_at, created_at, updated_at
+         ) VALUES (?, ?, ?, '{}', 'pending', 0, 10002, 10002, 10002)`,
+      ).run(effectKey, job.id, kind);
+      const effect = store.getEffect(job.id, effectKey);
+      if (!effect) throw new Error("mutating worker effect was not stored");
+
+      expect(store.admitTaskAuthorityOperation(effect, "worktree", 10_002)).toBe(true);
+      expect(store.taskAuthorityEffectIsCurrent(effect)).toBe(false);
+      expect(store.admitTaskAuthorityOperation(effect, "commit", 10_002)).toBe(true);
+      expect(store.admitTaskAuthorityOperation(effect, "pull_request", 10_002)).toBe(true);
+      expect(store.taskAuthorityEffectIsCurrent(effect)).toBe(true);
+    },
+  );
+
   it("binds controlled effects to the admitted authority revision and rejects stale replay", () => {
     const { bb, store, job } = ownerJobFixture("Fix and ship the retry loop");
     const effectKey = `${job.id}:controlled-worktree`;
@@ -209,6 +261,9 @@ describe("owner task authority intake", () => {
       jobId: job.id,
       ownerUserId: "7",
       ownerChatId: "7",
+      controllerKey: "owner-7-controller",
+      sourceUpdateId: 702,
+      authorityRevision: 1,
       outcome: "reviewed_change",
       constraints: ["no_merge"],
       now: 10_003,
@@ -406,7 +461,7 @@ describe("owner task authority intake", () => {
   it("atomically narrows authority and schedules active work reconciliation", () => {
     const fixture = ownerJobFixture("Fix and ship the retry loop");
     const { store, job } = fixture;
-    const boundary = store.recordOwnerBoundary(boundaryInput(job.id));
+    const boundary = recordPolicyBoundary(fixture);
     if (!boundary) throw new Error("owner boundary was not recorded");
     const releaseEffectKey = `${job.id}:release`;
     insertActiveTaskReleaseReceipt(fixture, releaseEffectKey);
@@ -450,6 +505,9 @@ describe("owner task authority intake", () => {
       jobId: job.id,
       ownerUserId: "7",
       ownerChatId: "7",
+      controllerKey: "owner-7-controller",
+      sourceUpdateId: 702,
+      authorityRevision: 1,
       outcome: "reviewed_change",
       constraints: ["no_merge"],
       now: 10_003,
@@ -499,6 +557,9 @@ describe("owner task authority intake", () => {
     const { store, job } = ownerJobFixture("Fix the retry loop, but do not merge it");
     const request = {
       jobId: job.id,
+      controllerKey: "owner-7-controller",
+      sourceUpdateId: 702,
+      authorityRevision: 1,
       outcome: "shipped_change" as const,
       constraints: [] as const,
       now: 10_003,
@@ -517,9 +578,43 @@ describe("owner task authority intake", () => {
     expect(store.getTaskAuthority(job.id)).toMatchObject({ revision: 1, outcome: "reviewed_change" });
   });
 
+  it("binds owner narrowing to the exact controller, source update, job, and revision", () => {
+    const { store, job } = ownerJobFixture("Fix and ship the retry loop");
+    const instruction = {
+      jobId: job.id,
+      ownerUserId: "7",
+      ownerChatId: "7",
+      controllerKey: "owner-7-controller",
+      sourceUpdateId: 702,
+      authorityRevision: 1,
+      outcome: "reviewed_change" as const,
+      constraints: ["no_merge"] as const,
+      now: 10_003,
+    };
+
+    expect(store.narrowTaskAuthority(instruction)).toMatchObject({
+      outcome: "recorded",
+      authority: { revision: 2, outcome: "reviewed_change", constraints: ["no_merge"] },
+    });
+    expect(store.narrowTaskAuthority({ ...instruction, now: 10_004 })).toMatchObject({
+      outcome: "recorded",
+      authority: { revision: 2 },
+    });
+    expect(store.narrowTaskAuthority({
+      ...instruction,
+      jobId: "other-job",
+      now: 10_004,
+    })).toEqual({ outcome: "rejected" });
+    expect(store.narrowTaskAuthority({
+      ...instruction,
+      controllerKey: "owner-other-controller",
+      now: 10_004,
+    })).toEqual({ outcome: "rejected" });
+  });
+
   it("persists one evidence-backed owner boundary, anchors the reply, and replays it", () => {
     const { bb, store, job, leaseGeneration } = ownerJobFixture("Fix the retry loop");
-    const recorded = store.recordOwnerBoundary(boundaryInput(job.id));
+    const recorded = recordPolicyBoundary({ bb, store, job, leaseGeneration });
 
     expect(recorded).toMatchObject({
       jobId: job.id,
@@ -583,11 +678,13 @@ describe("owner task authority intake", () => {
     ["technical_tradeoff_required", ["tradeoff:material", "retry:exhausted"]],
     ["production_recovery_required", ["production:failed", "recovery:exhausted"]],
   ] as const)("records %s only with its durable fact set", (code, evidenceFacts) => {
-    const { store, job } = ownerJobFixture("Fix and ship the retry loop");
+    const fixture = ownerJobFixture("Fix and ship the retry loop");
+    const { store, job } = fixture;
+    persistBoundaryFacts(fixture, code, evidenceFacts);
     expect(store.recordOwnerBoundary({
       ...boundaryInput(job.id),
       code,
-      evidenceFacts,
+      evidenceFacts: ["caller:self-attested"],
     })).toMatchObject({ code, evidenceFacts });
   });
 
@@ -611,8 +708,9 @@ describe("owner task authority intake", () => {
   });
 
   it("revokes a pending owner boundary and task authority when the owner cancels", () => {
-    const { store, job } = ownerJobFixture("Fix the retry loop");
-    const recorded = store.recordOwnerBoundary(boundaryInput(job.id));
+    const fixture = ownerJobFixture("Fix the retry loop");
+    const { store, job } = fixture;
+    const recorded = recordPolicyBoundary(fixture);
     if (!recorded) throw new Error("owner boundary was not recorded");
 
     const cancelled = store.applyJobEvent(job.id, job.version, {
@@ -644,8 +742,9 @@ describe("owner task authority intake", () => {
     ["owner", { ownerUserId: "8" }],
     ["chat", { ownerChatId: "8" }],
   ] as const)("rejects an owner answer with a mismatched %s binding", (_binding, changes) => {
-    const { store, job } = ownerJobFixture("Fix the retry loop");
-    const recorded = store.recordOwnerBoundary(boundaryInput(job.id));
+    const fixture = ownerJobFixture("Fix the retry loop");
+    const { store } = fixture;
+    const recorded = recordPolicyBoundary(fixture);
     if (!recorded) throw new Error("owner boundary was not recorded");
     const answer = {
       boundaryDigest: recorded.digest,

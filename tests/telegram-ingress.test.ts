@@ -271,6 +271,48 @@ function createImplementingJob(
   ).id;
 }
 
+function createOwnerControllerJob(fixture: ReturnType<typeof ingressFixture>, updateId: number): string {
+  fixture.store.enqueueControllerTurn({
+    controllerKey: CONTROLLER_KEY,
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId,
+    inputText: "Fix and ship the redirect loop",
+    now: 2_000,
+  });
+  const lease = fixture.store.acquireExecutorLease("executor", 2_000, 30_000);
+  if (!lease.acquired) throw new Error("missing executor lease");
+  const turn = fixture.store.claimNextControllerTurn({
+    ownerId: "executor",
+    generation: lease.generation,
+    now: 2_000,
+  });
+  if (!turn) throw new Error("missing controller turn");
+  if (!fixture.store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: "executor",
+    generation: lease.generation,
+    projectId: "proj_1",
+    hostId: "host_1",
+    threadId: "thr_controller",
+    now: 2_001,
+  })) throw new Error("controller spawn was not recorded");
+  if (!fixture.store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: "executor",
+    generation: lease.generation,
+    now: 2_002,
+  })) throw new Error("controller submission was not recorded");
+  const job = fixture.store.createConfirmedControllerJob({
+    controllerThreadId: "thr_controller",
+    projectId: "proj_1",
+    task: "Fix and ship the redirect loop",
+    now: 2_003,
+  });
+  fixture.store.setJobStatusMessage(job.id, 9_000 + updateId, job.version, 2_004);
+  return job.id;
+}
+
 function failJob(fixture: ReturnType<typeof ingressFixture>, jobId: string, updateId: number): string {
   const implementing = createImplementingJob(fixture, jobId, updateId, `${jobId}-thread`);
   const current = fixture.store.getJob(implementing);
@@ -778,6 +820,26 @@ it("routes standalone text to Luna while a job is active and steers only a statu
     text: "focus on the redirect test",
     threadId: "thr_implementation",
   });
+});
+
+it("atomically narrows the exact owner task from an authenticated status reply", async () => {
+  const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
+  const jobId = createOwnerControllerJob(fixture, 43);
+  const statusMessageId = fixture.store.getJob(jobId)?.statusMessageId;
+  if (statusMessageId === null || statusMessageId === undefined) throw new Error("missing status message");
+
+  await fixture.ingress.handleClaimed(messageUpdate(44, 7, 70, "Do not merge it and do not deploy it", {
+    reply_to_message: { message_id: statusMessageId },
+  }), 4_400);
+
+  expect(fixture.store.getTaskAuthority(jobId)).toMatchObject({
+    revision: 2,
+    outcome: "reviewed_change",
+    constraints: ["no_merge", "no_deploy"],
+  });
+  expect(fixture.store.listEffectsForJob(jobId)).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: "reconcile_job" }),
+  ]));
 });
 
 it("requests cancellation once and keeps it replay-safe", async () => {

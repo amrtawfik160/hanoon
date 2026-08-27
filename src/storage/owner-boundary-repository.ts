@@ -7,6 +7,7 @@ import {
   ownerBoundaryDigest,
   renderOwnerBoundary,
   OWNER_BOUNDARY_CODES,
+  OWNER_BOUNDARY_REQUIRED_FACTS,
   type OwnerBoundaryCode,
   type OwnerBoundaryDraft,
   type OwnerBoundaryOption,
@@ -252,6 +253,38 @@ function persistReconcileEffect(db: SqliteDatabase, boundary: OwnerBoundaryRecor
   ).run(key, boundary.jobId, payload, now, now, now);
 }
 
+function policyRequiresOwnerDecision(db: SqliteDatabase, jobId: string): boolean {
+  const row = db.prepare(
+    "SELECT policy_json FROM jobs WHERE id = ? AND state = 'awaiting_merge_approval'",
+  ).get(jobId) as { policy_json: string | null } | undefined;
+  if (!row?.policy_json) return false;
+  const policy = JSON.parse(row.policy_json) as {
+    production?: unknown;
+    autonomy?: { mergeWithoutProduction?: unknown };
+  };
+  return policy.production === undefined && policy.autonomy?.mergeWithoutProduction !== true;
+}
+
+function durableBoundaryFacts(db: SqliteDatabase, input: CreateOwnerBoundaryInput): readonly string[] {
+  const requiredFacts = OWNER_BOUNDARY_REQUIRED_FACTS[input.code];
+  if (input.code === "policy_change_required" && policyRequiresOwnerDecision(db, input.jobId)) {
+    return requiredFacts;
+  }
+  const rows = db.prepare(
+    `SELECT fact FROM owner_boundary_fact_records
+      WHERE job_id = ? AND code = ?
+        AND affected_artifact_id IS ?
+        AND affected_effect_idempotency_key IS ?`,
+  ).all(
+    input.jobId,
+    input.code,
+    input.affectedArtifactId ?? null,
+    input.affectedEffectIdempotencyKey ?? null,
+  ) as Array<{ fact: string }>;
+  const persistedFacts = new Set(rows.map((row) => row.fact));
+  return requiredFacts.every((fact) => persistedFacts.has(fact)) ? requiredFacts : [];
+}
+
 export class OwnerBoundaryRepository {
   public constructor(private readonly db: SqliteDatabase) {}
 
@@ -263,8 +296,9 @@ export class OwnerBoundaryRepository {
     assertPositiveInteger(input.authorityRevision, "authorityRevision");
     assertNonNegativeInteger(input.now, "now");
     if (!authorityMatches(this.db, input)) return null;
-    if (!ownerBoundaryFactsSupport(input.code, input.evidenceFacts)) return null;
-    const draft = normalizeOwnerBoundary(input);
+    const evidenceFacts = durableBoundaryFacts(this.db, input);
+    if (!ownerBoundaryFactsSupport(input.code, evidenceFacts)) return null;
+    const draft = normalizeOwnerBoundary({ ...input, evidenceFacts });
     const digest = ownerBoundaryDigest(draft);
     const existing = readByDigest(this.db, digest, input.jobId);
     if (existing) return existing;
