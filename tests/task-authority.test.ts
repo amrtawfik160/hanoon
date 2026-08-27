@@ -2,7 +2,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { projectResourceKey } from "../src/autonomy/models";
-import { deriveTaskOutcome } from "../src/domain/task-authority";
+import { deriveTaskOutcome, taskAuthorityEffectForOperation } from "../src/domain/task-authority";
 import { ownerBoundaryDigest } from "../src/domain/owner-boundary";
 import { transition } from "../src/domain/state-machine";
 import { EffectRunner } from "../src/services/effect-runner";
@@ -109,11 +109,54 @@ function boundaryInput(jobId: string, authorityRevision = 1) {
     ],
     recommendation: "Configure production because it preserves the task's requested shipped outcome",
     pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
+    evidenceFacts: ["policy:change-required"],
     affectedEffectIdempotencyKey: `${jobId}:merge_pr`,
   };
 }
 
+function insertActiveTaskReleaseReceipt(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  effectIdempotencyKey: string,
+): void {
+  const authority = fixture.store.getTaskAuthority(fixture.job.id);
+  if (!authority) throw new Error("task authority was not recorded");
+  fixture.bb.storage.database().prepare(
+    `INSERT INTO release_authority_receipts (
+       receipt_id, job_id, effect_idempotency_key, authority_id, authority_revision,
+       authority_source, project_id, repository, base_branch, environment_id,
+       pr_number, head_sha, artifact_graph_digest, review_attempt_id,
+       validation_completed_at, required_check_names_json, merge_method,
+       production_policy_digest, gate_receipt_digest, status, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 'task', ?, 'acme/cyndra', 'main', 'env_1',
+       4, ?, ?, 'review_1', 10002, '["test"]', 'squash', ?, ?, 'active', 10002, 10002)`,
+  ).run(
+    `receipt_${fixture.job.id}`,
+    fixture.job.id,
+    effectIdempotencyKey,
+    authority.authorityId,
+    authority.revision,
+    authority.projectId,
+    sha("d"),
+    authority.artifactGraphDigest,
+    "e".repeat(64),
+    "f".repeat(64),
+  );
+}
+
 describe("task outcome derivation", () => {
+  it.each([
+    ["artifact", "artifact_write"],
+    ["prototype", "prototype_write"],
+    ["worktree", "worktree_write"],
+    ["commit", "commit"],
+    ["pull_request", "pull_request"],
+    ["merge", "merge"],
+    ["deploy", "deploy"],
+    ["rollback", "rollback"],
+  ] as const)("maps the executor %s operation to %s authority", (operation, effect) => {
+    expect(taskAuthorityEffectForOperation(operation)).toBe(effect);
+  });
+
   it.each([
     ["Fix the retry loop", "shipped_change", []],
     ["Research why the retry loop is slow", "artifact", ["artifact_only"]],
@@ -148,6 +191,48 @@ describe("task outcome derivation", () => {
 });
 
 describe("owner task authority intake", () => {
+  it("binds controlled effects to the admitted authority revision and rejects stale replay", () => {
+    const { bb, store, job } = ownerJobFixture("Fix and ship the retry loop");
+    const effectKey = `${job.id}:controlled-worktree`;
+    bb.storage.database().prepare(
+      `INSERT INTO effects (
+         idempotency_key, job_id, kind, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, 'spawn_implementation', '{}', 'pending', 0, 10002, 10002, 10002)`,
+    ).run(effectKey, job.id);
+    const effect = store.getEffect(job.id, effectKey);
+    if (!effect) throw new Error("controlled effect was not stored");
+
+    expect(store.admitTaskAuthorityOperation(effect, "worktree", 10_002)).toBe(true);
+    expect(store.taskAuthorityOperationIsCurrent(effect, "worktree")).toBe(true);
+    expect(store.narrowTaskAuthority({
+      jobId: job.id,
+      ownerUserId: "7",
+      ownerChatId: "7",
+      outcome: "reviewed_change",
+      constraints: ["no_merge"],
+      now: 10_003,
+    }).outcome).toBe("recorded");
+    expect(store.taskAuthorityOperationIsCurrent(effect, "worktree")).toBe(false);
+    expect(store.admitTaskAuthorityOperation(effect, "worktree", 10_004)).toBe(false);
+  });
+
+  it("rejects a controlled effect outside the exact task grant", () => {
+    const { bb, store, job } = ownerJobFixture("Research the retry loop only");
+    const effectKey = `${job.id}:forbidden-worktree`;
+    bb.storage.database().prepare(
+      `INSERT INTO effects (
+         idempotency_key, job_id, kind, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, 'spawn_implementation', '{}', 'pending', 0, 10002, 10002, 10002)`,
+    ).run(effectKey, job.id);
+    const effect = store.getEffect(job.id, effectKey);
+    if (!effect) throw new Error("controlled effect was not stored");
+
+    expect(store.admitTaskAuthorityOperation(effect, "worktree", 10_002)).toBe(false);
+    expect(store.taskAuthorityOperationIsCurrent(effect, "worktree")).toBe(false);
+  });
+
   it("keeps a shipped task at the merge gate when production is not configured", () => {
     const job = jobFixture({
       state: "reviewing",
@@ -170,6 +255,25 @@ describe("owner task authority intake", () => {
 
     expect(result.job.state).toBe("awaiting_merge_approval");
     expect(result.effects).toEqual([expect.objectContaining({ kind: "issue_approval" })]);
+  });
+
+  it("continues routine shipped-task review remediation without owner approval", () => {
+    const job = jobFixture({
+      state: "awaiting_merge_approval",
+      taskOutcome: "shipped_change",
+      prHeadSha: sha("a"),
+      reviewCycle: 2,
+    });
+
+    const continued = transition(job, {
+      type: "REMEDIATION_CONTINUED",
+      reason: "The independent review did not clear the current head",
+    }, 10_002);
+
+    expect(continued.job.state).toBe("remediating");
+    expect(continued.effects).toEqual([
+      expect.objectContaining({ kind: "send_remediation" }),
+    ]);
   });
 
   it("resolves a live task grant only for its owning job", () => {
@@ -201,6 +305,26 @@ describe("owner task authority intake", () => {
       policy: null,
       evidence,
     })).toBeNull();
+  });
+
+  it("does not grant owner task authority to an autonomous-origin job", () => {
+    const { bb, store, job } = ownerJobFixture("Fix and ship the retry loop");
+    const db = bb.storage.database();
+    db.prepare("UPDATE jobs SET state = 'merged' WHERE id = ?").run(job.id);
+    db.prepare("UPDATE job_admissions SET state = 'released', released_at = 10002 WHERE job_id = ?").run(job.id);
+
+    const autonomous = store.createAutonomousJob({
+      projectId: "proj_1",
+      task: "Diagnose the unattended regression",
+      origin: "self_diagnosis",
+      minimumRecipe: "bug",
+      now: 10_003,
+    });
+    expect(autonomous.outcome).toBe("created");
+    if (autonomous.outcome !== "created") throw new Error("autonomous job was not created");
+    expect(autonomous.job.autonomousOrigin).toBe("self_diagnosis");
+    expect(autonomous.job.taskOutcome).toBeNull();
+    expect(store.getTaskAuthority(autonomous.job.id)).toBeNull();
   });
 
   it("records the derived outcome and authenticated grant with the job", () => {
@@ -245,6 +369,28 @@ describe("owner task authority intake", () => {
     expect(reopened.getTaskAuthority("sibling-job")).toBeNull();
   });
 
+  it("preserves every authority revision across restart", () => {
+    const { bb, store, job } = ownerJobFixture("Fix the retry loop, but do not merge it");
+    const original = store.getTaskAuthority(job.id);
+    if (!original) throw new Error("task authority was not recorded");
+
+    expect(store.recordMergePreApproval({
+      namedJobId: job.id,
+      ownerUserId: "7",
+      ownerChatId: "7",
+      now: 10_002,
+    })).toEqual({ outcome: "recorded", jobId: job.id });
+
+    const reopened = openStore(bb.storage, bb.storage.kv, () => 10_000);
+    expect(reopened.getTaskAuthorityRevision(job.id, 1)).toEqual(original);
+    expect(reopened.getTaskAuthorityRevision(job.id, 2)).toMatchObject({
+      revision: 2,
+      outcome: "shipped_change",
+      constraints: [],
+      status: "active",
+    });
+  });
+
   it("rejects a late instruction from a different owner identity", () => {
     const { store, job } = ownerJobFixture("Fix the retry loop, but do not merge it");
 
@@ -253,6 +399,120 @@ describe("owner task authority intake", () => {
       ownerUserId: "8",
       ownerChatId: "8",
       now: 10_002,
+    })).toEqual({ outcome: "rejected" });
+    expect(store.getTaskAuthority(job.id)).toMatchObject({ revision: 1, outcome: "reviewed_change" });
+  });
+
+  it("atomically narrows authority and schedules active work reconciliation", () => {
+    const fixture = ownerJobFixture("Fix and ship the retry loop");
+    const { store, job } = fixture;
+    const boundary = store.recordOwnerBoundary(boundaryInput(job.id));
+    if (!boundary) throw new Error("owner boundary was not recorded");
+    const releaseEffectKey = `${job.id}:release`;
+    insertActiveTaskReleaseReceipt(fixture, releaseEffectKey);
+    store.upsertWorkerLiveness({
+      jobId: job.id,
+      workerKind: "implementation",
+      resourceKind: "bb_thread",
+      resourceId: "thr_active",
+      generation: 1,
+      state: "active",
+      sourceUpdatedAt: 10_001,
+      observedAt: 10_001,
+      staleNotifiedAt: null,
+    });
+    store.upsertWorkerLiveness({
+      jobId: job.id,
+      workerKind: "review",
+      resourceKind: "bb_thread",
+      resourceId: "thr_review",
+      generation: 2,
+      state: "starting",
+      sourceUpdatedAt: 10_001,
+      observedAt: 10_001,
+      staleNotifiedAt: null,
+    });
+    for (const resourceId of ["thr_worker_3", "thr_worker_4", "thr_worker_5"]) {
+      store.upsertWorkerLiveness({
+        jobId: job.id,
+        workerKind: "review",
+        resourceKind: "bb_thread",
+        resourceId,
+        generation: 3,
+        state: "active",
+        sourceUpdatedAt: 10_001,
+        observedAt: 10_001,
+        staleNotifiedAt: null,
+      });
+    }
+
+    expect(store.narrowTaskAuthority({
+      jobId: job.id,
+      ownerUserId: "7",
+      ownerChatId: "7",
+      outcome: "reviewed_change",
+      constraints: ["no_merge"],
+      now: 10_003,
+    })).toMatchObject({ outcome: "recorded", authority: { revision: 2 } });
+
+    expect(store.getJob(job.id)).toMatchObject({
+      taskOutcome: "reviewed_change",
+      taskConstraints: ["no_merge"],
+      mergePreApprovedAt: null,
+    });
+    expect(store.getOwnerBoundary(boundary.digest)).toMatchObject({
+      status: "revoked",
+      revokedReason: "authority_narrowed",
+    });
+    expect(store.getReleaseAuthorityReceipt(releaseEffectKey)).toMatchObject({
+      status: "revoked",
+      revokedReason: "authority_narrowed",
+    });
+    expect(store.listEffectsForJob(job.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "stop_thread", payload: expect.objectContaining({
+        workers: expect.arrayContaining([
+          expect.objectContaining({ resourceId: "thr_active" }),
+          expect.objectContaining({ resourceId: "thr_review" }),
+        ]),
+      }) }),
+      expect.objectContaining({ kind: "reconcile_job" }),
+    ]));
+    const stopEffects = store.listEffectsForJob(job.id).filter((effect) => effect.kind === "stop_thread");
+    expect(stopEffects).toHaveLength(2);
+    const stoppedResources = stopEffects.flatMap((effect) => {
+      const workers = effect.payload.workers;
+      if (Array.isArray(workers)) {
+        return workers.map((worker) => (worker as { resourceId: string }).resourceId);
+      }
+      return [effect.payload.resourceId as string];
+    });
+    expect(new Set(stoppedResources)).toEqual(new Set([
+      "thr_active",
+      "thr_review",
+      "thr_worker_3",
+      "thr_worker_4",
+      "thr_worker_5",
+    ]));
+  });
+
+  it("rejects narrowing from a different owner or to broader authority", () => {
+    const { store, job } = ownerJobFixture("Fix the retry loop, but do not merge it");
+    const request = {
+      jobId: job.id,
+      outcome: "shipped_change" as const,
+      constraints: [] as const,
+      now: 10_003,
+    };
+
+    expect(store.narrowTaskAuthority({
+      ...request,
+      ownerUserId: "8",
+      ownerChatId: "8",
+    })).toEqual({ outcome: "rejected" });
+    expect(store.narrowTaskAuthority({
+      ...request,
+      ownerUserId: "7",
+      ownerChatId: "7",
     })).toEqual({ outcome: "rejected" });
     expect(store.getTaskAuthority(job.id)).toMatchObject({ revision: 1, outcome: "reviewed_change" });
   });
@@ -272,6 +532,9 @@ describe("owner task authority intake", () => {
     if (!recorded) throw new Error("owner boundary was not recorded");
     const boundaryOutboxKey = `owner-boundary:${job.id}:${recorded.digest}`;
     expect(store.getOutbox(boundaryOutboxKey)?.payload.text).toContain("Already checked:");
+    expect(store.getOutbox(boundaryOutboxKey)?.payload.text).toContain(
+      "No reply is not approval; the paused effect remains blocked.",
+    );
     expect(store.recordOwnerBoundary(boundaryInput(job.id))).toEqual(recorded);
 
     const outbox = store.getOutbox(boundaryOutboxKey);
@@ -308,6 +571,43 @@ describe("owner task authority intake", () => {
 
     const reopened = openStore(bb.storage, bb.storage.kv, () => 10_000);
     expect(reopened.getOwnerBoundary(recorded.digest)).toMatchObject({ status: "answered", answerDigest: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+  });
+
+  it.each([
+    ["product_decision_required", ["decision:product-options-unresolved"]],
+    ["scope_expansion_required", ["scope:outside-task-authority"]],
+    ["credential_or_access_required", ["access:required-and-unavailable"]],
+    ["spend_authority_required", ["spend:not-granted"]],
+    ["irreversible_effect_required", ["effect:irreversible"]],
+    ["policy_change_required", ["policy:change-required"]],
+    ["technical_tradeoff_required", ["tradeoff:material", "retry:exhausted"]],
+    ["production_recovery_required", ["production:failed", "recovery:exhausted"]],
+  ] as const)("records %s only with its durable fact set", (code, evidenceFacts) => {
+    const { store, job } = ownerJobFixture("Fix and ship the retry loop");
+    expect(store.recordOwnerBoundary({
+      ...boundaryInput(job.id),
+      code,
+      evidenceFacts,
+    })).toMatchObject({ code, evidenceFacts });
+  });
+
+  it.each([
+    ["product_decision_required", ["decision:technical-options-unresolved"]],
+    ["scope_expansion_required", ["scope:inside-task-authority"]],
+    ["credential_or_access_required", ["access:available"]],
+    ["spend_authority_required", ["spend:already-granted"]],
+    ["irreversible_effect_required", ["effect:reversible"]],
+    ["policy_change_required", ["policy:already-allows"]],
+    ["technical_tradeoff_required", ["tradeoff:material", "retry:first-failure"]],
+    ["production_recovery_required", ["production:failed", "recovery:available"]],
+  ] as const)("rejects the %s durable-fact near miss", (code, evidenceFacts) => {
+    const { store, job } = ownerJobFixture("Fix and ship the retry loop");
+    expect(store.recordOwnerBoundary({
+      ...boundaryInput(job.id),
+      code,
+      evidenceFacts,
+    })).toBeNull();
+    expect(store.listOwnerBoundaries(job.id)).toEqual([]);
   });
 
   it("revokes a pending owner boundary and task authority when the owner cancels", () => {
@@ -453,6 +753,24 @@ describe("owner task authority intake", () => {
       job_version: 2,
     });
     expect(approvals[0]?.consumed_at).not.toBeNull();
+  });
+
+  it("does not issue approval while a repeatedly reviewed shipped task seeks independent evidence", async () => {
+    const fixture = ownerJobFixture("Fix and ship the retry loop");
+    const key = prepareApprovalEffect(fixture, policyFixture(), sha("b"));
+    fixture.bb.storage.database().prepare(
+      "UPDATE jobs SET review_cycle = 2 WHERE id = ?",
+    ).run(fixture.job.id);
+
+    await runApprovalEffect(fixture, key);
+
+    expect(fixture.store.getJob(fixture.job.id)?.state).toBe("awaiting_merge_approval");
+    expect(fixture.store.listEffectsForJob(fixture.job.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "spawn_consensus_review", status: "pending" }),
+    ]));
+    expect(fixture.bb.storage.database().prepare(
+      "SELECT COUNT(*) AS count FROM approvals WHERE job_id = ?",
+    ).get(fixture.job.id)).toEqual({ count: 0 });
   });
 
   it("records one policy boundary instead of asking for merge approval without production", async () => {

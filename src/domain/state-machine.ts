@@ -780,6 +780,16 @@ function transitionAwaitingMergeApproval(job: Job, event: JobEvent, effects: Job
     emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
     return;
   }
+  if (event.type === "REMEDIATION_CONTINUED") {
+    assertSummary(event.reason, "reason");
+    job.state = "remediating";
+    emitEffect(job, effects, "send_remediation", {
+      summary: event.reason,
+      findings: [],
+      reasons: [event.reason],
+    });
+    return;
+  }
   illegal(job, event);
 }
 
@@ -796,6 +806,10 @@ function transitionMerging(job: Job, event: JobEvent, effects: JobEffect[]): voi
     job.mergedAt = event.mergedAt;
     if (!event.baseContentVerified) {
       enterProductionIncident(job, effects, "Merge succeeded but the base branch did not verify the approved content");
+      return;
+    }
+    if (job.taskConstraints.includes("no_deploy")) {
+      completeMergedWork(job, effects);
       return;
     }
     if (!job.policy?.production) {

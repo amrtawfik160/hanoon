@@ -113,6 +113,17 @@ export class NavigatorWorkflowExecutor {
       );
       return true;
     }
+    const operation = attempt.skillId === "prototype" ? "prototype" : "artifact";
+    if (!this.dependencies.store.taskAuthorityOperationIsCurrent(effect, operation)) {
+      this.dependencies.store.deadLetterEffect(
+        effect.idempotencyKey,
+        fence.ownerId,
+        fence.generation,
+        "Task authority effect admission is absent, stale, or denied",
+        this.dependencies.clock.now(),
+      );
+      return true;
+    }
     const leaseMs = this.dependencies.leaseMs ?? 30_000;
     const leaseAbort = new AbortController();
     const timeoutAbort = new AbortController();

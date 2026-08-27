@@ -9,6 +9,7 @@ import {
   OWNER_BOUNDARY_MIGRATIONS,
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_REVISION_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -63,7 +64,8 @@ const PRESERVED_FINALIZATION_PAYLOAD = JSON.stringify({
   obligationRefs: [],
 });
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
-  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length;
+  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length;
 
 function seedDuplicateControllerGenerations(
   bb: ReturnType<typeof createFakePluginHost>["bb"],

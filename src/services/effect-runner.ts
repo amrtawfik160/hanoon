@@ -1970,6 +1970,7 @@ export class EffectRunner {
         ],
         recommendation: "Configure production because it preserves the requested shipped outcome",
         pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
+        evidenceFacts: ["policy:change-required"],
         affectedEffectIdempotencyKey: `${current.id}:${current.version + 1}:merge_pr`,
         now: boundaryNow,
       });
@@ -2012,6 +2013,15 @@ export class EffectRunner {
       this.applyEvent(current.id, current.version, {
         type: "CONSENSUS_REQUIRED",
         headSha: job.prHeadSha,
+      });
+      return;
+    }
+    if (decision.outcome === "continue_remediation") {
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== "awaiting_merge_approval") return;
+      this.applyEvent(current.id, current.version, {
+        type: "REMEDIATION_CONTINUED",
+        reason: decision.reason,
       });
       return;
     }
@@ -2473,6 +2483,9 @@ export class EffectRunner {
     const job = this.currentJob(effect);
     const expected = expectedStates(effect.kind);
     if (expected.length > 0 && !expected.includes(job.state)) return;
+    if (!this.dependencies.store.taskAuthorityEffectIsCurrent(effect)) {
+      throw new PermanentEffectError("task authority effect admission is absent, stale, or denied");
+    }
     switch (effect.kind) {
       case "render_status":
         this.enqueueStatus(job);

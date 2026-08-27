@@ -662,6 +662,7 @@ export type JobEvent =
   | { type: "CONSENSUS_REQUIRED"; headSha: string }
   /** That pass produced durable evidence; decide the approval again. */
   | { type: "CONSENSUS_SETTLED"; headSha: string }
+  | { type: "REMEDIATION_CONTINUED"; reason: string }
   | { type: "MERGE_SUCCEEDED"; message: string; mergeCommitSha: string; mergedAt: string; baseContentVerified: boolean }
   | { type: "MERGE_FAILED"; reason?: string }
   | { type: "DEPLOY_SUCCEEDED"; summary: string }

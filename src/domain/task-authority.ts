@@ -29,6 +29,37 @@ export type TaskAuthorityEffect =
   | "deploy"
   | "rollback";
 
+export const TASK_AUTHORITY_EFFECTS: readonly TaskAuthorityEffect[] = [
+  "read",
+  "artifact_write",
+  "prototype_write",
+  "worktree_write",
+  "commit",
+  "pull_request",
+  "merge",
+  "deploy",
+  "rollback",
+];
+
+export const TASK_AUTHORITY_OPERATIONS = [
+  "artifact",
+  "prototype",
+  "worktree",
+  "commit",
+  "pull_request",
+  "merge",
+  "deploy",
+  "rollback",
+] as const;
+export type TaskAuthorityOperation = (typeof TASK_AUTHORITY_OPERATIONS)[number];
+
+export function taskAuthorityEffectForOperation(operation: TaskAuthorityOperation): TaskAuthorityEffect {
+  if (operation === "artifact") return "artifact_write";
+  if (operation === "prototype") return "prototype_write";
+  if (operation === "worktree") return "worktree_write";
+  return operation;
+}
+
 export function taskAuthorityAllows(outcome: TaskOutcome, effect: TaskAuthorityEffect): boolean {
   if (effect === "read" || effect === "artifact_write") return true;
   if (effect === "prototype_write") return outcome === "artifact";
@@ -51,6 +82,19 @@ export function taskAuthorityAllowsEffect(
   if (authority.constraints.includes("artifact_only") && effect !== "read" && effect !== "artifact_write") return false;
   if (authority.constraints.includes("pull_request_only") && (effect === "merge" || effect === "deploy" || effect === "rollback")) return false;
   return taskAuthorityAllows(authority.outcome, effect);
+}
+
+export function taskAuthorityIsStrictNarrowing(
+  current: Readonly<{ outcome: TaskOutcome; constraints: readonly TaskConstraint[] }>,
+  narrowed: Readonly<{ outcome: TaskOutcome; constraints: readonly TaskConstraint[] }>,
+): boolean {
+  const active = { status: "active" as const };
+  const currentEffects = TASK_AUTHORITY_EFFECTS.filter((effect) =>
+    taskAuthorityAllowsEffect({ ...active, ...current }, effect));
+  const narrowedEffects = TASK_AUTHORITY_EFFECTS.filter((effect) =>
+    taskAuthorityAllowsEffect({ ...active, ...narrowed }, effect));
+  return narrowedEffects.length < currentEffects.length &&
+    narrowedEffects.every((effect) => currentEffects.includes(effect));
 }
 
 const EXPLICIT_ARTIFACT_ONLY = /\b(?:artifact|research|diagnos(?:e|is)|analysis|review|design|map|spec(?:ification)?|tickets?)\s*only\b|\bnon[- ]release\b|\bno\s+(?:implementation|code|release)\b/u;

@@ -33,7 +33,9 @@ export type AutoApprovalDecision =
   /** Spawn the one consensus pass this head is allowed, then decide again. */
   | Readonly<{ outcome: "start_consensus" }>
   /** That pass is already running. Nothing is asked and nothing is approved. */
-  | Readonly<{ outcome: "await_consensus" }>;
+  | Readonly<{ outcome: "await_consensus" }>
+  /** The job-scoped shipped grant keeps routine review remediation inside the executor. */
+  | Readonly<{ outcome: "continue_remediation"; reason: string }>;
 
 /**
  * What the durable review evidence says about this head's consensus pass.
@@ -183,7 +185,7 @@ export function decideAutoApproval(input: {
     return { outcome: "ask_owner", reason: "the project has no production configuration" };
   }
   if (job.reviewCycle >= REMEDIATION_ASK_THRESHOLD) {
-    return decideRemediatedChange(job, input.consensus);
+    return decideRemediatedChange(job, input.consensus, live.source === "task");
   }
   return { outcome: "auto_approve" };
 }
@@ -200,14 +202,23 @@ export function decideAutoApproval(input: {
 function decideRemediatedChange(
   job: AuthorityJob,
   consensus: ConsensusEvidence | undefined,
+  taskGrant: boolean,
 ): AutoApprovalDecision {
   const asked: AutoApprovalDecision = {
     outcome: "ask_owner",
     reason: `the change needed ${job.reviewCycle} rounds of review fixes`,
   };
-  if (!consensus?.routeAvailable) return asked;
+  if (!consensus?.routeAvailable) return taskGrant
+    ? { outcome: "continue_remediation", reason: "Independent review is unavailable; continue fixing the reviewed change" }
+    : asked;
   if (consensus.assessment === "pass") return { outcome: "auto_approve" };
   if (consensus.assessment === "not_pass") {
+    if (taskGrant) {
+      return {
+        outcome: "continue_remediation",
+        reason: "The independent review did not clear the current head; continue remediation",
+      };
+    }
     return {
       outcome: "ask_owner",
       reason: `the change needed ${job.reviewCycle} rounds of review fixes and a second review did not clear it`,

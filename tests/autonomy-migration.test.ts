@@ -5,6 +5,7 @@ import {
   OWNER_BOUNDARY_MIGRATIONS,
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_REVISION_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   WorkArtifactRepository,
@@ -47,7 +48,8 @@ const LEGACY_MIGRATION_MARKERS = [
   [15, "notified_at"],
 ] as const;
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
-  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length;
+  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length;
 const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
 
 function legacyDatabase(pluginId: string) {
@@ -186,6 +188,52 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
     .toContain("CREATE TABLE navigator_ticket_worker_outcomes");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 62])
     .toContain("CREATE TABLE navigator_pull_requests");
+});
+
+it("backfills the mutable ticket-41 authority row into immutable revision history", () => {
+  const { bb } = createFakePluginHost({ pluginId: "task-authority-revision-backfill" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -TASK_AUTHORITY_REVISION_MIGRATIONS.length));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES ('job_1', 1, 'Fix the retry loop', 'cancelled', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 3, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '["no_merge"]', 1, ?, ?, 'active', 1000, 3000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    "SELECT authority_id, revision, task_outcome, constraints_json FROM task_authority_revisions",
+  ).all()).toEqual([{
+    authority_id: "authority_1",
+    revision: 3,
+    task_outcome: "reviewed_change",
+    constraints_json: '["no_merge"]',
+  }]);
+  expect(db.prepare("SELECT * FROM task_authority_current").all()).toEqual([{
+    job_id: "job_1",
+    authority_id: "authority_1",
+    revision: 3,
+  }]);
+  expect(() => db.prepare(
+    "UPDATE task_authority_revisions SET task_outcome = 'shipped_change' WHERE authority_id = 'authority_1'",
+  ).run()).toThrow(/append-only/u);
 });
 
 it("strengthens relationship triggers after the original artifact migration was applied", () => {

@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import {
   normalizeOwnerBoundary,
   normalizeOwnerBoundaryAnswer,
+  ownerBoundaryFactsSupport,
   ownerBoundaryDigest,
   renderOwnerBoundary,
   OWNER_BOUNDARY_CODES,
@@ -74,6 +75,7 @@ type BoundaryRow = Readonly<{
   options_json: string;
   recommendation: string;
   paused_effect: string;
+  evidence_facts_json: string;
   affected_artifact_id: string | null;
   affected_effect_idempotency_key: string | null;
   owner_user_id: string;
@@ -151,6 +153,7 @@ function parseBoundary(row: BoundaryRow): OwnerBoundaryRecord {
     options: JSON.parse(row.options_json) as readonly OwnerBoundaryOption[],
     recommendation: row.recommendation,
     pausedEffect: row.paused_effect,
+    evidenceFacts: JSON.parse(row.evidence_facts_json) as readonly string[],
     affectedArtifactId: row.affected_artifact_id,
     affectedEffectIdempotencyKey: row.affected_effect_idempotency_key,
   });
@@ -195,8 +198,12 @@ function authorityMatches(
   input: Pick<CreateOwnerBoundaryInput, "jobId" | "authorityId" | "authorityRevision" | "ownerUserId" | "ownerChatId">,
 ): boolean {
   const row = db.prepare(
-    `SELECT authority_id, job_id, revision, owner_user_id, owner_chat_id, status
-       FROM task_authorities WHERE authority_id = ? AND job_id = ?`,
+    `SELECT revision.authority_id, revision.job_id, revision.revision,
+            revision.owner_user_id, revision.owner_chat_id, revision.status
+       FROM task_authority_current AS current
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = current.authority_id AND revision.revision = current.revision
+      WHERE revision.authority_id = ? AND revision.job_id = ?`,
   ).get(input.authorityId, input.jobId) as {
     authority_id: string;
     job_id: string;
@@ -256,6 +263,7 @@ export class OwnerBoundaryRepository {
     assertPositiveInteger(input.authorityRevision, "authorityRevision");
     assertNonNegativeInteger(input.now, "now");
     if (!authorityMatches(this.db, input)) return null;
+    if (!ownerBoundaryFactsSupport(input.code, input.evidenceFacts)) return null;
     const draft = normalizeOwnerBoundary(input);
     const digest = ownerBoundaryDigest(draft);
     const existing = readByDigest(this.db, digest, input.jobId);
@@ -281,10 +289,10 @@ export class OwnerBoundaryRepository {
     this.db.prepare(
       `INSERT INTO owner_boundaries (
          boundary_id, job_id, digest, authority_id, authority_revision, code,
-         goal, blocker, prior_checks_json, options_json, recommendation, paused_effect,
+         goal, blocker, prior_checks_json, options_json, recommendation, paused_effect, evidence_facts_json,
          affected_artifact_id, affected_effect_idempotency_key, owner_user_id, owner_chat_id,
          status, created_at, updated_at, answered_at, answer_text, answer_digest, revoked_at, revoked_reason
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, NULL, NULL)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, NULL, NULL)`,
     ).run(
       boundary.boundaryId,
       boundary.jobId,
@@ -298,6 +306,7 @@ export class OwnerBoundaryRepository {
       JSON.stringify(boundary.options),
       boundary.recommendation,
       boundary.pausedEffect,
+      JSON.stringify(boundary.evidenceFacts),
       boundary.affectedArtifactId,
       boundary.affectedEffectIdempotencyKey,
       boundary.ownerUserId,

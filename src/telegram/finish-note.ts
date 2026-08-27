@@ -13,7 +13,7 @@ function finishSummary(requestText: string): string {
 }
 
 export function renderJobFinishNote(
-  job: Pick<Job, "state" | "requestText" | "prNumber" | "prUrl" | "policy" | "mergeCommitSha" | "canarySummary">,
+  job: Pick<Job, "state" | "requestText" | "prNumber" | "prUrl" | "policy" | "mergeCommitSha" | "canarySummary" | "taskConstraints">,
 ): string | null {
   if (job.state !== "complete" && job.state !== "merged") return null;
   if (job.prNumber === null || job.prUrl === null) return null;
@@ -25,6 +25,9 @@ export function renderJobFinishNote(
   // Merged with nothing configured to deploy. Saying it landed is true; saying
   // it shipped would claim a step this project does not have.
   if (job.state === "merged" && job.mergeCommitSha !== null) {
+    if (job.taskConstraints.includes("no_deploy")) {
+      return `Merged “${summary}”. Deployment was excluded by the task authority. PR #${job.prNumber}: ${job.prUrl}`;
+    }
     return `Merged “${summary}”. This project has nothing to deploy, so that finishes it. PR #${job.prNumber}: ${job.prUrl}`;
   }
   return `Finished “${summary}”; validation and review passed. PR #${job.prNumber} is ready for your decision: ${job.prUrl}`;

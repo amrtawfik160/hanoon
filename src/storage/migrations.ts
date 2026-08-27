@@ -3446,6 +3446,84 @@ CREATE TABLE owner_boundary_events (
 CREATE INDEX owner_boundary_events_job ON owner_boundary_events(job_id, occurred_at, id);
 `] as const;
 
+export const TASK_AUTHORITY_REVISION_MIGRATIONS = [String.raw`
+ALTER TABLE owner_boundaries ADD COLUMN evidence_facts_json TEXT NOT NULL DEFAULT '[]';
+
+CREATE TABLE task_authority_revisions (
+  authority_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  source_update_id INTEGER NOT NULL,
+  request_digest TEXT NOT NULL CHECK (request_digest GLOB '[0-9a-f]*' AND length(request_digest) = 64),
+  project_id TEXT NOT NULL,
+  task_outcome TEXT NOT NULL CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change')),
+  scope_digest TEXT NOT NULL CHECK (scope_digest GLOB '[0-9a-f]*' AND length(scope_digest) = 64),
+  constraints_json TEXT NOT NULL,
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  policy_digest TEXT NOT NULL CHECK (policy_digest GLOB '[0-9a-f]*' AND length(policy_digest) = 64),
+  artifact_graph_digest TEXT NOT NULL CHECK (artifact_graph_digest GLOB '[0-9a-f]*' AND length(artifact_graph_digest) = 64),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'suspended', 'superseded')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  superseded_at INTEGER,
+  superseded_reason TEXT,
+  PRIMARY KEY (authority_id, revision),
+  UNIQUE (job_id, revision),
+  CHECK ((status IN ('revoked', 'suspended') AND revoked_at IS NOT NULL) OR
+         (status IN ('active', 'superseded') AND revoked_at IS NULL)),
+  CHECK ((status = 'superseded') = (superseded_at IS NOT NULL))
+);
+
+INSERT INTO task_authority_revisions (
+  authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+  source_update_id, request_digest, project_id, task_outcome, scope_digest,
+  constraints_json, policy_version, policy_digest, artifact_graph_digest,
+  status, created_at, updated_at, revoked_at, revoked_reason, superseded_at, superseded_reason
+)
+SELECT authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at, revoked_at, revoked_reason, superseded_at, superseded_reason
+FROM task_authorities;
+
+CREATE TABLE task_authority_current (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  FOREIGN KEY (authority_id, revision) REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_current(job_id, authority_id, revision)
+SELECT job_id, authority_id, revision FROM task_authorities;
+
+CREATE TRIGGER task_authority_revisions_append_only_update
+BEFORE UPDATE ON task_authority_revisions
+BEGIN SELECT RAISE(ABORT, 'task authority revisions are append-only'); END;
+CREATE TRIGGER task_authority_revisions_append_only_delete
+BEFORE DELETE ON task_authority_revisions
+BEGIN SELECT RAISE(ABORT, 'task authority revisions are append-only'); END;
+
+CREATE TABLE task_authority_effect_admissions (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  effect TEXT NOT NULL CHECK (effect IN (
+    'read', 'artifact_write', 'prototype_write', 'worktree_write', 'commit',
+    'pull_request', 'merge', 'deploy', 'rollback'
+  )),
+  admitted_at INTEGER NOT NULL,
+  PRIMARY KEY (effect_idempotency_key, effect),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3530,4 +3608,5 @@ export const ALL_MIGRATIONS = [
   ...TASK_AUTHORITY_MIGRATIONS,
   ...RELEASE_AUTHORITY_MIGRATIONS,
   ...OWNER_BOUNDARY_MIGRATIONS,
+  ...TASK_AUTHORITY_REVISION_MIGRATIONS,
 ] as const;

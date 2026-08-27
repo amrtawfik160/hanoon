@@ -299,6 +299,7 @@ function ownerBoundaryDraftFromProposal(
     options: proposal.options,
     recommendation: proposal.recommendation,
     pausedEffect: proposal.pausedEffect,
+    evidenceFacts: proposal.evidenceRefs,
     affectedArtifactId: proposal.affectedArtifactId,
     affectedEffectIdempotencyKey: proposal.affectedEffectIdempotencyKey,
   };
@@ -353,7 +354,11 @@ function proposalReason(
   if (observation.externalStateDigest !== snapshot.externalStateDigest) return "external_drift";
   if (job.workflowMode === "shadow") return null;
   if (proposal.kind === "owner_boundary") {
-    return job.taskOutcome === null ? "owner_boundary_requires_owner_task" : null;
+    if (job.taskOutcome === null) return "owner_boundary_requires_owner_task";
+    const snapshotFacts = new Set(snapshot.evidenceRefs);
+    return proposal.evidenceRefs.every((fact) => snapshotFacts.has(fact))
+      ? null
+      : "owner_boundary_evidence_invalid";
   }
   if (proposal.kind === "unresolved_next_step") {
     const candidates = new Set(proposal.candidateSkillIds);
@@ -1114,6 +1119,15 @@ export class NavigatorRepository {
           LIMIT 1`,
       ).get(input.now, input.now) as EffectRow | undefined;
       if (!row) return null;
+      const skill = this.db.prepare(
+        "SELECT skill_id FROM navigator_skill_attempts WHERE effect_idempotency_key = ?",
+      ).get(row.idempotency_key) as { skill_id: string } | undefined;
+      if (!skill || !this.taskAuthorities.admitEffect(
+        row.job_id,
+        row.idempotency_key,
+        skill.skill_id === "prototype" ? "prototype_write" : "artifact_write",
+        input.now,
+      )) return null;
       const updated = this.db.prepare(
         `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
              lease_expires_at = ?, attempts = attempts + 1, updated_at = ?

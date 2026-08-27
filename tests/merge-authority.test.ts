@@ -21,10 +21,11 @@ function grant(overrides: Partial<MergeAuthorityGrant> = {}): MergeAuthorityGran
   };
 }
 
-type AuthorityJob = Pick<Job, "projectId" | "prHeadSha" | "reviewCycle" | "cancelRequestedAt" | "policy">;
+type AuthorityJob = Pick<Job, "id" | "projectId" | "prHeadSha" | "reviewCycle" | "cancelRequestedAt" | "policy">;
 
 function job(overrides: Partial<AuthorityJob> = {}): AuthorityJob {
   return {
+    id: "job_owner",
     projectId: "proj_alpha",
     prHeadSha: HEAD,
     reviewCycle: 0,
@@ -282,5 +283,24 @@ describe("a change that argued with its own review twice", () => {
   it("leaves an ordinary change alone: one round of fixes still merges directly", () => {
     expect(decideAutoApproval({ job: job({ reviewCycle: 1 }), grant: grant(), consensus: consensus() }))
       .toEqual({ outcome: "auto_approve" });
+  });
+
+  it.each([
+    ["no consensus facts", undefined],
+    ["no independent route", consensus({ routeAvailable: false })],
+    ["uncleared second review", consensus({ requested: true, assessment: "not_pass" })],
+  ])("continues shipped-task remediation without generic approval for %s", (_case, evidence) => {
+    expect(decideAutoApproval({
+      job: twoRounds(),
+      grant: null,
+      taskAuthority: {
+        jobId: "job_owner",
+        projectId: "proj_alpha",
+        outcome: "shipped_change",
+        constraints: [],
+        status: "active",
+      },
+      consensus: evidence,
+    })).toMatchObject({ outcome: "continue_remediation", reason: expect.any(String) });
   });
 });

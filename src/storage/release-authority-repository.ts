@@ -96,7 +96,6 @@ const OUTCOME_CONSTRAINTS = new Set<TaskConstraint>([
   "artifact_only",
   "pull_request_only",
   "no_merge",
-  "no_deploy",
 ]);
 const SHA256 = /^[0-9a-f]{64}$/u;
 const FULL_SHA = /^[0-9a-f]{40}$/u;

@@ -27,9 +27,29 @@ export type OwnerBoundaryDraft = Readonly<{
   options: readonly OwnerBoundaryOption[];
   recommendation: string;
   pausedEffect: string;
+  evidenceFacts: readonly string[];
   affectedArtifactId?: string | null;
   affectedEffectIdempotencyKey?: string | null;
 }>;
+
+export const OWNER_BOUNDARY_REQUIRED_FACTS: Readonly<Record<OwnerBoundaryCode, readonly string[]>> = {
+  product_decision_required: ["decision:product-options-unresolved"],
+  scope_expansion_required: ["scope:outside-task-authority"],
+  credential_or_access_required: ["access:required-and-unavailable"],
+  spend_authority_required: ["spend:not-granted"],
+  irreversible_effect_required: ["effect:irreversible"],
+  policy_change_required: ["policy:change-required"],
+  technical_tradeoff_required: ["tradeoff:material", "retry:exhausted"],
+  production_recovery_required: ["production:failed", "recovery:exhausted"],
+};
+
+export function ownerBoundaryFactsSupport(
+  code: OwnerBoundaryCode,
+  evidenceFacts: readonly string[],
+): boolean {
+  const facts = new Set(evidenceFacts);
+  return OWNER_BOUNDARY_REQUIRED_FACTS[code].every((required) => facts.has(required));
+}
 
 const MAX_BOUNDARY_TEXT = 2_000;
 const MAX_PRIOR_CHECKS = 8;
@@ -95,6 +115,11 @@ export function normalizeOwnerBoundary(input: OwnerBoundaryDraft): OwnerBoundary
   if (new Set(optionLabels).size !== optionLabels.length) throw new TypeError("owner boundary options are duplicated");
   const recommendation = text(input.recommendation, "boundary recommendation");
   const pausedEffect = text(input.pausedEffect, "boundary paused effect");
+  if (!Array.isArray(input.evidenceFacts) || input.evidenceFacts.length === 0 || input.evidenceFacts.length > 16) {
+    throw new TypeError("owner boundary evidence facts must contain one to sixteen facts");
+  }
+  const evidenceFacts = input.evidenceFacts.map((fact, index) => identifier(fact, `boundary evidence fact ${index + 1}`));
+  if (new Set(evidenceFacts).size !== evidenceFacts.length) throw new TypeError("owner boundary evidence facts are duplicated");
   const affectedArtifactId = input.affectedArtifactId === undefined || input.affectedArtifactId === null
     ? null
     : identifier(input.affectedArtifactId, "affected artifact id");
@@ -112,6 +137,7 @@ export function normalizeOwnerBoundary(input: OwnerBoundaryDraft): OwnerBoundary
     options,
     recommendation,
     pausedEffect,
+    evidenceFacts,
     affectedArtifactId,
     affectedEffectIdempotencyKey,
   };
@@ -136,7 +162,7 @@ export function renderOwnerBoundary(input: OwnerBoundaryDraft): string {
     `Options:\n${options}`,
     `Recommendation: ${boundary.recommendation}`,
     `Paused safely: ${boundary.pausedEffect}`,
-    "Reply to this message with your decision. No reply is treated as approval.",
+    "Reply to this message with your decision. No reply is not approval; the paused effect remains blocked.",
   ].join("\n\n");
 }
 

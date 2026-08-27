@@ -21,6 +21,11 @@ import {
 import {
   deriveTaskOutcome,
   taskAuthorityAllowsEffect,
+  taskAuthorityEffectForOperation,
+  type TaskConstraint,
+  type TaskAuthorityEffect,
+  type TaskAuthorityOperation,
+  type TaskOutcome,
   type TaskOutcomeDerivation,
 } from "../domain/task-authority";
 import {
@@ -1478,6 +1483,29 @@ const PIPELINE_STAGE_ROLES: ReadonlySet<PipelineStageRole> = new Set([
   "PLAN", "CRITIQUE", "BUILD", "TEST", "REVIEW", "PATCH", "DOCS",
   "FINAL_TEST", "FINAL_REVIEW", "DEPLOY", "CANARY",
 ]);
+
+function taskAuthorityEffectsForJobEffect(effect: JobEffect): readonly TaskAuthorityEffect[] {
+  if (["spawn_plan", "spawn_critique", "spawn_docs", "run_navigator_skill"].includes(effect.kind)) {
+    return ["artifact_write"];
+  }
+  if (["spawn_implementation", "steer_implementation", "run_navigator_ticket_worker"].includes(effect.kind)) {
+    return ["worktree_write", "commit", "pull_request"];
+  }
+  if (effect.kind === "inspect_implementation") return ["commit"];
+  if (effect.kind === "resolve_pr_head") return ["pull_request"];
+  if (effect.kind === "merge_pr") return ["merge"];
+  if (effect.kind === "deploy_production" || effect.kind === "verify_production") return ["deploy", "rollback"];
+  return [];
+}
+
+function taskAuthorityWorkerStopPayload(worker: WorkerLiveness): Record<string, unknown> {
+  return {
+    generation: worker.generation,
+    resourceId: worker.resourceId,
+    resourceKind: worker.resourceKind,
+    workerKind: worker.workerKind,
+  };
+}
 
 export class IdempotencyConflictError extends Error {
   public constructor(sourceUpdateId: number) {
@@ -3794,6 +3822,18 @@ export interface TelegramAgentStore {
   }):
     { outcome: "recorded"; jobId: string } | { outcome: "rejected" };
   getTaskAuthority(jobId: string): TaskAuthority | null;
+  getTaskAuthorityRevision(jobId: string, revision: number): TaskAuthority | null;
+  taskAuthorityEffectIsCurrent(effect: JobEffect): boolean;
+  admitTaskAuthorityOperation(effect: JobEffect, operation: TaskAuthorityOperation, now: number): boolean;
+  taskAuthorityOperationIsCurrent(effect: JobEffect, operation: TaskAuthorityOperation): boolean;
+  narrowTaskAuthority(input: Readonly<{
+    jobId: string;
+    ownerUserId: string;
+    ownerChatId: string;
+    outcome: TaskOutcome;
+    constraints: readonly TaskConstraint[];
+    now: number;
+  }>): Readonly<{ outcome: "recorded"; authority: TaskAuthority }> | Readonly<{ outcome: "rejected" }>;
   recordOwnerBoundary(input: OwnerBoundaryDraft & { jobId: string; authorityRevision: number; now: number }): OwnerBoundaryRecord | null;
   getOwnerBoundary(digest: string, jobId?: string): OwnerBoundaryRecord | null;
   listOwnerBoundaries(jobId: string): readonly OwnerBoundaryRecord[];
@@ -12621,7 +12661,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         if (input.ownerUserId !== authority.ownerUserId || input.ownerChatId !== authority.ownerChatId) {
           return { outcome: "rejected" };
         }
-        if (authority.outcome !== "reviewed_change" || authority.constraints.includes("no_deploy")) {
+        if (authority.outcome !== "reviewed_change") {
           return { outcome: "rejected" };
         }
         const current = this.readJobById(jobId);
@@ -12649,6 +12689,115 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getTaskAuthority(jobId: string): TaskAuthority | null {
     return this.taskAuthorityRepository.get(jobId);
+  }
+
+  public getTaskAuthorityRevision(jobId: string, revision: number): TaskAuthority | null {
+    return this.taskAuthorityRepository.getRevision(jobId, revision);
+  }
+
+  public taskAuthorityEffectIsCurrent(effect: JobEffect): boolean {
+    return taskAuthorityEffectsForJobEffect(effect).every((authorityEffect) =>
+      this.taskAuthorityRepository.effectAdmissionIsCurrent(
+        effect.jobId,
+        effect.idempotencyKey,
+        authorityEffect,
+      ));
+  }
+
+  public admitTaskAuthorityOperation(
+    effect: JobEffect,
+    operation: TaskAuthorityOperation,
+    now: number,
+  ): boolean {
+    return this.taskAuthorityRepository.admitEffect(
+      effect.jobId,
+      effect.idempotencyKey,
+      taskAuthorityEffectForOperation(operation),
+      now,
+    );
+  }
+
+  public taskAuthorityOperationIsCurrent(effect: JobEffect, operation: TaskAuthorityOperation): boolean {
+    return this.taskAuthorityRepository.effectAdmissionIsCurrent(
+      effect.jobId,
+      effect.idempotencyKey,
+      taskAuthorityEffectForOperation(operation),
+    );
+  }
+
+  private taskAuthorityNarrowingEffects(jobId: string, revision: number): JobEffect[] {
+    const workerRows = this.db.prepare(
+      `SELECT job_id, worker_kind, resource_kind, resource_id, generation, state,
+              source_updated_at, observed_at, stale_notified_at
+        FROM worker_liveness
+        WHERE job_id = ? AND state IN ('starting', 'active', 'stopping')
+        ORDER BY resource_id`,
+    ).all(jobId) as WorkerLivenessRow[];
+    const workerPayloads = workerRows.map(parseWorkerLiveness).map(taskAuthorityWorkerStopPayload);
+    const effects: JobEffect[] = [];
+    for (let offset = 0; offset < workerPayloads.length; offset += 4) {
+      const batch = workerPayloads.slice(offset, offset + 4);
+      effects.push({
+        idempotencyKey: `${jobId}:authority:${revision}:stop${offset === 0 ? "" : `:${offset / 4 + 1}`}`,
+        jobId,
+        kind: "stop_thread",
+        payload: batch.length === 1
+          ? batch[0]!
+          : { ...batch[0], workers: batch },
+      });
+    }
+    effects.push({
+      idempotencyKey: `${jobId}:authority:${revision}:reconcile`,
+      jobId,
+      kind: "reconcile_job",
+      payload: { authorityRevision: revision },
+    });
+    return effects;
+  }
+
+  public narrowTaskAuthority(input: Readonly<{
+    jobId: string;
+    ownerUserId: string;
+    ownerChatId: string;
+    outcome: TaskOutcome;
+    constraints: readonly TaskConstraint[];
+    now: number;
+  }>): Readonly<{ outcome: "recorded"; authority: TaskAuthority }> | Readonly<{ outcome: "rejected" }> {
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction(() => {
+      const current = this.taskAuthorityRepository.get(input.jobId);
+      const job = this.readJobById(input.jobId);
+      if (!current || !job || current.status !== "active" ||
+        current.ownerUserId !== input.ownerUserId || current.ownerChatId !== input.ownerChatId ||
+        job.cancelRequestedAt !== null) return { outcome: "rejected" as const };
+      const narrowed = this.taskAuthorityRepository.narrow(
+        input.jobId,
+        input.outcome,
+        input.constraints,
+        input.now,
+      );
+      if (!narrowed) return { outcome: "rejected" as const };
+      const projected = this.db.prepare(
+        `UPDATE jobs SET task_outcome = ?, task_constraints_json = ?, merge_pre_approved_at = NULL, updated_at = ?
+          WHERE id = ? AND task_outcome = ? AND task_constraints_json = ? AND cancel_requested_at IS NULL`,
+      ).run(
+        narrowed.outcome,
+        JSON.stringify(narrowed.constraints),
+        input.now,
+        input.jobId,
+        current.outcome,
+        JSON.stringify(current.constraints),
+      );
+      if (projected.changes !== 1) throw new Error("Task authority projection changed during narrowing");
+      this.releaseAuthorityRepository.revokeForJob(input.jobId, "authority_narrowed", input.now);
+      this.ownerBoundaryRepository.revokeForJob(input.jobId, "authority_narrowed", input.now);
+      persistPendingEffects(
+        this.db,
+        this.taskAuthorityNarrowingEffects(input.jobId, narrowed.revision),
+        input.now,
+      );
+      return { outcome: "recorded" as const, authority: narrowed };
+    }).immediate();
   }
 
   public recordOwnerBoundary(
@@ -13918,6 +14067,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       for (const row of rows) {
         const effect = parseEffect(row);
         if (!admissionAllowsEffect(admission, effect, worker)) continue;
+        const authorityEffects = taskAuthorityEffectsForJobEffect(effect);
+        if (!authorityEffects.every((authorityEffect) => this.taskAuthorityRepository.admitEffect(
+          effect.jobId,
+          effect.idempotencyKey,
+          authorityEffect,
+          input.now,
+        ))) continue;
         if (effect.kind === "merge_pr" || effect.kind === "deploy_production" || effect.kind === "verify_production") {
           const job = this.readJobById(effect.jobId);
           if (!job || !this.admissionJobPolicyIdentityIsValid(admission, job)) return null;
@@ -15341,8 +15497,28 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         return { ok: false, reason: "version_conflict" };
       }
 
+      let authorizedCurrent = current;
+      const taskAuthority = this.taskAuthorityRepository.get(current.id);
+      if (taskAuthority?.outcome === "reviewed_change") {
+        if (!input.identity || input.identity.userId !== taskAuthority.ownerUserId ||
+          input.identity.chatId !== taskAuthority.ownerChatId) return { ok: false, reason: "revoked" };
+        const revised = this.taskAuthorityRepository.reviseForMergeInstruction(current.id, boundaryNow);
+        if (!revised || revised.outcome !== "shipped_change" || !taskAuthorityAllowsEffect(revised, "merge")) {
+          return { ok: false, reason: "revoked" };
+        }
+        authorizedCurrent = {
+          ...current,
+          taskOutcome: revised.outcome,
+          taskConstraints: revised.constraints,
+        };
+        this.releaseAuthorityRepository.revokeForJob(current.id, "authority_revised", boundaryNow);
+        this.ownerBoundaryRepository.revokeForJob(current.id, "authority_revised", boundaryNow);
+      } else if (taskAuthority && !taskAuthorityAllowsEffect(taskAuthority, "merge")) {
+        return { ok: false, reason: "revoked" };
+      }
+
       const transitioned = transition(
-        current,
+        authorizedCurrent,
         { type: "APPROVAL_ACCEPTED", headSha: row.head_sha },
         boundaryNow,
       );
@@ -15370,7 +15546,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           input.effect,
           payload,
           generatedEffect.idempotencyKey,
-          current,
+          authorizedCurrent,
           row,
           input.nonceHash,
           boundaryNow,
@@ -15632,7 +15808,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         generation: input.leaseGeneration,
         now: boundaryNow,
         reason: "merge_succeeded",
-        resourceKinds: transitioned.job.state === "production_failed"
+        resourceKinds: transitioned.job.state === "production_failed" || transitioned.job.state === "merged"
           ? ["repository_merge", "production_target"]
           : ["repository_merge"],
       });

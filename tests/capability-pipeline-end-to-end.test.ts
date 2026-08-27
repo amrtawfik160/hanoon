@@ -54,7 +54,7 @@ const RECIPE_TASK: Readonly<Record<TaskRecipe, string>> = {
   bug: "Reproduce the crash when saving",
   architectural: "Migrate the public billing schema",
   "skill-authoring": "Update the deployment skill",
-  "adopted-pr": "Review and finish the existing pull request",
+  "adopted-pr": "Fix and finish the existing pull request",
 };
 
 let fixtureId = 0;

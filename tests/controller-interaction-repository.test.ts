@@ -11,6 +11,7 @@ import {
   OWNER_BOUNDARY_MIGRATIONS,
   RELEASE_AUTHORITY_MIGRATIONS,
   TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_REVISION_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   ControllerInteractionRepository,
@@ -65,7 +66,8 @@ const SENSITIVE_QUERY_KEYS = [
   "sig",
 ] as const;
 const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
-  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length;
+  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length;
 
 function percentEncodeLayers(value: string, layers: number): string {
   let encoded = value;

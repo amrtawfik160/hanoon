@@ -797,6 +797,11 @@ export class NavigatorImplementationExecutor {
       this.finishEffect(effect, fence, now, "dead", "navigator ticket attempt identity is unavailable");
       return true;
     }
+    if (!(["worktree", "commit", "pull_request"] as const).every((operation) =>
+      this.dependencies.store.taskAuthorityOperationIsCurrent(effect, operation))) {
+      this.finishEffect(effect, fence, now, "dead", "task authority effect admission is absent, stale, or denied");
+      return true;
+    }
     const leaseMs = this.dependencies.leaseMs ?? 30_000;
     if (!this.adoptAttemptClaim(attempt, fence, now, leaseMs)) {
       this.settleClaimFenceFailure(attempt, effect, fence, now);
@@ -1270,6 +1275,13 @@ export class NavigatorImplementationExecutor {
          ORDER BY effect.created_at, effect.idempotency_key LIMIT 1`,
       ).get(now, now) as Parameters<typeof this.parseEffect>[0] | undefined;
       if (!row) return null;
+      const pendingEffect = this.parseEffect(row);
+      if (!(["worktree", "commit", "pull_request"] as const).every((operation) =>
+        this.dependencies.store.admitTaskAuthorityOperation(
+          pendingEffect,
+          operation,
+          now,
+        ))) return null;
       const changed = this.db.prepare(
         `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
              lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
