@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { modelRouteSchema, type ModelRoute } from "../capabilities/models";
 import type { Job, StoredEffect } from "../domain/models";
+import type { OwnerBoundaryDraft } from "../domain/owner-boundary";
 import {
   type EffectRow,
   parseStoredEffect,
@@ -10,6 +11,9 @@ import {
   VersionConflictError,
 } from "../storage/job-persistence";
 import { WorkArtifactRepository } from "../work-artifacts/repository";
+import { OwnerBoundaryRepository } from "../storage/owner-boundary-repository";
+import { ReleaseAuthorityRepository } from "../storage/release-authority-repository";
+import { taskArtifactGraphDigest, TaskAuthorityRepository } from "../storage/task-authority-repository";
 import {
   navigatorPlanningInput,
   navigatorPlanningInputSchema,
@@ -279,6 +283,27 @@ function artifactEvidenceMatchesBindings(
     });
 }
 
+function ownerBoundaryDraftFromProposal(
+  proposal: Extract<NavigatorProposal, { kind: "owner_boundary" }>,
+): OwnerBoundaryDraft | null {
+  if (
+    proposal.goal === undefined || proposal.blocker === undefined || proposal.priorChecks === undefined ||
+    proposal.options === undefined || proposal.recommendation === undefined || proposal.pausedEffect === undefined ||
+    (proposal.affectedArtifactId === undefined && proposal.affectedEffectIdempotencyKey === undefined)
+  ) return null;
+  return {
+    code: proposal.boundaryCode,
+    goal: proposal.goal,
+    blocker: proposal.blocker,
+    priorChecks: proposal.priorChecks,
+    options: proposal.options,
+    recommendation: proposal.recommendation,
+    pausedEffect: proposal.pausedEffect,
+    affectedArtifactId: proposal.affectedArtifactId,
+    affectedEffectIdempotencyKey: proposal.affectedEffectIdempotencyKey,
+  };
+}
+
 function validatedNavigatorOutcome(skillId: string, rawOutcome: unknown): Record<string, unknown> | null {
   const parsed = skillId === "research"
     ? navigatorResearchResultSchema.safeParse(rawOutcome)
@@ -327,6 +352,9 @@ function proposalReason(
   if (observation.dynamicEffectToolIds.length > 0) return "policy_dynamic_effect_tool";
   if (observation.externalStateDigest !== snapshot.externalStateDigest) return "external_drift";
   if (job.workflowMode === "shadow") return null;
+  if (proposal.kind === "owner_boundary") {
+    return job.taskOutcome === null ? "owner_boundary_requires_owner_task" : null;
+  }
   if (proposal.kind === "unresolved_next_step") {
     const candidates = new Set(proposal.candidateSkillIds);
     if (candidates.size !== proposal.candidateSkillIds.length) return "malformed_proposal";
@@ -374,9 +402,24 @@ function proposalReason(
 
 export class NavigatorRepository {
   private readonly artifacts: WorkArtifactRepository;
+  private readonly taskAuthorities: TaskAuthorityRepository;
+  private readonly releaseAuthorities: ReleaseAuthorityRepository;
+  private readonly ownerBoundaries: OwnerBoundaryRepository;
 
   public constructor(private readonly db: SqliteDatabase) {
     this.artifacts = new WorkArtifactRepository(db);
+    this.taskAuthorities = new TaskAuthorityRepository(db);
+    this.releaseAuthorities = new ReleaseAuthorityRepository(db);
+    this.ownerBoundaries = new OwnerBoundaryRepository(db);
+  }
+
+  private updateTaskAuthorityGraph(jobId: string, bindings: readonly NavigatorArtifactBinding[], now: number): void {
+    const before = this.taskAuthorities.get(jobId);
+    const after = this.taskAuthorities.updateArtifactGraph(jobId, taskArtifactGraphDigest(bindings), now);
+    if (before && after && after.revision !== before.revision) {
+      this.releaseAuthorities.revokeForJob(jobId, "artifact_graph_advanced", now);
+      this.ownerBoundaries.revokeForJob(jobId, "artifact_graph_advanced", now);
+    }
   }
 
   public bindJobArtifacts(input: Readonly<{
@@ -424,6 +467,7 @@ export class NavigatorRepository {
       if (updated.changes !== 1) throw new VersionConflictError(input.jobId, input.expectedVersion);
       const stored = readJobById(this.db, input.jobId);
       if (!stored) throw new Error("navigator job disappeared after initialization");
+      this.updateTaskAuthorityGraph(stored.id, bindings, input.now);
       return stored;
     }).immediate();
   }
@@ -467,6 +511,7 @@ export class NavigatorRepository {
         if (refreshed.changes !== 1) throw new VersionConflictError(job.id, job.version);
         job = readJobById(this.db, input.jobId);
         if (!job) throw new Error("navigator job disappeared during artifact reconsideration");
+        this.updateTaskAuthorityGraph(job.id, refreshedBindings, input.now);
       }
       if (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") {
         throw new TypeError("navigator workflow mode changed during artifact reconsideration");
@@ -574,6 +619,40 @@ export class NavigatorRepository {
       }
       if (job.workflowMode === "shadow") {
         this.insertDecision(proposalId, job.id, input.snapshotId, "shadowed", "shadow_only", input.now);
+        return this.requireDecision(proposalId);
+      }
+      if (proposal === null) throw new Error("accepted navigator proposal disappeared after validation");
+      if (proposal.kind === "owner_boundary") {
+        const authority = this.taskAuthorities.get(job.id);
+        const draft = ownerBoundaryDraftFromProposal(proposal);
+        if (!authority || authority.status !== "active" || authority.jobId !== job.id) {
+          this.insertDecision(proposalId, job.id, input.snapshotId, "rejected", "owner_boundary_requires_live_task_authority", input.now);
+          return this.requireDecision(proposalId);
+        }
+        if (draft === null) {
+          this.insertDecision(proposalId, job.id, input.snapshotId, "rejected", "owner_boundary_evidence_missing", input.now);
+          return this.requireDecision(proposalId);
+        }
+        let boundary: ReturnType<OwnerBoundaryRepository["record"]>;
+        try {
+          boundary = this.ownerBoundaries.record({
+            ...draft,
+            jobId: job.id,
+            authorityId: authority.authorityId,
+            authorityRevision: authority.revision,
+            ownerUserId: authority.ownerUserId,
+            ownerChatId: authority.ownerChatId,
+            now: input.now,
+          });
+        } catch (error) {
+          if (!(error instanceof TypeError)) throw error;
+          boundary = null;
+        }
+        if (boundary === null) {
+          this.insertDecision(proposalId, job.id, input.snapshotId, "rejected", "owner_boundary_evidence_invalid", input.now);
+          return this.requireDecision(proposalId);
+        }
+        this.insertDecision(proposalId, job.id, input.snapshotId, "accepted", "owner_boundary_recorded", input.now);
         return this.requireDecision(proposalId);
       }
       if (proposal?.kind !== "invoke_skill" && proposal?.kind !== "unresolved_next_step") {
@@ -1269,6 +1348,7 @@ export class NavigatorRepository {
           WHERE id = ? AND current_workflow_step_id = ?`,
       ).run(JSON.stringify(nextBindings), resultKind, input.now, attempt.jobId, attempt.workflowStepId);
       if (jobUpdate.changes !== 1) throw new Error("navigator workflow step changed before settlement");
+      this.updateTaskAuthorityGraph(attempt.jobId, nextBindings, input.now);
       const effectUpdate = this.db.prepare(
         `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
              lease_expires_at = NULL, last_error = NULL, updated_at = ?

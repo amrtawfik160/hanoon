@@ -3313,6 +3313,139 @@ BEFORE DELETE ON navigator_ticket_repair_dispatches
 BEGIN SELECT RAISE(ABORT, 'navigator ticket repair dispatches are append-only'); END;
 `] as const;
 
+export const TASK_AUTHORITY_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN task_outcome TEXT CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change'));
+ALTER TABLE jobs ADD COLUMN task_constraints_json TEXT NOT NULL DEFAULT '[]';
+
+CREATE TABLE task_authorities (
+  authority_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  source_update_id INTEGER NOT NULL,
+  request_digest TEXT NOT NULL CHECK (request_digest GLOB '[0-9a-f]*' AND length(request_digest) = 64),
+  project_id TEXT NOT NULL,
+  task_outcome TEXT NOT NULL CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change')),
+  scope_digest TEXT NOT NULL CHECK (scope_digest GLOB '[0-9a-f]*' AND length(scope_digest) = 64),
+  constraints_json TEXT NOT NULL,
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  policy_digest TEXT NOT NULL CHECK (policy_digest GLOB '[0-9a-f]*' AND length(policy_digest) = 64),
+  artifact_graph_digest TEXT NOT NULL CHECK (artifact_graph_digest GLOB '[0-9a-f]*' AND length(artifact_graph_digest) = 64),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'suspended', 'superseded')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  superseded_at INTEGER,
+  superseded_reason TEXT,
+  CHECK ((status IN ('revoked', 'suspended') AND revoked_at IS NOT NULL) OR
+         (status IN ('active', 'superseded') AND revoked_at IS NULL)),
+  CHECK ((status = 'superseded') = (superseded_at IS NOT NULL))
+);
+CREATE INDEX task_authorities_job_status ON task_authorities(job_id, status, revision);
+
+CREATE TABLE task_authority_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  authority_id TEXT NOT NULL REFERENCES task_authorities(authority_id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  action TEXT NOT NULL CHECK (action IN ('granted', 'revised', 'revoked', 'suspended', 'superseded')),
+  reason TEXT,
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX task_authority_events_job ON task_authority_events(job_id, occurred_at, id);
+`] as const;
+
+export const RELEASE_AUTHORITY_MIGRATIONS = [String.raw`
+CREATE TABLE release_authority_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  effect_idempotency_key TEXT NOT NULL UNIQUE,
+  authority_id TEXT REFERENCES task_authorities(authority_id),
+  authority_revision INTEGER,
+  authority_source TEXT NOT NULL CHECK (authority_source IN ('task', 'explicit', 'button', 'policy')),
+  project_id TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  environment_id TEXT NOT NULL,
+  pr_number INTEGER NOT NULL CHECK (pr_number >= 1),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  artifact_graph_digest TEXT,
+  review_attempt_id TEXT NOT NULL,
+  validation_completed_at INTEGER NOT NULL,
+  required_check_names_json TEXT NOT NULL,
+  merge_method TEXT NOT NULL CHECK (merge_method IN ('merge', 'rebase', 'squash')),
+  production_policy_digest TEXT,
+  gate_receipt_digest TEXT NOT NULL CHECK (length(gate_receipt_digest) = 64),
+  status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'revoked')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  consumed_at INTEGER,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  CHECK ((authority_source = 'task') = (
+    authority_id IS NOT NULL AND authority_revision IS NOT NULL AND artifact_graph_digest IS NOT NULL
+  )),
+  CHECK ((status = 'consumed') = (consumed_at IS NOT NULL)),
+  CHECK ((status = 'revoked') = (revoked_at IS NOT NULL))
+);
+CREATE INDEX release_authority_receipts_job ON release_authority_receipts(job_id, status, created_at);
+`] as const;
+
+export const OWNER_BOUNDARY_MIGRATIONS = [String.raw`
+CREATE TABLE owner_boundaries (
+  boundary_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  digest TEXT NOT NULL,
+  authority_id TEXT NOT NULL REFERENCES task_authorities(authority_id),
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  code TEXT NOT NULL CHECK (code IN (
+    'product_decision_required', 'scope_expansion_required',
+    'credential_or_access_required', 'spend_authority_required',
+    'irreversible_effect_required', 'policy_change_required',
+    'technical_tradeoff_required', 'production_recovery_required'
+  )),
+  goal TEXT NOT NULL,
+  blocker TEXT NOT NULL,
+  prior_checks_json TEXT NOT NULL,
+  options_json TEXT NOT NULL,
+  recommendation TEXT NOT NULL,
+  paused_effect TEXT NOT NULL,
+  affected_artifact_id TEXT,
+  affected_effect_idempotency_key TEXT,
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'revoked')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  answer_text TEXT,
+  answer_digest TEXT,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  UNIQUE(job_id, digest),
+  CHECK (affected_artifact_id IS NOT NULL OR affected_effect_idempotency_key IS NOT NULL),
+  CHECK ((status = 'pending' AND answered_at IS NULL AND answer_text IS NULL AND answer_digest IS NULL AND revoked_at IS NULL) OR
+         (status = 'answered' AND answered_at IS NOT NULL AND answer_text IS NOT NULL AND answer_digest IS NOT NULL AND revoked_at IS NULL) OR
+         (status = 'revoked' AND revoked_at IS NOT NULL AND revoked_reason IS NOT NULL AND answered_at IS NULL AND answer_text IS NULL AND answer_digest IS NULL))
+);
+CREATE INDEX owner_boundaries_reply ON owner_boundaries(owner_chat_id, status, created_at);
+CREATE INDEX owner_boundaries_job ON owner_boundaries(job_id, status, created_at);
+
+CREATE TABLE owner_boundary_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  boundary_id TEXT NOT NULL REFERENCES owner_boundaries(boundary_id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  action TEXT NOT NULL CHECK (action IN ('created', 'answered', 'revoked')),
+  reason TEXT,
+  answer_digest TEXT,
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX owner_boundary_events_job ON owner_boundary_events(job_id, occurred_at, id);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3394,4 +3527,7 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_PLANNING_MIGRATIONS,
   ...NAVIGATOR_IMPLEMENTATION_MIGRATIONS,
   ...NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS,
+  ...TASK_AUTHORITY_MIGRATIONS,
+  ...RELEASE_AUTHORITY_MIGRATIONS,
+  ...OWNER_BOUNDARY_MIGRATIONS,
 ] as const;

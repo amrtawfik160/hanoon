@@ -23,6 +23,12 @@ import {
   type WorkflowMode,
 } from "../navigator/models";
 import { containsForbiddenCallbackMaterial } from "../telegram/callback-material";
+import {
+  TASK_CONSTRAINTS,
+  TASK_OUTCOMES,
+  type TaskConstraint,
+  type TaskOutcome,
+} from "../domain/task-authority";
 
 type SqliteDatabase = Database.Database;
 
@@ -62,6 +68,8 @@ export type JobRow = {
   task_reason_codes_json: string;
   job_origin: JobOrigin;
   autonomous_origin: AutonomousJobOrigin | null;
+  task_outcome: TaskOutcome | null;
+  task_constraints_json: string;
   adopted_branch: string | null;
   adopted_head_sha: string | null;
   plan_cycle: number;
@@ -138,6 +146,8 @@ const TASK_RECIPE_SET: ReadonlySet<TaskRecipe> = new Set(TASK_RECIPES);
 const ROUTING_MODES: ReadonlySet<RoutingMode> = new Set(["legacy", "shadow", "active"]);
 const WORKFLOW_ENGINE_SET: ReadonlySet<string> = new Set(WORKFLOW_ENGINES);
 const WORKFLOW_MODE_SET: ReadonlySet<string> = new Set(WORKFLOW_MODES);
+const TASK_OUTCOME_SET: ReadonlySet<TaskOutcome> = new Set(TASK_OUTCOMES);
+const TASK_CONSTRAINT_SET: ReadonlySet<TaskConstraint> = new Set(TASK_CONSTRAINTS);
 
 const MAX_RECEIPT_STRING = 512;
 export const MAX_MERGE_RESULT_JSON = 64_000;
@@ -298,6 +308,15 @@ export function parseJobRow(row: JobRow): Job {
   if (row.autonomous_origin !== null && !AUTONOMOUS_JOB_ORIGINS.has(row.autonomous_origin)) {
     throw new Error(`Unknown persisted autonomous origin: ${row.autonomous_origin}`);
   }
+  if (row.task_outcome !== null && !TASK_OUTCOME_SET.has(row.task_outcome)) {
+    throw new Error(`Unknown persisted task outcome: ${row.task_outcome}`);
+  }
+  const taskConstraints = JSON.parse(row.task_constraints_json) as unknown;
+  if (!Array.isArray(taskConstraints) || taskConstraints.some((constraint) =>
+    typeof constraint !== "string" || !TASK_CONSTRAINT_SET.has(constraint as TaskConstraint))) {
+    throw new Error("Invalid persisted task constraints");
+  }
+  if (new Set(taskConstraints).size !== taskConstraints.length) throw new Error("Persisted task constraints are duplicated");
   return {
     id: row.id,
     sourceUpdateId: row.source_update_id,
@@ -336,6 +355,8 @@ export function parseJobRow(row: JobRow): Job {
     taskReasonCodes,
     origin: row.job_origin,
     autonomousOrigin: row.autonomous_origin,
+    taskOutcome: row.task_outcome,
+    taskConstraints: taskConstraints as TaskConstraint[],
     adoptedBranch: row.adopted_branch,
     adoptedHeadSha: row.adopted_head_sha,
     planCycle: row.plan_cycle,
@@ -389,7 +410,7 @@ export function persistJobTransition(
          deployment_summary = ?, canary_summary = ?, status_message_id = ?, delivery_mode = ?,
          task_recipe = ?, recipe_version = ?, recipe_promotion_count = ?, routing_mode = ?,
          task_traits_json = ?, task_reason_codes_json = ?, plan_cycle = ?, review_cycle = ?,
-         review_block_at = ?, cancel_requested_at = ?, merge_pre_approved_at = ?, blocked_reason = ?,
+         task_outcome = ?, task_constraints_json = ?, review_block_at = ?, cancel_requested_at = ?, merge_pre_approved_at = ?, blocked_reason = ?,
          last_error = ?, version = ?, updated_at = ?
        WHERE id = ? AND version = ?`,
     )
@@ -422,6 +443,8 @@ export function persistJobTransition(
       JSON.stringify(transitionedJob.taskReasonCodes),
       transitionedJob.planCycle,
       transitionedJob.reviewCycle,
+      transitionedJob.taskOutcome,
+      JSON.stringify(transitionedJob.taskConstraints),
       transitionedJob.reviewBlockAt,
       transitionedJob.cancelRequestedAt,
       transitionedJob.mergePreApprovedAt,
@@ -468,7 +491,7 @@ export const JOB_SELECT = `
          delivery_mode, task_recipe, recipe_version, recipe_promotion_count, routing_mode,
          workflow_engine, workflow_mode, workflow_revision, current_workflow_step_id, artifact_bindings_json,
          task_traits_json, task_reason_codes_json, job_origin, autonomous_origin,
-         adopted_branch, adopted_head_sha,
+         task_outcome, task_constraints_json, adopted_branch, adopted_head_sha,
          plan_cycle, review_cycle, review_block_at, cancel_requested_at, merge_pre_approved_at,
          blocked_reason, last_error, version, created_at, updated_at
     FROM jobs`;

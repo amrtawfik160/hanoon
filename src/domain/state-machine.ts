@@ -175,6 +175,10 @@ function headMatches(job: Job, headSha: string | undefined): boolean {
   return job.prHeadSha !== null && headSha === job.prHeadSha;
 }
 
+function taskRequiresRelease(job: Pick<Job, "taskOutcome">): boolean {
+  return job.taskOutcome === "shipped_change";
+}
+
 function retryEffect(
   job: Job,
   effects: JobEffect[],
@@ -536,7 +540,7 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
       emitEffect(job, effects, "run_final_validation", { headSha: event.headSha });
       return;
     }
-    if (job.policy?.production || mergesWithoutProduction(job.policy)) {
+    if (job.policy?.production || mergesWithoutProduction(job.policy) || taskRequiresRelease(job)) {
       job.state = "awaiting_merge_approval";
       emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
       return;
@@ -711,7 +715,7 @@ function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[
       invalidateDriftedHead(job, effects);
       return;
     }
-    if (!job.policy?.production && !mergesWithoutProduction(job.policy)) {
+    if (!job.policy?.production && !mergesWithoutProduction(job.policy) && !taskRequiresRelease(job)) {
       completeReviewedWork(job, effects);
       return;
     }

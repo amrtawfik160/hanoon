@@ -11,6 +11,7 @@ import {
   stageExecutionPolicySchema,
   type PipelineStage,
 } from "./stage-execution";
+import type { TaskConstraint, TaskOutcome } from "./task-authority";
 
 export { executionProfileSchema };
 export type { ExecutionProfile } from "./stage-execution";
@@ -539,6 +540,10 @@ export interface Job {
   origin: JobOrigin;
   /** Absent on every job a person asked for. Immutable once written. */
   autonomousOrigin: AutonomousJobOrigin | null;
+  /** The outcome an authenticated owner asked this job to reach. */
+  taskOutcome: TaskOutcome | null;
+  /** Explicit owner constraints that narrow the task outcome. */
+  taskConstraints: readonly TaskConstraint[];
   adoptedBranch: string | null;
   adoptedHeadSha: string | null;
   planCycle: number;

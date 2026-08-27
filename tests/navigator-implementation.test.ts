@@ -15,7 +15,11 @@ import {
   type NavigatorTicketWorkerRunner,
 } from "../src/navigator/implementation-executor";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
-import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  NAVIGATOR_IMPLEMENTATION_MIGRATIONS,
+  NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS,
+} from "../src/storage/migrations";
 import {
   registerWorkArtifactRelationshipValidation,
   stableWorkArtifactId,
@@ -307,19 +311,23 @@ function validGitObserver(): NavigatorGitObserver {
 
 describe("navigator ticket integration executor", () => {
   it("appends the navigator persistence upgrade after the shipped implementation migration", () => {
-    expect(ALL_MIGRATIONS).toHaveLength(80);
-    expect(ALL_MIGRATIONS[78]).not.toContain("step_contract_json");
-    expect(ALL_MIGRATIONS[78]).not.toContain("navigator_ticket_repair_snapshots");
-    expect(ALL_MIGRATIONS[78]).not.toContain("git_observation_json");
-    expect(ALL_MIGRATIONS[79]).toContain("step_contract_json");
-    expect(ALL_MIGRATIONS[79]).toContain("navigator_ticket_repair_snapshots");
-    expect(ALL_MIGRATIONS[79]).toContain("git_observation_json");
+    const implementationMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_IMPLEMENTATION_MIGRATIONS[0]);
+    const upgradeMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS[0]);
+    expect(implementationMigrationId).toBeGreaterThanOrEqual(0);
+    expect(upgradeMigrationId).toBe(implementationMigrationId + 1);
+    expect(ALL_MIGRATIONS[implementationMigrationId]).not.toContain("step_contract_json");
+    expect(ALL_MIGRATIONS[implementationMigrationId]).not.toContain("navigator_ticket_repair_snapshots");
+    expect(ALL_MIGRATIONS[implementationMigrationId]).not.toContain("git_observation_json");
+    expect(ALL_MIGRATIONS[upgradeMigrationId]).toContain("step_contract_json");
+    expect(ALL_MIGRATIONS[upgradeMigrationId]).toContain("navigator_ticket_repair_snapshots");
+    expect(ALL_MIGRATIONS[upgradeMigrationId]).toContain("git_observation_json");
   });
 
   it("backfills an existing v1 navigator attempt before enabling repair and Git evidence", () => {
     const legacyEffect = "legacy-navigator-effect";
     const legacyAttempt = "legacy-navigator-attempt";
-    const value = fixture(ALL_MIGRATIONS.length - 1, (database) => {
+    const upgradeMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS[0]);
+    const value = fixture(upgradeMigrationId, (database) => {
       database.pragma("foreign_keys = OFF");
       database.prepare(
         `INSERT INTO effects (

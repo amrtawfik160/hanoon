@@ -385,6 +385,28 @@ export class TelegramIngress {
 
     const replyMessageId = message.reply_to_message?.message_id;
     if (replyMessageId !== undefined) {
+      const boundary = this.store.getOwnerBoundaryForReply({
+        ownerChatId: identity.chatId,
+        messageId: replyMessageId,
+      });
+      if (boundary) {
+        const answered = this.store.answerOwnerBoundary({
+          boundaryDigest: boundary.digest,
+          jobId: boundary.jobId,
+          authorityId: boundary.authorityId,
+          authorityRevision: boundary.authorityRevision,
+          affectedArtifactId: boundary.affectedArtifactId,
+          affectedEffectIdempotencyKey: boundary.affectedEffectIdempotencyKey,
+          ownerUserId: identity.userId,
+          ownerChatId: identity.chatId,
+          answerText: normalized,
+          now,
+        });
+        if (answered.outcome === "answered") this.onWorkAvailable();
+        if (answered.outcome !== "rejected") return { updateSettled: true };
+      }
+    }
+    if (replyMessageId !== undefined) {
       const repliedJob = this.store.findJobByStatusMessageId(replyMessageId);
       if (repliedJob && this.canSteer(repliedJob, replyMessageId)) {
         this.steer(repliedJob, normalized, updateId, now);

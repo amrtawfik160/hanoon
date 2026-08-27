@@ -598,7 +598,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     expect(store.getOwner()).toMatchObject({ userId: "7", chatId: "70" });
 
     store.upsertProjectPolicy(policy, ++time);
-    await ingress.handleClaimed({ update_id: 2, message: privateMessage("Implement the bounded Telegram task") } as TelegramUpdate, ++time);
+    await ingress.handleClaimed({ update_id: 2, message: privateMessage("Implement the bounded Telegram task, but do not deploy it") } as TelegramUpdate, ++time);
     const controller = store.getControllerForOwner("7", "70");
     if (!controller) throw new Error("task did not create a controller mapping");
     const controllerLease = store.acquireExecutorLease("controller-setup", ++time, 1_000_000);
@@ -651,7 +651,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     let job = store.createConfirmedControllerJob({
       controllerThreadId: "thr_controller",
       projectId: "proj_1",
-      task: "Implement the bounded Telegram task",
+      task: "Implement the bounded Telegram task, but do not deploy it",
       now: ++time,
     });
     const status = await telegram.sendMessage("70", { text: "Job started." });
