@@ -979,11 +979,13 @@ it("atomically creates one queued controller job with one confirmed admission", 
     state: "awaiting_confirmation",
     projectId: "proj_1",
     policyVersion: 1,
-    taskRecipe: "bug",
+    workflowEngine: "navigator-v1",
+    workflowMode: "deterministic",
+    routingMode: "legacy",
     recipeVersion: 1,
     recipePromotionCount: 0,
-    routingMode: "shadow",
   });
+  expect(job.taskRecipe).not.toBe("bug");
   expect(store.getAdmission(job.id)).toMatchObject({
     projectId: "proj_1",
     state: "queued",
@@ -1011,9 +1013,10 @@ it("does not let an explicit legacy small-fix hint downgrade behavioral work", (
   });
   expect(job).toMatchObject({
     deliveryMode: "full",
-    taskRecipe: "bounded",
-    routingMode: "shadow",
+    workflowEngine: "navigator-v1",
+    routingMode: "legacy",
   });
+  expect(job.taskRecipe).not.toBe("bounded");
 });
 
 it("creates an adopted-PR job with honest skipped planning stages", () => {
@@ -1033,13 +1036,14 @@ it("creates an adopted-PR job with honest skipped planning stages", () => {
   expect(job).toMatchObject({
     state: "awaiting_confirmation",
     origin: "adopted_pr",
-    taskRecipe: "adopted-pr",
-    routingMode: "shadow",
+    workflowEngine: "navigator-v1",
+    routingMode: "legacy",
     adoptedBranch: "telegram-agent/adopt-pr-17-aaaaaaaaaaaa",
     adoptedHeadSha: headSha,
     prNumber: 17,
     prHeadSha: headSha,
   });
+  expect(job.taskRecipe).not.toBe("adopted-pr");
   expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
     state: "skipped",
     outcome: { disposition: "skipped", reason: "existing_pull_request" },

@@ -416,10 +416,12 @@ function selectedWorkerTraits(
 ): string[] {
   const traits = new Set<string>(job.taskTraits.map((entry) => entry.id));
   for (const trait of extraTraits) traits.add(trait);
-  if (["bounded", "bug", "architectural", "skill-authoring"].includes(job.taskRecipe)) {
-    traits.add("behavioral-change");
+  if (job.workflowEngine === "recipe-v1") {
+    if (["bounded", "bug", "architectural", "skill-authoring"].includes(job.taskRecipe)) {
+      traits.add("behavioral-change");
+    }
+    if (job.taskRecipe === "bug") traits.add("unexpected-behavior");
   }
-  if (job.taskRecipe === "bug") traits.add("unexpected-behavior");
   if (role === "planner" && stage === "planning") traits.add("approved-spec");
   if (role === "critic" || role === "review" || role === "final-review" || role === "documentation") {
     traits.add("strict-json");
@@ -762,9 +764,11 @@ export class EffectRunner {
       engine: job.workflowEngine,
     });
     const pipelineRole = role === "planner" || role === "critic" || role === "documentation";
-    const risk = job.taskRecipe === "architectural" || job.taskTraits.some((trait) => trait.id === "high-risk")
-      ? "high" as const
-      : job.taskRecipe === "direct" ? "low" as const : "medium" as const;
+    const risk = job.workflowEngine === "navigator-v1"
+      ? job.taskTraits.some((trait) => trait.id === "high-risk") ? "high" as const : "medium" as const
+      : job.taskRecipe === "architectural" || job.taskTraits.some((trait) => trait.id === "high-risk")
+        ? "high" as const
+        : job.taskRecipe === "direct" ? "low" as const : "medium" as const;
     const assignments = selected.assignments.map((assignment) => ({
       capabilityId: assignment.capabilityId,
       descriptorDigest: assignment.descriptorDigest,
@@ -1358,9 +1362,11 @@ export class EffectRunner {
   private async spawnReview(effect: StoredEffect, job: Job): Promise<void> {
     if (job.state !== "reviewing") return;
     const capabilityTraits = await this.reviewCapabilityTraits(effect, job);
-    const lenses = job.routingMode === "active"
-      ? job.taskRecipe === "direct" ? ["quality" as const] : ["quality" as const, "risk" as const]
-      : isSmallFixJob(job) ? ["quality" as const] : ["quality" as const, "risk" as const];
+    const lenses = job.workflowEngine === "navigator-v1"
+      ? ["quality" as const, "risk" as const]
+      : job.routingMode === "active"
+        ? job.taskRecipe === "direct" ? ["quality" as const] : ["quality" as const, "risk" as const]
+        : isSmallFixJob(job) ? ["quality" as const] : ["quality" as const, "risk" as const];
     const nativeAdapter = this.prepareNativeAdapter(effect, job, "review-created", lenses.length);
     const qualityAttemptId = `attempt:${effect.idempotencyKey}`;
     const ordinal = this.dependencies.store.getAttempt(qualityAttemptId)?.ordinal ??
@@ -1408,9 +1414,11 @@ export class EffectRunner {
   private async spawnFinalReview(effect: StoredEffect, job: Job): Promise<void> {
     if (job.state !== "final_reviewing") return;
     const capabilityTraits = await this.reviewCapabilityTraits(effect, job);
-    const lenses = job.routingMode === "active"
-      ? job.taskRecipe === "direct" ? ["quality" as const] : ["quality" as const, "risk" as const]
-      : isSmallFixJob(job) ? ["quality" as const] : ["quality" as const, "risk" as const];
+    const lenses = job.workflowEngine === "navigator-v1"
+      ? ["quality" as const, "risk" as const]
+      : job.routingMode === "active"
+        ? job.taskRecipe === "direct" ? ["quality" as const] : ["quality" as const, "risk" as const]
+        : isSmallFixJob(job) ? ["quality" as const] : ["quality" as const, "risk" as const];
     const nativeAdapter = this.prepareNativeAdapter(effect, job, "review-created", lenses.length);
     const qualityAttemptId = `attempt:${effect.idempotencyKey}`;
     const ordinal = this.dependencies.store.getAttempt(qualityAttemptId)?.ordinal ??

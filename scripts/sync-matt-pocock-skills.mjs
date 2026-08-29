@@ -490,8 +490,7 @@ function syncBundle(syncRequest, sourceMetadata) {
 
 function main() {
   if (process.argv[2] === "--rebuild-lock") {
-    writeFileSync(lockDestination, buildLock(join(pluginRoot, MATT_POCOCK_ROOT)));
-    return;
+    fail("lock rebuild is only allowed through the reviewed-source maintainer sync");
   }
   const syncRequest = readArguments(process.argv.slice(2));
   const sourceMetadata = validatedSource(syncRequest);

@@ -110,8 +110,8 @@ The capability control plane sits before provider work and reuses the delivery s
 
 ```mermaid
 flowchart LR
-    Request --> Classifier[Traits + six recipes]
-    Classifier --> JobSnapshot[Recipe + legacy/shadow/active mode]
+    Request --> Navigator[Navigator-v1 deterministic]
+    Navigator --> JobSnapshot[Job snapshot]
     JobSnapshot --> Profile[Immutable least-capability profile]
     Profile --> Route[Exact model tuple]
     Route --> Provider[BB provider boundary]
@@ -120,9 +120,9 @@ flowchart LR
     Gate --> Transition[Authoritative job transition]
 ```
 
-The pinned catalog validates every admitted skill, controller bundle, native adapter, model-pool marker, and recipe descriptor by digest and dependency graph. Profiles bind the catalog and graph digests, recipe/version, routing mode, exact model tuple, selected assignments, traits, and reason codes to one controller turn or worker attempt. A profile is written before its provider call. Selected mandatory capabilities receive exactly one terminal outcome before their stage may advance; native-adapter outcomes commit in the same SQLite transaction as the transition they authorize.
+The pinned catalog validates every admitted skill, controller bundle, native adapter, model-pool marker, and leftover recipe descriptor by digest and dependency graph. Profiles bind the catalog and graph digests, leftover recipe/version when present, routing mode, exact model tuple, selected assignments, traits, and reason codes to one controller turn or worker attempt. A profile is written before its provider call. Selected mandatory capabilities receive exactly one terminal outcome before their stage may advance; native-adapter outcomes commit in the same SQLite transaction as the transition they authorize.
 
-The six recipes are `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, and `architectural`. Their graphs express direct diff guards, approved-design implementation, diagnosis plus regression, skill baseline proof, adopted-pull-request inspection, and plan/critique plus task and integrated review respectively. Later evidence can raise rigor at most twice, never downgrade it, and the persisted job snapshot survives retry and restart.
+Leftover recipe-v1 still names six recipes: `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, and `architectural`. Those graphs remain readable for historical jobs. New work does not enter them.
 
 Active model routing pins provider, model, reasoning, and service tier before spawn. One equivalent provider failure retries the same tuple; a second escalates only the next provider call from `fast` to `standard` to `strong`. It never switches within an attempt or downgrades after restart. A second equivalent failure at `strong` blocks. Permission remains a separate policy field.
 
@@ -180,7 +180,7 @@ MATT_SKILLS_REVISION=6654f6b60cd9d5be8b54c6fafe44346dabeb3b76
 npm run skills:sync -- --source "$MATT_SKILLS_SOURCE" --revision "$MATT_SKILLS_REVISION"
 ```
 
-The command verifies source identity, package and plugin metadata, the MIT license, the exact promoted manifest, invocation frontmatter, OpenAI metadata, tree bounds, and cleanliness. It stages the complete promoted subtrees and atomically replaces only `skills/matt-pocock` and `skills/skills.lock.json`.
+The command verifies source identity, package and plugin metadata, the MIT license, the exact promoted manifest, invocation frontmatter, OpenAI metadata, tree bounds, and cleanliness. It stages the complete promoted subtrees and atomically replaces only `skills/matt-pocock` and `skills/skills.lock.json`. `--rebuild-lock` is refused, so the lock cannot be rebuilt from the vendored tree outside that gate.
 
 ## BB threads and worktrees
 

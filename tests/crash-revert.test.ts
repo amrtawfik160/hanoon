@@ -223,8 +223,10 @@ it("starts one revert job through the ordinary pipeline", () => {
     projectId: PROJECT,
     state: "awaiting_confirmation",
     autonomousOrigin: "crash_revert",
-    taskRecipe: "bug",
+    workflowEngine: "navigator-v1",
+    routingMode: "legacy",
   });
+  expect(job?.taskRecipe).not.toBe("bug");
   expect(job?.requestText).toContain(MERGE_SHA);
   // Queued for the executor like everything else, never pushed out of band.
   expect(store.getAdmission(outcome.jobId)?.state).toBe("queued");

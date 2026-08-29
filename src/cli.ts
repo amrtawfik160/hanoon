@@ -398,12 +398,20 @@ function safeJob(store: TelegramAgentStore, job: Job, now: number): JsonRecord {
   return {
     id: job.id,
     state: job.state,
-    recipe: {
-      id: job.taskRecipe,
-      version: job.recipeVersion,
-      promotionCount: job.recipePromotionCount,
-      routingMode: job.routingMode,
+    workflow: {
+      engine: job.workflowEngine,
+      mode: job.workflowMode,
     },
+    ...(job.workflowEngine === "recipe-v1"
+      ? {
+          recipe: {
+            id: job.taskRecipe,
+            version: job.recipeVersion,
+            promotionCount: job.recipePromotionCount,
+            routingMode: job.routingMode,
+          },
+        }
+      : {}),
     projectId: job.projectId,
     origin: job.origin,
     autonomousOrigin: job.autonomousOrigin,

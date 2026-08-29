@@ -392,7 +392,11 @@ describe("new-attempt kill switches", () => {
       task: "Change the README copy",
       now,
     });
-    expect(firstJob).toMatchObject({ taskRecipe: "direct", routingMode: "shadow" });
+    expect(firstJob).toMatchObject({
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
+    });
+    expect(firstJob.taskRecipe).not.toBe("direct");
     finish(first.turn.id);
 
     store.appendRecipeRolloutDecision({
@@ -430,8 +434,11 @@ describe("new-attempt kill switches", () => {
       task: "Change the README copy",
       now,
     });
-    expect(secondJob.routingMode).toBe("active");
-    expect(store.getJob(firstJob.id)?.routingMode).toBe("shadow");
+    expect(secondJob).toMatchObject({
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
+    });
+    expect(store.getJob(firstJob.id)?.routingMode).toBe("legacy");
     expect(controllerBundleIdsFromProfile(store.getCapabilityProfileById(first.profile.id)!)).toEqual(["core-observation"]);
     expect(store.getCapabilityProfileById(first.profile.id)?.model.pool).toBe("standard");
     expect(store.listCapabilityReceipts(first.profile.id, 100)).toEqual(firstReceipts);
@@ -451,8 +458,11 @@ describe("new-attempt kill switches", () => {
       task: "Change the README copy",
       now,
     });
-    expect(thirdJob.routingMode).toBe("shadow");
-    expect(store.getJob(secondJob.id)?.routingMode).toBe("active");
+    expect(thirdJob).toMatchObject({
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
+    });
+    expect(store.getJob(secondJob.id)?.routingMode).toBe("legacy");
     finish(third.turn.id);
 
     parsed = parseGlobalConfig({
@@ -471,8 +481,11 @@ describe("new-attempt kill switches", () => {
       task: "Change the README copy",
       now,
     });
-    expect(fourthJob.routingMode).toBe("legacy");
-    expect(store.getJob(thirdJob.id)?.routingMode).toBe("shadow");
+    expect(fourthJob).toMatchObject({
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
+    });
+    expect(store.getJob(thirdJob.id)?.routingMode).toBe("legacy");
     finish(fourth.turn.id);
     expect(store.releaseExecutorLease("switch-test", lease.generation, now)).toBe(true);
   });

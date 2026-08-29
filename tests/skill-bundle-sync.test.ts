@@ -33,20 +33,19 @@ function rebuildLock(root: string) {
   });
 }
 
-test("rebuild-lock is idempotent against the committed contracted lock", () => {
+test("rebuild-lock cannot rebuild the lock outside the reviewed-source maintainer gate", () => {
   const root = fixtureRoot();
-  const before = readFileSync(join(repositoryRoot, "skills/skills.lock.json"), "utf8");
+  const before = readFileSync(join(root, "skills/skills.lock.json"), "utf8");
 
   const result = rebuildLock(root);
 
-  expect(result.status, result.stderr).toBe(0);
+  expect(result.status, `${result.stdout}${result.stderr}`).not.toBe(0);
+  expect(`${result.stderr}${result.stdout}`).toMatch(/reviewed-source maintainer sync/u);
   expect(readFileSync(join(root, "skills/skills.lock.json"), "utf8")).toBe(before);
 });
 
-test("rebuild-lock writes 35 admitted skills with no leftover kits", () => {
-  const root = fixtureRoot();
-  const result = rebuildLock(root);
-  const lock = JSON.parse(readFileSync(join(root, "skills/skills.lock.json"), "utf8")) as {
+test("committed lock still admits 35 skills with no leftover kits", () => {
+  const lock = JSON.parse(readFileSync(join(repositoryRoot, "skills/skills.lock.json"), "utf8")) as {
     skills: Array<{ id: string }>;
     legacySkills: unknown[];
     shadowedSkills: unknown[];
@@ -54,7 +53,6 @@ test("rebuild-lock writes 35 admitted skills with no leftover kits", () => {
     discoveryKit?: unknown;
   };
 
-  expect(result.status, result.stderr).toBe(0);
   expect(lock.skills).toHaveLength(35);
   expect(lock.legacySkills).toEqual([]);
   expect(lock.shadowedSkills).toEqual([]);

@@ -1,10 +1,11 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import plugin from "../server";
-import { HISTORICAL_ROLE_SKILLS, ROLE_SKILLS } from "../src/agent-skills/role-resolver";
+import { ROLE_SKILLS } from "../src/agent-skills/role-resolver";
 import { CONTROLLER_DEFAULT_SKILLS } from "../src/capabilities/controller-bundles";
 import {
   HISTORICAL_RECIPE_GRAPH_DIGEST,
@@ -12,10 +13,13 @@ import {
 } from "../src/capabilities/catalog";
 import { nativeAdapterRequirementForEvent } from "../src/capabilities/native-adapters";
 import { hashSecret } from "../src/crypto";
+import { classifyTaskTraits } from "../src/capabilities/routing";
+import { selectControllerCapabilityProfile } from "../src/capabilities/controller-bundles";
 import { DualEngineCoordinator, DualEngineContractionError } from "../src/navigator/coordinator";
 import { workflowIdentityForNewAdmission } from "../src/navigator/promotion";
+import { transition } from "../src/domain/state-machine";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
-import { jobFixture, policyFixture } from "./helpers";
+import { jobFixture, policyFixture, stateJob } from "./helpers";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
 const REPOSITORY_ROOT = new URL("..", import.meta.url).pathname;
@@ -126,6 +130,111 @@ describe("contracted new-work admission", () => {
       action: "rollback",
       reasonCode: "operator_requested",
     })).toEqual({ engine: "navigator-v1", mode: "deterministic" });
+  });
+
+  it("does not classify new controller jobs into a recipe or recipe-promotion routing mode", () => {
+    const { store, now } = openFixture();
+    const copyTask = "Change the README copy";
+    const migrateTask = "Migrate the public billing schema";
+    expect(classifyTaskTraits({ origin: "requested", text: copyTask }).recipe).toBe("direct");
+    expect(classifyTaskTraits({ origin: "requested", text: migrateTask }).recipe).toBe("architectural");
+    const copy = confirmControllerJob(store, { task: copyTask, updateId: 44_010, now: now() });
+    const finish = (turnId: string) => completeTurnThroughFinalization(store, {
+      ownerId: "executor",
+      generation: copy.leaseGeneration,
+      now: now(),
+    }, {
+      turnId,
+      controllerKey: "owner-7-controller",
+      responseText: "Queued the navigator effort.",
+    });
+    finish(copy.turnId);
+    const migrate = confirmControllerJob(store, {
+      task: migrateTask,
+      updateId: 44_011,
+      now: now(),
+      leaseGeneration: copy.leaseGeneration,
+    });
+    finish(migrate.turnId);
+    store.appendRecipeRolloutDecision({
+      recipe: "direct",
+      action: "promote",
+      reasonCode: "promotion_gates_passed",
+      evidenceDigest: "a".repeat(64),
+      now: now(),
+    });
+    const afterPromote = confirmControllerJob(store, {
+      task: copyTask,
+      updateId: 44_012,
+      now: now(),
+      leaseGeneration: copy.leaseGeneration,
+    });
+
+    expect(copy.job).toMatchObject({
+      workflowEngine: "navigator-v1",
+      workflowMode: "deterministic",
+      routingMode: "legacy",
+      taskTraits: [],
+      taskReasonCodes: [],
+    });
+    expect(copy.job.taskRecipe).not.toBe("direct");
+    expect(migrate.job).toMatchObject({
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
+      taskRecipe: copy.job.taskRecipe,
+      taskTraits: [],
+    });
+    expect(afterPromote.job).toMatchObject({
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
+      taskRecipe: copy.job.taskRecipe,
+    });
+    expect(store.getJob(copy.job.id)?.routingMode).toBe("legacy");
+  });
+
+  it("confirms navigator-v1 work without recipeExecutionPolicy", () => {
+    const { store, now } = openFixture();
+    const { job } = confirmControllerJob(store, {
+      task: "Migrate the public billing schema",
+      updateId: 44_013,
+      now: now(),
+    });
+    const result = transition(job, { type: "CONFIRMED" }, now());
+
+    expect(result.job.state).toBe("implementing");
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["render_status"]);
+    expect(result.effects.some((effect) =>
+      effect.kind === "spawn_plan" || effect.kind === "spawn_implementation",
+    )).toBe(false);
+  });
+
+  it("keeps leftover recipe-v1 confirmation on recipeExecutionPolicy", () => {
+    const leftover = stateJob("awaiting_confirmation", {
+      projectId: "proj_1",
+      policyVersion: 1,
+      policy: policyFixture(),
+      routingMode: "active",
+      taskRecipe: "architectural",
+      workflowEngine: "recipe-v1",
+      workflowMode: "live",
+    });
+    const result = transition(leftover, { type: "CONFIRMED" }, 10_000);
+
+    expect(result.job.state).toBe("planning");
+    expect(result.effects[0]).toMatchObject({
+      kind: "spawn_plan",
+      payload: { recipeId: "architectural", recipeVersion: 1 },
+    });
+  });
+
+  it("does not stamp controller profiles from classifyTaskTraits", () => {
+    const copy = selectControllerCapabilityProfile("Change the README copy");
+    const migrate = selectControllerCapabilityProfile("Migrate the public billing schema");
+
+    expect(copy.recipeId).toBe(migrate.recipeId);
+    expect(copy.traits).toEqual([]);
+    expect(migrate.traits).toEqual([]);
+    expect(copy.reasonCodes.every((code) => code.startsWith("controller_bundle:"))).toBe(true);
   });
 });
 
@@ -260,7 +369,7 @@ describe("historical recipe evidence after contraction", () => {
       .toBe("665deccc825d74de0d814e94a3799ea50aab2d18176ea6aacbc779651eebf64e");
   });
 
-  it("lets the dual-engine release restore the legacy bundle without rewriting navigator jobs", () => {
+  it("lets the dual-engine release restore the legacy bundle without rewriting navigator jobs", async () => {
     const { store, database, now } = openFixture();
     store.appendWorkflowEngineRolloutDecision({
       action: "promote",
@@ -276,14 +385,78 @@ describe("historical recipe evidence after contraction", () => {
     const coordinator = new DualEngineCoordinator({ store, database, now });
     coordinator.contractRecipeEngine();
     const beforeRestore = store.getJob(navigator.job.id);
-    const restored = spawnSync("git", [
-      "cat-file", "-e", `${DUAL_ENGINE_HEAD}:skills/workflow-kit/using-superpowers/SKILL.md`,
-    ], { cwd: REPOSITORY_ROOT, encoding: "utf8" });
+    if (!beforeRestore) throw new Error("navigator job disappeared after contraction");
 
-    expect(restored.status).toBe(0);
+    const scratch = mkdtempSync(join(tmpdir(), "dual-engine-rollback-"));
+    try {
+      const dbPath = join(scratch, "contracted.sqlite");
+      await database.backup(dbPath);
+      const kitRoot = join(scratch, "restored");
+      mkdirSync(kitRoot, { recursive: true });
+      const archived = spawnSync("git", ["archive", DUAL_ENGINE_HEAD, "skills/workflow-kit"], {
+        cwd: REPOSITORY_ROOT,
+        encoding: "buffer",
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      expect(archived.status, archived.stderr.toString("utf8")).toBe(0);
+      const extracted = spawnSync("tar", ["-x", "-C", kitRoot], { input: archived.stdout });
+      expect(extracted.status, extracted.stderr?.toString("utf8") ?? "").toBe(0);
+      const restoredSkill = join(kitRoot, "skills/workflow-kit/using-superpowers/SKILL.md");
+      expect(existsSync(restoredSkill)).toBe(true);
+      expect(readFileSync(restoredSkill, "utf8").length).toBeGreaterThan(0);
+
+      const persistence = spawnSync("git", ["show", `${DUAL_ENGINE_HEAD}:src/storage/job-persistence.ts`], {
+        cwd: REPOSITORY_ROOT,
+        encoding: "utf8",
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      expect(persistence.status, persistence.stderr).toBe(0);
+      const selectMatch = persistence.stdout.match(/(?:export )?const JOB_SELECT = `([^`]+)`/u);
+      if (!selectMatch) throw new Error("dual-engine job persistence reader is missing JOB_SELECT");
+      const readerPath = join(scratch, "read-contracted-job.mjs");
+      writeFileSync(readerPath, [
+        "import { createRequire } from \"node:module\";",
+        "const require = createRequire(process.cwd() + \"/\");",
+        "const Database = require(\"better-sqlite3\");",
+        `const select = ${JSON.stringify(`${selectMatch[1]} WHERE id = ?`)};`,
+        "const db = new Database(process.argv[2], { readonly: true, fileMustExist: true });",
+        "const row = db.prepare(select).get(process.argv[3]);",
+        "if (!row) throw new Error(\"dual-engine reader did not load the contracted job\");",
+        "process.stdout.write(JSON.stringify({",
+        "  reader: \"0fa9d232eef21ff33d34de86011ea3c8cddf6192\",",
+        "  id: row.id,",
+        "  workflowEngine: row.workflow_engine,",
+        "  workflowMode: row.workflow_mode,",
+        "  requestText: row.request_text,",
+        "}));",
+        "",
+      ].join("\n"));
+      const read = spawnSync(process.execPath, [readerPath, dbPath, navigator.job.id], {
+        cwd: REPOSITORY_ROOT,
+        encoding: "utf8",
+      });
+      expect(read.status, `${read.stdout}${read.stderr}`).toBe(0);
+      const dualEngineJob = JSON.parse(read.stdout) as {
+        reader: string;
+        id: string;
+        workflowEngine: string;
+        workflowMode: string;
+        requestText: string;
+      };
+      expect(dualEngineJob).toEqual({
+        reader: DUAL_ENGINE_HEAD,
+        id: beforeRestore.id,
+        workflowEngine: "navigator-v1",
+        workflowMode: "deterministic",
+        requestText: beforeRestore.requestText,
+      });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+
     expect(existsSync(join(REPOSITORY_ROOT, "skills/workflow-kit"))).toBe(false);
     expect(store.getJob(navigator.job.id)).toEqual(beforeRestore);
-    expect(beforeRestore?.workflowEngine).toBe("navigator-v1");
+    expect(beforeRestore.workflowEngine).toBe("navigator-v1");
   });
 });
 
@@ -312,7 +485,6 @@ describe("contracted new-work vocabulary", () => {
       "pr-writer",
     ]);
     expect(ROLE_SKILLS.planner).toEqual(["unslop", "writing-for-agents", "docs-guard"]);
-    expect(HISTORICAL_ROLE_SKILLS.planner).toEqual(["unslop", "writing-plans", "docs-guard"]);
     expect(CONTROLLER_DEFAULT_SKILLS).toEqual(["driving-bb", "unslop"]);
     expect(readFileSync(join(REPOSITORY_ROOT, "package.json"), "utf8")).not.toContain("skills/workflow-kit");
     expect(readFileSync(join(REPOSITORY_ROOT, "package.json"), "utf8")).not.toContain("skills/discovery");

@@ -28,7 +28,14 @@ import {
 } from "../src/services/effect-runner";
 import { settleEffectFailure } from "../src/services/job-executor-service";
 import { MergeHandler } from "../src/services/merge-handler";
+import { deriveTaskOutcome } from "../src/domain/task-authority";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import {
+  TaskAuthorityRepository,
+  taskArtifactGraphDigest,
+  taskAuthorityIdForJob,
+  taskPolicyDigest,
+} from "../src/storage/task-authority-repository";
 import { policyFixture } from "./helpers";
 
 type ActiveProviderFixture = Readonly<{
@@ -90,6 +97,91 @@ function providerAdapter(
     : { spawnImplementation: provider };
 }
 
+function admitLeftoverActiveRecipeJob(
+  store: TelegramAgentStore,
+  db: Database.Database,
+  input: Readonly<{
+    recipe: TaskRecipe;
+    task: string;
+    policy: ReturnType<typeof policyFixture>;
+    sourceUpdateId: number;
+    controllerKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>,
+): Job {
+  const job = store.createJob({
+    id: `job_leftover_${input.recipe}_${String(input.sourceUpdateId)}`,
+    sourceUpdateId: input.sourceUpdateId,
+    requestText: input.task,
+    now: input.now,
+  });
+  const outcome = deriveTaskOutcome(input.task);
+  const adopted = input.recipe === "adopted-pr";
+  const headSha = "a".repeat(40);
+  db.prepare(
+    `UPDATE jobs SET task_recipe = ?, routing_mode = 'active',
+       task_outcome = ?, task_constraints_json = ?,
+       job_origin = ?, adopted_branch = ?, adopted_head_sha = ?,
+       pr_number = ?, pr_url = ?, pr_head_sha = ?
+     WHERE id = ?`,
+  ).run(
+    input.recipe,
+    outcome.outcome,
+    JSON.stringify(outcome.constraints),
+    adopted ? "adopted_pr" : "requested",
+    adopted ? "telegram-agent/adopt-pr-17-aaaaaaaaaaaa" : null,
+    adopted ? headSha : null,
+    adopted ? 17 : null,
+    adopted ? `https://github.com/${input.policy.githubRepository}/pull/17` : null,
+    adopted ? headSha : null,
+    job.id,
+  );
+  const selected = store.applyJobEvent(job.id, store.getJob(job.id)!.version, {
+    type: "PROJECT_SELECTED",
+    projectId: input.policy.projectId,
+    policyVersion: 1,
+    policy: input.policy,
+  }, input.now);
+  new TaskAuthorityRepository(db).create({
+    authorityId: taskAuthorityIdForJob(selected.id),
+    jobId: selected.id,
+    ownerUserId: "7",
+    ownerChatId: "70",
+    controllerKey: input.controllerKey,
+    sourceUpdateId: input.sourceUpdateId,
+    requestDigest: outcome.requestDigest,
+    projectId: input.policy.projectId,
+    outcome: outcome.outcome,
+    scopeDigest: outcome.scopeDigest,
+    constraints: outcome.constraints,
+    policyVersion: 1,
+    policyDigest: taskPolicyDigest(JSON.stringify(input.policy)),
+    artifactGraphDigest: taskArtifactGraphDigest([]),
+    now: input.now,
+  });
+  store.queueAdmission({
+    jobId: selected.id,
+    expectedVersion: selected.version,
+    projectId: input.policy.projectId,
+    resumeEvent: "CONFIRMED",
+    now: input.now,
+  });
+  const admitted = store.tryAdmit({
+    jobId: selected.id,
+    maxConcurrentJobs: 8,
+    ownerId: input.ownerId,
+    generation: input.generation,
+    now: input.now,
+    leaseMs: 120_000,
+  });
+  if (admitted.outcome !== "admitted") throw new Error(`job admission failed: ${admitted.reason}`);
+  const leftover = store.getJob(selected.id);
+  if (!leftover) throw new Error("leftover recipe job disappeared after admission");
+  return leftover;
+}
+
 function activeProviderFixture(recipe: TaskRecipe): ActiveProviderFixture {
   const { bb } = createFakePluginHost({ pluginId: `capability-pipeline-e2e-${recipe}-${fixtureId++}` });
   const db = bb.storage.database();
@@ -134,36 +226,24 @@ function activeProviderFixture(recipe: TaskRecipe): ActiveProviderFixture {
   })).toBe(true);
   const submitted = store.getControllerTurn(turn.id);
   if (!submitted?.capabilityProfileId) throw new Error("controller profile was not persisted before job creation");
-  const selected = recipe === "adopted-pr"
-    ? store.createAdoptedControllerJob({
-        controllerThreadId: "thr_controller",
-        projectId: policy.projectId,
-        task: RECIPE_TASK[recipe],
-        prNumber: 17,
-        prUrl: `https://github.com/${policy.githubRepository}/pull/17`,
-        headSha: "a".repeat(40),
-        branchName: "telegram-agent/adopt-pr-17-aaaaaaaaaaaa",
-        now: 605,
-      })
-    : store.createConfirmedControllerJob({
-        controllerThreadId: "thr_controller",
-        projectId: policy.projectId,
-        task: RECIPE_TASK[recipe],
-        now: 605,
-      });
-  expect(selected).toMatchObject({ taskRecipe: recipe, routingMode: "active" });
-  const admitted = store.tryAdmit({
-    jobId: selected.id,
-    maxConcurrentJobs: 8,
+  const selected = admitLeftoverActiveRecipeJob(store, db, {
+    recipe,
+    task: RECIPE_TASK[recipe],
+    policy,
+    sourceUpdateId: turn.updateId,
+    controllerKey: turn.controllerKey,
     ownerId,
     generation: lease.generation,
-    now: 606,
-    leaseMs: 120_000,
+    now: 605,
   });
-  if (admitted.outcome !== "admitted") throw new Error(`job admission failed: ${admitted.reason}`);
+  expect(selected).toMatchObject({
+    taskRecipe: recipe,
+    routingMode: "active",
+    workflowEngine: "recipe-v1",
+  });
   const effectKind = recipe === "architectural" ? "spawn_plan" : "spawn_implementation";
   const effect = store.listEffectsForJob(selected.id).find((candidate) => candidate.kind === effectKind);
-  if (!effect) throw new Error(`${effectKind} effect was not created by controller job routing`);
+  if (!effect) throw new Error(`${effectKind} effect was not created by leftover recipe-v1 routing`);
   return {
     bb,
     db,
@@ -455,12 +535,14 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
       state: "creating_implementation",
       routingMode: "active",
       taskRecipe: "direct",
+      workflowEngine: "recipe-v1",
     });
     expect(shadowJob).toMatchObject({
       state: "awaiting_confirmation",
-      routingMode: "shadow",
-      taskRecipe: "direct",
+      workflowEngine: "navigator-v1",
+      routingMode: "legacy",
     });
+    expect(shadowJob.taskRecipe).not.toBe("direct");
     expect(fixture.store.listRecipeRolloutDecisions("direct", 10).map((decision) => decision.action))
       .toEqual(["promote", "rollback"]);
   });

@@ -78,46 +78,6 @@ export const ROLE_SKILLS = {
   ],
 } as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
 
-export const HISTORICAL_ROLE_SKILLS = {
-  planner: [COMMUNICATION_SKILL_ID, "writing-plans", "docs-guard"],
-  critic: [COMMUNICATION_SKILL_ID],
-  implementation: [
-    COMMUNICATION_SKILL_ID,
-    "systematic-debugging",
-    "test-driven-development",
-    "verification-before-completion",
-    "clean-code-guard",
-    "test-guard",
-    "durable-boundary-audit",
-    "pr-writer",
-  ],
-  review: [
-    COMMUNICATION_SKILL_ID,
-    "clean-code-guard",
-    "test-guard",
-    "durable-boundary-audit",
-    "blast-radius",
-  ],
-  documentation: [
-    COMMUNICATION_SKILL_ID,
-    TECHNICAL_WRITING_SKILL_ID,
-    "docs-guard",
-    "verification-before-completion",
-  ],
-  "final-review": [
-    COMMUNICATION_SKILL_ID,
-    "clean-code-guard",
-    "test-guard",
-    "docs-guard",
-    "durable-boundary-audit",
-    "blast-radius",
-  ],
-} as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
-
-export function roleSkillsForEngine(_engine?: WorkflowEngine): Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>> {
-  return ROLE_SKILLS;
-}
-
 export type WorkerTitleIdentity = Readonly<{
   jobId: string;
   attemptId: string;
@@ -207,13 +167,13 @@ function verifiedWorkerInstructions(
 }
 
 export function buildWorkerInstructions(
-  profile: Readonly<Pick<WorkerSkillProfile, "role"> & { workflowEngine?: WorkflowEngine }>,
+  profile: Readonly<Pick<WorkerSkillProfile, "role">>,
 ): string {
-  return verifiedWorkerInstructions(profile.role, roleSkillsForEngine(profile.workflowEngine)[profile.role]);
+  return verifiedWorkerInstructions(profile.role, ROLE_SKILLS[profile.role]);
 }
 
 function exactPersistedSkills(identity: DurableWorkerIdentity): readonly BundledSkillId[] | null {
-  if (identity.routingMode !== "active") return roleSkillsForEngine(identity.workflowEngine)[identity.role];
+  if (identity.routingMode !== "active") return ROLE_SKILLS[identity.role];
   const profile = identity.persistedSkillProfile;
   if (!profile || !/^[A-Za-z0-9_.:-]{1,256}$/u.test(profile.profileId) ||
     !Number.isSafeInteger(profile.profileRevision) || profile.profileRevision < 1) return null;
@@ -256,7 +216,6 @@ export function resolveWorkerSkillProfile(input: Readonly<{
       ? verifiedWorkerInstructions(titleIdentity.role, skills)
       : buildWorkerInstructions({
         role: titleIdentity.role,
-        workflowEngine: durableIdentity.workflowEngine,
       }),
   };
 }

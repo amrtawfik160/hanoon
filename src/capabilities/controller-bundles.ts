@@ -2,7 +2,6 @@ import type {
   CapabilityModelSelection,
   CapabilityProfile,
 } from "../storage/capability-repository";
-import { classifyTaskTraits } from "./routing";
 import {
   CAPABILITY_BY_ID,
   CAPABILITY_GRAPH_DIGEST,
@@ -255,22 +254,21 @@ export function selectControllerCapabilityProfile(
   const selected = new Set<ControllerToolBundleId>(requestedBundleIds);
   selected.add("core-observation");
   const bundleIds = orderedBundles(selected);
-  const classification = classifyTaskTraits({ origin: "requested", text });
   const skills = controllerSkillsForTurn(text);
   return {
-    recipeId: classification.recipe,
+    recipeId: "architectural",
     recipeVersion: 1,
     registryDigest: CAPABILITY_REGISTRY_DIGEST,
     graphDigest: CAPABILITY_GRAPH_DIGEST,
     mode: "active",
     model: modelRouteSchema.parse(model),
-    reasonCodes: [...classification.reasonCodes, ...bundleIds.map((id) => `controller_bundle:${id}`)]
+    reasonCodes: bundleIds.map((id) => `controller_bundle:${id}`)
       .sort((left, right) => left.localeCompare(right)),
-    traits: classification.traits.map((entry) => entry.id),
+    traits: [],
     bundleIds,
     skills,
     assignments: profileAssignments({
-      recipeId: classification.recipe,
+      recipeId: "architectural",
       modelPool: model.pool,
       bundleIds,
       skills,

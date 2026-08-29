@@ -55,7 +55,6 @@ import {
   type OwnerBoundaryRecord,
 } from "./owner-boundary-repository";
 import type { OwnerBoundaryDraft } from "../domain/owner-boundary";
-import { classifyTaskTraits } from "../capabilities/routing";
 import { INTAKE_SUPPRESSION_MS } from "../autonomy/audit-intake";
 import {
   controllerBundleIdsFromProfile,
@@ -68,7 +67,6 @@ import {
 } from "../capabilities/controller-bundles";
 import type { ModelRoute } from "../capabilities/models";
 import {
-  routingModeForNewAttempt,
   type AppendRecipeRolloutDecisionInput,
   type CapabilityJobGraphMode,
   type RecipeRolloutDecision,
@@ -6238,6 +6236,21 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     );
   }
 
+  /** Leftover recipe-v1 columns for contracted new work. They never control routing, skill, model, or stage. */
+  private leftoverNewWorkAdmission(): Readonly<{
+    leftoverRecipe: "architectural";
+    routingMode: "legacy";
+    traitsJson: "[]";
+    reasonCodesJson: "[]";
+  }> {
+    return {
+      leftoverRecipe: "architectural",
+      routingMode: "legacy",
+      traitsJson: "[]",
+      reasonCodesJson: "[]",
+    };
+  }
+
   public getActiveCapabilityProfile(
     subjectKind: CapabilitySubjectKind,
     subjectId: string,
@@ -11990,14 +12003,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .update(`controller-job:${turn.controller_key}:${turn.telegram_update_id}`, "utf8")
         .digest("base64url")
         .slice(0, 22);
-      const routing = classifyTaskTraits({ origin: "requested", text: input.task });
+      const leftover = this.leftoverNewWorkAdmission();
       const deliveryMode = "full";
-      const dispatchSettings = this.capabilityDispatchSettings();
-      const routingMode = routingModeForNewAttempt(
-        routing.recipe,
-        dispatchSettings.jobGraph,
-        this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
-      );
       const workflowIdentity = this.admissionWorkflowIdentity();
       this.db.prepare(
         `INSERT INTO jobs (
@@ -12011,12 +12018,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         turn.telegram_update_id,
         input.task,
         deliveryMode,
-        routing.recipe,
-        routingMode,
+        leftover.leftoverRecipe,
+        leftover.routingMode,
         workflowIdentity.engine,
         workflowIdentity.mode,
-        JSON.stringify(routing.traits),
-        JSON.stringify(routing.reasonCodes),
+        leftover.traitsJson,
+        leftover.reasonCodesJson,
         taskOutcome.outcome,
         JSON.stringify(taskOutcome.constraints),
         input.now,
@@ -12119,13 +12126,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .update(`controller-adopted-job:${turn.controller_key}:${turn.telegram_update_id}`, "utf8")
         .digest("base64url")
         .slice(0, 22);
-      const routing = classifyTaskTraits({ origin: "adopted_pr", text: input.task });
-      const dispatchSettings = this.capabilityDispatchSettings();
-      const routingMode = routingModeForNewAttempt(
-        routing.recipe,
-        dispatchSettings.jobGraph,
-        this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
-      );
+      const leftover = this.leftoverNewWorkAdmission();
       const workflowIdentity = this.admissionWorkflowIdentity();
       this.db.prepare(
         `INSERT INTO jobs (
@@ -12146,12 +12147,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.prNumber,
         safeUrl,
         input.headSha,
-        routing.recipe,
-        routingMode,
+        leftover.leftoverRecipe,
+        leftover.routingMode,
         workflowIdentity.engine,
         workflowIdentity.mode,
-        JSON.stringify(routing.traits),
-        JSON.stringify(routing.reasonCodes),
+        leftover.traitsJson,
+        leftover.reasonCodesJson,
         taskOutcome.outcome,
         JSON.stringify(taskOutcome.constraints),
         input.now,
@@ -12317,17 +12318,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .update(`autonomous-job:${input.origin}:${sourceUpdateId}`, "utf8")
         .digest("base64url")
         .slice(0, 22);
-      const routing = classifyTaskTraits({
-        origin: "requested",
-        text: input.task,
-        ...(input.minimumRecipe === undefined ? {} : { ownerMinimumRecipe: input.minimumRecipe }),
-      });
-      const dispatchSettings = this.capabilityDispatchSettings();
-      const routingMode = routingModeForNewAttempt(
-        routing.recipe,
-        dispatchSettings.jobGraph,
-        this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
-      );
+      const leftover = this.leftoverNewWorkAdmission();
       const workflowIdentity = this.admissionWorkflowIdentity();
       this.db.prepare(
         `INSERT INTO jobs (
@@ -12341,12 +12332,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         sourceUpdateId,
         input.task,
         "full",
-        routing.recipe,
-        routingMode,
+        leftover.leftoverRecipe,
+        leftover.routingMode,
         workflowIdentity.engine,
         workflowIdentity.mode,
-        JSON.stringify(routing.traits),
-        JSON.stringify(routing.reasonCodes),
+        leftover.traitsJson,
+        leftover.reasonCodesJson,
         input.origin,
         input.now,
         input.now,

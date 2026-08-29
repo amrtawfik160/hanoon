@@ -1075,6 +1075,29 @@ it("projects bounded admission and resource facts without lease ownership detail
   expect(listed.stdout).toContain(`${draft.id}\tplanning\tadmitted\tproj_1`);
 });
 
+it("hides leftover recipe fields on job show for navigator jobs", async () => {
+  const { harness, store } = await loadPlugin();
+  const draft = store.createJob({
+    id: "job_navigator_show",
+    sourceUpdateId: 42,
+    requestText: "private navigator task",
+    workflow: { engine: "navigator-v1", mode: "deterministic" },
+    now: 1,
+  });
+
+  const shown = await harness.behavior.runCli(["job", "show", draft.id, "--json"]);
+
+  expect(shown.exitCode).toBe(0);
+  const projection = parseJson(shown.stdout);
+  expect(projection.recipe).toBeUndefined();
+  expect(projection).toMatchObject({
+    id: draft.id,
+    workflow: { engine: "navigator-v1", mode: "deterministic" },
+  });
+  expect(JSON.stringify(projection)).not.toMatch(/"recipe"/u);
+  expect(JSON.stringify(projection)).not.toContain("private navigator task");
+});
+
 it("cancels through the CLI with an active worker and queues its stop effect", async () => {
   const { harness, store } = await loadPlugin();
   const active = store.createJob({ id: "job_cancel_worker", sourceUpdateId: 3, requestText: "cancel worker", now: 3 });

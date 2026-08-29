@@ -240,9 +240,12 @@ it("files a diagnosed failure against the same allowance the audit spends", () =
   expect(filed).toMatchObject({ origin: "self_diagnosis" });
   if ("refused" in filed) throw new Error("the diagnosis should have been filed");
 
-  expect(store.getJob(filed.jobId)).toMatchObject({ autonomousOrigin: "self_diagnosis" });
-  // A diagnosis is a guess about a failure, so it takes the bug route.
-  expect(store.getJob(filed.jobId)?.taskRecipe).toBe("bug");
+  expect(store.getJob(filed.jobId)).toMatchObject({
+    autonomousOrigin: "self_diagnosis",
+    workflowEngine: "navigator-v1",
+    routingMode: "legacy",
+  });
+  expect(store.getJob(filed.jobId)?.taskRecipe).not.toBe("bug");
   expect(enqueueControllerTurn.mock.calls[0]?.[0]).toMatchObject({ origin: "system" });
 
   // The allowance was one job a day, and the diagnosis just spent it.
