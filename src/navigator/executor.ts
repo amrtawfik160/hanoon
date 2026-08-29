@@ -9,6 +9,11 @@ import type {
   NavigatorSnapshot,
 } from "./models";
 import { NAVIGATOR_RESEARCH_STEP_CONTRACT } from "./models";
+import {
+  NavigatorPublicationDriftError,
+  type NavigatorPlanningPublication,
+} from "./planning-publisher";
+import { navigatorStepContract } from "./planning-contracts";
 
 export interface WorkflowNavigator {
   propose(snapshot: NavigatorSnapshot): Promise<unknown>;
@@ -38,6 +43,13 @@ export type NavigatorWorkflowExecutorDependencies = Readonly<{
   navigator: WorkflowNavigator;
   observeInference(snapshot: NavigatorSnapshot): Promise<NavigatorInferenceObservation>;
   skillRunner: NavigatorSkillRunner;
+  planningPublisher?: Readonly<{
+    publish(
+      attempt: NavigatorSkillAttempt,
+      result: unknown,
+      fence: Readonly<{ ownerId: string; generation: number; now: number }>,
+    ): Promise<NavigatorPlanningPublication>;
+  }>;
   modelRoute(): ModelRoute;
   clock: { now(): number };
   leaseMs?: number;
@@ -114,9 +126,10 @@ export class NavigatorWorkflowExecutor {
         reject(runSignal.reason ?? new Error("navigator skill run was aborted"));
       }, { once: true });
     });
+    const contract = navigatorStepContract(attempt.skillId) ?? NAVIGATOR_RESEARCH_STEP_CONTRACT;
     const timeout = setTimeout(() => {
       timeoutAbort.abort(new Error("navigator skill step timed out"));
-    }, NAVIGATOR_RESEARCH_STEP_CONTRACT.timeoutMs);
+    }, contract.timeoutMs);
     const renewal = setInterval(() => {
       try {
         const renewed = this.dependencies.store.renewJobOperationFences({
@@ -148,10 +161,17 @@ export class NavigatorWorkflowExecutor {
           if (!bound) throw new Error("navigator skill resource fence was lost");
         },
       };
-      const skillRun = await Promise.race([
-        this.dependencies.skillRunner.run(attempt, hooks, runSignal),
-        interruption,
-      ]);
+      const persistedResult = this.dependencies.store.getNavigatorPlanningResult(attempt.id);
+      const skillRun = persistedResult === null
+        ? await Promise.race([
+          this.dependencies.skillRunner.run(attempt, hooks, runSignal),
+          interruption,
+        ])
+        : {
+          resource: attempt.resource!,
+          observedExternalStateDigest: persistedResult.observedExternalStateDigest,
+          result: persistedResult.result,
+        };
       const returnedDifferentResource = attempt.resource !== null && (
         attempt.resource.kind !== skillRun.resource.kind || attempt.resource.id !== skillRun.resource.id
       );
@@ -161,11 +181,36 @@ export class NavigatorWorkflowExecutor {
         rebound.resource.id === skillRun.resource.id
         ? undefined
         : "bb_resource_mismatch";
+      const durableResult = policyFailureReason === undefined
+        ? persistedResult ?? this.dependencies.store.recordNavigatorPlanningResult({
+          attemptId: attempt.id,
+          effectIdempotencyKey: effect.idempotencyKey,
+          observedExternalStateDigest: skillRun.observedExternalStateDigest,
+          result: skillRun.result,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: this.dependencies.clock.now(),
+        })
+        : null;
+      let publication: NavigatorPlanningPublication | null = null;
+      if (durableResult && this.dependencies.planningPublisher) {
+        publication = await this.dependencies.planningPublisher.publish(
+          attempt,
+          durableResult.result,
+          {
+            ownerId: fence.ownerId,
+            generation: fence.generation,
+            now: this.dependencies.clock.now(),
+          },
+        );
+      }
       const settled = this.dependencies.store.settleNavigatorSkillAttempt({
         attemptId: attempt.id,
         effectIdempotencyKey: effect.idempotencyKey,
         observedExternalStateDigest: skillRun.observedExternalStateDigest,
-        result: skillRun.result,
+        result: durableResult?.result ?? skillRun.result,
+        ...(publication === null ? {} : { publishedArtifactBindings: publication.artifactBindings }),
+        ...(publication === null ? {} : { reconciledArtifactIds: publication.reconciledArtifactIds }),
         ...(policyFailureReason === undefined ? {} : { policyFailureReason }),
         ownerId: fence.ownerId,
         generation: fence.generation,
@@ -174,6 +219,21 @@ export class NavigatorWorkflowExecutor {
       if (!settled) throw new Error("navigator skill settlement fence was lost");
       return true;
     } catch (error) {
+      const durableResult = this.dependencies.store.getNavigatorPlanningResult(attempt.id);
+      if (error instanceof NavigatorPublicationDriftError && durableResult) {
+        const settled = this.dependencies.store.settleNavigatorSkillAttempt({
+          attemptId: attempt.id,
+          effectIdempotencyKey: effect.idempotencyKey,
+          observedExternalStateDigest: durableResult.observedExternalStateDigest,
+          result: durableResult.result,
+          policyFailureReason: error.reasonCode,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now: this.dependencies.clock.now(),
+        });
+        if (!settled) throw new Error("navigator publication drift settlement fence was lost");
+        return true;
+      }
       this.dependencies.store.failEffect(
         effect.idempotencyKey,
         fence.ownerId,

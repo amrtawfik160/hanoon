@@ -266,8 +266,10 @@ import { NavigatorRepository } from "../navigator/repository";
 import type {
   NavigatorArtifactBinding,
   NavigatorInferenceObservation,
+  NavigatorPlanningResultRecord,
   NavigatorProposalDecision,
   NavigatorProposalRecord,
+  NavigatorRoutingDecision,
   NavigatorSkillAttempt,
   NavigatorSnapshot,
   NavigatorWorkflowStep,
@@ -3793,6 +3795,17 @@ export interface TelegramAgentStore {
   getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null;
   getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
+  recordNavigatorPlanningResult(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorPlanningResultRecord | null;
+  getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null;
+  getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null;
   leaseNavigatorSkillEffect(input: {
     ownerId: string;
     generation: number;
@@ -3812,6 +3825,8 @@ export interface TelegramAgentStore {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
     ownerId: string;
     generation: number;
@@ -11953,6 +11968,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.getOutcome(workflowStepId);
   }
 
+  public recordNavigatorPlanningResult(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorPlanningResultRecord | null {
+    return this.navigatorRepository.recordPlanningResult(input);
+  }
+
+  public getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null {
+    return this.navigatorRepository.getPlanningResult(attemptId);
+  }
+
+  public getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null {
+    return this.navigatorRepository.getRoutingDecision(decisionDigest);
+  }
+
   public leaseNavigatorSkillEffect(input: {
     ownerId: string;
     generation: number;
@@ -11978,6 +12013,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
     ownerId: string;
     generation: number;
