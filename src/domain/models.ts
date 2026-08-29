@@ -11,6 +11,7 @@ import {
   stageExecutionPolicySchema,
   type PipelineStage,
 } from "./stage-execution";
+import type { TaskConstraint, TaskOutcome } from "./task-authority";
 
 export { executionProfileSchema };
 export type { ExecutionProfile } from "./stage-execution";
@@ -539,6 +540,10 @@ export interface Job {
   origin: JobOrigin;
   /** Absent on every job a person asked for. Immutable once written. */
   autonomousOrigin: AutonomousJobOrigin | null;
+  /** The outcome an authenticated owner asked this job to reach. */
+  taskOutcome: TaskOutcome | null;
+  /** Explicit owner constraints that narrow the task outcome. */
+  taskConstraints: readonly TaskConstraint[];
   adoptedBranch: string | null;
   adoptedHeadSha: string | null;
   planCycle: number;
@@ -657,6 +662,7 @@ export type JobEvent =
   | { type: "CONSENSUS_REQUIRED"; headSha: string }
   /** That pass produced durable evidence; decide the approval again. */
   | { type: "CONSENSUS_SETTLED"; headSha: string }
+  | { type: "REMEDIATION_CONTINUED"; reason: string }
   | { type: "MERGE_SUCCEEDED"; message: string; mergeCommitSha: string; mergedAt: string; baseContentVerified: boolean }
   | { type: "MERGE_FAILED"; reason?: string }
   | { type: "DEPLOY_SUCCEEDED"; summary: string }

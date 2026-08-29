@@ -1,4 +1,5 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TelegramUpdate } from "../src/telegram/types";
@@ -32,16 +33,82 @@ function memoryKv(): Kv {
   };
 }
 
-function storeFixture(): { store: TelegramAgentStore; db: Database.Database } {
+function storeFixture(): {
+  store: TelegramAgentStore;
+  db: Database.Database;
+  storage: ReturnType<typeof createFakePluginHost>["bb"]["storage"];
+  kv: Kv;
+} {
   const { bb } = createFakePluginHost({ pluginId: `telegram-agent-task10-telegram-${fixtureNumber++}` });
   const db = bb.storage.database();
-  const store = openStore(bb.storage, memoryKv(), () => 1_000);
+  const kv = memoryKv();
+  const store = openStore(bb.storage, kv, () => 1_000);
   db.prepare(
     "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', 1, NULL)",
   ).run();
   store.bindTelegramIdentity({ botId: "123", username: "bot", now: 1, hasActiveJob: false });
   store.upsertProjectPolicy(policyFixture(), 1);
-  return { store, db };
+  return { store, db, storage: bb.storage, kv };
+}
+
+function createOwnerJobForNarrowing(store: TelegramAgentStore): { jobId: string; statusMessageId: number } {
+  const controllerKey = createHash("sha256")
+    .update("telegram-controller:7:70", "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+  store.enqueueControllerTurn({
+    controllerKey,
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId: 701,
+    inputText: "Fix and ship the retry loop",
+    now: 1_100,
+  });
+  const lease = store.acquireExecutorLease("controller", 1_101, 30_000);
+  if (!lease.acquired) throw new Error("controller lease missing");
+  const turn = store.claimNextControllerTurn({
+    ownerId: "controller",
+    generation: lease.generation,
+    now: 1_101,
+  });
+  if (!turn) throw new Error("controller turn missing");
+  if (!store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: "controller",
+    generation: lease.generation,
+    projectId: "proj_1",
+    hostId: "host_1",
+    threadId: "thr_controller",
+    now: 1_102,
+  })) throw new Error("controller spawn missing");
+  if (!store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: "controller",
+    generation: lease.generation,
+    now: 1_103,
+  })) throw new Error("controller submission missing");
+  const job = store.createConfirmedControllerJob({
+    controllerThreadId: "thr_controller",
+    projectId: "proj_1",
+    task: "Fix and ship the retry loop",
+    now: 1_104,
+  });
+  const statusMessageId = 900;
+  store.setJobStatusMessage(job.id, statusMessageId, job.version, 1_105);
+  return { jobId: job.id, statusMessageId };
+}
+
+function narrowingUpdate(updateId: number, statusMessageId: number, text = "Do not merge it and do not deploy it"): TelegramUpdate {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: updateId + 1_000,
+      from: { id: 7, is_bot: false },
+      chat: { id: 70, type: "private" },
+      text,
+      reply_to_message: { message_id: statusMessageId },
+    },
+  } as TelegramUpdate;
 }
 
 function callbackStartUpdate(jobId: string, updateId = 50): TelegramUpdate {
@@ -88,6 +155,52 @@ function serviceDeps(
 }
 
 describe("Telegram ingress service", () => {
+  it("atomically settles owner narrowing and replays it after a store restart", async () => {
+    const fixture = storeFixture();
+    const { jobId, statusMessageId } = createOwnerJobForNarrowing(fixture.store);
+    const update = narrowingUpdate(44, statusMessageId);
+    const runOnce = async (store: TelegramAgentStore, ingress: TelegramIngress) => {
+      const abort = new AbortController();
+      const client = realClientFactory([
+        { ok: true, result: { id: 123, username: "bot" } },
+        { ok: true, result: [update] },
+        { ok: true, result: [] },
+      ], (pollNumber) => {
+        if (pollNumber === 2) abort.abort();
+      });
+      await runTelegramService(
+        serviceDeps(store, client, ingress, () => ({ ok: true, value: { botToken: "123:secret" } })),
+        abort.signal,
+      );
+    };
+    const transport = {
+      sendMessage: vi.fn(async () => ({ message_id: 200 })),
+      editMessage: vi.fn(async () => undefined),
+      answerCallback: vi.fn(async () => undefined),
+    };
+
+    await runOnce(fixture.store, new TelegramIngress({ store: fixture.store, telegram: transport }));
+    expect(fixture.store.getTaskAuthority(jobId)).toMatchObject({
+      revision: 2,
+      outcome: "reviewed_change",
+      constraints: ["no_merge", "no_deploy"],
+    });
+    expect(fixture.db.prepare(
+      "SELECT status, outcome FROM telegram_updates WHERE update_id = 44",
+    ).get()).toEqual({ status: "processed", outcome: "task_authority_narrowed" });
+    expect(fixture.db.prepare(
+      "SELECT COUNT(*) AS count FROM task_authority_narrowings WHERE source_update_id = 44",
+    ).get()).toEqual({ count: 1 });
+
+    const reopened = openStore(fixture.storage, fixture.kv, () => 2_100);
+    await runOnce(reopened, new TelegramIngress({ store: reopened, telegram: transport }));
+    expect(reopened.getTaskAuthority(jobId)?.revision).toBe(2);
+    expect(fixture.db.prepare(
+      "SELECT COUNT(*) AS count FROM task_authority_narrowings WHERE source_update_id = 44",
+    ).get()).toEqual({ count: 1 });
+    expect(reopened.listEffectsForJob(jobId).filter((effect) => effect.kind === "reconcile_job")).toHaveLength(1);
+  });
+
   it("uses the fixed 30-second Telegram long-poll timeout", async () => {
     const { store } = storeFixture();
     const abort = new AbortController();

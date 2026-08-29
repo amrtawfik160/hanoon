@@ -72,6 +72,17 @@ export const navigatorProposalSchema = z.discriminatedUnion("kind", [
     ]),
     question: boundedTextSchema,
     recommendedAction: boundedTextSchema.nullable(),
+    goal: boundedTextSchema.optional(),
+    blocker: boundedTextSchema.optional(),
+    priorChecks: stringListSchema.optional(),
+    options: z.array(z.object({
+      label: boundedTextSchema,
+      consequence: boundedTextSchema,
+    }).strict()).min(2).max(3).optional(),
+    recommendation: boundedTextSchema.optional(),
+    pausedEffect: boundedTextSchema.optional(),
+    affectedArtifactId: identifierSchema.nullable().optional(),
+    affectedEffectIdempotencyKey: identifierSchema.nullable().optional(),
   }).strict(),
   z.object({
     ...proposalBase,

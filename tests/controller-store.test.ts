@@ -4,7 +4,17 @@ import { expect, expectTypeOf, it } from "vitest";
 import type { ControllerTurnRecord } from "../src/controller/models";
 import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
-import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  OWNER_BOUNDARY_MIGRATIONS,
+  OWNER_BOUNDARY_SOURCE_MIGRATIONS,
+  POLICY_APPROVAL_INTENT_MIGRATIONS,
+  RELEASE_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS,
+  TASK_AUTHORITY_REVISION_MIGRATIONS,
+} from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
@@ -57,6 +67,11 @@ const PRESERVED_FINALIZATION_PAYLOAD = JSON.stringify({
   segments: [{ type: "text", text: "preserved finalization" }],
   obligationRefs: [],
 });
+const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
+  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+  POLICY_APPROVAL_INTENT_MIGRATIONS.length;
 
 function seedDuplicateControllerGenerations(
   bb: ReturnType<typeof createFakePluginHost>["bb"],
@@ -200,7 +215,7 @@ function expectDuplicateGenerationRepair(
 // Applied migrations are immutable history: each release appends, so these are
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(80);
+  expect(ALL_MIGRATIONS).toHaveLength(80 + TICKET_41_MIGRATION_COUNT);
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");
   expect(ALL_MIGRATIONS[72]).toContain("merge_pre_approved_at");

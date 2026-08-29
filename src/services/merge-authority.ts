@@ -1,4 +1,13 @@
 import type { Job, ProjectPolicy } from "../domain/models";
+import { taskAuthorityAllowsEffect, type TaskConstraint, type TaskOutcome } from "../domain/task-authority";
+
+type TaskAuthorityEvidence = Readonly<{
+  jobId: string;
+  projectId: string;
+  outcome: TaskOutcome;
+  constraints: readonly TaskConstraint[];
+  status: "active" | "revoked" | "suspended" | "superseded";
+}>;
 
 /**
  * A standing merge grant is the owner saying "you no longer need to ask me for
@@ -24,7 +33,9 @@ export type AutoApprovalDecision =
   /** Spawn the one consensus pass this head is allowed, then decide again. */
   | Readonly<{ outcome: "start_consensus" }>
   /** That pass is already running. Nothing is asked and nothing is approved. */
-  | Readonly<{ outcome: "await_consensus" }>;
+  | Readonly<{ outcome: "await_consensus" }>
+  /** The job-scoped shipped grant keeps routine review remediation inside the executor. */
+  | Readonly<{ outcome: "continue_remediation"; reason: string }>;
 
 /**
  * What the durable review evidence says about this head's consensus pass.
@@ -44,7 +55,7 @@ export type ConsensusEvidence = Readonly<{
  * Where a live grant came from. The owner should always be able to tell the two
  * apart: one was a tap they remember, the other is a line in a policy file.
  */
-export type MergeGrantSource = "button" | "policy";
+export type MergeGrantSource = "button" | "policy" | "task";
 
 export type LiveMergeGrant = Readonly<{ source: MergeGrantSource }>;
 
@@ -61,6 +72,8 @@ export type MergeGrantEvidence = Readonly<{
   revokedAt: number | null;
   /** When this project's current policy snapshot was stored. */
   policyStoredAt: number | null;
+  /** The owner-origin grant for one exact job, if this is that job. */
+  taskAuthority?: TaskAuthorityEvidence | null;
 }>;
 
 type GrantPolicy = Pick<ProjectPolicy, "autonomy"> | null;
@@ -84,9 +97,13 @@ function policyGrantIsLive(policy: GrantPolicy, evidence: MergeGrantEvidence): b
  */
 export function resolveMergeGrant(input: {
   projectId: string | null;
+  jobId?: string | null;
   policy: GrantPolicy;
   evidence: MergeGrantEvidence;
 }): LiveMergeGrant | null {
+  if (taskGrantIsLive(input.evidence.taskAuthority, input.projectId, input.jobId ?? null)) {
+    return { source: "task" };
+  }
   if (grantIsLive(input.evidence.grant, input.projectId)) return { source: "button" };
   if (input.projectId !== null && policyGrantIsLive(input.policy, input.evidence)) return { source: "policy" };
   return null;
@@ -102,7 +119,17 @@ export const REMEDIATION_ASK_THRESHOLD = 2;
 type AuthorityJob = Pick<
   Job,
   "projectId" | "prHeadSha" | "reviewCycle" | "cancelRequestedAt" | "policy"
->;
+> & Readonly<{ id?: string }>;
+
+function taskGrantIsLive(
+  authority: TaskAuthorityEvidence | null | undefined,
+  projectId: string | null,
+  jobId: string | null,
+): boolean {
+  if (!authority || !taskAuthorityAllowsEffect(authority, "merge")) return false;
+  if (projectId === null || jobId === null || authority.projectId !== projectId || authority.jobId !== jobId) return false;
+  return true;
+}
 
 function grantIsLive(grant: MergeAuthorityGrant | null, projectId: string | null): boolean {
   if (!grant || grant.revokedAt !== null) return false;
@@ -121,6 +148,8 @@ export function decideAutoApproval(input: {
   revokedAt?: number | null;
   /** When this project's current policy snapshot was stored. */
   policyStoredAt?: number | null;
+  /** The job-scoped grant, when the caller is evaluating an owner-origin job. */
+  taskAuthority?: TaskAuthorityEvidence | null;
   /**
    * The consensus pass for this exact head. Absent means none is available,
    * which reads the same as no independent route: the owner is asked.
@@ -130,11 +159,13 @@ export function decideAutoApproval(input: {
   const { job, grant } = input;
   const live = resolveMergeGrant({
     projectId: job.projectId,
+    jobId: job.id,
     policy: job.policy,
     evidence: {
       grant,
       revokedAt: input.revokedAt ?? null,
       policyStoredAt: input.policyStoredAt ?? null,
+      taskAuthority: input.taskAuthority ?? null,
     },
   });
   if (live === null) {
@@ -154,7 +185,7 @@ export function decideAutoApproval(input: {
     return { outcome: "ask_owner", reason: "the project has no production configuration" };
   }
   if (job.reviewCycle >= REMEDIATION_ASK_THRESHOLD) {
-    return decideRemediatedChange(job, input.consensus);
+    return decideRemediatedChange(job, input.consensus, live.source === "task");
   }
   return { outcome: "auto_approve" };
 }
@@ -171,14 +202,23 @@ export function decideAutoApproval(input: {
 function decideRemediatedChange(
   job: AuthorityJob,
   consensus: ConsensusEvidence | undefined,
+  taskGrant: boolean,
 ): AutoApprovalDecision {
   const asked: AutoApprovalDecision = {
     outcome: "ask_owner",
     reason: `the change needed ${job.reviewCycle} rounds of review fixes`,
   };
-  if (!consensus?.routeAvailable) return asked;
+  if (!consensus?.routeAvailable) return taskGrant
+    ? { outcome: "continue_remediation", reason: "Independent review is unavailable; continue fixing the reviewed change" }
+    : asked;
   if (consensus.assessment === "pass") return { outcome: "auto_approve" };
   if (consensus.assessment === "not_pass") {
+    if (taskGrant) {
+      return {
+        outcome: "continue_remediation",
+        reason: "The independent review did not clear the current head; continue remediation",
+      };
+    }
     return {
       outcome: "ask_owner",
       reason: `the change needed ${job.reviewCycle} rounds of review fixes and a second review did not clear it`,

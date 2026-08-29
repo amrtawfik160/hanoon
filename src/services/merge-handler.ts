@@ -471,6 +471,8 @@ export class MergeHandler {
     if (!live && liveApprovals.length === 0) {
       return this.options.store.recordMergePreApproval({
         namedJobId: instructionNamesJob(input.instructionText, input.jobId) ? input.jobId : null,
+        ownerUserId: input.userId,
+        ownerChatId: input.chatId,
         now,
       });
     }

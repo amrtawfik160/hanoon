@@ -3313,6 +3313,647 @@ BEFORE DELETE ON navigator_ticket_repair_dispatches
 BEGIN SELECT RAISE(ABORT, 'navigator ticket repair dispatches are append-only'); END;
 `] as const;
 
+export const TASK_AUTHORITY_MIGRATIONS = [String.raw`
+ALTER TABLE jobs ADD COLUMN task_outcome TEXT CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change'));
+ALTER TABLE jobs ADD COLUMN task_constraints_json TEXT NOT NULL DEFAULT '[]';
+
+CREATE TABLE task_authorities (
+  authority_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  source_update_id INTEGER NOT NULL,
+  request_digest TEXT NOT NULL CHECK (request_digest GLOB '[0-9a-f]*' AND length(request_digest) = 64),
+  project_id TEXT NOT NULL,
+  task_outcome TEXT NOT NULL CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change')),
+  scope_digest TEXT NOT NULL CHECK (scope_digest GLOB '[0-9a-f]*' AND length(scope_digest) = 64),
+  constraints_json TEXT NOT NULL,
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  policy_digest TEXT NOT NULL CHECK (policy_digest GLOB '[0-9a-f]*' AND length(policy_digest) = 64),
+  artifact_graph_digest TEXT NOT NULL CHECK (artifact_graph_digest GLOB '[0-9a-f]*' AND length(artifact_graph_digest) = 64),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'suspended', 'superseded')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  superseded_at INTEGER,
+  superseded_reason TEXT,
+  CHECK ((status IN ('revoked', 'suspended') AND revoked_at IS NOT NULL) OR
+         (status IN ('active', 'superseded') AND revoked_at IS NULL)),
+  CHECK ((status = 'superseded') = (superseded_at IS NOT NULL))
+);
+CREATE INDEX task_authorities_job_status ON task_authorities(job_id, status, revision);
+
+CREATE TABLE task_authority_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  authority_id TEXT NOT NULL REFERENCES task_authorities(authority_id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  action TEXT NOT NULL CHECK (action IN ('granted', 'revised', 'revoked', 'suspended', 'superseded')),
+  reason TEXT,
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX task_authority_events_job ON task_authority_events(job_id, occurred_at, id);
+`] as const;
+
+export const RELEASE_AUTHORITY_MIGRATIONS = [String.raw`
+CREATE TABLE release_authority_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  effect_idempotency_key TEXT NOT NULL UNIQUE,
+  authority_id TEXT REFERENCES task_authorities(authority_id),
+  authority_revision INTEGER,
+  authority_source TEXT NOT NULL CHECK (authority_source IN ('task', 'explicit', 'button', 'policy')),
+  project_id TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  environment_id TEXT NOT NULL,
+  pr_number INTEGER NOT NULL CHECK (pr_number >= 1),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  artifact_graph_digest TEXT,
+  review_attempt_id TEXT NOT NULL,
+  validation_completed_at INTEGER NOT NULL,
+  required_check_names_json TEXT NOT NULL,
+  merge_method TEXT NOT NULL CHECK (merge_method IN ('merge', 'rebase', 'squash')),
+  production_policy_digest TEXT,
+  gate_receipt_digest TEXT NOT NULL CHECK (length(gate_receipt_digest) = 64),
+  status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'revoked')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  consumed_at INTEGER,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  CHECK ((authority_source = 'task') = (
+    authority_id IS NOT NULL AND authority_revision IS NOT NULL AND artifact_graph_digest IS NOT NULL
+  )),
+  CHECK ((status = 'consumed') = (consumed_at IS NOT NULL)),
+  CHECK ((status = 'revoked') = (revoked_at IS NOT NULL))
+);
+CREATE INDEX release_authority_receipts_job ON release_authority_receipts(job_id, status, created_at);
+`] as const;
+
+export const OWNER_BOUNDARY_MIGRATIONS = [String.raw`
+CREATE TABLE owner_boundaries (
+  boundary_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  digest TEXT NOT NULL,
+  authority_id TEXT NOT NULL REFERENCES task_authorities(authority_id),
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  code TEXT NOT NULL CHECK (code IN (
+    'product_decision_required', 'scope_expansion_required',
+    'credential_or_access_required', 'spend_authority_required',
+    'irreversible_effect_required', 'policy_change_required',
+    'technical_tradeoff_required', 'production_recovery_required'
+  )),
+  goal TEXT NOT NULL,
+  blocker TEXT NOT NULL,
+  prior_checks_json TEXT NOT NULL,
+  options_json TEXT NOT NULL,
+  recommendation TEXT NOT NULL,
+  paused_effect TEXT NOT NULL,
+  affected_artifact_id TEXT,
+  affected_effect_idempotency_key TEXT,
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'revoked')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  answer_text TEXT,
+  answer_digest TEXT,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  UNIQUE(job_id, digest),
+  CHECK (affected_artifact_id IS NOT NULL OR affected_effect_idempotency_key IS NOT NULL),
+  CHECK ((status = 'pending' AND answered_at IS NULL AND answer_text IS NULL AND answer_digest IS NULL AND revoked_at IS NULL) OR
+         (status = 'answered' AND answered_at IS NOT NULL AND answer_text IS NOT NULL AND answer_digest IS NOT NULL AND revoked_at IS NULL) OR
+         (status = 'revoked' AND revoked_at IS NOT NULL AND revoked_reason IS NOT NULL AND answered_at IS NULL AND answer_text IS NULL AND answer_digest IS NULL))
+);
+CREATE INDEX owner_boundaries_reply ON owner_boundaries(owner_chat_id, status, created_at);
+CREATE INDEX owner_boundaries_job ON owner_boundaries(job_id, status, created_at);
+
+CREATE TABLE owner_boundary_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  boundary_id TEXT NOT NULL REFERENCES owner_boundaries(boundary_id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  action TEXT NOT NULL CHECK (action IN ('created', 'answered', 'revoked')),
+  reason TEXT,
+  answer_digest TEXT,
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX owner_boundary_events_job ON owner_boundary_events(job_id, occurred_at, id);
+`] as const;
+
+export const TASK_AUTHORITY_REVISION_MIGRATIONS = [String.raw`
+ALTER TABLE owner_boundaries ADD COLUMN evidence_facts_json TEXT NOT NULL DEFAULT '[]';
+
+CREATE TABLE task_authority_revisions (
+  authority_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  source_update_id INTEGER NOT NULL,
+  request_digest TEXT NOT NULL CHECK (request_digest GLOB '[0-9a-f]*' AND length(request_digest) = 64),
+  project_id TEXT NOT NULL,
+  task_outcome TEXT NOT NULL CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change')),
+  scope_digest TEXT NOT NULL CHECK (scope_digest GLOB '[0-9a-f]*' AND length(scope_digest) = 64),
+  constraints_json TEXT NOT NULL,
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  policy_digest TEXT NOT NULL CHECK (policy_digest GLOB '[0-9a-f]*' AND length(policy_digest) = 64),
+  artifact_graph_digest TEXT NOT NULL CHECK (artifact_graph_digest GLOB '[0-9a-f]*' AND length(artifact_graph_digest) = 64),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'suspended', 'superseded')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  revoked_reason TEXT,
+  superseded_at INTEGER,
+  superseded_reason TEXT,
+  PRIMARY KEY (authority_id, revision),
+  UNIQUE (job_id, revision),
+  CHECK ((status IN ('revoked', 'suspended') AND revoked_at IS NOT NULL) OR
+         (status IN ('active', 'superseded') AND revoked_at IS NULL)),
+  CHECK ((status = 'superseded') = (superseded_at IS NOT NULL))
+);
+
+INSERT INTO task_authority_revisions (
+  authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+  source_update_id, request_digest, project_id, task_outcome, scope_digest,
+  constraints_json, policy_version, policy_digest, artifact_graph_digest,
+  status, created_at, updated_at, revoked_at, revoked_reason, superseded_at, superseded_reason
+)
+SELECT authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at, revoked_at, revoked_reason, superseded_at, superseded_reason
+FROM task_authorities;
+
+CREATE TABLE task_authority_current (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  FOREIGN KEY (authority_id, revision) REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_current(job_id, authority_id, revision)
+SELECT job_id, authority_id, revision FROM task_authorities;
+
+CREATE TRIGGER task_authority_revisions_append_only_update
+BEFORE UPDATE ON task_authority_revisions
+BEGIN SELECT RAISE(ABORT, 'task authority revisions are append-only'); END;
+CREATE TRIGGER task_authority_revisions_append_only_delete
+BEFORE DELETE ON task_authority_revisions
+BEGIN SELECT RAISE(ABORT, 'task authority revisions are append-only'); END;
+
+CREATE TABLE task_authority_effect_admissions (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  effect TEXT NOT NULL CHECK (effect IN (
+    'read', 'artifact_write', 'prototype_write', 'worktree_write', 'commit',
+    'pull_request', 'merge', 'deploy', 'rollback'
+  )),
+  admitted_at INTEGER NOT NULL,
+  PRIMARY KEY (effect_idempotency_key, effect),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+`] as const;
+
+export const TASK_AUTHORITY_CLOSURE_MIGRATIONS = [String.raw`
+CREATE TABLE owner_boundary_fact_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  code TEXT NOT NULL CHECK (code IN (
+    'product_decision_required', 'scope_expansion_required',
+    'credential_or_access_required', 'spend_authority_required',
+    'irreversible_effect_required', 'policy_change_required',
+    'technical_tradeoff_required', 'production_recovery_required'
+  )),
+  fact TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (source_kind IN (
+    'artifact', 'access', 'budget', 'policy', 'production', 'retry', 'effect'
+  )),
+  source_id TEXT NOT NULL,
+  affected_artifact_id TEXT,
+  affected_effect_idempotency_key TEXT,
+  recorded_at INTEGER NOT NULL,
+  UNIQUE (job_id, code, fact, source_kind, source_id),
+  CHECK (affected_artifact_id IS NOT NULL OR affected_effect_idempotency_key IS NOT NULL)
+);
+CREATE TRIGGER owner_boundary_fact_records_append_only_update
+BEFORE UPDATE ON owner_boundary_fact_records
+BEGIN SELECT RAISE(ABORT, 'owner boundary fact records are append-only'); END;
+CREATE TRIGGER owner_boundary_fact_records_append_only_delete
+BEFORE DELETE ON owner_boundary_fact_records
+BEGIN SELECT RAISE(ABORT, 'owner boundary fact records are append-only'); END;
+
+CREATE TABLE task_authority_narrowings (
+  source_update_id INTEGER PRIMARY KEY,
+  controller_key TEXT NOT NULL REFERENCES controller_threads(controller_key),
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  target_revision INTEGER NOT NULL CHECK (target_revision = source_revision + 1),
+  task_outcome TEXT NOT NULL CHECK (task_outcome IN ('artifact', 'reviewed_change', 'shipped_change')),
+  constraints_json TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  UNIQUE (authority_id, target_revision),
+  FOREIGN KEY (authority_id, source_revision)
+    REFERENCES task_authority_revisions(authority_id, revision),
+  FOREIGN KEY (authority_id, target_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_revisions (
+  authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+  source_update_id, request_digest, project_id, task_outcome, scope_digest,
+  constraints_json, policy_version, policy_digest, artifact_graph_digest,
+  status, created_at, updated_at, revoked_at, revoked_reason, superseded_at, superseded_reason
+)
+SELECT authority.authority_id, receipt.authority_revision, authority.job_id,
+       authority.owner_user_id, authority.owner_chat_id, authority.controller_key,
+       authority.source_update_id, authority.request_digest, authority.project_id,
+       authority.task_outcome, authority.scope_digest, authority.constraints_json,
+       authority.policy_version, authority.policy_digest, receipt.artifact_graph_digest,
+       'active', authority.created_at, receipt.created_at, NULL, NULL, NULL, NULL
+  FROM task_authorities AS authority
+  JOIN release_authority_receipts AS receipt
+    ON receipt.authority_id = authority.authority_id
+   AND receipt.job_id = authority.job_id
+   AND receipt.authority_source = 'task'
+  LEFT JOIN task_authority_revisions AS revision
+    ON revision.authority_id = receipt.authority_id
+   AND revision.revision = receipt.authority_revision
+ WHERE revision.authority_id IS NULL
+   AND receipt.authority_revision < authority.revision
+   AND authority.task_outcome = 'shipped_change'
+   AND (
+     SELECT COUNT(*) FROM task_authority_events AS event
+      WHERE event.authority_id = authority.authority_id
+        AND event.revision > receipt.authority_revision
+        AND event.revision <= authority.revision
+        AND event.action = 'revised'
+        AND event.reason = 'artifact_graph_advanced'
+   ) = authority.revision - receipt.authority_revision
+ GROUP BY authority.authority_id, receipt.authority_revision
+HAVING COUNT(DISTINCT receipt.artifact_graph_digest) = 1;
+
+CREATE TEMP TABLE task_authority_history_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO task_authority_history_guard(valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT referenced.authority_id, referenced.authority_revision
+    FROM (
+      SELECT authority_id, authority_revision FROM release_authority_receipts
+       WHERE authority_id IS NOT NULL AND authority_revision IS NOT NULL
+      UNION
+      SELECT authority_id, authority_revision FROM owner_boundaries
+    ) AS referenced
+    LEFT JOIN task_authority_revisions AS revision
+      ON revision.authority_id = referenced.authority_id
+     AND revision.revision = referenced.authority_revision
+   WHERE revision.authority_id IS NULL
+) THEN 1 ELSE 0 END;
+DROP TABLE task_authority_history_guard;
+`] as const;
+
+export const TASK_AUTHORITY_PUBLISH_MIGRATIONS = [String.raw`
+CREATE TEMP TABLE task_authority_admission_identity_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO task_authority_admission_identity_guard(valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1
+    FROM task_authority_effect_admissions AS admission
+    JOIN effects AS effect ON effect.idempotency_key = admission.effect_idempotency_key
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = admission.authority_id
+     AND revision.revision = admission.authority_revision
+   WHERE admission.job_id <> effect.job_id OR admission.job_id <> revision.job_id
+) THEN 1 ELSE 0 END;
+DROP TABLE task_authority_admission_identity_guard;
+
+ALTER TABLE task_authority_effect_admissions RENAME TO task_authority_effect_admissions_without_push;
+
+CREATE TABLE task_authority_effect_admissions (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  effect TEXT NOT NULL CHECK (effect IN (
+    'read', 'artifact_write', 'prototype_write', 'worktree_write', 'commit',
+    'push', 'pull_request', 'merge', 'deploy', 'rollback'
+  )),
+  admitted_at INTEGER NOT NULL,
+  PRIMARY KEY (effect_idempotency_key, effect),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_effect_admissions (
+  effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+)
+SELECT effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+FROM task_authority_effect_admissions_without_push;
+
+DROP TABLE task_authority_effect_admissions_without_push;
+
+CREATE TRIGGER task_authority_effect_admissions_exact_job_insert
+BEFORE INSERT ON task_authority_effect_admissions
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM effects AS effect
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = NEW.authority_id
+     AND revision.revision = NEW.authority_revision
+   WHERE effect.idempotency_key = NEW.effect_idempotency_key
+     AND effect.job_id = NEW.job_id
+     AND revision.job_id = NEW.job_id
+)
+BEGIN SELECT RAISE(ABORT, 'task authority admission job identity mismatch'); END;
+
+CREATE TRIGGER task_authority_effect_admissions_exact_job_update
+BEFORE UPDATE ON task_authority_effect_admissions
+BEGIN SELECT RAISE(ABORT, 'task authority admissions are immutable'); END;
+
+ALTER TABLE task_authority_narrowings ADD COLUMN source_message_id INTEGER;
+ALTER TABLE task_authority_narrowings ADD COLUMN reply_to_message_id INTEGER;
+ALTER TABLE task_authority_narrowings ADD COLUMN instruction_digest TEXT;
+
+CREATE TRIGGER task_authority_narrowings_require_payload_identity
+BEFORE INSERT ON task_authority_narrowings
+WHEN NEW.source_message_id IS NULL OR NEW.source_message_id < 1
+  OR NEW.reply_to_message_id IS NULL OR NEW.reply_to_message_id < 1
+  OR NEW.instruction_digest IS NULL OR length(NEW.instruction_digest) <> 64
+  OR NEW.instruction_digest NOT GLOB '[0-9a-f]*'
+BEGIN SELECT RAISE(ABORT, 'task authority narrowing payload identity is required'); END;
+
+CREATE TRIGGER owner_boundary_fact_records_no_insert
+BEFORE INSERT ON owner_boundary_fact_records
+BEGIN SELECT RAISE(ABORT, 'owner boundary facts are derived from authoritative records'); END;
+`] as const;
+
+export const OWNER_BOUNDARY_SOURCE_MIGRATIONS = [String.raw`
+CREATE TEMP TABLE owner_boundary_source_upgrade_guard (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO owner_boundary_source_upgrade_guard(valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1 FROM owner_boundaries WHERE status <> 'revoked'
+) THEN 1 ELSE 0 END;
+DROP TABLE owner_boundary_source_upgrade_guard;
+
+CREATE TABLE policy_boundary_observations (
+  observation_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  artifact_graph_digest TEXT NOT NULL CHECK (length(artifact_graph_digest) = 64),
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  source_effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  affected_effect_idempotency_key TEXT NOT NULL,
+  observed_job_version INTEGER NOT NULL CHECK (observed_job_version >= 0),
+  observed_at INTEGER NOT NULL,
+  UNIQUE(job_id, authority_revision, affected_effect_idempotency_key),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+CREATE TRIGGER policy_boundary_observations_append_only_update
+BEFORE UPDATE ON policy_boundary_observations
+BEGIN SELECT RAISE(ABORT, 'policy boundary observations are append-only'); END;
+CREATE TRIGGER policy_boundary_observations_append_only_delete
+BEFORE DELETE ON policy_boundary_observations
+BEGIN SELECT RAISE(ABORT, 'policy boundary observations are append-only'); END;
+
+CREATE TRIGGER owner_boundaries_require_authoritative_source
+BEFORE INSERT ON owner_boundaries
+WHEN NEW.code <> 'policy_change_required' OR NOT EXISTS (
+  SELECT 1
+    FROM policy_boundary_observations AS observation
+    JOIN task_authority_current AS current
+      ON current.job_id = observation.job_id
+     AND current.authority_id = observation.authority_id
+     AND current.revision = observation.authority_revision
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = observation.authority_id
+     AND revision.revision = observation.authority_revision
+    JOIN jobs AS job ON job.id = observation.job_id
+    JOIN effects AS source_effect
+      ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+     AND source_effect.job_id = observation.job_id
+   WHERE observation.job_id = NEW.job_id
+     AND observation.authority_id = NEW.authority_id
+     AND observation.authority_revision = NEW.authority_revision
+     AND observation.affected_effect_idempotency_key = NEW.affected_effect_idempotency_key
+     AND NEW.affected_artifact_id IS NULL
+     AND revision.status = 'active'
+     AND revision.task_outcome = 'shipped_change'
+     AND revision.artifact_graph_digest = observation.artifact_graph_digest
+     AND revision.policy_digest = observation.policy_digest
+     AND job.version = observation.observed_job_version
+     AND job.state = 'awaiting_merge_approval'
+     AND json_extract(job.policy_json, '$.production') IS NULL
+     AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+     AND source_effect.kind = 'issue_approval'
+)
+BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
+`] as const;
+
+export const POLICY_APPROVAL_INTENT_MIGRATIONS = [String.raw`
+UPDATE effects
+   SET payload_json = (
+     SELECT json_object(
+       'intentVersion', 1,
+       'jobId', job.id,
+       'projectId', revision.project_id,
+       'controllerKey', revision.controller_key,
+       'policyDigest', revision.policy_digest,
+       'artifactGraphDigest', revision.artifact_graph_digest,
+       'affectedEffectIdempotencyKey', job.id || ':' || (job.version + 1) || ':merge_pr',
+       'affectedEffectKind', 'merge_pr',
+       'headSha', job.pr_head_sha,
+       'operation', 'merge'
+     )
+       FROM jobs AS job
+       JOIN task_authority_current AS current ON current.job_id = job.id
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = current.authority_id
+        AND revision.revision = current.revision
+      WHERE job.id = effects.job_id
+   )
+ WHERE effects.kind = 'issue_approval'
+   AND json_valid(effects.payload_json)
+   AND json_type(effects.payload_json) = 'object'
+   AND (SELECT COUNT(*) FROM json_each(effects.payload_json)) = 1
+   AND json_type(effects.payload_json, '$.headSha') = 'text'
+   AND EXISTS (
+     SELECT 1
+       FROM jobs AS job
+       JOIN task_authority_current AS current ON current.job_id = job.id
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = current.authority_id
+        AND revision.revision = current.revision
+      WHERE job.id = effects.job_id
+        AND job.state = 'awaiting_merge_approval'
+        AND job.pr_head_sha = json_extract(effects.payload_json, '$.headSha')
+        AND revision.status = 'active'
+        AND revision.task_outcome = 'shipped_change'
+        AND json_extract(job.policy_json, '$.production') IS NULL
+        AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+   );
+
+ALTER TABLE task_authority_effect_admissions RENAME TO task_authority_effect_admissions_without_payload;
+
+CREATE TABLE task_authority_effect_admissions (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  effect TEXT NOT NULL CHECK (effect IN (
+    'read', 'artifact_write', 'prototype_write', 'worktree_write', 'commit',
+    'push', 'pull_request', 'merge', 'deploy', 'rollback'
+  )),
+  effect_payload_json TEXT NOT NULL,
+  admitted_at INTEGER NOT NULL,
+  PRIMARY KEY (effect_idempotency_key, effect),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+
+INSERT INTO task_authority_effect_admissions (
+  effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+  effect_payload_json, admitted_at
+)
+SELECT admission.effect_idempotency_key, admission.job_id, admission.authority_id,
+       admission.authority_revision, admission.effect, effect.payload_json, admission.admitted_at
+  FROM task_authority_effect_admissions_without_payload AS admission
+  JOIN effects AS effect ON effect.idempotency_key = admission.effect_idempotency_key;
+
+DROP TABLE task_authority_effect_admissions_without_payload;
+
+CREATE TRIGGER task_authority_effect_admissions_exact_source_insert
+BEFORE INSERT ON task_authority_effect_admissions
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM effects AS effect
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = NEW.authority_id
+     AND revision.revision = NEW.authority_revision
+   WHERE effect.idempotency_key = NEW.effect_idempotency_key
+     AND effect.job_id = NEW.job_id
+     AND effect.payload_json = NEW.effect_payload_json
+     AND revision.job_id = NEW.job_id
+)
+BEGIN SELECT RAISE(ABORT, 'task authority admission source identity mismatch'); END;
+
+CREATE TRIGGER task_authority_effect_admissions_immutable_update
+BEFORE UPDATE ON task_authority_effect_admissions
+BEGIN SELECT RAISE(ABORT, 'task authority admissions are immutable'); END;
+CREATE TRIGGER task_authority_effect_admissions_immutable_delete
+BEFORE DELETE ON task_authority_effect_admissions
+BEGIN SELECT RAISE(ABORT, 'task authority admissions are immutable'); END;
+
+CREATE TRIGGER policy_boundary_observations_require_admitted_source
+BEFORE INSERT ON policy_boundary_observations
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM effects AS source_effect
+    JOIN task_authority_effect_admissions AS admission
+      ON admission.effect_idempotency_key = source_effect.idempotency_key
+     AND admission.job_id = source_effect.job_id
+     AND admission.effect = 'read'
+     AND admission.effect_payload_json = source_effect.payload_json
+    JOIN task_authority_current AS current
+      ON current.job_id = admission.job_id
+     AND current.authority_id = admission.authority_id
+     AND current.revision = admission.authority_revision
+    JOIN task_authority_revisions AS revision
+      ON revision.authority_id = admission.authority_id
+     AND revision.revision = admission.authority_revision
+    JOIN jobs AS job ON job.id = source_effect.job_id
+   WHERE source_effect.idempotency_key = NEW.source_effect_idempotency_key
+     AND source_effect.job_id = NEW.job_id
+     AND source_effect.kind = 'issue_approval'
+     AND admission.authority_id = NEW.authority_id
+     AND admission.authority_revision = NEW.authority_revision
+     AND revision.status = 'active'
+     AND revision.task_outcome = 'shipped_change'
+     AND revision.artifact_graph_digest = NEW.artifact_graph_digest
+     AND revision.policy_digest = NEW.policy_digest
+     AND job.version = NEW.observed_job_version
+     AND json_valid(source_effect.payload_json)
+     AND json_type(source_effect.payload_json) = 'object'
+     AND (SELECT COUNT(*) FROM json_each(source_effect.payload_json)) = 10
+     AND json_extract(source_effect.payload_json, '$.intentVersion') = 1
+     AND json_extract(source_effect.payload_json, '$.jobId') = NEW.job_id
+     AND json_extract(source_effect.payload_json, '$.projectId') = revision.project_id
+     AND json_extract(source_effect.payload_json, '$.controllerKey') = revision.controller_key
+     AND json_extract(source_effect.payload_json, '$.policyDigest') = NEW.policy_digest
+     AND json_extract(source_effect.payload_json, '$.artifactGraphDigest') = NEW.artifact_graph_digest
+     AND json_extract(source_effect.payload_json, '$.affectedEffectIdempotencyKey') = NEW.affected_effect_idempotency_key
+     AND json_extract(source_effect.payload_json, '$.affectedEffectKind') = 'merge_pr'
+     AND json_extract(source_effect.payload_json, '$.headSha') = job.pr_head_sha
+     AND json_extract(source_effect.payload_json, '$.operation') = 'merge'
+)
+BEGIN SELECT RAISE(ABORT, 'policy observation lacks an admitted policy approval source'); END;
+
+INSERT OR IGNORE INTO policy_boundary_observations (
+  observation_id, job_id, authority_id, authority_revision, artifact_graph_digest,
+  policy_digest, source_effect_idempotency_key, affected_effect_idempotency_key,
+  observed_job_version, observed_at
+)
+SELECT observation.observation_id, observation.job_id, observation.authority_id,
+       observation.authority_revision, observation.artifact_graph_digest,
+       observation.policy_digest, observation.source_effect_idempotency_key,
+       observation.affected_effect_idempotency_key, observation.observed_job_version,
+       observation.observed_at
+  FROM policy_boundary_observations AS observation
+  JOIN owner_boundaries AS boundary
+    ON boundary.job_id = observation.job_id
+   AND boundary.authority_id = observation.authority_id
+   AND boundary.authority_revision = observation.authority_revision
+   AND boundary.affected_effect_idempotency_key = observation.affected_effect_idempotency_key
+ WHERE boundary.status <> 'revoked';
+`, String.raw`
+CREATE TRIGGER policy_boundary_observations_require_live_executor_fence
+BEFORE INSERT ON policy_boundary_observations
+WHEN EXISTS (
+  SELECT 1
+    FROM effects AS source_effect
+    JOIN task_authority_effect_admissions AS admission
+      ON admission.effect_idempotency_key = source_effect.idempotency_key
+     AND admission.job_id = source_effect.job_id
+     AND admission.effect = 'read'
+     AND admission.effect_payload_json = source_effect.payload_json
+     AND admission.authority_id = NEW.authority_id
+     AND admission.authority_revision = NEW.authority_revision
+   WHERE source_effect.idempotency_key = NEW.source_effect_idempotency_key
+     AND source_effect.job_id = NEW.job_id
+) AND NOT EXISTS (
+  SELECT 1
+    FROM effects AS source_effect
+    JOIN executor_lease AS lease
+      ON lease.singleton = 1
+     AND lease.owner_id = source_effect.lease_owner
+     AND lease.generation = source_effect.lease_generation
+   WHERE source_effect.idempotency_key = NEW.source_effect_idempotency_key
+     AND source_effect.job_id = NEW.job_id
+     AND source_effect.status = 'leased'
+     AND source_effect.lease_expires_at > NEW.observed_at
+     AND lease.lease_expires_at > NEW.observed_at
+)
+BEGIN SELECT RAISE(ABORT, 'policy observation lacks a live executor fence'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -3394,4 +4035,12 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_PLANNING_MIGRATIONS,
   ...NAVIGATOR_IMPLEMENTATION_MIGRATIONS,
   ...NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS,
+  ...TASK_AUTHORITY_MIGRATIONS,
+  ...RELEASE_AUTHORITY_MIGRATIONS,
+  ...OWNER_BOUNDARY_MIGRATIONS,
+  ...TASK_AUTHORITY_REVISION_MIGRATIONS,
+  ...TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  ...TASK_AUTHORITY_PUBLISH_MIGRATIONS,
+  ...OWNER_BOUNDARY_SOURCE_MIGRATIONS,
+  ...POLICY_APPROVAL_INTENT_MIGRATIONS,
 ] as const;

@@ -598,7 +598,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     expect(store.getOwner()).toMatchObject({ userId: "7", chatId: "70" });
 
     store.upsertProjectPolicy(policy, ++time);
-    await ingress.handleClaimed({ update_id: 2, message: privateMessage("Implement the bounded Telegram task") } as TelegramUpdate, ++time);
+    await ingress.handleClaimed({ update_id: 2, message: privateMessage("Implement the bounded Telegram task, but do not deploy it") } as TelegramUpdate, ++time);
     const controller = store.getControllerForOwner("7", "70");
     if (!controller) throw new Error("task did not create a controller mapping");
     const controllerLease = store.acquireExecutorLease("controller-setup", ++time, 1_000_000);
@@ -651,7 +651,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     let job = store.createConfirmedControllerJob({
       controllerThreadId: "thr_controller",
       projectId: "proj_1",
-      task: "Implement the bounded Telegram task",
+      task: "Implement the bounded Telegram task, but do not deploy it",
       now: ++time,
     });
     const status = await telegram.sendMessage("70", { text: "Job started." });
@@ -843,42 +843,13 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: HEAD_THREE }, ++time);
     await drainEffects(store, makeRunner, now, executorSession);
     job = store.getJob(job.id)!;
-    expect(job.state).toBe("awaiting_merge_approval");
-    expect(approvalIssue).toHaveBeenCalledTimes(2);
-    const secondApproval = approvalIssue.mock.results[1]?.value as { nonce: string };
-
-    await ingress.handleClaimed(
-      callbackUpdate(6, statusMessageId, encodeCallbackData({ type: "merge", nonce: secondApproval.nonce }), "merge-fresh"),
-      ++time,
-    );
-    const mergeEffect = store.listEffectsForJob(job.id).find((effect) => effect.kind === "merge_pr" && effect.status === "pending");
-    if (!mergeEffect) throw new Error("fresh merge effect is missing");
-    const leased = store.leaseNextJobEffect({
-      jobId: job.id,
-      ownerId: executorSession.ownerId,
-      generation: executorSession.generation,
-      now: now(),
-      leaseMs: 1_000_000,
-    });
-    if (!leased) throw new Error("fresh merge effect was not leased by the winning executor");
-    expect(leased.idempotencyKey).toBe(mergeEffect.idempotencyKey);
-    expect(store.renewJobOperationFences({
-      jobId: leased.jobId,
-      effectIdempotencyKey: leased.idempotencyKey,
-      ownerId: executorSession.ownerId,
-      generation: executorSession.generation,
-      now: now(),
-      leaseMs: 1_000_000,
-    })).toBe(true);
-    await makeRunner(executorSession.fence).run(leased);
+    expect(approvalIssue).toHaveBeenCalledTimes(1);
     expect(mergeCalls).toHaveLength(1);
-    expect(store.getEffect(leased.jobId, leased.idempotencyKey)?.status).toBe("done");
-    await drainEffects(store, makeRunner, now, executorSession);
-    expect(store.getJob(job.id)).toMatchObject({
-      state: "complete",
+    expect(job).toMatchObject({
+      state: "merged",
       mergeCommitSha: MERGE_COMMIT,
-      deploymentSummary: `1/1 production deploy commands passed at ${MERGE_COMMIT.slice(0, 12)}`,
-      canarySummary: `1/1 production canary commands passed at ${MERGE_COMMIT.slice(0, 12)}`,
+      deploymentSummary: null,
+      canarySummary: null,
     });
     expect(deprecatedLease).not.toHaveBeenCalled();
     expect(store.getAdmission(job.id)?.state).toBe("draining");
@@ -900,7 +871,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       ownerId: executorSession.ownerId,
       generation: executorSession.generation,
       now: ++time,
-    })).toMatchObject({ id: job.id, state: "complete" });
+    })).toMatchObject({ id: job.id, state: "merged" });
     const releaseResult = store.finalizeRelease({
       jobId: job.id,
       ownerId: executorSession.ownerId,
@@ -937,7 +908,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     time += 5_000;
     await runExecutorOnce(store, now, completionTelegram);
     expect(delivered).toHaveLength(2);
-    expect(delivered.some((payload) => typeof payload.text === "string" && payload.text.startsWith("Shipped “"))).toBe(true);
+    expect(delivered.some((payload) => typeof payload.text === "string" && payload.text.startsWith("Merged “"))).toBe(true);
     expect(store.getAdmission(job.id)?.state).toBe("released");
     expect(store.listOutbox(20).some((item) => item.status === "sent")).toBe(true);
     expect(mergeCalls).toHaveLength(1);
@@ -987,15 +958,15 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     ))).toBe(true);
     expect(forks).toHaveLength(0);
     expect(terminalCommands.filter((command) => command.includes("git ls-remote --exit-code origin refs/pull/17/head")).length).toBeGreaterThanOrEqual(6);
-    expect(terminalCommands.some((command) => command.includes("./scripts/deploy-production.sh"))).toBe(true);
-    expect(terminalCommands.some((command) => command.includes("./scripts/verify-production.sh"))).toBe(true);
-    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toMatchObject({ state: "completed" });
-    expect(store.getLatestPipelineStageAttempt(job.id, "CANARY")).toMatchObject({ state: "completed" });
+    expect(terminalCommands.some((command) => command.includes("./scripts/deploy-production.sh"))).toBe(false);
+    expect(terminalCommands.some((command) => command.includes("./scripts/verify-production.sh"))).toBe(false);
+    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toBeNull();
+    expect(store.getLatestPipelineStageAttempt(job.id, "CANARY")).toBeNull();
     const effectIdentityCounts = bb.storage.database().prepare(
       "SELECT COUNT(*) AS total, COUNT(DISTINCT idempotency_key) AS unique_count FROM effects WHERE job_id = ?",
     ).get(job.id) as { total: number; unique_count: number };
     expect(effectIdentityCounts.total).toBe(effectIdentityCounts.unique_count);
     expect(store.getJob(job.id)?.prHeadSha).toBe(HEAD_THREE);
-    expect(store.getJob(job.id)?.state).toBe("complete");
+    expect(store.getJob(job.id)?.state).toBe("merged");
   });
 });

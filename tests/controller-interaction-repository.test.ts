@@ -6,7 +6,17 @@ import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
-import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  OWNER_BOUNDARY_MIGRATIONS,
+  OWNER_BOUNDARY_SOURCE_MIGRATIONS,
+  POLICY_APPROVAL_INTENT_MIGRATIONS,
+  RELEASE_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS,
+  TASK_AUTHORITY_REVISION_MIGRATIONS,
+} from "../src/storage/migrations";
 import {
   ControllerInteractionRepository,
   type ControllerInteractionAnswer,
@@ -59,6 +69,11 @@ const SENSITIVE_QUERY_KEYS = [
   "signature",
   "sig",
 ] as const;
+const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
+  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+  POLICY_APPROVAL_INTENT_MIGRATIONS.length;
 
 function percentEncodeLayers(value: string, layers: number): string {
   let encoded = value;
@@ -489,7 +504,7 @@ async function runInteractionRace(
 }
 
 it("pins the shipped migration bytes and appends the runtime repair migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(80);
+  expect(ALL_MIGRATIONS).toHaveLength(80 + TICKET_41_MIGRATION_COUNT);
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );

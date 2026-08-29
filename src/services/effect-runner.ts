@@ -1924,8 +1924,67 @@ export class EffectRunner {
    * set in motion, so an unattended merge always has an audit row explaining
    * who authorised it — never the other way round.
    */
-  private issueApproval(job: Job): void {
+  private issueApproval(effect: StoredEffect, job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("approval requires an authoritative pull-request head");
+    const taskAuthority = this.dependencies.store.getTaskAuthority(job.id);
+    const evidence = job.projectId === null
+      ? null
+      : this.dependencies.store.getMergeGrantEvidence(job.projectId);
+    const liveGrant = evidence === null ? null : resolveMergeGrant({
+      projectId: job.projectId,
+      jobId: job.id,
+      policy: job.policy,
+      evidence: { ...evidence, taskAuthority },
+    });
+    // A shipped task with no configured production path is not allowed to
+    // silently fall back to a one-use merge approval. That would turn the
+    // owner's exact task grant into a broader release decision.
+    if (
+      liveGrant?.source === "task" &&
+      taskAuthority?.outcome === "shipped_change" &&
+      !job.policy?.production &&
+      job.policy?.autonomy?.mergeWithoutProduction !== true
+    ) {
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+      const boundaryNow = this.now();
+      const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
+      if (!this.dependencies.store.recordExecutorPolicyBoundaryObservation({
+        jobId: current.id,
+        authorityRevision: taskAuthority.revision,
+        sourceEffectIdempotencyKey: effect.idempotencyKey,
+        affectedEffectIdempotencyKey,
+        ...this.executorFence(),
+      })) throw new Error("executor refused the policy boundary observation");
+      const boundary = this.dependencies.store.recordOwnerBoundary({
+        jobId: current.id,
+        authorityRevision: taskAuthority.revision,
+        code: "policy_change_required",
+        goal: "Complete the owner-requested shipped change",
+        blocker: "No production policy or merge-without-production permission is configured for this project",
+        priorChecks: [
+          "The pull-request head is the exact head that passed the review gate",
+          "The task authority is active for this job at its current revision",
+        ],
+        options: [
+          {
+            label: "Configure production",
+            consequence: "The task can continue through deploy and canary under project policy",
+          },
+          {
+            label: "Allow merge without production",
+            consequence: "The task can merge under its required checks and regression monitoring",
+          },
+        ],
+        recommendation: "Configure production because it preserves the requested shipped outcome",
+        pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
+        evidenceFacts: ["policy:change-required"],
+        affectedEffectIdempotencyKey,
+        now: boundaryNow,
+      });
+      if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
+      return;
+    }
     // The owner already granted this merge in so many words, before the gate
     // was reached. Their word outranks the button: consuming it here is what
     // stops an approval dying in a fifteen-minute window they never saw.
@@ -1933,6 +1992,10 @@ export class EffectRunner {
       const current = this.dependencies.store.getJob(job.id);
       if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
       if (current.mergePreApprovedAt === null || current.cancelRequestedAt !== null) return;
+      if (liveGrant?.source === "task" && taskAuthority) {
+        this.acceptTaskMerge(current);
+        return;
+      }
       const merging = this.applyEvent(current.id, current.version, {
         type: "APPROVAL_ACCEPTED",
         headSha: job.prHeadSha,
@@ -1940,19 +2003,12 @@ export class EffectRunner {
       this.enqueueStatus(merging, { autoApproved: true });
       return;
     }
-    const evidence = job.projectId === null
-      ? null
-      : this.dependencies.store.getMergeGrantEvidence(job.projectId);
-    const liveGrant = evidence === null ? null : resolveMergeGrant({
-      projectId: job.projectId,
-      policy: job.policy,
-      evidence,
-    });
     const decision = decideAutoApproval({
       job,
       grant: evidence?.grant ?? null,
       revokedAt: evidence?.revokedAt ?? null,
       policyStoredAt: evidence?.policyStoredAt ?? null,
+      taskAuthority,
       consensus: this.consensusEvidence(job),
     });
     // The consensus pass is running, or is about to. Neither branch approves
@@ -1968,12 +2024,25 @@ export class EffectRunner {
       });
       return;
     }
+    if (decision.outcome === "continue_remediation") {
+      const current = this.dependencies.store.getJob(job.id);
+      if (!current || current.state !== "awaiting_merge_approval") return;
+      this.applyEvent(current.id, current.version, {
+        type: "REMEDIATION_CONTINUED",
+        reason: decision.reason,
+      });
+      return;
+    }
     if (decision.outcome === "auto_approve" && job.projectId !== null) {
       // Re-read before transitioning: the job may have drifted since this
       // effect was dispatched, and merging a head the owner has since
       // superseded is exactly what a standing approval must not do.
       const current = this.dependencies.store.getJob(job.id);
       if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+      if (liveGrant?.source === "task" && taskAuthority) {
+        this.acceptTaskMerge(current);
+        return;
+      }
       this.dependencies.store.recordMergeAuthorityUse({
         projectId: job.projectId,
         jobId: job.id,
@@ -1994,6 +2063,20 @@ export class EffectRunner {
       mergeAuthorityGranted: liveGrant !== null,
       ...(decision.outcome === "ask_owner" ? { approvalReason: decision.reason } : {}),
     });
+  }
+
+  private acceptTaskMerge(job: Job): void {
+    if (!job.prHeadSha) throw new PermanentEffectError("task merge requires an authoritative pull-request head");
+    const accepted = this.dependencies.store.acceptTaskAuthorityAndEnqueueMerge({
+      jobId: job.id,
+      expectedJobVersion: job.version,
+      headSha: job.prHeadSha,
+      ...this.executorFence(),
+    });
+    if (!accepted.ok && accepted.reason === "fence_lost") throw new Error("executor lease was lost before task merge acceptance");
+    if (!accepted.ok) return;
+    const merging = this.dependencies.store.getJob(job.id);
+    if (merging) this.enqueueStatus(merging, { autoApproved: true });
   }
 
   /**
@@ -2408,6 +2491,9 @@ export class EffectRunner {
     const job = this.currentJob(effect);
     const expected = expectedStates(effect.kind);
     if (expected.length > 0 && !expected.includes(job.state)) return;
+    if (!this.dependencies.store.taskAuthorityEffectIsCurrent(effect)) {
+      throw new PermanentEffectError("task authority effect admission is absent, stale, or denied");
+    }
     switch (effect.kind) {
       case "render_status":
         this.enqueueStatus(job);
@@ -2449,7 +2535,7 @@ export class EffectRunner {
         await this.spawnConsensusReview(effect, job);
         return;
       case "issue_approval":
-        this.issueApproval(job);
+        this.issueApproval(effect, job);
         return;
       case "revoke_approvals":
         if (this.dependencies.store.revokeExecutorApprovals({

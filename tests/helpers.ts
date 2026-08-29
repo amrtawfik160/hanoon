@@ -203,6 +203,8 @@ export function jobFixture(overrides: Partial<Job> = {}): Job {
     taskReasonCodes: [],
     origin: "requested",
     autonomousOrigin: null,
+    taskOutcome: null,
+    taskConstraints: [],
     adoptedBranch: null,
     adoptedHeadSha: null,
     planCycle: 0,

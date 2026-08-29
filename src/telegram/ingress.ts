@@ -20,6 +20,7 @@ import {
 } from "../storage/store";
 import { detectStandingInstruction } from "../controller/context";
 import { containsCredentialLikeText } from "../domain/state-machine";
+import { deriveTaskOutcome } from "../domain/task-authority";
 import type { HealthReport } from "../services/health-report";
 import { activationSummary } from "../services/runtime-identity";
 import {
@@ -96,6 +97,15 @@ function stableControllerKey(userId: string, chatId: string): string {
     .update(`telegram-controller:${userId}:${chatId}`, "utf8")
     .digest("base64url")
     .slice(0, 32);
+}
+
+function narrowingInstructionDigest(input: Readonly<{
+  updateId: number;
+  messageId: number;
+  replyToMessageId: number;
+  text: string;
+}>): string {
+  return createHash("sha256").update(JSON.stringify(input), "utf8").digest("hex");
 }
 
 function numericIdentity(value: number): string | null {
@@ -385,7 +395,57 @@ export class TelegramIngress {
 
     const replyMessageId = message.reply_to_message?.message_id;
     if (replyMessageId !== undefined) {
+      const boundary = this.store.getOwnerBoundaryForReply({
+        ownerChatId: identity.chatId,
+        messageId: replyMessageId,
+      });
+      if (boundary) {
+        const answered = this.store.answerOwnerBoundary({
+          boundaryDigest: boundary.digest,
+          jobId: boundary.jobId,
+          authorityId: boundary.authorityId,
+          authorityRevision: boundary.authorityRevision,
+          affectedArtifactId: boundary.affectedArtifactId,
+          affectedEffectIdempotencyKey: boundary.affectedEffectIdempotencyKey,
+          ownerUserId: identity.userId,
+          ownerChatId: identity.chatId,
+          answerText: normalized,
+          now,
+        });
+        if (answered.outcome === "answered") this.onWorkAvailable();
+        if (answered.outcome !== "rejected") return { updateSettled: true };
+      }
+    }
+    if (replyMessageId !== undefined) {
       const repliedJob = this.store.findJobByStatusMessageId(replyMessageId);
+      const authority = repliedJob ? this.store.getTaskAuthority(repliedJob.id) : null;
+      if (repliedJob && authority) {
+        const narrowed = deriveTaskOutcome(normalized);
+        const authorityRevision = this.store.getTaskAuthorityNarrowingSourceRevision(updateId) ?? authority.revision;
+        const narrowing = this.store.narrowTaskAuthority({
+          jobId: repliedJob.id,
+          ownerUserId: identity.userId,
+          ownerChatId: identity.chatId,
+          controllerKey: stableControllerKey(identity.userId, identity.chatId),
+          sourceUpdateId: updateId,
+          sourceMessageId: message.message_id,
+          replyToMessageId: replyMessageId,
+          instructionDigest: narrowingInstructionDigest({
+            updateId,
+            messageId: message.message_id,
+            replyToMessageId: replyMessageId,
+            text: normalized,
+          }),
+          authorityRevision,
+          outcome: narrowed.outcome,
+          constraints: narrowed.constraints,
+          now,
+        });
+        if (narrowing.outcome === "recorded") {
+          this.onWorkAvailable();
+          return { updateSettled: true };
+        }
+      }
       if (repliedJob && this.canSteer(repliedJob, replyMessageId)) {
         this.steer(repliedJob, normalized, updateId, now);
         return;

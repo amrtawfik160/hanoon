@@ -1,6 +1,16 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
-import { ALL_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  OWNER_BOUNDARY_SOURCE_MIGRATIONS,
+  OWNER_BOUNDARY_MIGRATIONS,
+  POLICY_APPROVAL_INTENT_MIGRATIONS,
+  RELEASE_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_MIGRATIONS,
+  TASK_AUTHORITY_CLOSURE_MIGRATIONS,
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS,
+  TASK_AUTHORITY_REVISION_MIGRATIONS,
+} from "../src/storage/migrations";
 import {
   WorkArtifactRepository,
   registerWorkArtifactRelationshipValidation,
@@ -41,6 +51,13 @@ const LEGACY_MIGRATION_MARKERS = [
   [14, "'unsupported'"],
   [15, "notified_at"],
 ] as const;
+const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
+  RELEASE_AUTHORITY_MIGRATIONS.length + OWNER_BOUNDARY_MIGRATIONS.length +
+  TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+  TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+  POLICY_APPROVAL_INTENT_MIGRATIONS.length;
+
+const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
 
 function legacyDatabase(pluginId: string) {
   const { bb } = createFakePluginHost({ pluginId });
@@ -86,6 +103,53 @@ function applyCurrentMigrations(bb: ReturnType<typeof legacyDatabase>["bb"]): vo
   bb.storage.migrate(db, [...ALL_MIGRATIONS]);
 }
 
+function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
+  const { bb } = createFakePluginHost({ pluginId });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+    ),
+  ));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES
+       ('job_1', 1, 'First task', 'cancelled', 1000, 1000),
+       ('job_2', 2, 'Second task', 'cancelled', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES ('job_1:publish', 'job_1', 'inspect_implementation', '{}', 'pending', 0, 1000, 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authority_revisions (
+       authority_id, revision, job_id, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 1, ?, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '[]', 1, ?, ?, 'active', 1000, 1000
+     )`,
+  ).run(revisionJobId, "a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'commit', 1000)`,
+  ).run();
+  return { bb, db };
+}
+
 function insertRelationshipUpgradeArtifact(
   db: ReturnType<typeof legacyDatabase>["db"],
   id: string,
@@ -105,7 +169,8 @@ function insertRelationshipUpgradeArtifact(
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 64);
+  expect(PRE_TICKET_41_MIGRATION_COUNT).toBe(LEGACY_MIGRATION_COUNT + 64);
+  expect(ALL_MIGRATIONS).toHaveLength(PRE_TICKET_41_MIGRATION_COUNT + TICKET_41_MIGRATION_COUNT);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -179,10 +244,278 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
     .toContain("CREATE TABLE navigator_pull_requests");
 });
 
+it("upgrades publisher admissions without losing grants and enforces exact durable identities", () => {
+  const { bb, db } = admissionUpgradeDatabase("task-authority-publish-upgrade");
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    "SELECT effect FROM task_authority_effect_admissions ORDER BY effect",
+  ).all()).toEqual([{ effect: "commit" }]);
+  db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+       effect_payload_json, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'push', '{}', 1001)`,
+  ).run();
+  expect(() => db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+       effect_payload_json, admitted_at
+     ) VALUES ('job_1:publish', 'job_2', 'authority_1', 1, 'pull_request', '{}', 1002)`,
+  ).run()).toThrow(/source identity mismatch/u);
+  expect(() => db.prepare(
+    `INSERT INTO task_authority_narrowings (
+       source_update_id, controller_key, owner_user_id, owner_chat_id, job_id,
+       authority_id, source_revision, target_revision, task_outcome, constraints_json, recorded_at
+     ) VALUES (3, 'controller_1', '7', '7', 'job_1', 'authority_1', 1, 2,
+       'artifact', '[]', 1003)`,
+  ).run()).toThrow(/payload identity is required/u);
+});
+
+it("rolls back the boundary-source upgrade when active legacy evidence cannot be proven", () => {
+  const { bb, db } = admissionUpgradeDatabase("owner-boundary-source-upgrade");
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(OWNER_BOUNDARY_SOURCE_MIGRATIONS.length + POLICY_APPROVAL_INTENT_MIGRATIONS.length),
+  ));
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 1, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '[]', 1, ?, ?, 'active', 1000, 1000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO owner_boundaries (
+       boundary_id, job_id, digest, authority_id, authority_revision, code,
+       goal, blocker, prior_checks_json, options_json, recommendation, paused_effect,
+       evidence_facts_json, affected_artifact_id, affected_effect_idempotency_key,
+       owner_user_id, owner_chat_id, status, created_at, updated_at
+     ) VALUES (
+       'boundary_legacy', 'job_1', ?, 'authority_1', 1, 'policy_change_required',
+       'Ship safely', 'Policy is unresolved', '["Checked policy"]',
+       '[{"label":"Configure","consequence":"Continue safely"}]',
+       'Configure policy', 'Merge is paused', '["policy:change-required"]',
+       NULL, 'job_1:publish', '7', '7', 'pending', 1000, 1000
+     )`,
+  ).run("e".repeat(64));
+  const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();
+
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all()).toEqual(ledgerBefore);
+  expect(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'policy_boundary_observations'",
+  ).get()).toBeUndefined();
+});
+
+it("rolls back the publisher migration when a legacy admission crosses job identity", () => {
+  const { bb, db } = admissionUpgradeDatabase("task-authority-publish-rollback", "job_2");
+
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare("SELECT effect FROM task_authority_effect_admissions").all())
+    .toEqual([{ effect: "commit" }]);
+  expect(() => db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect, admitted_at
+     ) VALUES ('job_1:publish', 'job_1', 'authority_1', 1, 'push', 1001)`,
+  ).run()).toThrow();
+  const narrowingColumns = db.prepare("PRAGMA table_info(task_authority_narrowings)").all() as Array<{ name: string }>;
+  expect(narrowingColumns.map((column) => column.name)).not.toContain("source_message_id");
+});
+
+it("backfills the mutable ticket-41 authority row into immutable revision history", () => {
+  const { bb } = createFakePluginHost({ pluginId: "task-authority-revision-backfill" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(
+      TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+    ),
+  ));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES ('job_1', 1, 'Fix the retry loop', 'cancelled', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 3, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '["no_merge"]', 1, ?, ?, 'active', 1000, 3000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    "SELECT authority_id, revision, task_outcome, constraints_json FROM task_authority_revisions",
+  ).all()).toEqual([{
+    authority_id: "authority_1",
+    revision: 3,
+    task_outcome: "reviewed_change",
+    constraints_json: '["no_merge"]',
+  }]);
+  expect(db.prepare("SELECT * FROM task_authority_current").all()).toEqual([{
+    job_id: "job_1",
+    authority_id: "authority_1",
+    revision: 3,
+  }]);
+  expect(() => db.prepare(
+    "UPDATE task_authority_revisions SET task_outcome = 'shipped_change' WHERE authority_id = 'authority_1'",
+  ).run()).toThrow(/append-only/u);
+});
+
+it("fails the authority upgrade when an older bound revision cannot be reconstructed", () => {
+  const { bb } = createFakePluginHost({ pluginId: "task-authority-history-guard" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(
+      TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+    ),
+  ));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES ('job_1', 1, 'Fix the retry loop', 'cancelled', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 3, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'reviewed_change', ?, '["no_merge"]', 1, ?, ?, 'active', 1000, 3000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO task_authority_events (
+       authority_id, job_id, revision, action, reason, occurred_at
+     ) VALUES
+       ('authority_1', 'job_1', 2, 'revised', 'artifact_graph_advanced', 2000),
+       ('authority_1', 'job_1', 3, 'revised', 'artifact_graph_advanced', 3000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO owner_boundaries (
+       boundary_id, job_id, digest, authority_id, authority_revision, code,
+       goal, blocker, prior_checks_json, options_json, recommendation,
+       paused_effect, affected_artifact_id, affected_effect_idempotency_key,
+       owner_user_id, owner_chat_id, status, created_at, updated_at
+     ) VALUES (
+       'boundary_1', 'job_1', ?, 'authority_1', 1, 'policy_change_required',
+       'Ship the fix', 'Policy is missing', '["Checked policy"]',
+       '[{"label":"Configure","consequence":"Continue"},{"label":"Stop","consequence":"Remain paused"}]',
+       'Configure policy', 'Merge remains paused', 'artifact_1', NULL,
+       '7', '7', 'pending', 1000, 1000
+     )`,
+  ).run("e".repeat(64));
+
+  expect(() => bb.storage.migrate(db, [...ALL_MIGRATIONS])).toThrow();
+  expect(db.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name IN ('task_authority_revisions', 'task_authority_narrowings')`,
+  ).get()).toBeUndefined();
+});
+
+it("reconstructs an older shipped revision from its authoritative release binding", () => {
+  const { bb } = createFakePluginHost({ pluginId: "task-authority-release-reconstruction" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(
+      TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
+      TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+    ),
+  ));
+  db.prepare(
+    `INSERT INTO controller_threads (
+       controller_key, telegram_user_id, telegram_chat_id, state, created_at, updated_at
+     ) VALUES ('controller_1', '7', '7', 'active', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES ('job_1', 1, 'Ship the retry fix', 'merged', 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES ('job_1:merge', 'job_1', 'merge_pr', '{}', 'done', 1, 1000, 1000, 1000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO task_authorities (
+       authority_id, job_id, revision, owner_user_id, owner_chat_id, controller_key,
+       source_update_id, request_digest, project_id, task_outcome, scope_digest,
+       constraints_json, policy_version, policy_digest, artifact_graph_digest,
+       status, created_at, updated_at
+     ) VALUES (
+       'authority_1', 'job_1', 3, '7', '7', 'controller_1', 1, ?, 'proj_1',
+       'shipped_change', ?, '[]', 1, ?, ?, 'active', 1000, 3000
+     )`,
+  ).run("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+  db.prepare(
+    `INSERT INTO task_authority_events (
+       authority_id, job_id, revision, action, reason, occurred_at
+     ) VALUES
+       ('authority_1', 'job_1', 2, 'revised', 'artifact_graph_advanced', 2000),
+       ('authority_1', 'job_1', 3, 'revised', 'artifact_graph_advanced', 3000)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO release_authority_receipts (
+       receipt_id, job_id, effect_idempotency_key, authority_id, authority_revision,
+       authority_source, project_id, repository, base_branch, environment_id,
+       pr_number, head_sha, artifact_graph_digest, review_attempt_id,
+       validation_completed_at, required_check_names_json, merge_method,
+       production_policy_digest, gate_receipt_digest, status, created_at, updated_at
+     ) VALUES (
+       'receipt_1', 'job_1', 'job_1:merge', 'authority_1', 1, 'task', 'proj_1',
+       'acme/repo', 'main', 'env_1', 1, ?, ?, 'review_1', 1000, '[]', 'squash',
+       ?, ?, 'active', 1000, 1000
+     )`,
+  ).run("1".repeat(40), "e".repeat(64), "f".repeat(64), "0".repeat(64));
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+
+  expect(db.prepare(
+    `SELECT revision, task_outcome, constraints_json, artifact_graph_digest
+       FROM task_authority_revisions WHERE authority_id = 'authority_1' ORDER BY revision`,
+  ).all()).toEqual([
+    { revision: 1, task_outcome: "shipped_change", constraints_json: "[]", artifact_graph_digest: "e".repeat(64) },
+    { revision: 3, task_outcome: "shipped_change", constraints_json: "[]", artifact_graph_digest: "d".repeat(64) },
+  ]);
+});
+
 it("strengthens relationship triggers after the original artifact migration was applied", () => {
   const { bb } = createFakePluginHost({ pluginId: "work-artifact-relationship-trigger-upgrade" });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -5));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, PRE_TICKET_41_MIGRATION_COUNT - 5));
   expect(db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_artifact_relationships'",
   ).get()).toEqual({ name: "work_artifact_relationships" });
@@ -244,7 +577,7 @@ it("SPEC-39-002: backfills preexisting snapshot dependencies for recursive inval
   const { bb } = createFakePluginHost({ pluginId: "navigator-dependency-backfill-upgrade" });
   const db = bb.storage.database();
   registerWorkArtifactRelationshipValidation(db);
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -3));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, PRE_TICKET_41_MIGRATION_COUNT - 3));
   const insertArtifact = db.prepare(
     `INSERT INTO work_artifacts (
        id, project_id, effort_id, operation_id, kind, initial_status, status,
@@ -395,7 +728,7 @@ it.each([
     pluginId: `work-artifact-invalid-relationship-upgrade-${String(relationship[1])}`,
   });
   const db = bb.storage.database();
-  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 6;
+  const migrationsBeforeUpgrade = PRE_TICKET_41_MIGRATION_COUNT - 6;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
   const insertArtifact = db.prepare(
     `INSERT INTO work_artifacts (
@@ -538,7 +871,7 @@ it.each([
     pluginId: `work-artifact-canonical-relationship-${String(_scenario).replaceAll(" ", "-")}`,
   });
   const db = bb.storage.database();
-  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 5;
+  const migrationsBeforeUpgrade = PRE_TICKET_41_MIGRATION_COUNT - 5;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
   arrange(db);
   const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();

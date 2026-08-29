@@ -175,6 +175,10 @@ function headMatches(job: Job, headSha: string | undefined): boolean {
   return job.prHeadSha !== null && headSha === job.prHeadSha;
 }
 
+function taskRequiresRelease(job: Pick<Job, "taskOutcome">): boolean {
+  return job.taskOutcome === "shipped_change";
+}
+
 function retryEffect(
   job: Job,
   effects: JobEffect[],
@@ -536,7 +540,7 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
       emitEffect(job, effects, "run_final_validation", { headSha: event.headSha });
       return;
     }
-    if (job.policy?.production || mergesWithoutProduction(job.policy)) {
+    if (job.policy?.production || mergesWithoutProduction(job.policy) || taskRequiresRelease(job)) {
       job.state = "awaiting_merge_approval";
       emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
       return;
@@ -711,7 +715,7 @@ function transitionFinalReviewing(job: Job, event: JobEvent, effects: JobEffect[
       invalidateDriftedHead(job, effects);
       return;
     }
-    if (!job.policy?.production && !mergesWithoutProduction(job.policy)) {
+    if (!job.policy?.production && !mergesWithoutProduction(job.policy) && !taskRequiresRelease(job)) {
       completeReviewedWork(job, effects);
       return;
     }
@@ -776,6 +780,16 @@ function transitionAwaitingMergeApproval(job: Job, event: JobEvent, effects: Job
     emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
     return;
   }
+  if (event.type === "REMEDIATION_CONTINUED") {
+    assertSummary(event.reason, "reason");
+    job.state = "remediating";
+    emitEffect(job, effects, "send_remediation", {
+      summary: event.reason,
+      findings: [],
+      reasons: [event.reason],
+    });
+    return;
+  }
   illegal(job, event);
 }
 
@@ -792,6 +806,10 @@ function transitionMerging(job: Job, event: JobEvent, effects: JobEffect[]): voi
     job.mergedAt = event.mergedAt;
     if (!event.baseContentVerified) {
       enterProductionIncident(job, effects, "Merge succeeded but the base branch did not verify the approved content");
+      return;
+    }
+    if (job.taskConstraints.includes("no_deploy")) {
+      completeMergedWork(job, effects);
       return;
     }
     if (!job.policy?.production) {
