@@ -262,6 +262,18 @@ import {
   type StageExecutionRecord,
 } from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
+import { NavigatorRepository } from "../navigator/repository";
+import type {
+  NavigatorArtifactBinding,
+  NavigatorInferenceObservation,
+  NavigatorProposalDecision,
+  NavigatorProposalRecord,
+  NavigatorSkillAttempt,
+  NavigatorSnapshot,
+  NavigatorWorkflowStep,
+  NavigatorWorkflowStepOutcome,
+  WorkflowMode,
+} from "../navigator/models";
 
 /**
  * A tapped controller button. `replayed` is a Telegram redelivery of a callback
@@ -3752,8 +3764,59 @@ export interface TelegramAgentStore {
     id: string;
     sourceUpdateId: number;
     requestText: string;
+    workflow?: Readonly<{
+      engine: "navigator-v1";
+      mode: Exclude<WorkflowMode, "live">;
+    }>;
     now: number;
   }): Job;
+  bindNavigatorJobArtifacts(input: {
+    jobId: string;
+    expectedVersion: number;
+    artifactBindings: readonly NavigatorArtifactBinding[];
+    now: number;
+  }): Job;
+  createNavigatorSnapshot(input: {
+    jobId: string;
+    externalStateDigest: string;
+    evidenceRefs: readonly string[];
+    now: number;
+  }): NavigatorSnapshot;
+  recordNavigatorProposal(input: {
+    snapshotId: string;
+    rawProposal: unknown;
+    observation: NavigatorInferenceObservation;
+    selectModelRoute(): ModelRoute;
+    now: number;
+  }): NavigatorProposalDecision;
+  getNavigatorProposal(id: string): NavigatorProposalRecord | null;
+  getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null;
+  getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
+  getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
+  leaseNavigatorSkillEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null;
+  bindNavigatorSkillAttemptResource(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    resource: { kind: "bb_thread"; id: string };
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): boolean;
+  settleNavigatorSkillAttempt(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    policyFailureReason?: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorWorkflowStepOutcome | null;
   setJobStatusMessage(jobId: string, messageId: number, expectedVersion: number, now: number): Job;
   enqueueSteeringEffect(
     jobId: string,
@@ -5157,6 +5220,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly stageExecutionRepository: StageExecutionRepository;
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
+  private readonly navigatorRepository: NavigatorRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -5173,6 +5237,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.stageExecutionRepository = new StageExecutionRepository(db);
     this.referenceRepository = new ReferenceRepository(db);
     this.workArtifactRepository = new WorkArtifactRepository(db);
+    this.navigatorRepository = new NavigatorRepository(db);
   }
 
   public reconcileCredentialHealth(input: CredentialHealthReconcileInput): CredentialHealthReconcileResult {
@@ -11805,31 +11870,120 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     id: string;
     sourceUpdateId: number;
     requestText: string;
+    workflow?: Readonly<{
+      engine: "navigator-v1";
+      mode: Exclude<WorkflowMode, "live">;
+    }>;
     now: number;
   }): Job {
     if (!input.id || !input.requestText) throw new TypeError("Job id and request text are required");
     if (!Number.isInteger(input.sourceUpdateId) || input.sourceUpdateId < 0) {
       throw new TypeError("sourceUpdateId must be a non-negative integer");
     }
+    const workflowEngine = input.workflow?.engine ?? "recipe-v1";
+    const workflowMode = input.workflow?.mode ?? "live";
+    if (
+      input.workflow !== undefined &&
+      (input.workflow.engine !== "navigator-v1" ||
+        (input.workflow.mode !== "shadow" && input.workflow.mode !== "deterministic"))
+    ) throw new TypeError("navigator workflow identity is invalid");
     this.db
       .prepare(
         `INSERT OR IGNORE INTO jobs (
            id, source_update_id, request_text, state, review_cycle,
-           review_block_at, version, created_at, updated_at
-         ) VALUES (?, ?, ?, 'awaiting_project', 0, 3, 1, ?, ?)`,
+           review_block_at, workflow_engine, workflow_mode, version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'awaiting_project', 0, 3, ?, ?, 1, ?, ?)`,
       )
-      .run(input.id, input.sourceUpdateId, input.requestText, input.now, input.now);
+      .run(input.id, input.sourceUpdateId, input.requestText, workflowEngine, workflowMode, input.now, input.now);
 
     const byId = this.readJobById(input.id);
     const existing = byId ?? this.readJobBySourceUpdate(input.sourceUpdateId);
     if (!existing) throw new Error("Job was not stored");
     if (
       existing.sourceUpdateId !== input.sourceUpdateId ||
-      existing.requestText !== input.requestText
+      existing.requestText !== input.requestText ||
+      existing.workflowEngine !== workflowEngine || existing.workflowMode !== workflowMode
     ) {
       throw new IdempotencyConflictError(input.sourceUpdateId);
     }
     return existing;
+  }
+
+  public bindNavigatorJobArtifacts(input: {
+    jobId: string;
+    expectedVersion: number;
+    artifactBindings: readonly NavigatorArtifactBinding[];
+    now: number;
+  }): Job {
+    return this.navigatorRepository.bindJobArtifacts(input);
+  }
+
+  public createNavigatorSnapshot(input: {
+    jobId: string;
+    externalStateDigest: string;
+    evidenceRefs: readonly string[];
+    now: number;
+  }): NavigatorSnapshot {
+    return this.navigatorRepository.createSnapshot(input);
+  }
+
+  public recordNavigatorProposal(input: {
+    snapshotId: string;
+    rawProposal: unknown;
+    observation: NavigatorInferenceObservation;
+    selectModelRoute(): ModelRoute;
+    now: number;
+  }): NavigatorProposalDecision {
+    return this.navigatorRepository.recordProposal(input);
+  }
+
+  public getNavigatorProposal(id: string): NavigatorProposalRecord | null {
+    return this.navigatorRepository.getProposal(id);
+  }
+
+  public getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null {
+    return this.navigatorRepository.getWorkflowStep(id);
+  }
+
+  public getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null {
+    return this.navigatorRepository.getAttempt(id);
+  }
+
+  public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {
+    return this.navigatorRepository.getOutcome(workflowStepId);
+  }
+
+  public leaseNavigatorSkillEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null {
+    return this.navigatorRepository.leaseSkillEffect(input);
+  }
+
+  public bindNavigatorSkillAttemptResource(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    resource: { kind: "bb_thread"; id: string };
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): boolean {
+    return this.navigatorRepository.bindAttemptResource(input);
+  }
+
+  public settleNavigatorSkillAttempt(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    policyFailureReason?: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorWorkflowStepOutcome | null {
+    return this.navigatorRepository.settleAttempt(input);
   }
 
   public setJobStatusMessage(
