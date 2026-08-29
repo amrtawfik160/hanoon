@@ -74,6 +74,10 @@ export type JobExecutorDependencies = {
   navigatorImplementation?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
+  /** Deterministic navigator-v1 exact-head release work. */
+  navigatorRelease?: {
+    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
+  };
   monitors?: {
     processDue(): Promise<boolean>;
     processDueDelegations(): Promise<boolean>;
@@ -937,6 +941,9 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.navigatorImplementation) {
           didWork = await deps.navigatorImplementation.processOne(effectFence, workAbort.signal) || didWork;
+        }
+        if (deps.navigatorRelease) {
+          didWork = await deps.navigatorRelease.processOne(effectFence, workAbort.signal) || didWork;
         }
         if (deps.monitors) {
           didWork = await deps.monitors.processDue() || didWork;

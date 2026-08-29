@@ -594,6 +594,7 @@ export interface JobEffect {
     | "steer_implementation"
     | "run_navigator_skill"
     | "run_navigator_ticket_worker"
+    | "run_navigator_release"
     | "reconcile_job";
   payload: Record<string, unknown>;
 }
@@ -626,6 +627,7 @@ export type JobEvent =
   | { type: "CRITIQUE_NEEDS_REVISION"; attemptId: string; summary: string }
   | { type: "IMPLEMENTATION_CREATED"; threadId: string; environmentId: string }
   | { type: "IMPLEMENTATION_IDLE" }
+  | { type: "RELEASE_STARTED"; number: number; url: string; environmentId: string }
   | { type: "PR_LOCATED"; number: number; url: string }
   | { type: "PR_HEAD_RESOLVED"; headSha: string }
   | { type: "REVIEW_STARTED"; laneCount?: number }
@@ -669,6 +671,7 @@ export type JobEvent =
   | { type: "DEPLOY_FAILED"; reason: string }
   | { type: "CANARY_SUCCEEDED"; summary: string }
   | { type: "CANARY_FAILED"; reason: string }
+  | { type: "PRODUCTION_INCIDENT_RECOVERED"; phase: "deploy" | "canary"; reason: string }
   | { type: "THREAD_FAILED"; workerKind?: WorkerKind; error?: string }
   | {
       type: "WORKER_RECOVERY_REQUESTED";

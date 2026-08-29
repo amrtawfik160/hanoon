@@ -3954,6 +3954,156 @@ WHEN EXISTS (
 BEGIN SELECT RAISE(ABORT, 'policy observation lacks a live executor fence'); END;
 `] as const;
 
+export const NAVIGATOR_RELEASE_MIGRATIONS = [String.raw`
+CREATE TABLE navigator_release_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT NOT NULL UNIQUE REFERENCES workflow_steps(id),
+  effect_idempotency_key TEXT NOT NULL UNIQUE REFERENCES effects(idempotency_key),
+  implementation_ticket_ids_json TEXT NOT NULL CHECK (json_valid(implementation_ticket_ids_json)),
+  snapshot_digest TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+  job_version INTEGER NOT NULL CHECK (job_version >= 0),
+  workflow_revision INTEGER NOT NULL CHECK (workflow_revision >= 1),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_release_attempts_append_only_delete
+BEFORE DELETE ON navigator_release_attempts
+BEGIN SELECT RAISE(ABORT, 'navigator release attempts cannot be deleted'); END;
+
+CREATE TABLE navigator_release_outcomes (
+  attempt_id TEXT PRIMARY KEY REFERENCES navigator_release_attempts(id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('entered_release', 'returned_to_navigation', 'completed', 'recovery_required')),
+  reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 128),
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_release_outcomes_append_only_update
+BEFORE UPDATE ON navigator_release_outcomes
+BEGIN SELECT RAISE(ABORT, 'navigator release outcomes are append-only'); END;
+CREATE TRIGGER navigator_release_outcomes_append_only_delete
+BEFORE DELETE ON navigator_release_outcomes
+BEGIN SELECT RAISE(ABORT, 'navigator release outcomes are append-only'); END;
+
+CREATE TABLE navigator_release_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT REFERENCES workflow_steps(id),
+  reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 128),
+  previous_state TEXT NOT NULL CHECK (length(previous_state) BETWEEN 1 AND 64),
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_release_findings_append_only_update
+BEFORE UPDATE ON navigator_release_findings
+BEGIN SELECT RAISE(ABORT, 'navigator release findings are append-only'); END;
+CREATE TRIGGER navigator_release_findings_append_only_delete
+BEFORE DELETE ON navigator_release_findings
+BEGIN SELECT RAISE(ABORT, 'navigator release findings are append-only'); END;
+
+CREATE TABLE navigator_release_incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT REFERENCES workflow_steps(id),
+  phase TEXT NOT NULL CHECK (phase IN ('deploy', 'canary')),
+  failure_signature TEXT NOT NULL CHECK (length(failure_signature) BETWEEN 1 AND 500),
+  rollback_outcome TEXT NOT NULL CHECK (rollback_outcome IN ('pass', 'fail', 'missing', 'indeterminate')),
+  recorded_at INTEGER NOT NULL
+);
+CREATE TRIGGER navigator_release_incidents_append_only_update
+BEFORE UPDATE ON navigator_release_incidents
+BEGIN SELECT RAISE(ABORT, 'navigator release incidents are append-only'); END;
+CREATE TRIGGER navigator_release_incidents_append_only_delete
+BEFORE DELETE ON navigator_release_incidents
+BEGIN SELECT RAISE(ABORT, 'navigator release incidents are append-only'); END;
+
+CREATE TABLE production_recovery_observations (
+  observation_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  authority_id TEXT NOT NULL,
+  authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
+  artifact_graph_digest TEXT NOT NULL CHECK (length(artifact_graph_digest) = 64),
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  source_effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  affected_effect_idempotency_key TEXT NOT NULL,
+  observed_job_version INTEGER NOT NULL CHECK (observed_job_version >= 0),
+  observed_at INTEGER NOT NULL,
+  UNIQUE(job_id, authority_revision, affected_effect_idempotency_key),
+  FOREIGN KEY (authority_id, authority_revision)
+    REFERENCES task_authority_revisions(authority_id, revision)
+);
+CREATE TRIGGER production_recovery_observations_append_only_update
+BEFORE UPDATE ON production_recovery_observations
+BEGIN SELECT RAISE(ABORT, 'production recovery observations are append-only'); END;
+CREATE TRIGGER production_recovery_observations_append_only_delete
+BEFORE DELETE ON production_recovery_observations
+BEGIN SELECT RAISE(ABORT, 'production recovery observations are append-only'); END;
+
+DROP TRIGGER IF EXISTS owner_boundaries_require_authoritative_source;
+CREATE TRIGGER owner_boundaries_require_authoritative_source
+BEFORE INSERT ON owner_boundaries
+WHEN NOT (
+  (
+    NEW.code = 'policy_change_required' AND EXISTS (
+      SELECT 1
+        FROM policy_boundary_observations AS observation
+        JOIN task_authority_current AS current
+          ON current.job_id = observation.job_id
+         AND current.authority_id = observation.authority_id
+         AND current.revision = observation.authority_revision
+        JOIN task_authority_revisions AS revision
+          ON revision.authority_id = observation.authority_id
+         AND revision.revision = observation.authority_revision
+        JOIN jobs AS job ON job.id = observation.job_id
+        JOIN effects AS source_effect
+          ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+         AND source_effect.job_id = observation.job_id
+       WHERE observation.job_id = NEW.job_id
+         AND observation.authority_id = NEW.authority_id
+         AND observation.authority_revision = NEW.authority_revision
+         AND observation.affected_effect_idempotency_key = NEW.affected_effect_idempotency_key
+         AND NEW.affected_artifact_id IS NULL
+         AND revision.status = 'active'
+         AND revision.task_outcome = 'shipped_change'
+         AND revision.artifact_graph_digest = observation.artifact_graph_digest
+         AND revision.policy_digest = observation.policy_digest
+         AND job.version = observation.observed_job_version
+         AND job.state = 'awaiting_merge_approval'
+         AND json_extract(job.policy_json, '$.production') IS NULL
+         AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+         AND source_effect.kind = 'issue_approval'
+    )
+  ) OR (
+    NEW.code = 'production_recovery_required' AND EXISTS (
+      SELECT 1
+        FROM production_recovery_observations AS observation
+        JOIN task_authority_current AS current
+          ON current.job_id = observation.job_id
+         AND current.authority_id = observation.authority_id
+         AND current.revision = observation.authority_revision
+        JOIN task_authority_revisions AS revision
+          ON revision.authority_id = observation.authority_id
+         AND revision.revision = observation.authority_revision
+        JOIN jobs AS job ON job.id = observation.job_id
+        JOIN effects AS source_effect
+          ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+         AND source_effect.job_id = observation.job_id
+       WHERE observation.job_id = NEW.job_id
+         AND observation.authority_id = NEW.authority_id
+         AND observation.authority_revision = NEW.authority_revision
+         AND observation.affected_effect_idempotency_key = NEW.affected_effect_idempotency_key
+         AND NEW.affected_artifact_id IS NULL
+         AND revision.status = 'suspended'
+         AND revision.task_outcome = 'shipped_change'
+         AND revision.artifact_graph_digest = observation.artifact_graph_digest
+         AND revision.policy_digest = observation.policy_digest
+         AND job.version = observation.observed_job_version
+         AND job.state = 'production_failed'
+         AND source_effect.kind IN ('deploy_production', 'verify_production')
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -4043,4 +4193,5 @@ export const ALL_MIGRATIONS = [
   ...TASK_AUTHORITY_PUBLISH_MIGRATIONS,
   ...OWNER_BOUNDARY_SOURCE_MIGRATIONS,
   ...POLICY_APPROVAL_INTENT_MIGRATIONS,
+  ...NAVIGATOR_RELEASE_MIGRATIONS,
 ] as const;

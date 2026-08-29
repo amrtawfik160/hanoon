@@ -802,3 +802,230 @@ it("completes a cancellation that was already requested but never confirmed", ()
   expect(result.job.state).toBe("cancelled");
   expect(result.job.cancelRequestedAt).toBe(4_000);
 });
+
+describe("navigator-v1 release transitions", () => {
+  const head = sha();
+  const navigator = (state: JobState, overrides: Parameters<typeof stateJob>[1] = {}) =>
+    stateJob(state, {
+      workflowEngine: "navigator-v1",
+      workflowMode: "deterministic",
+      taskOutcome: "shipped_change",
+      ...overrides,
+    });
+
+  it("starts exact-head release from implementing without inspecting the implementation", () => {
+    const result = transition(
+      navigator("implementing"),
+      {
+        type: "RELEASE_STARTED",
+        number: 42,
+        url: "https://github.test/pr/42",
+        environmentId: "env_job_42",
+      },
+      10_000,
+    );
+
+    expect(result.job).toMatchObject({
+      state: "resolving_pr_head",
+      prNumber: 42,
+      prUrl: "https://github.test/pr/42",
+      environmentId: "env_job_42",
+    });
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["resolve_pr_head"]);
+  });
+
+  it("rejects implementation idle and recipe release-started on the opposite engines", () => {
+    expect(() => transition(navigator("implementing"), { type: "IMPLEMENTATION_IDLE" }, 10_000))
+      .toThrow(IllegalTransitionError);
+    expect(() => transition(
+      stateJob("implementing"),
+      {
+        type: "RELEASE_STARTED",
+        number: 42,
+        url: "https://github.test/pr/42",
+        environmentId: "env_job_42",
+      },
+      10_000,
+    )).toThrow(IllegalTransitionError);
+  });
+
+  it("returns validation, review, and documentation findings to navigation without remediation or docs work", () => {
+    const validation = transition(
+      navigator("validating", { prHeadSha: head, prNumber: 42 }),
+      { type: "VALIDATION_FAILED", headSha: head, reason: "Validation did not pass" },
+      10_000,
+    );
+    expect(validation.job).toMatchObject({ state: "implementing", prHeadSha: null });
+    expect(validation.effects.map((effect) => effect.kind)).toEqual(["revoke_approvals", "render_status"]);
+
+    const review = transition(
+      navigator("reviewing", { prHeadSha: head, prNumber: 42 }),
+      { type: "REVIEW_CHANGES_REQUESTED", headSha: head, summary: "Review requested changes" },
+      10_001,
+    );
+    expect(review.job).toMatchObject({ state: "implementing", prHeadSha: null });
+    expect(review.effects.map((effect) => effect.kind)).toEqual(["revoke_approvals", "render_status"]);
+
+    const docs = transition(
+      navigator("reviewing", { prHeadSha: head, prNumber: 42, policy: policyFixture() }),
+      {
+        type: "REVIEW_PASSED",
+        headSha: head,
+        documentation: { required: true, reasons: ["docs.stale"], diffDigest: "b".repeat(64) },
+      },
+      10_002,
+    );
+    expect(docs.job).toMatchObject({ state: "implementing", prHeadSha: null });
+    expect(docs.effects.map((effect) => effect.kind)).toEqual(["revoke_approvals", "render_status"]);
+  });
+
+  it("still patches and documents recipe jobs after the same findings", () => {
+    const validation = transition(
+      stateJob("validating", { prHeadSha: head }),
+      { type: "VALIDATION_FAILED", headSha: head, reason: "Validation did not pass" },
+      10_000,
+    );
+    expect(validation.job.state).toBe("remediating");
+    expect(validation.effects.map((effect) => effect.kind)).toContain("send_remediation");
+
+    const docs = transition(
+      stateJob("reviewing", { prHeadSha: head, policy: policyFixture() }),
+      { type: "REVIEW_PASSED", headSha: head },
+      10_001,
+    );
+    expect(docs.job.state).toBe("documenting");
+    expect(docs.effects.map((effect) => effect.kind)).toContain("spawn_docs");
+  });
+
+  it("skips the recipe docs loop and issues approval for a shipped navigator head", () => {
+    const result = transition(
+      navigator("reviewing", { prHeadSha: head, policy: policyFixture() }),
+      { type: "REVIEW_PASSED", headSha: head },
+      10_000,
+    );
+
+    expect(result.job.state).toBe("awaiting_merge_approval");
+    expect(result.effects.map((effect) => effect.kind)).toEqual(["issue_approval"]);
+  });
+
+  it("returns a recovered production incident to navigation and rejects that event on recipe jobs", () => {
+    const recovered = transition(
+      navigator("deploying", {
+        mergeMessage: "Merged pull request #42",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+        prHeadSha: head,
+      }),
+      { type: "PRODUCTION_INCIDENT_RECOVERED", phase: "deploy", reason: "Production deploy failed" },
+      10_000,
+    );
+    expect(recovered.job).toMatchObject({
+      state: "implementing",
+      prHeadSha: null,
+      mergeCommitSha: sha("d"),
+    });
+    expect(recovered.effects.map((effect) => effect.kind)).toEqual(["revoke_approvals", "render_status"]);
+
+    const canary = transition(
+      navigator("verifying_production", {
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+      }),
+      { type: "PRODUCTION_INCIDENT_RECOVERED", phase: "canary", reason: "Production canary failed" },
+      10_001,
+    );
+    expect(canary.job.state).toBe("implementing");
+
+    expect(() => transition(
+      stateJob("deploying"),
+      { type: "PRODUCTION_INCIDENT_RECOVERED", phase: "deploy", reason: "Production deploy failed" },
+      10_002,
+    )).toThrow(IllegalTransitionError);
+  });
+
+  it("still fails recipe production after a successful rollback event is withheld", () => {
+    const result = transition(
+      stateJob("deploying", {
+        mergeMessage: "Merged pull request #7",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+      }),
+      { type: "DEPLOY_FAILED", reason: "Production deploy failed" },
+      10_000,
+    );
+    expect(result.job.state).toBe("production_failed");
+  });
+
+  it("keeps merge-once and unverified base-content incidents for navigator jobs", () => {
+    const merged = transition(
+      navigator("awaiting_merge_approval", { prHeadSha: head, prNumber: 42 }),
+      { type: "APPROVAL_ACCEPTED", headSha: head },
+      10_000,
+    );
+    expect(merged.job.state).toBe("merging");
+    expect(merged.effects.map((effect) => effect.kind)).toEqual(["merge_pr"]);
+
+    const unverified = transition(
+      navigator("merging"),
+      {
+        type: "MERGE_SUCCEEDED",
+        message: "Merged pull request #42",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+        baseContentVerified: false,
+      },
+      10_001,
+    );
+    expect(unverified.job.state).toBe("production_failed");
+    expect(unverified.job.lastError).toMatch(/did not verify the approved content/u);
+  });
+
+  it("deploys before canary and completes only after canary, or merges without production", () => {
+    const deployed = transition(
+      navigator("merging", { policy: policyFixture() }),
+      {
+        type: "MERGE_SUCCEEDED",
+        message: "Merged pull request #42",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+        baseContentVerified: true,
+      },
+      10_000,
+    );
+    expect(deployed.job.state).toBe("deploying");
+    expect(deployed.effects.map((effect) => effect.kind)).toEqual(["render_status", "deploy_production"]);
+
+    const canary = transition(
+      navigator("deploying", { policy: policyFixture() }),
+      { type: "DEPLOY_SUCCEEDED", summary: "Production deployment passed" },
+      10_001,
+    );
+    expect(canary.job.state).toBe("verifying_production");
+    expect(canary.effects.map((effect) => effect.kind)).toContain("verify_production");
+
+    const complete = transition(
+      navigator("verifying_production"),
+      { type: "CANARY_SUCCEEDED", summary: "Production canary passed" },
+      10_002,
+    );
+    expect(complete.job.state).toBe("complete");
+
+    const policy = policyFixture({
+      autonomy: { unattendedMerge: false, mergeWithoutProduction: true },
+    });
+    delete (policy as Partial<typeof policy>).production;
+    const merged = transition(
+      navigator("merging", { policy, taskOutcome: "shipped_change" }),
+      {
+        type: "MERGE_SUCCEEDED",
+        message: "Merged pull request #42",
+        mergeCommitSha: sha("d"),
+        mergedAt: "2026-08-10T18:00:00.000Z",
+        baseContentVerified: true,
+      },
+      10_003,
+    );
+    expect(merged.job.state).toBe("merged");
+  });
+});
+
