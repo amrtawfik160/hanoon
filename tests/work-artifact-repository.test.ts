@@ -1088,6 +1088,27 @@ describe("WorkArtifactRepository", () => {
     })?.id).toBe(claim?.id);
 
     expect(store.releaseExecutorLease("executor-a", first.generation, 1_020)).toBe(true);
+    const liveTakeover = store.acquireExecutorLease("executor-b", 1_030, 100);
+    if (!liveTakeover.acquired) throw new Error("live takeover executor lease was not acquired");
+    expect(repository.adoptArtifactClaim({
+      artifactId: created.artifact.id,
+      workflowStepId: "workflow_1",
+      jobId: "job_1",
+      externalAssignee: "hanoon-bot",
+      ownerId: "executor-b",
+      generation: liveTakeover.generation,
+      expectedOwnerId: claim!.ownerId,
+      expectedGeneration: claim!.generation,
+      expectedLeaseExpiresAt: claim!.leaseExpiresAt,
+      now: 1_035,
+      leaseMs: 100,
+    })).toBe(false);
+    expect(repository.getHeldClaim(created.artifact.id)).toMatchObject({
+      ownerId: "executor-a",
+      generation: first.generation,
+      leaseExpiresAt: claim!.leaseExpiresAt,
+    });
+    expect(store.releaseExecutorLease("executor-b", liveTakeover.generation, 1_040)).toBe(true);
     const second = store.acquireExecutorLease("executor-b", 1_200, 100);
     if (!second.acquired) throw new Error("second executor lease was not acquired");
     expect(repository.adoptArtifactClaim({
@@ -1097,6 +1118,9 @@ describe("WorkArtifactRepository", () => {
       externalAssignee: "hanoon-bot",
       ownerId: "executor-b",
       generation: second.generation,
+      expectedOwnerId: claim!.ownerId,
+      expectedGeneration: claim!.generation,
+      expectedLeaseExpiresAt: claim!.leaseExpiresAt,
       now: 1_210,
       leaseMs: 100,
     })).toBe(false);
@@ -1107,6 +1131,9 @@ describe("WorkArtifactRepository", () => {
       externalAssignee: "hanoon-bot",
       ownerId: "executor-b",
       generation: second.generation,
+      expectedOwnerId: claim!.ownerId,
+      expectedGeneration: claim!.generation,
+      expectedLeaseExpiresAt: claim!.leaseExpiresAt,
       now: 1_210,
       leaseMs: 100,
     })).toBe(true);
@@ -1152,6 +1179,39 @@ describe("WorkArtifactRepository", () => {
       reason: "ticket_complete",
     })).toBe(true);
     expect(repository.getArtifact(created.artifact.id)?.status).toBe("ready");
+  });
+
+  it("STD-40-001: transactional release refuses an expired claim", () => {
+    const { repository, store } = fixture();
+    const created = repository.captureArtifact(artifactInput("expired-release", "63", {
+      assignees: ["hanoon-bot"],
+    }));
+    const executor = store.acquireExecutorLease("expired-release-executor", 1_000, 1_000);
+    if (!executor.acquired) throw new Error("executor lease was not acquired");
+    const claim = repository.claimArtifact({
+      artifactId: created.artifact.id,
+      workflowStepId: "workflow_expired_release",
+      jobId: "job_1",
+      snapshotId: created.snapshot.id,
+      externalAssignee: "hanoon-bot",
+      ownerId: "expired-release-executor",
+      generation: executor.generation,
+      now: 1_010,
+      leaseMs: 50,
+    });
+    if (!claim) throw new Error("artifact was not claimed");
+
+    expect(repository.releaseArtifactClaim({
+      claimId: claim.id,
+      ownerId: "expired-release-executor",
+      generation: executor.generation,
+      now: 1_061,
+      reason: "expired claim",
+    })).toBe(false);
+    expect(repository.getClaim(claim.id)).toMatchObject({
+      state: "held",
+      leaseExpiresAt: 1_060,
+    });
   });
 
   it("persists immutable tracker mutation identity and a stable indeterminate outcome", () => {

@@ -105,7 +105,7 @@ function insertRelationshipUpgradeArtifact(
 }
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 62);
+  expect(ALL_MIGRATIONS).toHaveLength(LEGACY_MIGRATION_COUNT + 64);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -171,12 +171,18 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
     .toContain("CREATE TABLE navigator_snapshots");
   expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 61])
     .toContain("CREATE TABLE navigator_planning_results");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 62])
+    .toContain("CREATE TABLE navigator_integrations");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 62])
+    .toContain("CREATE TABLE navigator_ticket_worker_outcomes");
+  expect(ALL_MIGRATIONS[LEGACY_MIGRATION_COUNT + 62])
+    .toContain("CREATE TABLE navigator_pull_requests");
 });
 
 it("strengthens relationship triggers after the original artifact migration was applied", () => {
   const { bb } = createFakePluginHost({ pluginId: "work-artifact-relationship-trigger-upgrade" });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -3));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -5));
   expect(db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_artifact_relationships'",
   ).get()).toEqual({ name: "work_artifact_relationships" });
@@ -238,7 +244,7 @@ it("SPEC-39-002: backfills preexisting snapshot dependencies for recursive inval
   const { bb } = createFakePluginHost({ pluginId: "navigator-dependency-backfill-upgrade" });
   const db = bb.storage.database();
   registerWorkArtifactRelationshipValidation(db);
-  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -1));
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, -3));
   const insertArtifact = db.prepare(
     `INSERT INTO work_artifacts (
        id, project_id, effort_id, operation_id, kind, initial_status, status,
@@ -389,7 +395,7 @@ it.each([
     pluginId: `work-artifact-invalid-relationship-upgrade-${String(relationship[1])}`,
   });
   const db = bb.storage.database();
-  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 4;
+  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 6;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
   const insertArtifact = db.prepare(
     `INSERT INTO work_artifacts (
@@ -532,7 +538,7 @@ it.each([
     pluginId: `work-artifact-canonical-relationship-${String(_scenario).replaceAll(" ", "-")}`,
   });
   const db = bb.storage.database();
-  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 3;
+  const migrationsBeforeUpgrade = ALL_MIGRATIONS.length - 5;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, migrationsBeforeUpgrade));
   arrange(db);
   const ledgerBefore = db.prepare("SELECT * FROM _bb_migrations ORDER BY id").all();

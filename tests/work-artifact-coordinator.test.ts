@@ -1075,6 +1075,78 @@ describe("WorkArtifactCoordinator", () => {
       .toEqual(["hanoon-bot", "human-owner"]);
   });
 
+  it("STD-40-001: fails closed before releasing an expired artifact claim", async () => {
+    fixtureNumber += 1;
+    const directory = await mkdtemp(join(tmpdir(), "work-artifact-release-expiry-"));
+    temporaryDirectories.push(directory);
+    const { bb } = createFakePluginHost({ pluginId: `work-artifact-release-expiry-${fixtureNumber}` });
+    let clock = 4_700;
+    const store = openStore(bb.storage, bb.storage.kv, () => clock);
+    createClaimJob(store, bb.storage.database());
+    const baseTracker = createConfiguredWorkTracker({
+      kind: "local_markdown",
+      repositoryRoot: directory,
+      effortSlug: "release-expiry",
+    });
+    let releaseCalls = 0;
+    const tracker = new Proxy(baseTracker, {
+      get(target, property, receiver) {
+        if (property === "release") {
+          return async (input: Parameters<WorkTracker["release"]>[0]) => {
+            releaseCalls += 1;
+            return target.release(input);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as WorkTracker;
+    const lease = store.acquireExecutorLease("release-expiry-executor", clock, 1_000);
+    if (!lease.acquired) throw new Error("executor lease was not acquired");
+    const fence = { ownerId: "release-expiry-executor", generation: lease.generation };
+    const coordinator = new WorkArtifactCoordinator(store, tracker, () => clock);
+    const created = await coordinator.create({
+      projectId: "proj_1",
+      effortId: "effort_1",
+      operationId: "release-expiry-create",
+      kind: "implementation_ticket",
+      status: "ready",
+      title: "Expired release claim",
+      body: "# Goal\n\nKeep expired releases from changing tracker ownership.",
+      acceptanceCriteria: [],
+      relationships: [],
+      ...fence,
+      now: clock,
+    });
+    const claimed = await coordinator.claim({
+      artifactId: created.artifact.id,
+      workflowStepId: "workflow_release_expiry",
+      jobId: "job_work_artifact",
+      assignee: "hanoon-bot",
+      operationId: "release-expiry-claim",
+      leaseMs: 50,
+      ...fence,
+      now: 4_710,
+    });
+    if (!claimed) throw new Error("artifact was not claimed");
+
+    clock = 4_761;
+    expect(await coordinator.release({
+      claimId: claimed.claim.id,
+      operationId: "release-expiry-release",
+      reason: "expired claim",
+      ...fence,
+      now: clock,
+    })).toBe(false);
+    expect(releaseCalls).toBe(0);
+    expect(store.getWorkArtifactClaim(claimed.claim.id)).toMatchObject({
+      state: "held",
+      leaseExpiresAt: 4_760,
+    });
+    expect((await baseTracker.read(created.artifact.externalId)).assignees)
+      .toEqual(["hanoon-bot"]);
+  });
+
   it("settles an interrupted local release before observation can invalidate the claim", async () => {
     fixtureNumber += 1;
     const directory = await mkdtemp(join(tmpdir(), "work-artifact-release-restart-"));

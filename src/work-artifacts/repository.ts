@@ -153,6 +153,9 @@ export type AdoptWorkArtifactClaimInput = Readonly<{
   externalAssignee: string;
   ownerId: string;
   generation: number;
+  expectedOwnerId: string;
+  expectedGeneration: number;
+  expectedLeaseExpiresAt: number;
   now: number;
   leaseMs: number;
 }>;
@@ -1255,7 +1258,7 @@ export class WorkArtifactRepository {
   }
 
   public adoptArtifactClaim(input: AdoptWorkArtifactClaimInput): boolean {
-    this.validateClaimFence(input);
+    this.validateAdoptionFence(input);
     return this.db.transaction((): boolean => {
       if (!currentExecutorLease(this.db, input.ownerId, input.generation, input.now)) return false;
       const artifact = this.requireArtifact(input.artifactId);
@@ -1269,16 +1272,29 @@ export class WorkArtifactRepository {
         artifact.assignees.length !== 1 || artifact.assignees[0] !== input.externalAssignee ||
         !this.isSnapshotValid(claim.snapshotId)
       ) return false;
+      if (
+        claim.ownerId !== input.expectedOwnerId ||
+        claim.generation !== input.expectedGeneration ||
+        claim.leaseExpiresAt !== input.expectedLeaseExpiresAt
+      ) return false;
+      if (
+        (claim.ownerId !== input.ownerId || claim.generation !== input.generation) &&
+        claim.leaseExpiresAt > input.now
+      ) return false;
       return this.db.prepare(
         `UPDATE work_artifact_claims
             SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
-          WHERE id = ? AND state = 'held'`,
+          WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+            AND lease_expires_at = ?`,
       ).run(
         input.ownerId,
         input.generation,
         input.now + input.leaseMs,
         input.now,
         claim.id,
+        input.expectedOwnerId,
+        input.expectedGeneration,
+        input.expectedLeaseExpiresAt,
       ).changes === 1;
     }).immediate();
   }
@@ -1327,12 +1343,21 @@ export class WorkArtifactRepository {
           claim.releaseReason === reason;
       }
       if (claim.state !== "held") return false;
+      if (claim.leaseExpiresAt <= input.now) return false;
       if (!currentExecutorLease(this.db, input.ownerId, input.generation, input.now)) return false;
       const updated = this.db.prepare(
         `UPDATE work_artifact_claims
             SET state = 'released', released_at = ?, release_reason = ?
-          WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?`,
-      ).run(input.now, reason, input.claimId, input.ownerId, input.generation);
+          WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+            AND lease_expires_at > ?`,
+      ).run(
+        input.now,
+        reason,
+        input.claimId,
+        input.ownerId,
+        input.generation,
+        input.now,
+      );
       if (updated.changes !== 1) return false;
       this.db.prepare(
         `UPDATE work_artifacts SET status = 'ready', updated_at = ?
@@ -1770,7 +1795,7 @@ export class WorkArtifactRepository {
   }
 
   private navigatorResultAuthorizesResolution(attemptId: string, artifact: WorkArtifact): boolean {
-    return this.db.prepare(
+    const planningResult = this.db.prepare(
       `SELECT 1
          FROM navigator_planning_results AS result
          JOIN navigator_skill_attempts AS attempt ON attempt.id = result.attempt_id
@@ -1780,6 +1805,18 @@ export class WorkArtifactRepository {
           AND job.project_id = ?
           AND json_extract(binding.value, '$.artifactId') = ?
           AND json_extract(binding.value, '$.snapshotId') = ?`,
+    ).get(attemptId, artifact.projectId, artifact.id, artifact.currentSnapshotId);
+    if (planningResult !== undefined) return true;
+    return this.db.prepare(
+      `SELECT 1
+         FROM navigator_ticket_worker_outcomes AS outcome
+         JOIN navigator_ticket_worker_attempts AS attempt ON attempt.id = outcome.attempt_id
+         JOIN navigator_ticket_slices AS slice ON slice.id = attempt.slice_id
+         JOIN jobs AS job ON job.id = attempt.job_id
+        WHERE outcome.attempt_id = ? AND outcome.outcome = 'succeeded'
+          AND attempt.kind = 'review' AND slice.state = 'accepted'
+          AND job.project_id = ? AND slice.ticket_artifact_id = ?
+          AND slice.ticket_snapshot_id = ?`,
     ).get(attemptId, artifact.projectId, artifact.id, artifact.currentSnapshotId) !== undefined;
   }
 
@@ -1877,6 +1914,13 @@ export class WorkArtifactRepository {
     assertPositiveInteger(input.generation, "generation");
     assertNonNegativeInteger(input.now, "now");
     assertPositiveInteger(input.leaseMs, "leaseMs");
+  }
+
+  private validateAdoptionFence(input: AdoptWorkArtifactClaimInput): void {
+    this.validateClaimFence(input);
+    assertBoundedString(input.expectedOwnerId, "expectedOwnerId");
+    assertPositiveInteger(input.expectedGeneration, "expectedGeneration");
+    assertNonNegativeInteger(input.expectedLeaseExpiresAt, "expectedLeaseExpiresAt");
   }
 
   private validateClaimLeaseInput(input: RenewWorkArtifactClaimInput): void {

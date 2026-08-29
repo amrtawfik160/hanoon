@@ -578,13 +578,17 @@ export class WorkArtifactCoordinator {
     const settlement = this.commitExecutorMutation(input, (boundaryNow) => {
       const adoptNow = Math.max(input.now, boundaryNow);
       const adoptedCapture = this.captureObservation(artifact, external, adoptNow);
-      const adopted = this.store.adoptWorkArtifactClaim({
+      const currentClaim = this.store.getHeldWorkArtifactClaim(artifact.id);
+      const adopted = currentClaim !== null && this.store.adoptWorkArtifactClaim({
         artifactId: artifact.id,
         workflowStepId: input.workflowStepId,
         jobId: input.jobId,
         externalAssignee: input.assignee,
         ownerId: input.ownerId,
         generation: input.generation,
+        expectedOwnerId: currentClaim.ownerId,
+        expectedGeneration: currentClaim.generation,
+        expectedLeaseExpiresAt: currentClaim.leaseExpiresAt,
         now: adoptNow,
         leaseMs: input.leaseMs,
       });
@@ -689,6 +693,7 @@ export class WorkArtifactCoordinator {
     }
     if (claim.state !== "held") return false;
     if (!this.store.isExecutorLeaseCurrent(input.ownerId, input.generation, input.now)) return false;
+    if (claim.leaseExpiresAt <= input.now) return false;
     const artifact = this.requireArtifact(claim.artifactId);
     let observed = await this.readBoundTrackerArtifact(artifact);
     const releaseEvidence = await this.tracker.operationStatus({
