@@ -575,7 +575,15 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       }),
     });
 
-    const policy = policyFixture({ projectId: "proj_1", alias: "cyndra", githubRepository: "acme/cyndra" });
+    const policy = policyFixture({
+      projectId: "proj_1",
+      alias: "cyndra",
+      githubRepository: "acme/cyndra",
+      production: {
+        ...policyFixture().production!,
+        rollbackCommand: { name: "rollback", command: "./rollback", timeoutMs: 60_000 },
+      },
+    });
     let executorSession: ExecutorSession;
     const completeDocs = (jobId: string): void => {
       const current = store.getJob(jobId);

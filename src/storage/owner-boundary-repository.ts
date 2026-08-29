@@ -283,8 +283,15 @@ function policySource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): bool
         AND revision.policy_digest = observation.policy_digest
         AND job.version = observation.observed_job_version
         AND job.state = 'awaiting_merge_approval'
-        AND json_extract(job.policy_json, '$.production') IS NULL
-        AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+        AND (
+          (
+            json_extract(job.policy_json, '$.production') IS NULL
+            AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+          ) OR (
+            json_extract(job.policy_json, '$.production') IS NOT NULL
+            AND json_extract(job.policy_json, '$.production.rollbackCommand') IS NULL
+          )
+        )
         AND source_effect.kind = 'issue_approval'
      LIMIT 1`,
   ).get(input.jobId, input.authorityId, input.authorityRevision, input.affectedEffectIdempotencyKey) !== undefined;

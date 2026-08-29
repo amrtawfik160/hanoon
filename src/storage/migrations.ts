@@ -4102,6 +4102,79 @@ WHEN NOT (
   )
 )
 BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
+`, String.raw`
+DROP TRIGGER IF EXISTS owner_boundaries_require_authoritative_source;
+CREATE TRIGGER owner_boundaries_require_authoritative_source
+BEFORE INSERT ON owner_boundaries
+WHEN NOT (
+  (
+    NEW.code = 'policy_change_required' AND EXISTS (
+      SELECT 1
+        FROM policy_boundary_observations AS observation
+        JOIN task_authority_current AS current
+          ON current.job_id = observation.job_id
+         AND current.authority_id = observation.authority_id
+         AND current.revision = observation.authority_revision
+        JOIN task_authority_revisions AS revision
+          ON revision.authority_id = observation.authority_id
+         AND revision.revision = observation.authority_revision
+        JOIN jobs AS job ON job.id = observation.job_id
+        JOIN effects AS source_effect
+          ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+         AND source_effect.job_id = observation.job_id
+       WHERE observation.job_id = NEW.job_id
+         AND observation.authority_id = NEW.authority_id
+         AND observation.authority_revision = NEW.authority_revision
+         AND observation.affected_effect_idempotency_key = NEW.affected_effect_idempotency_key
+         AND NEW.affected_artifact_id IS NULL
+         AND revision.status = 'active'
+         AND revision.task_outcome = 'shipped_change'
+         AND revision.artifact_graph_digest = observation.artifact_graph_digest
+         AND revision.policy_digest = observation.policy_digest
+         AND job.version = observation.observed_job_version
+         AND job.state = 'awaiting_merge_approval'
+         AND (
+           (
+             json_extract(job.policy_json, '$.production') IS NULL
+             AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+           ) OR (
+             json_extract(job.policy_json, '$.production') IS NOT NULL
+             AND json_extract(job.policy_json, '$.production.rollbackCommand') IS NULL
+           )
+         )
+         AND source_effect.kind = 'issue_approval'
+    )
+  ) OR (
+    NEW.code = 'production_recovery_required' AND EXISTS (
+      SELECT 1
+        FROM production_recovery_observations AS observation
+        JOIN task_authority_current AS current
+          ON current.job_id = observation.job_id
+         AND current.authority_id = observation.authority_id
+         AND current.revision = observation.authority_revision
+        JOIN task_authority_revisions AS revision
+          ON revision.authority_id = observation.authority_id
+         AND revision.revision = observation.authority_revision
+        JOIN jobs AS job ON job.id = observation.job_id
+        JOIN effects AS source_effect
+          ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+         AND source_effect.job_id = observation.job_id
+       WHERE observation.job_id = NEW.job_id
+         AND observation.authority_id = NEW.authority_id
+         AND observation.authority_revision = NEW.authority_revision
+         AND observation.affected_effect_idempotency_key = NEW.affected_effect_idempotency_key
+         AND NEW.affected_artifact_id IS NULL
+         AND revision.status = 'suspended'
+         AND revision.task_outcome = 'shipped_change'
+         AND revision.artifact_graph_digest = observation.artifact_graph_digest
+         AND revision.policy_digest = observation.policy_digest
+         AND job.version = observation.observed_job_version
+         AND job.state = 'production_failed'
+         AND source_effect.kind IN ('deploy_production', 'verify_production')
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
 `] as const;
 
 export const ALL_MIGRATIONS = [

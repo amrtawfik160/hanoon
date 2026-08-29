@@ -12,6 +12,14 @@ import { openStore } from "../src/storage/store";
 import { jobFixture, policyFixture, sha } from "./helpers";
 
 let fixtureIndex = 0;
+function policyWithRollback() {
+  return policyFixture({
+    production: {
+      ...policyFixture().production!,
+      rollbackCommand: { name: "rollback", command: "./rollback", timeoutMs: 60_000 },
+    },
+  });
+}
 function ownerJobFixture(task: string, policy = policyFixture()) {
   fixtureIndex += 1;
   const { bb } = createFakePluginHost({ pluginId: `task-authority-${fixtureIndex}` });
@@ -445,7 +453,7 @@ function staleAuthoritativeBoundarySource(
     expect(fixture.store.admitTaskAuthorityOperation(effect, "merge", 10_003)).toBe(true);
   } else if (code === "policy_change_required") {
     db.prepare("UPDATE jobs SET policy_json = ? WHERE id = ?")
-      .run(JSON.stringify(policyFixture()), fixture.job.id);
+      .run(JSON.stringify(policyWithRollback()), fixture.job.id);
   } else if (code === "technical_tradeoff_required") {
     db.prepare("UPDATE effects SET attempts = 19 WHERE idempotency_key = ?")
       .run(affected.affectedEffectIdempotencyKey);
@@ -1195,7 +1203,7 @@ describe("owner task authority intake", () => {
     }],
     ["resolved policy", (fixture: ReturnType<typeof ownerJobFixture>, affectedEffectIdempotencyKey: string) => {
       fixture.bb.storage.database().prepare("UPDATE jobs SET policy_json = ? WHERE id = ?")
-        .run(JSON.stringify(policyFixture()), fixture.job.id);
+        .run(JSON.stringify(policyWithRollback()), fixture.job.id);
       return { affectedEffectIdempotencyKey };
     }],
   ] as const)("rejects a policy boundary with %s", (_scenario, arrange) => {
@@ -1642,9 +1650,10 @@ describe("owner task authority intake", () => {
   });
 
   it("auto-authorizes the exact shipped task merge with a durable accepted approval", async () => {
-    const fixture = ownerJobFixture("Fix the retry loop");
+    const policy = policyWithRollback();
+    const fixture = ownerJobFixture("Fix the retry loop", policy);
     const headSha = sha("b");
-    const key = prepareApprovalEffect(fixture, policyFixture(), headSha);
+    const key = prepareApprovalEffect(fixture, policy, headSha);
 
     await runApprovalEffect(fixture, key);
 
@@ -1674,8 +1683,9 @@ describe("owner task authority intake", () => {
   });
 
   it("does not issue approval while a repeatedly reviewed shipped task seeks independent evidence", async () => {
-    const fixture = ownerJobFixture("Fix and ship the retry loop");
-    const key = prepareApprovalEffect(fixture, policyFixture(), sha("b"));
+    const policy = policyWithRollback();
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("b"));
     fixture.bb.storage.database().prepare(
       "UPDATE jobs SET review_cycle = 2 WHERE id = ?",
     ).run(fixture.job.id);
@@ -1709,6 +1719,30 @@ describe("owner task authority intake", () => {
       status: "pending",
       affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
     });
+    expect(fixture.store.listEffectsForJob(fixture.job.id).some((effect) => effect.kind === "merge_pr")).toBe(false);
+    const reopened = openStore(fixture.bb.storage, fixture.bb.storage.kv, () => 10_000);
+    expect(reopened.listOwnerBoundaries(fixture.job.id)).toEqual(boundaries);
+  });
+
+  it("records one policy boundary instead of merging production without rollback", async () => {
+    const policy = policyFixture();
+    const fixture = ownerJobFixture("Fix the retry loop", policy);
+    const key = prepareApprovalEffect(fixture, policy, sha("c"));
+
+    await runApprovalEffect(fixture, key);
+
+    expect(fixture.store.getJob(fixture.job.id)?.state).toBe("awaiting_merge_approval");
+    expect(fixture.bb.storage.database().prepare(
+      "SELECT COUNT(*) AS count FROM approvals WHERE job_id = ?",
+    ).get(fixture.job.id)).toEqual({ count: 0 });
+    const boundaries = fixture.store.listOwnerBoundaries(fixture.job.id);
+    expect(boundaries).toHaveLength(1);
+    expect(boundaries[0]).toMatchObject({
+      code: "policy_change_required",
+      status: "pending",
+      affectedEffectIdempotencyKey: `${fixture.job.id}:3:merge_pr`,
+    });
+    expect(boundaries[0]?.blocker.toLowerCase()).toContain("rollback");
     expect(fixture.store.listEffectsForJob(fixture.job.id).some((effect) => effect.kind === "merge_pr")).toBe(false);
     const reopened = openStore(fixture.bb.storage, fixture.bb.storage.kv, () => 10_000);
     expect(reopened.listOwnerBoundaries(fixture.job.id)).toEqual(boundaries);

@@ -23,6 +23,12 @@ function grant(overrides: Partial<MergeAuthorityGrant> = {}): MergeAuthorityGran
 
 type AuthorityJob = Pick<Job, "id" | "projectId" | "prHeadSha" | "reviewCycle" | "cancelRequestedAt" | "policy">;
 
+const PRODUCTION_WITH_ROLLBACK = {
+  deployCommands: [] as const,
+  canaryCommands: [] as const,
+  rollbackCommand: { name: "rollback", command: "./rollback", timeoutMs: 60_000 },
+};
+
 function job(overrides: Partial<AuthorityJob> = {}): AuthorityJob {
   return {
     id: "job_owner",
@@ -30,7 +36,7 @@ function job(overrides: Partial<AuthorityJob> = {}): AuthorityJob {
     prHeadSha: HEAD,
     reviewCycle: 0,
     cancelRequestedAt: null,
-    policy: { production: { deployCommands: [], canaryCommands: [] } } as unknown as Job["policy"],
+    policy: { production: PRODUCTION_WITH_ROLLBACK } as unknown as Job["policy"],
     ...overrides,
   };
 }
@@ -76,6 +82,19 @@ describe("standing merge approval", () => {
     expect(decision.outcome).toBe("ask_owner");
   });
 
+  it("asks when production has no rollback command", () => {
+    const decision = decideAutoApproval({
+      job: job({
+        policy: { production: { deployCommands: [], canaryCommands: [] } } as unknown as Job["policy"],
+      }),
+      grant: grant(),
+    });
+    expect(decision).toMatchObject({
+      outcome: "ask_owner",
+      reason: expect.stringContaining("rollback"),
+    });
+  });
+
   it("still merges a change that needed one round of review fixes", () => {
     const decision = decideAutoApproval({ job: job({ reviewCycle: 1 }), grant: grant() });
     expect(decision).toEqual({ outcome: "auto_approve" });
@@ -94,7 +113,7 @@ describe("standing merge approval", () => {
 function policyGrantJob(autonomy: Record<string, unknown>, overrides: Partial<AuthorityJob> = {}) {
   return job({
     policy: {
-      production: { deployCommands: [], canaryCommands: [] },
+      production: PRODUCTION_WITH_ROLLBACK,
       autonomy,
     } as unknown as Job["policy"],
     ...overrides,

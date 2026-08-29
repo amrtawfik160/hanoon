@@ -453,7 +453,7 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("appends the navigator release migration after the ticket 41 policy intent migrations", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_RELEASE_MIGRATIONS[0]);
+    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");
@@ -619,7 +619,7 @@ describe("navigator exact-head release", () => {
       failureSignature: "deploy",
       rollbackOutcome: "pass",
     })).toBe(1);
-    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident`)).toMatchObject({
+    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident:deploy`)).toMatchObject({
       payload: {
         text: "Production deploy failed. The configured rollback restored the previous release. No action is required.",
       },
@@ -640,6 +640,40 @@ describe("navigator exact-head release", () => {
     expect(reopened.listOwnerBoundaries(fixture.job.id)[0]).toMatchObject({
       code: "production_recovery_required",
       goal: "Restore production after a failed release",
+    });
+  });
+
+  it("records a distinct owner notice for each successful rollback phase", async () => {
+    const fixture = ownedFixture();
+    await runLeasedProduction(fixture, seedProductionEffect(fixture, "deploying"), failedStage("deploy", "pass"));
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({
+      state: "implementing",
+      prHeadSha: null,
+    });
+    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident:deploy`)).toMatchObject({
+      payload: {
+        text: "Production deploy failed. The configured rollback restored the previous release. No action is required.",
+      },
+    });
+
+    await runLeasedProduction(
+      fixture,
+      seedProductionEffect(fixture, "verifying_production"),
+      failedStage("canary", "pass"),
+    );
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({
+      state: "implementing",
+      prHeadSha: null,
+    });
+    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident:canary`)).toMatchObject({
+      payload: {
+        text: "Production canary failed. The configured rollback restored the previous release. No action is required.",
+      },
+    });
+    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident:deploy`)).toMatchObject({
+      payload: {
+        text: "Production deploy failed. The configured rollback restored the previous release. No action is required.",
+      },
     });
   });
 
@@ -672,7 +706,7 @@ describe("navigator exact-head release", () => {
     ).run(fixture.job.id);
     await runLeasedProduction(fixture, seedProductionEffect(fixture, "deploying"), failedStage("deploy", "pass"));
     expect(fixture.store.getJob(fixture.job.id)?.state).toBe("production_failed");
-    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident`)).toBeNull();
+    expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident:deploy`)).toBeNull();
     expect(fixture.store.listOwnerBoundaries(fixture.job.id)).toEqual([]);
   });
 

@@ -24,7 +24,7 @@ import {
   type NativeAdapterTransition,
   type NativeAdapterTransitionEnvelope,
 } from "../capabilities/native-adapters";
-import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
+import { isSmallFixJob, productionHasRollbackCommand, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
 import { resolveConsensusExecution, type PipelineStage } from "../domain/stage-execution";
 import { assessConsensusReview, type ReviewLens } from "../domain/review-lenses";
 import { jobStageExecution } from "../domain/stage-routing";
@@ -1942,54 +1942,45 @@ export class EffectRunner {
       policy: job.policy,
       evidence: { ...evidence, taskAuthority },
     });
-    // A shipped task with no configured production path is not allowed to
-    // silently fall back to a one-use merge approval. That would turn the
-    // owner's exact task grant into a broader release decision.
-    if (
-      liveGrant?.source === "task" &&
-      taskAuthority?.outcome === "shipped_change" &&
-      !job.policy?.production &&
-      job.policy?.autonomy?.mergeWithoutProduction !== true
-    ) {
-      const current = this.dependencies.store.getJob(job.id);
-      if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
-      const boundaryNow = this.now();
-      const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
-      if (!this.dependencies.store.recordExecutorPolicyBoundaryObservation({
-        jobId: current.id,
-        authorityRevision: taskAuthority.revision,
-        sourceEffectIdempotencyKey: effect.idempotencyKey,
-        affectedEffectIdempotencyKey,
-        ...this.executorFence(),
-      })) throw new Error("executor refused the policy boundary observation");
-      const boundary = this.dependencies.store.recordOwnerBoundary({
-        jobId: current.id,
-        authorityRevision: taskAuthority.revision,
-        code: "policy_change_required",
-        goal: "Complete the owner-requested shipped change",
-        blocker: "No production policy or merge-without-production permission is configured for this project",
-        priorChecks: [
-          "The pull-request head is the exact head that passed the review gate",
-          "The task authority is active for this job at its current revision",
-        ],
-        options: [
-          {
-            label: "Configure production",
-            consequence: "The task can continue through deploy and canary under project policy",
-          },
-          {
-            label: "Allow merge without production",
-            consequence: "The task can merge under its required checks and regression monitoring",
-          },
-        ],
-        recommendation: "Configure production because it preserves the requested shipped outcome",
-        pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
-        evidenceFacts: ["policy:change-required"],
-        affectedEffectIdempotencyKey,
-        now: boundaryNow,
-      });
-      if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
-      return;
+    // A shipped task with no configured production path, or with production and
+    // no rollback, is not allowed to silently fall back to a one-use merge
+    // approval. That would turn the owner's exact task grant into a broader
+    // release decision.
+    if (liveGrant?.source === "task" && taskAuthority?.outcome === "shipped_change") {
+      if (!job.policy?.production && job.policy?.autonomy?.mergeWithoutProduction !== true) {
+        this.pauseShippedTaskForPolicyChange(effect, job, taskAuthority, {
+          blocker: "No production policy or merge-without-production permission is configured for this project",
+          options: [
+            {
+              label: "Configure production",
+              consequence: "The task can continue through deploy and canary under project policy",
+            },
+            {
+              label: "Allow merge without production",
+              consequence: "The task can merge under its required checks and regression monitoring",
+            },
+          ],
+          recommendation: "Configure production because it preserves the requested shipped outcome",
+        });
+        return;
+      }
+      if (job.policy?.production && !productionHasRollbackCommand(job.policy)) {
+        this.pauseShippedTaskForPolicyChange(effect, job, taskAuthority, {
+          blocker: "This project deploys to production with no rollback command, so a failed unattended release cannot be restored",
+          options: [
+            {
+              label: "Configure rollback",
+              consequence: "A failed deploy or canary can restore the previous release under project policy",
+            },
+            {
+              label: "Remove production until rollback exists",
+              consequence: "The task stays paused rather than deploying with no way back",
+            },
+          ],
+          recommendation: "Configure a rollback command because unattended production requires a way back",
+        });
+        return;
+      }
     }
     // The owner already granted this merge in so many words, before the gate
     // was reached. Their word outranks the button: consuming it here is what
@@ -2069,6 +2060,47 @@ export class EffectRunner {
       mergeAuthorityGranted: liveGrant !== null,
       ...(decision.outcome === "ask_owner" ? { approvalReason: decision.reason } : {}),
     });
+  }
+
+  private pauseShippedTaskForPolicyChange(
+    effect: StoredEffect,
+    job: Job,
+    taskAuthority: { revision: number },
+    copy: {
+      blocker: string;
+      options: Array<{ label: string; consequence: string }>;
+      recommendation: string;
+    },
+  ): void {
+    const current = this.dependencies.store.getJob(job.id);
+    if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+    const boundaryNow = this.now();
+    const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
+    if (!this.dependencies.store.recordExecutorPolicyBoundaryObservation({
+      jobId: current.id,
+      authorityRevision: taskAuthority.revision,
+      sourceEffectIdempotencyKey: effect.idempotencyKey,
+      affectedEffectIdempotencyKey,
+      ...this.executorFence(),
+    })) throw new Error("executor refused the policy boundary observation");
+    const boundary = this.dependencies.store.recordOwnerBoundary({
+      jobId: current.id,
+      authorityRevision: taskAuthority.revision,
+      code: "policy_change_required",
+      goal: "Complete the owner-requested shipped change",
+      blocker: copy.blocker,
+      priorChecks: [
+        "The pull-request head is the exact head that passed the review gate",
+        "The task authority is active for this job at its current revision",
+      ],
+      options: copy.options,
+      recommendation: copy.recommendation,
+      pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
+      evidenceFacts: ["policy:change-required"],
+      affectedEffectIdempotencyKey,
+      now: boundaryNow,
+    });
+    if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
   }
 
   private acceptTaskMerge(job: Job): void {

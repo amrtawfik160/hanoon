@@ -6,6 +6,7 @@ import {
   isResumableConfigurationBlock,
   isReviewedPrCompletionBlock,
   PRODUCTION_NOT_CONFIGURED,
+  productionHasRollbackCommand,
   projectPolicySchema,
   type AutonomousJobOrigin,
   type Job,
@@ -5364,13 +5365,19 @@ function authoritySupportsPolicyBoundary(
     authority.outcome === "shipped_change";
 }
 
+function policyRequiresShippedTaskBoundary(policy: ProjectPolicy | null | undefined): boolean {
+  if (policy == null) return false;
+  if (policy.production === undefined) return policy.autonomy?.mergeWithoutProduction !== true;
+  return !productionHasRollbackCommand(policy);
+}
+
 function jobNeedsPolicyBoundary(
   job: Job,
   authority: TaskAuthority,
   affectedEffectIdempotencyKey: string,
 ): boolean {
   return job.state === "awaiting_merge_approval" && job.policy !== null &&
-    job.policy.production === undefined && job.policy.autonomy?.mergeWithoutProduction !== true &&
+    policyRequiresShippedTaskBoundary(job.policy) &&
     taskPolicyDigest(JSON.stringify(job.policy)) === authority.policyDigest &&
     affectedEffectIdempotencyKey === `${job.id}:${job.version + 1}:merge_pr`;
 }
@@ -12939,8 +12946,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (effect.kind !== "issue_approval") return effect;
     const job = this.readJobById(effect.jobId);
     const authority = this.taskAuthorityRepository.get(effect.jobId);
-    if (!job || !authority || authority.outcome !== "shipped_change" || job.policy?.production ||
-      job.policy?.autonomy?.mergeWithoutProduction === true) return effect;
+    if (!job || !authority || authority.outcome !== "shipped_change" ||
+      !policyRequiresShippedTaskBoundary(job.policy)) return effect;
     const payload = policyApprovalIntentForLease(effect, job, authority);
     if (!payload) return null;
     if (policyApprovalIntentMatches(effect.payload, job, authority, `${job.id}:${job.version + 1}:merge_pr`)) {
@@ -17317,7 +17324,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ? "Production canary failed. The configured rollback restored the previous release. No action is required."
       : "Production deploy failed. The configured rollback restored the previous release. No action is required.";
     const item: OutboxInput = {
-      logicalKey: `job:${next.id}:production-incident`,
+      logicalKey: `job:${next.id}:production-incident:${phase}`,
       chatId: owner.chatId,
       payload: { text, disable_web_page_preview: true },
     };

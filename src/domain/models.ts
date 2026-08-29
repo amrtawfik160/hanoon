@@ -162,7 +162,7 @@ export const projectPolicySchema = z
     // nobody is watching an unattended merge do it. A rollback command is the
     // one thing that turns that from an incident into a recovery, so it is
     // required before the owner's signature may be skipped.
-    if (policy.autonomy?.unattendedMerge && policy.production && !policy.production.rollbackCommand) {
+    if (policy.autonomy?.unattendedMerge && policy.production && !productionHasRollbackCommand(policy)) {
       context.addIssue({
         code: "custom",
         path: ["autonomy", "unattendedMerge"],
@@ -442,6 +442,10 @@ export function isResumablePermanentFailure(
  */
 export function mergesWithoutProduction(policy: ProjectPolicy | null | undefined): boolean {
   return policy?.production === undefined && policy?.autonomy?.mergeWithoutProduction === true;
+}
+
+export function productionHasRollbackCommand(policy: ProjectPolicy | null | undefined): boolean {
+  return policy?.production?.rollbackCommand !== undefined;
 }
 
 export function isReviewedPrCompletionBlock(

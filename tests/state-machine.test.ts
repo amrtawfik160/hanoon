@@ -900,7 +900,11 @@ describe("navigator-v1 release transitions", () => {
   it("skips the recipe docs loop and issues approval for a shipped navigator head", () => {
     const result = transition(
       navigator("reviewing", { prHeadSha: head, policy: policyFixture() }),
-      { type: "REVIEW_PASSED", headSha: head },
+      {
+        type: "REVIEW_PASSED",
+        headSha: head,
+        documentation: { required: false, reasons: [], diffDigest: "b".repeat(64) },
+      },
       10_000,
     );
 

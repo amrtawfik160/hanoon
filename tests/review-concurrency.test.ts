@@ -237,3 +237,81 @@ it("keeps simultaneous opposite review verdicts bound to their own jobs", async 
     await run.done;
   }
 });
+
+it("returns a legacy navigator review pass to navigation when the exact diff requires docs", async () => {
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "navigator-review-docs-plugin",
+    sdk: {
+      subscribe: () => () => undefined,
+      threads: { interactions: { list: async () => [] } },
+    },
+  });
+  await plugin(bb);
+  const store = openStore(bb.storage);
+  const db = bb.storage.database();
+  const headSha = sha("d");
+  const job = prepareReviewJob(store, db, {
+    id: "job_nav_docs",
+    sourceUpdateId: 201,
+    projectId: "proj_nav",
+    environmentId: "environment_nav",
+    implementationThreadId: "implementation_nav",
+    reviewThreadId: "review_quality_nav",
+    riskReviewThreadId: "review_risk_nav",
+    attemptId: "attempt_nav",
+    riskAttemptId: "attempt_nav_risk",
+    headSha,
+  });
+  db.prepare(
+    `UPDATE jobs SET workflow_engine = 'navigator-v1', workflow_mode = 'deterministic',
+       routing_mode = 'legacy' WHERE id = ?`,
+  ).run(job.id);
+
+  harness.sdk.stub("environments.status", async () => ({
+    outcome: "available",
+    available: true,
+    clean: true,
+    checkout: { headSha },
+  }));
+  harness.sdk.stub("environments.diff", async () => ({
+    outcome: "available",
+    diff: {
+      diff: "diff --git a/docs/operations.md b/docs/operations.md\n+++ b/docs/operations.md\n@@ -1 +1 @@\n-old\n+new",
+      truncated: false,
+    },
+  }));
+  harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({
+    id: threadId,
+    projectId: "proj_nav",
+    environmentId: "environment_nav",
+    status: threadId === "implementation_nav" ? "active" : "idle",
+    updatedAt: 2_000,
+    runtime: {
+      displayStatus: threadId === "implementation_nav" ? "active" : "idle",
+      hostReconnectGraceExpiresAt: null,
+    },
+  }));
+  harness.sdk.stub("threads.output", async () => ({
+    output: reviewOutput({
+      verdict: "pass",
+      reviewedHeadSha: headSha,
+      summary: "Navigator review passed",
+    }),
+  }));
+
+  const run = harness.behavior.runService("job-executor");
+  try {
+    await vi.waitFor(() => expect(store.getJob(job.id)).toMatchObject({
+      state: "implementing",
+      prHeadSha: null,
+    }));
+    expect(db.prepare(
+      "SELECT reason_code, previous_state FROM navigator_release_findings WHERE job_id = ?",
+    ).all(job.id)).toEqual([
+      { reason_code: "documentation_required", previous_state: "reviewing" },
+    ]);
+  } finally {
+    run.controller.abort();
+    await run.done;
+  }
+});
