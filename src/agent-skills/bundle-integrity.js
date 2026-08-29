@@ -6,17 +6,24 @@ import {
   BUNDLE_LIMITS,
   DELIVERY_KIT,
   DISCOVERY_KIT,
+  FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
+  LOCKED_ROOTS,
+  MATT_POCOCK_KIT,
+  MATT_POCOCK_ROOT,
   PSTACK_KIT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
   REGISTERED_ROOTS,
+  REQUIRED_LEGACY_SKILLS,
+  REQUIRED_MATT_POCOCK_SKILLS,
+  REQUIRED_SHADOWED_SKILLS,
   REQUIRED_SKILLS,
   SKILL_ID_PATTERN,
   WORKFLOW_KIT,
 } from "./bundle-contract.js";
-import { skillFrontmatterName } from "./frontmatter.js";
+import { skillFrontmatter } from "./frontmatter.js";
 
 const {
   maximumFileBytes: MAX_FILE_BYTES,
@@ -28,7 +35,17 @@ const {
   maximumTreeDepth: MAX_TREE_DEPTH,
 } = BUNDLE_LIMITS;
 const requiredSkillsById = new Map(REQUIRED_SKILLS.map((skill) => [skill.id, skill]));
+const requiredLegacySkillsById = new Map(REQUIRED_LEGACY_SKILLS.map((skill) => [skill.id, skill]));
+const requiredShadowedSkillsById = new Map(REQUIRED_SHADOWED_SKILLS.map((skill) => [skill.id, skill]));
+const mattMetadataPaths = new Set([
+  MATT_POCOCK_KIT.licensePath,
+  MATT_POCOCK_KIT.manifestPath,
+  `${MATT_POCOCK_ROOT}/PROVENANCE.json`,
+]);
+const requiredMattSkillRoots = REQUIRED_MATT_POCOCK_SKILLS.map((skill) =>
+  skill.skillPath.slice(0, -"/SKILL.md".length));
 const expectedKits = [
+  ["mattPocockKit", "matt-pocock-kit", MATT_POCOCK_KIT],
   ["workflowKit", "workflow-kit", WORKFLOW_KIT],
   ["guardKit", "guard-kit", GUARD_KIT],
   ["deliveryKit", "delivery-kit", DELIVERY_KIT],
@@ -140,11 +157,16 @@ function parseLock(pluginRoot) {
   const decoded = parsedJson(contents, `malformed lock JSON: ${LOCK_PATH}`);
   if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw integrityError("malformed lock JSON: skills/skills.lock.json");
   if (decoded.schemaVersion !== LOCK_SCHEMA_VERSION) throw integrityError("unsupported lock schema version");
-  if (!Array.isArray(decoded.files) || !Array.isArray(decoded.skills) || !decoded.workflowKit || typeof decoded.workflowKit !== "object") {
+  if (!Array.isArray(decoded.files) || !Array.isArray(decoded.skills) || !Array.isArray(decoded.legacySkills) ||
+    !Array.isArray(decoded.shadowedSkills) ||
+    !decoded.workflowKit || typeof decoded.workflowKit !== "object" ||
+    !decoded.mattPocockKit || typeof decoded.mattPocockKit !== "object") {
     throw integrityError("malformed lock schema");
   }
   if (decoded.files.length > MAX_LOCKED_FILES) throw integrityError(`locked file count exceeds ${MAX_LOCKED_FILES}`);
-  if (decoded.skills.length > MAX_SKILLS) throw integrityError(`skill count exceeds ${MAX_SKILLS}`);
+  if (decoded.skills.length + decoded.legacySkills.length + decoded.shadowedSkills.length > MAX_SKILLS) {
+    throw integrityError(`skill count exceeds ${MAX_SKILLS}`);
+  }
   return decoded;
 }
 
@@ -208,7 +230,11 @@ function verifyFiles(pluginRoot, lockFiles, actualFiles) {
   for (const entry of lockFiles) {
     if (!entry || typeof entry !== "object") throw integrityError("malformed locked file record");
     const path = normalizedRelativePath(entry.path, "locked file path");
-    if (!REGISTERED_ROOTS.some((root) => path.startsWith(`${root}/`))) throw integrityError(`locked file escapes skills/: ${path}`);
+    if (!LOCKED_ROOTS.some((root) => path.startsWith(`${root}/`))) throw integrityError(`locked file escapes skills/: ${path}`);
+    if (path.startsWith(`${MATT_POCOCK_ROOT}/`) && !mattMetadataPaths.has(path) &&
+      !requiredMattSkillRoots.some((root) => path.startsWith(`${root}/`))) {
+      throw integrityError(`unsupported Matt Pocock bundle path: ${path}`);
+    }
     if (!/^[a-f0-9]{64}$/.test(entry.sha256)) throw integrityError(`invalid SHA-256 for ${path}`);
     if (lockedPaths.has(path)) throw integrityError(`duplicate locked file: ${path}`);
     if (previousPath && previousPath.localeCompare(path) >= 0) throw integrityError("locked files are not lexically sorted");
@@ -226,15 +252,15 @@ function verifyFiles(pluginRoot, lockFiles, actualFiles) {
   }
 }
 
-function skillName(pluginRoot, skillPath, path) {
+function parsedSkill(pluginRoot, skillPath, path) {
   const contents = readRegularFile(pluginRoot, skillPath, path, MAX_FILE_BYTES).toString("utf8");
-  let name;
+  let frontmatter;
   try {
-    name = skillFrontmatterName(contents);
+    frontmatter = skillFrontmatter(contents);
   } catch (error) {
     throw integrityError(`${error.message}: ${path}`);
   }
-  return { name, contents };
+  return { ...frontmatter, contents };
 }
 
 function localMarkdownTargets(contents) {
@@ -259,9 +285,9 @@ function localMarkdownTargets(contents) {
 function verifyNestedResources(pluginRoot, skillPath, contents) {
   const absoluteSkillPath = join(pluginRoot, skillPath);
   const skillDirectory = dirname(absoluteSkillPath);
-  const registeredRoot = REGISTERED_ROOTS.find((root) => skillPath.startsWith(`${root}/`));
-  if (!registeredRoot) throw integrityError(`skill is outside a registered root: ${skillPath}`);
-  const rootDirectory = join(pluginRoot, registeredRoot);
+  const bundleRoot = LOCKED_ROOTS.find((root) => skillPath.startsWith(`${root}/`));
+  if (!bundleRoot) throw integrityError(`skill is outside a locked root: ${skillPath}`);
+  const rootDirectory = join(pluginRoot, bundleRoot);
   for (const target of localMarkdownTargets(contents)) {
     let decoded;
     try {
@@ -279,14 +305,18 @@ function verifyNestedResources(pluginRoot, skillPath, contents) {
   }
 }
 
-function assertRequiredCatalog(records) {
-  if (records.size !== REQUIRED_SKILLS.length) throw integrityError("required skill catalog differs");
-  for (const expected of REQUIRED_SKILLS) {
-    if (records.get(expected.id)?.skillPath !== expected.skillPath) throw integrityError("required skill catalog differs");
+function assertRequiredCatalog(records, expectedSkills) {
+  if (records.size !== expectedSkills.length) throw integrityError("required skill catalog differs");
+  for (const expected of expectedSkills) {
+    const record = records.get(expected.id);
+    if (!record || ["skillPath", "sourcePath", "sourceRevision", "invocationClass", "source", "license"]
+      .some((field) => record[field] !== expected[field])) {
+      throw integrityError("required skill catalog differs");
+    }
   }
 }
 
-function verifyKitProvenance(pluginRoot, lock) {
+function verifyKitDeclarations(pluginRoot, lock) {
   for (const [lockKey, label, expected] of expectedKits) {
     const actual = lock[lockKey];
     if (!actual || typeof actual !== "object" || Array.isArray(actual)
@@ -297,42 +327,192 @@ function verifyKitProvenance(pluginRoot, lock) {
   }
 }
 
-function verifySkills(pluginRoot, lock, roots) {
-  const records = new Map();
-  for (const record of lock.skills) {
-    if (!record || typeof record !== "object") throw integrityError("malformed skill record");
-    if (typeof record.id !== "string" || !SKILL_ID_PATTERN.test(record.id)) throw integrityError("invalid skill id");
-    const skillPath = normalizedRelativePath(record.skillPath, "skill path");
-    if (records.has(record.id)) throw integrityError(`duplicate skill id: ${record.id}`);
-    records.set(record.id, { ...record, skillPath });
+function fileSha256(pluginRoot, path) {
+  const contents = readRegularFile(pluginRoot, join(pluginRoot, path), path, MAX_FILE_BYTES);
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+function assertPinnedFileDigest(pluginRoot, path, expectedDigest, errorReason) {
+  if (fileSha256(pluginRoot, path) !== expectedDigest) throw integrityError(errorReason);
+}
+
+function readMattProvenance(pluginRoot) {
+  const provenancePath = "skills/matt-pocock/PROVENANCE.json";
+  return parsedJson(
+    readRegularFile(pluginRoot, join(pluginRoot, provenancePath), provenancePath, MAX_FILE_BYTES),
+    `malformed provenance JSON: ${provenancePath}`,
+  );
+}
+
+function mattProvenanceMatches(provenance) {
+  const expectedPaths = REQUIRED_MATT_POCOCK_SKILLS.map((skill) => skill.sourcePath);
+  return provenance?.schemaVersion === 1 && provenance.sourceUrl === MATT_POCOCK_KIT.sourceUrl &&
+    provenance.revision === MATT_POCOCK_KIT.revision && provenance.version === MATT_POCOCK_KIT.version &&
+    provenance.manifestPath === ".claude-plugin/plugin.json" &&
+    provenance.manifestSha256 === MATT_POCOCK_KIT.manifestSha256 &&
+    provenance.licenseSha256 === MATT_POCOCK_KIT.licenseSha256 &&
+    Array.isArray(provenance.promotedPaths) && provenance.promotedPaths.length === expectedPaths.length &&
+    provenance.promotedPaths.every((path, index) => path === expectedPaths[index]);
+}
+
+function verifyKitProvenance(pluginRoot, lock) {
+  verifyKitDeclarations(pluginRoot, lock);
+  assertPinnedFileDigest(
+    pluginRoot, MATT_POCOCK_KIT.licensePath, MATT_POCOCK_KIT.licenseSha256,
+    "Matt Pocock license digest differs",
+  );
+  assertPinnedFileDigest(
+    pluginRoot, MATT_POCOCK_KIT.manifestPath, MATT_POCOCK_KIT.manifestSha256,
+    "Matt Pocock manifest digest differs",
+  );
+  if (!mattProvenanceMatches(readMattProvenance(pluginRoot))) {
+    throw integrityError("malformed Matt Pocock provenance record");
   }
-  assertRequiredCatalog(records);
-  const discovered = [];
-  for (const root of roots) {
-    const directory = opendirSync(join(pluginRoot, root));
-    try {
-      for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-        if (!entry.isDirectory()) continue;
-        const path = `${root}/${entry.name}/SKILL.md`;
-        if (!records.has(entry.name)) throw integrityError(`unlocked skill directory: ${root}/${entry.name}`);
-        discovered.push(entry.name);
-        const record = records.get(entry.name);
-        if (record.skillPath !== path) throw integrityError(`skill lock path differs for ${entry.name}`);
-        const parsed = skillName(pluginRoot, join(pluginRoot, path), path);
-        if (parsed.name !== entry.name || parsed.name !== record.id) throw integrityError(`frontmatter name differs from lock record: ${path}`);
-        verifyNestedResources(pluginRoot, path, parsed.contents);
-      }
-    } finally {
-      directory.closeSync();
+}
+
+function skillRecordDigest(record) {
+  return createHash("sha256").update(JSON.stringify({
+    id: record.id,
+    invocationClass: record.invocationClass,
+    license: record.license,
+    skillPath: record.skillPath,
+    source: record.source,
+    sourceDigest: record.sourceDigest,
+    sourcePath: record.sourcePath,
+    sourceRevision: record.sourceRevision,
+  })).digest("hex");
+}
+
+function assertSkillRecordShape(record) {
+  if (!record || typeof record !== "object") throw integrityError("malformed skill record");
+  if (typeof record.id !== "string" || !SKILL_ID_PATTERN.test(record.id)) throw integrityError("invalid skill id");
+  if (record.invocationClass !== "user" && record.invocationClass !== "model") {
+    throw integrityError(`invalid invocation class for ${record.id}`);
+  }
+  const boundedRevision = typeof record.sourceRevision === "string" &&
+    record.sourceRevision.length > 0 && record.sourceRevision.length <= 128;
+  const validProvenance = typeof record.source === "string" && record.source.length > 0 &&
+    typeof record.license === "string" && record.license.length > 0;
+  if (!boundedRevision || !validProvenance || !/^[a-f0-9]{64}$/.test(record.sourceDigest) ||
+    !/^[a-f0-9]{64}$/.test(record.descriptorDigest)) {
+    throw integrityError(`malformed skill record for ${record.id}`);
+  }
+}
+
+function normalizedSkillRecord(record) {
+  assertSkillRecordShape(record);
+  const skillPath = normalizedRelativePath(record.skillPath, "skill path");
+  const sourcePath = normalizedRelativePath(record.sourcePath, "source path");
+  if (!LOCKED_ROOTS.some((root) => skillPath.startsWith(`${root}/`))) {
+    throw integrityError(`skill is outside a locked root: ${skillPath}`);
+  }
+  const normalized = { ...record, skillPath, sourcePath };
+  if (skillRecordDigest(normalized) !== normalized.descriptorDigest) {
+    throw integrityError(`descriptor digest differs for ${record.id}`);
+  }
+  return normalized;
+}
+
+function parsedRecords(records, label) {
+  const parsed = new Map();
+  for (const candidate of records) {
+    const record = normalizedSkillRecord(candidate);
+    if (parsed.has(record.id)) throw integrityError(`duplicate ${label} skill id: ${record.id}`);
+    parsed.set(record.id, record);
+  }
+  return parsed;
+}
+
+function verifyOpenAiInvocationMetadata(pluginRoot, record) {
+  if (record.source !== MATT_POCOCK_KIT.sourceUrl) return;
+  const metadataPath = `${dirname(record.skillPath)}/agents/openai.yaml`;
+  const metadata = readRegularFile(
+    pluginRoot, join(pluginRoot, metadataPath), metadataPath, MAX_FILE_BYTES,
+  ).toString("utf8");
+  const implicit = /^\s*allow_implicit_invocation:\s*(true|false)\s*$/mu.exec(metadata)?.[1];
+  if (record.invocationClass === "user" && implicit !== "false") {
+    throw integrityError(`user-invoked skill ${record.id} does not disable implicit invocation`);
+  }
+  if (record.invocationClass === "model" && implicit === "false") {
+    throw integrityError(`model-invoked skill ${record.id} disables implicit invocation`);
+  }
+}
+
+function assertCatalogSeparation(records, legacyRecords, shadowedRecords) {
+  for (const id of records.keys()) {
+    if (FORBIDDEN_SKILL_ID_PATTERN.test(id)) throw integrityError(`forbidden admitted skill id: ${id}`);
+    if (legacyRecords.has(id)) throw integrityError(`legacy skill collides with admitted id: ${id}`);
+  }
+  for (const id of shadowedRecords.keys()) {
+    if (!records.has(id)) throw integrityError(`shadowed skill has no admitted counterpart: ${id}`);
+    if (legacyRecords.has(id)) throw integrityError(`shadowed skill collides with legacy-only id: ${id}`);
+  }
+}
+
+function verifySkillFile(pluginRoot, record) {
+  const absolutePath = join(pluginRoot, record.skillPath);
+  const parsed = parsedSkill(pluginRoot, absolutePath, record.skillPath);
+  if (parsed.name !== record.id || parsed.invocationClass !== record.invocationClass) {
+    throw integrityError(`frontmatter differs from lock record: ${record.skillPath}`);
+  }
+  if (fileSha256(pluginRoot, record.skillPath) !== record.sourceDigest) {
+    throw bundleError(`source digest mismatch: ${record.skillPath}`);
+  }
+  verifyNestedResources(pluginRoot, record.skillPath, parsed.contents);
+  verifyOpenAiInvocationMetadata(pluginRoot, record);
+}
+
+function verifiedSkillPaths(pluginRoot, records) {
+  const byPath = new Map();
+  for (const record of records) {
+    if (byPath.has(record.skillPath)) throw integrityError(`duplicate skill path: ${record.skillPath}`);
+    byPath.set(record.skillPath, record);
+    verifySkillFile(pluginRoot, record);
+  }
+  return byPath;
+}
+
+function assertCatalogedSkillFiles(lock, byPath) {
+  const discoveredPaths = lock.files
+    .map((entry) => entry.path)
+    .filter((path) => path.endsWith("/SKILL.md"));
+  if (discoveredPaths.length !== byPath.size || discoveredPaths.some((path) => !byPath.has(path))) {
+    throw integrityError("bundled skill files differ from active, legacy, and shadowed catalogs");
+  }
+}
+
+function assertRecordProvenance(records, expectedById, label) {
+  for (const record of records.values()) {
+    const expected = expectedById.get(record.id);
+    if (record.source !== expected.source || record.license !== expected.license) {
+      throw integrityError(`invalid ${label}provenance for ${record.id}`);
     }
   }
-  if (discovered.length !== records.size) throw integrityError("lock references a missing skill directory");
+}
+
+function verifiedSkillIds(records, legacyRecords) {
+  return {
+    admittedSkillIds: [...records.keys()].sort(),
+    legacySkillIds: [...legacyRecords.keys()].sort(),
+    skillIds: [...records.keys(), ...legacyRecords.keys()].sort(),
+  };
+}
+
+function verifySkills(pluginRoot, lock) {
+  const records = parsedRecords(lock.skills, "admitted");
+  const legacyRecords = parsedRecords(lock.legacySkills, "legacy");
+  const shadowedRecords = parsedRecords(lock.shadowedSkills, "shadowed");
+  assertCatalogSeparation(records, legacyRecords, shadowedRecords);
+  assertRequiredCatalog(records, REQUIRED_SKILLS);
+  assertRequiredCatalog(legacyRecords, REQUIRED_LEGACY_SKILLS);
+  assertRequiredCatalog(shadowedRecords, REQUIRED_SHADOWED_SKILLS);
+  const allRecords = [...records.values(), ...legacyRecords.values(), ...shadowedRecords.values()];
+  assertCatalogedSkillFiles(lock, verifiedSkillPaths(pluginRoot, allRecords));
   verifyKitProvenance(pluginRoot, lock);
-  for (const record of records.values()) {
-    const expected = requiredSkillsById.get(record.id);
-    if (record.source !== expected.source || record.license !== expected.license) throw integrityError(`invalid provenance for ${record.id}`);
-  }
-  return [...records.keys()].sort();
+  assertRecordProvenance(records, requiredSkillsById, "");
+  assertRecordProvenance(legacyRecords, requiredLegacySkillsById, "legacy ");
+  assertRecordProvenance(shadowedRecords, requiredShadowedSkillsById, "shadowed ");
+  return verifiedSkillIds(records, legacyRecords);
 }
 
 /** @param {string} moduleUrl */
@@ -361,13 +541,18 @@ export function resolvePluginRoot(moduleUrl) {
 /** @param {string} pluginRoot */
 export function verifySkillBundle(pluginRoot) {
   const root = verifiedPluginRoot(pluginRoot);
-  const roots = declaredRoots(root);
+  declaredRoots(root);
   const lock = parseLock(root);
-  const actualFiles = collectFiles(root, roots);
+  const actualFiles = collectFiles(root, LOCKED_ROOTS);
   verifyFiles(root, lock.files, actualFiles);
-  const skillIds = verifySkills(root, lock, roots);
+  const verifiedSkills = verifySkills(root, lock);
   const bundleDigest = createHash("sha256")
     .update(lock.files.map((entry) => `${entry.path}\0${entry.sha256}\n`).join(""))
     .digest("hex");
-  return Object.freeze({ bundleDigest, skillIds: Object.freeze(skillIds) });
+  return Object.freeze({
+    bundleDigest,
+    admittedSkillIds: Object.freeze(verifiedSkills.admittedSkillIds),
+    legacySkillIds: Object.freeze(verifiedSkills.legacySkillIds),
+    skillIds: Object.freeze(verifiedSkills.skillIds),
+  });
 }

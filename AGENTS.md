@@ -4,6 +4,20 @@ Use the smallest safe workflow for each task
 
 Do not duplicate brainstorming, specifications, plans, reviews, documentation, or subagent work
 
+## Agent skills
+
+### Issue tracker
+
+Issues, specifications, and tickets use GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Agent readiness uses the canonical Matt Pocock triage roles. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. See `docs/agents/domain.md`.
+
 ## Workflow routing
 
 ### Direct changes

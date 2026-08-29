@@ -5,7 +5,7 @@ Language for how Hanoon assigns and proves agent capabilities.
 ## Language
 
 **Capability**:
-A skill, tool, connector, model, or workflow recipe that Hanoon can identify and make available under policy.
+A skill, tool, connector, model, or native operation that Hanoon can identify and make available under policy.
 
 **Capability profile**:
 The smallest policy-approved set of capabilities assigned to one verified role and task attempt.
@@ -36,15 +36,11 @@ A discovered capability with a complete descriptor, passing compatibility eviden
 _Avoid_: Installed capability, trusted by presence
 
 **Task trait**:
-A durable, bounded fact about requested work or its observed change surface that influences recipe and capability eligibility.
+A durable, bounded fact about requested work or its observed change surface that influences workflow and capability eligibility.
 _Avoid_: Prompt guess, hidden classification
 
-**Task recipe**:
-A versioned Hanoon stage graph selected from durable task traits: `direct`, `bounded`, `bug`, `architectural`, `skill-authoring`, or `adopted-pr`.
-_Avoid_: Universal pipeline, model-managed workflow
-
 **Rigor escalation**:
-A one-way change from a task recipe or capability profile to a more protective compatible version after new risk, scope, or failure evidence.
+A one-way change to a more protective workflow step, capability profile, or model route after new risk, scope, or failure evidence.
 _Avoid_: Silent reroute, automatic downgrade
 
 **Delivery metadata**:
@@ -54,10 +50,6 @@ _Avoid_: Pull-request action, raw request title
 **Code-writing lane**:
 The single implementation thread allowed to modify one Hanoon-managed worktree at a time.
 _Avoid_: Parallel editors, nested implementer
-
-**Native recipe adapter**:
-A versioned Hanoon implementation of an orchestration skill's preserved invariants, with conflicting mechanics replaced by executor-owned stages and receipts.
-_Avoid_: Injected orchestration skill, simulated skill use
 
 **Capability compatibility graph**:
 Declarative prerequisites, exclusions, ordering rules, and task-surface triggers that constrain capability profile composition.
@@ -76,7 +68,7 @@ A named, policy-approved group of related controller tools granted to one logica
 _Avoid_: Global toolset, permanent session permission
 
 **Model pool**:
-An explicitly configured `strong`, `standard`, or `fast` execution tuple from which Hanoon selects by recipe, stage, risk, and observed complexity.
+An explicitly configured `strong`, `standard`, or `fast` execution tuple from which Hanoon selects by step contract, risk, and observed complexity.
 _Avoid_: Default model, model self-selection
 
 **External capability adapter**:
@@ -87,16 +79,12 @@ _Avoid_: Other-plugin tool selection, installed integration
 An append-only `requested`, `selected`, `denied`, or `outcome` record binding a capability and descriptor digest to one profile revision and durable subject.
 _Avoid_: Reasoning log, mutable skill claim
 
-**Recipe promotion**:
-The per-recipe transition from shadow observation to dispatch control after deterministic, disposable-live, and fixed-harness gates pass.
-_Avoid_: Global rollout, trial by production
-
 **Shadow profile**:
 A candidate capability profile recorded for comparison without controlling the active attempt.
 _Avoid_: Dry run, inactive configuration
 
 **Orchestration authority**:
-The Hanoon executor that owns agent fan-out, worktrees, retries, publishing, and durable stage transitions.
+The Hanoon executor's exclusive right to own agent fan-out, worktrees, retries, publishing, external effects, and durable transitions.
 _Avoid_: Nested orchestrator, worker-owned pipeline
 
 **Capability expansion budget**:
@@ -104,8 +92,64 @@ The single batched, compatible profile revision and bounded continuation allowed
 _Avoid_: Recursive discovery, repeated tool expansion
 
 **Mandatory capability**:
-A capability whose successful terminal outcome is required by the selected recipe before its stage may advance.
+A capability whose successful terminal outcome is required by an accepted workflow step or release gate before work may advance.
 _Avoid_: Best-effort guard, silently skipped skill
+
+**Invocation class**:
+Whether a skill may be selected by a matching model or must be explicitly invoked by the owner or workflow navigator.
+_Avoid_: Globally auto-triggered skill, prompt convention
+
+**Workflow navigator**:
+The agent-owned decision module that proposes one next workflow step from current durable facts without holding effect authority.
+_Avoid_: Recipe classifier, executor, autonomous tool caller
+
+**Navigator snapshot**:
+An immutable, bounded view of the job, artifacts, policy, capabilities, and evidence against which one navigator proposal is made.
+_Avoid_: Live service context, mutable job object
+
+**Workflow step**:
+One accepted, version-bound attempt to invoke an admitted skill or enter a guarded release from a navigator snapshot.
+_Avoid_: Pipeline stage, mutable plan item
+
+**Skill step contract**:
+Hanoon's executable policy for a schedulable skill's inputs, resources, result schema, evidence, and allowed artifact effects.
+_Avoid_: Skill prose as API, worker discretion
+
+**Work artifact**:
+A durable map, specification, decision ticket, implementation ticket, or resolution represented in the configured tracker and mirrored into Hanoon's evidence model.
+_Avoid_: Worker thread, job status, prompt attachment
+
+**Artifact snapshot**:
+An immutable tracker revision and content digest accepted as the input to a workflow step.
+_Avoid_: Current issue body, mutable reference document
+
+**Frontier**:
+The ordered set of open, unblocked, and unclaimed work artifacts eligible for the next claim.
+_Avoid_: Backlog, all open issues
+
+**Task outcome**:
+The terminal result the owner asked one job to reach: an accepted artifact, a reviewed change, or a shipped change.
+_Avoid_: Delivery mode, workflow recipe
+
+**Task authority**:
+An authenticated, project- and job-scoped grant to perform the effects required by one task outcome under project policy.
+_Avoid_: Standing approval, blanket autonomy
+
+**Owner boundary**:
+A durable wait for a specific decision, authority grant, access action, or spending choice that Hanoon cannot safely supply itself.
+_Avoid_: Uncertainty, progress update, routine approval
+
+**Release authority receipt**:
+One exact-head record showing that live task, explicit, or standing authority permits a merge after all release gates pass.
+_Avoid_: Task authority, merge button, review receipt
+
+**Release controller**:
+The executor-owned submachine that validates the final head and carries an authorized change through merge, deployment, canary, and recovery.
+_Avoid_: Workflow navigator, shipping skill
+
+**Production incident**:
+A failed or indeterminate deployment or canary after a production mutation may have occurred.
+_Avoid_: Test failure, ordinary retry
 
 **Guard disposition**:
 The registry-derived classification of a guard finding as `must_fix` or `advisory`; it is recomputed by Hanoon from stable rule identity rather than trusted from reviewer prose.
@@ -116,7 +160,7 @@ The one-line reason the controller gives when it messages a worker thread, recor
 _Avoid_: Tool narration, the sent message, a promise to explain later
 
 **Reference document**:
-A specification the owner gives Hanoon to consult, scoped to one project or globally. It informs work but is not itself an executable instruction.
+A project- or globally-scoped document Hanoon indexes for consultation. It informs work but is neither the canonical tracker artifact nor an executable instruction.
 _Avoid_: Uploaded file, attachment, knowledge base
 
 **Structural map**:

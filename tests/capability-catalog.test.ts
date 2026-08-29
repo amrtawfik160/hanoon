@@ -7,6 +7,8 @@ import {
 } from "../src/capabilities/contracts";
 import {
   CAPABILITY_CATALOG,
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
   CONTROLLER_BUNDLE_TOOLS,
   CONTROLLER_METADATA_TOOL_IDS,
   CONTROLLER_PROTOCOL_TOOL_IDS,
@@ -53,6 +55,13 @@ function redigest(descriptor: CapabilityDescriptor): CapabilityDescriptor {
 }
 
 describe("capability catalog", () => {
+  it("keeps the recipe compatibility registry stable during skill expansion", () => {
+    expect(CAPABILITY_REGISTRY_DIGEST)
+      .toBe("d14130f744f1ca484beec08d8956a20e16db854b88a304f9576fcc79bdaa0481");
+    expect(CAPABILITY_GRAPH_DIGEST)
+      .toBe("665deccc825d74de0d814e94a3799ea50aab2d18176ea6aacbc779651eebf64e");
+  });
+
   it("describes every bundled skill exactly once with its approved route", () => {
     const skills = CAPABILITY_CATALOG.filter((entry) => entry.kind === "skill");
     expect(skills.map((entry) => entry.id).sort())

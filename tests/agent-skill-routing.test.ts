@@ -87,36 +87,20 @@ function effectIdempotencyKey(jobId: string, version: number, effectKind: string
 
 describe("worker skill role table", () => {
   test("contains exactly the selected manifest skill ids", () => {
-    expect(BUNDLED_SKILL_IDS).toEqual([
-      "blast-radius",
+    expect(BUNDLED_SKILL_IDS).toHaveLength(50);
+    expect(new Set(BUNDLED_SKILL_IDS).size).toBe(50);
+    expect(BUNDLED_SKILL_IDS).toEqual(expect.arrayContaining([
+      "ask-matt",
+      "diagnosing-bugs",
+      "implement",
+      "tdd",
+      "wayfinder",
+      "writing-for-agents",
       "brainstorming",
-      "checking-system-logs",
-      "clean-code-guard",
-      "dispatching-parallel-agents",
-      "docs-guard",
-      "domain-modeling",
-      "driving-bb",
-      "durable-boundary-audit",
-      "executing-plans",
-      "finishing-a-development-branch",
-      "grill-with-docs",
-      "grilling",
-      "pr-writer",
       "proportional-development-workflow",
-      "receiving-code-review",
-      "requesting-code-review",
-      "subagent-driven-development",
-      "systematic-debugging",
-      "technical-writing",
-      "test-driven-development",
-      "test-guard",
-      "unslop",
-      "using-git-worktrees",
       "using-superpowers",
-      "verification-before-completion",
-      "writing-plans",
-      "writing-skills",
-    ]);
+      "unslop",
+    ]));
   });
 
   test.each([

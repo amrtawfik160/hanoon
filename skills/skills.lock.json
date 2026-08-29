@@ -1,10 +1,14 @@
 {
-  "schemaVersion": 1,
-  "workflowKit": {
-    "version": "6.3.0",
-    "sourceUrl": "https://github.com/obra/superpowers",
+  "schemaVersion": 2,
+  "mattPocockKit": {
+    "version": "1.2.3",
+    "revision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+    "sourceUrl": "https://github.com/mattpocock/skills",
     "license": "MIT",
-    "licensePath": "skills/workflow-kit/LICENSE"
+    "licensePath": "skills/matt-pocock/LICENSE",
+    "manifestPath": "skills/matt-pocock/UPSTREAM_MANIFEST.json",
+    "licenseSha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+    "manifestSha256": "e531ddc6560515397ac32d93334fa3eb586b6b6bcc2e472c3646641fd3d2b951"
   },
   "guardKit": {
     "sourceUrl": "https://github.com/amElnagdy/guard-skills",
@@ -15,13 +19,6 @@
     "sourceUrl": "https://github.com/getsentry/skills",
     "license": "Apache-2.0",
     "licensePath": "skills/delivery/LICENSE"
-  },
-  "discoveryKit": {
-    "version": "1.2.3",
-    "revision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
-    "sourceUrl": "https://github.com/mattpocock/skills",
-    "license": "MIT",
-    "licensePath": "skills/discovery/LICENSE"
   },
   "hanoonKit": {
     "sourceUrl": "first-party",
@@ -34,174 +31,606 @@
     "license": "MIT",
     "licensePath": "skills/pstack/LICENSE"
   },
+  "workflowKit": {
+    "version": "6.3.0",
+    "sourceUrl": "https://github.com/obra/superpowers",
+    "license": "MIT",
+    "licensePath": "skills/workflow-kit/LICENSE"
+  },
+  "discoveryKit": {
+    "version": "1.2.3",
+    "revision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+    "sourceUrl": "https://github.com/mattpocock/skills",
+    "license": "MIT",
+    "licensePath": "skills/discovery/LICENSE"
+  },
   "skills": [
+    {
+      "id": "ask-matt",
+      "skillPath": "skills/matt-pocock/engineering/ask-matt/SKILL.md",
+      "sourcePath": "skills/engineering/ask-matt",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "b25d86fb36b1d294eeead5d7db529f86135f9671f2afcd607579a63bb2213769",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "4ef913dc61cc753023e96ebc2e8d2983e89bc606a250e81d18a5d7fdc75ea8d8"
+    },
     {
       "id": "blast-radius",
       "skillPath": "skills/hanoon/blast-radius/SKILL.md",
+      "sourcePath": "skills/hanoon/blast-radius/SKILL.md",
       "source": "first-party",
-      "license": "first-party"
-    },
-    {
-      "id": "brainstorming",
-      "skillPath": "skills/workflow-kit/brainstorming/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "repository",
+      "sourceDigest": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d",
+      "license": "first-party",
+      "invocationClass": "model",
+      "descriptorDigest": "373f332324ffebb43c1961fb3cb56dc0a8627a6c54056f1d6f396fc396a4b5d5"
     },
     {
       "id": "checking-system-logs",
       "skillPath": "skills/hanoon/checking-system-logs/SKILL.md",
+      "sourcePath": "skills/hanoon/checking-system-logs/SKILL.md",
       "source": "first-party",
-      "license": "first-party"
+      "sourceRevision": "repository",
+      "sourceDigest": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245",
+      "license": "first-party",
+      "invocationClass": "model",
+      "descriptorDigest": "e86dafdf371e580eea02fa6792141e2bcb1611491d8f6ee6fbcd9da59d8576cc"
     },
     {
       "id": "clean-code-guard",
       "skillPath": "skills/guards/clean-code-guard/SKILL.md",
+      "sourcePath": "skills/guards/clean-code-guard/SKILL.md",
       "source": "https://github.com/amElnagdy/guard-skills",
-      "license": "MIT"
+      "sourceRevision": "vendored",
+      "sourceDigest": "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "539aa4075dc5a4142705238a0c4ef35b46b09a48fa4693300c6558804fe02b6d"
     },
     {
-      "id": "dispatching-parallel-agents",
-      "skillPath": "skills/workflow-kit/dispatching-parallel-agents/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "id": "code-review",
+      "skillPath": "skills/matt-pocock/engineering/code-review/SKILL.md",
+      "sourcePath": "skills/engineering/code-review",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "700ee1661d4eff3add54f10baa5202851314d17b4538db818ca1bf572921bad3"
+    },
+    {
+      "id": "codebase-design",
+      "skillPath": "skills/matt-pocock/engineering/codebase-design/SKILL.md",
+      "sourcePath": "skills/engineering/codebase-design",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "46460be29afb7f5ebdfc8bda398ad9c21199c5074850cf8a7707ec8378c70136"
+    },
+    {
+      "id": "diagnosing-bugs",
+      "skillPath": "skills/matt-pocock/engineering/diagnosing-bugs/SKILL.md",
+      "sourcePath": "skills/engineering/diagnosing-bugs",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "77f3cf31bc99b2f49af943222526531fcc9fc41d047626d3640e875e85af3e84",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "2e9d27811a60afee0ee9951a75e459cf59489e712e1ac0832f663940184558f5"
     },
     {
       "id": "docs-guard",
       "skillPath": "skills/guards/docs-guard/SKILL.md",
+      "sourcePath": "skills/guards/docs-guard/SKILL.md",
       "source": "https://github.com/amElnagdy/guard-skills",
-      "license": "MIT"
+      "sourceRevision": "vendored",
+      "sourceDigest": "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "9cb8301e495687ad40ee11e8e1ccb508a0b2c331423880eb8fbb753a517a9f06"
     },
     {
       "id": "domain-modeling",
-      "skillPath": "skills/discovery/domain-modeling/SKILL.md",
+      "skillPath": "skills/matt-pocock/compatibility/engineering/domain-modeling/SKILL.md",
+      "sourcePath": "skills/engineering/domain-modeling",
       "source": "https://github.com/mattpocock/skills",
-      "license": "MIT"
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "212f3ce6227d6e59255a7710fe818e03a80c1ba536214698730506235f3241ba"
     },
     {
       "id": "driving-bb",
       "skillPath": "skills/hanoon/driving-bb/SKILL.md",
+      "sourcePath": "skills/hanoon/driving-bb/SKILL.md",
       "source": "first-party",
-      "license": "first-party"
+      "sourceRevision": "repository",
+      "sourceDigest": "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216",
+      "license": "first-party",
+      "invocationClass": "model",
+      "descriptorDigest": "956e67950b79a179ba0f814836a2812b12147bf76928c9ae39f6ae2b950a22bb"
     },
     {
       "id": "durable-boundary-audit",
       "skillPath": "skills/hanoon/durable-boundary-audit/SKILL.md",
+      "sourcePath": "skills/hanoon/durable-boundary-audit/SKILL.md",
       "source": "first-party",
-      "license": "first-party"
+      "sourceRevision": "repository",
+      "sourceDigest": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f",
+      "license": "first-party",
+      "invocationClass": "model",
+      "descriptorDigest": "39270df4fabf5032e62eecc9cd4c99425afd533ce20492b321477aca9f08cd2f"
     },
     {
-      "id": "executing-plans",
-      "skillPath": "skills/workflow-kit/executing-plans/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
-    },
-    {
-      "id": "finishing-a-development-branch",
-      "skillPath": "skills/workflow-kit/finishing-a-development-branch/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "id": "grill-me",
+      "skillPath": "skills/matt-pocock/productivity/grill-me/SKILL.md",
+      "sourcePath": "skills/productivity/grill-me",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "b60265b7de314625667b53857322f0a543502705a8453c0b2023bc0308bd1938"
     },
     {
       "id": "grill-with-docs",
-      "skillPath": "skills/discovery/grill-with-docs/SKILL.md",
+      "skillPath": "skills/matt-pocock/compatibility/engineering/grill-with-docs/SKILL.md",
+      "sourcePath": "skills/engineering/grill-with-docs",
       "source": "https://github.com/mattpocock/skills",
-      "license": "MIT"
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "3b123f6d7fb7568adddd55dbdf43d8530583774d0e439bb765fa07ac2b1c07ce"
     },
     {
       "id": "grilling",
-      "skillPath": "skills/discovery/grilling/SKILL.md",
+      "skillPath": "skills/matt-pocock/compatibility/productivity/grilling/SKILL.md",
+      "sourcePath": "skills/productivity/grilling",
       "source": "https://github.com/mattpocock/skills",
-      "license": "MIT"
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "4f98e2ee6df7cab51bcba268d1373c521c9ccd44d150205dd44ccc2bcdbd876d"
+    },
+    {
+      "id": "handoff",
+      "skillPath": "skills/matt-pocock/productivity/handoff/SKILL.md",
+      "sourcePath": "skills/productivity/handoff",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "423c22f3804d4033a4435e629187bad38242fe76199376cc2ee039bf025753ff"
+    },
+    {
+      "id": "implement",
+      "skillPath": "skills/matt-pocock/engineering/implement/SKILL.md",
+      "sourcePath": "skills/engineering/implement",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "e41da514b2c2f671bff0efc0dee773a606842c84ae1dccb6e5f82d43595a80ef"
+    },
+    {
+      "id": "improve-codebase-architecture",
+      "skillPath": "skills/matt-pocock/engineering/improve-codebase-architecture/SKILL.md",
+      "sourcePath": "skills/engineering/improve-codebase-architecture",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "d1ac25511a936ff4250a48dbcefda363837d6bb9321b3cba73df99fa37270a75",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "24732f0720aaa6b7dd37db3669e394722698d24ba0578098ed3990fab739ac9b"
     },
     {
       "id": "pr-writer",
       "skillPath": "skills/delivery/pr-writer/SKILL.md",
+      "sourcePath": "skills/delivery/pr-writer/SKILL.md",
       "source": "https://github.com/getsentry/skills",
-      "license": "Apache-2.0"
+      "sourceRevision": "vendored",
+      "sourceDigest": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc",
+      "license": "Apache-2.0",
+      "invocationClass": "model",
+      "descriptorDigest": "6fe1ab2cbe47303da8a613703b3e7d49c5e7ffd03f7273d365a1584ac4e7e11f"
     },
     {
-      "id": "proportional-development-workflow",
-      "skillPath": "skills/hanoon/proportional-development-workflow/SKILL.md",
-      "source": "first-party",
-      "license": "first-party"
+      "id": "prototype",
+      "skillPath": "skills/matt-pocock/engineering/prototype/SKILL.md",
+      "sourcePath": "skills/engineering/prototype",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "714de632d116bb73f65cdb5a882db15b9369a6713b9a47c0fad827848f0bfbe3",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "7bd26fbafde838442449be94facaee393a9c89fc783b7975b68fc3f468bb67ab"
     },
     {
-      "id": "receiving-code-review",
-      "skillPath": "skills/workflow-kit/receiving-code-review/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "id": "research",
+      "skillPath": "skills/matt-pocock/engineering/research/SKILL.md",
+      "sourcePath": "skills/engineering/research",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "985569f15739c713d6784887c3d186d4ef9ac85bec5ad9c068d25bf0739928e4",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "0607555f7ea8634bff956695f02c42c4f87a814dcf1761a5555833235be0e312"
     },
     {
-      "id": "requesting-code-review",
-      "skillPath": "skills/workflow-kit/requesting-code-review/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "id": "resolving-merge-conflicts",
+      "skillPath": "skills/matt-pocock/engineering/resolving-merge-conflicts/SKILL.md",
+      "sourcePath": "skills/engineering/resolving-merge-conflicts",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "9d8114f8ef0b31f535a265fc05c364bd8cf2e2895a830040e06c22acb11f54b0",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "0d0b45ea81e64fe6eaa4e2650770d4015363c4ccf6638b76546809ed447494c8"
     },
     {
-      "id": "subagent-driven-development",
-      "skillPath": "skills/workflow-kit/subagent-driven-development/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "id": "setup-matt-pocock-skills",
+      "skillPath": "skills/matt-pocock/engineering/setup-matt-pocock-skills/SKILL.md",
+      "sourcePath": "skills/engineering/setup-matt-pocock-skills",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "2bcd89e97777cdb705914424e39c97d5db524c8eb4eafac8120778a07774f0ec",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "be6b0e4460c175a93c2e814de91584b278f7159c51211e1121a0528e90f6d6c0"
     },
     {
-      "id": "systematic-debugging",
-      "skillPath": "skills/workflow-kit/systematic-debugging/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "id": "tdd",
+      "skillPath": "skills/matt-pocock/engineering/tdd/SKILL.md",
+      "sourcePath": "skills/engineering/tdd",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "cb01f66bebfaa25fa1f88e6b7e769cd9fd9f35b1120b8563749820738814c927",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "4cce72c6f2afef293007eecf4ec18436ee454a8a3c37e81ea860c30d0c0c566a"
+    },
+    {
+      "id": "teach",
+      "skillPath": "skills/matt-pocock/productivity/teach/SKILL.md",
+      "sourcePath": "skills/productivity/teach",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "a32df9dcdfc0c4fdc1c98e1ed3940c5f56b84c1aa90ff60346f32b8b53915b43",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "d1cbc2515700c1370b8f74a0e7e41df053dc3299e579b90b054588daf66bd0df"
     },
     {
       "id": "technical-writing",
       "skillPath": "skills/pstack/technical-writing/SKILL.md",
+      "sourcePath": "skills/pstack/technical-writing/SKILL.md",
       "source": "https://github.com/cursor/plugins",
-      "license": "MIT"
-    },
-    {
-      "id": "test-driven-development",
-      "skillPath": "skills/workflow-kit/test-driven-development/SKILL.md",
-      "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "60c641e4fad674784b30abcf9f8915dea39df38d",
+      "sourceDigest": "bd0cb21034f4fe6695cfdf8cd3561026eec943f0bb6e9300bc78a2b3340865a7",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "9d355e8d479c993462baf65f53560ed273056346a17b69a3e5022696b4a5972f"
     },
     {
       "id": "test-guard",
       "skillPath": "skills/guards/test-guard/SKILL.md",
+      "sourcePath": "skills/guards/test-guard/SKILL.md",
       "source": "https://github.com/amElnagdy/guard-skills",
-      "license": "MIT"
+      "sourceRevision": "vendored",
+      "sourceDigest": "77aeeb60d5cd12f075b358c3a99b49aba5eaf012fa8f3e217d1ed6983922e9b0",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "ac83a80f2930ac5ec029cbdf8637ac7f89070c2ba44da3a40138238eee31e472"
+    },
+    {
+      "id": "to-questionnaire",
+      "skillPath": "skills/matt-pocock/productivity/to-questionnaire/SKILL.md",
+      "sourcePath": "skills/productivity/to-questionnaire",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "b5eb929842ee0e93d867c5e906d183d350f2f2d149eaeaa86967d94d8eda1d3b",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "506194622581c1bb9a46483544fe031cec39f741bbdba34e4616a427b1b3adcb"
+    },
+    {
+      "id": "to-spec",
+      "skillPath": "skills/matt-pocock/engineering/to-spec/SKILL.md",
+      "sourcePath": "skills/engineering/to-spec",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "43ad9cf318e5e7d3d1fa360253a37021796dc87a0c2e595ad262661a10f85088",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "5c46ca1e93c69d81889bbc364589898ba55bc5406d9c8cef4321c07157aeecb5"
+    },
+    {
+      "id": "to-tickets",
+      "skillPath": "skills/matt-pocock/engineering/to-tickets/SKILL.md",
+      "sourcePath": "skills/engineering/to-tickets",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "9a08bf131473369099956d3e12a00f7c2ab83442a42a7e7245d67952c6fca636"
+    },
+    {
+      "id": "triage",
+      "skillPath": "skills/matt-pocock/engineering/triage/SKILL.md",
+      "sourcePath": "skills/engineering/triage",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "623a2ed692bdc77d2090e2a3dea3b627dd722ad3bbaca0be83aada75292c8fc4",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "4587c75023a35b9e8f48134b0782c0c4cead02dfb2f0e6225c4397a4cb797ea5"
     },
     {
       "id": "unslop",
       "skillPath": "skills/pstack/unslop/SKILL.md",
+      "sourcePath": "skills/pstack/unslop/SKILL.md",
       "source": "https://github.com/cursor/plugins",
-      "license": "MIT"
+      "sourceRevision": "60c641e4fad674784b30abcf9f8915dea39df38d",
+      "sourceDigest": "181883e539caec8258ec9129e3ba5f133409144a2cbf2aa361158ab94cfc3441",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "6e14a9599a53f3e56bb1bc209305afb17a9ea874563be261b05c113dcc607abd"
+    },
+    {
+      "id": "wait-what",
+      "skillPath": "skills/matt-pocock/productivity/wait-what/SKILL.md",
+      "sourcePath": "skills/productivity/wait-what",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "e3f44e3ccbc0e7b62f20ba70b295fc9c9f4aa3f96c77168faee1c71bacbf4215",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "de05f7ead3a572428d42b2703510e9acf1c7cc3f7dcb535d271af998b45342ea"
+    },
+    {
+      "id": "wayfinder",
+      "skillPath": "skills/matt-pocock/engineering/wayfinder/SKILL.md",
+      "sourcePath": "skills/engineering/wayfinder",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "fee6e1d0c50f0e736b4ef8a599060c959afae904c9a97d82c97f049fcc3aa0f1",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "9a14b2db7afa928d558b3127cbcf82da906f58b7d6cb557043798a04adfaff28"
+    },
+    {
+      "id": "wizard",
+      "skillPath": "skills/matt-pocock/engineering/wizard/SKILL.md",
+      "sourcePath": "skills/engineering/wizard",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "bdf31d48211ea559878f95a4f344aeabf8d85897488ba564382bab0b000daac1",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "1723a91b0d9ffcc0b35e0996823fd17bd46925c15d13be55d8d3cd5e016ac3bf"
+    },
+    {
+      "id": "writing-for-agents",
+      "skillPath": "skills/matt-pocock/productivity/writing-for-agents/SKILL.md",
+      "sourcePath": "skills/productivity/writing-for-agents",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "sourceDigest": "551adca942227b44192edba88acd4e8db911f0121ce58ad16944ccf6a896a74a",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "68e5ea2a8427966c48f162b48e9854cebf9f967d3cc09a28e234b5a13fb237ae"
+    }
+  ],
+  "legacySkills": [
+    {
+      "id": "brainstorming",
+      "skillPath": "skills/workflow-kit/brainstorming/SKILL.md",
+      "sourcePath": "skills/workflow-kit/brainstorming/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "74edf03ea6d24ef53db48677b93558d14a979bdf052ca3f57ecdca0c66791608",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "06019cd230405b3cbbe3f6ec5bb8fa3083086a8fe936039caed2c22c0571b018"
+    },
+    {
+      "id": "dispatching-parallel-agents",
+      "skillPath": "skills/workflow-kit/dispatching-parallel-agents/SKILL.md",
+      "sourcePath": "skills/workflow-kit/dispatching-parallel-agents/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "1968923066f3b707eb01d1992cdf4c42284c3855f70253b9cd5000ff45fca13c",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "76cc8f56b34bbdccbac84b219021c367f9c92219a690bdc162d7d64e9bb761c1"
+    },
+    {
+      "id": "executing-plans",
+      "skillPath": "skills/workflow-kit/executing-plans/SKILL.md",
+      "sourcePath": "skills/workflow-kit/executing-plans/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "c4c3d8b628c51114cd165fb8246fe02744cd8be180032328391252e653028d9b",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "d79fca5b26591a4705a0dc3962157289e73d1bc4685401003e1347a98fa6dcf0"
+    },
+    {
+      "id": "finishing-a-development-branch",
+      "skillPath": "skills/workflow-kit/finishing-a-development-branch/SKILL.md",
+      "sourcePath": "skills/workflow-kit/finishing-a-development-branch/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "8db5a922b242dd4e1bf824cb91c13b3e8d8e8a86d6ceaf7f0774eb9cce909d65",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "ee163cce5d7be5ecff508f575502033ab825f97a9a60f26ce0c93064ec5a8425"
+    },
+    {
+      "id": "proportional-development-workflow",
+      "skillPath": "skills/hanoon/proportional-development-workflow/SKILL.md",
+      "sourcePath": "skills/hanoon/proportional-development-workflow/SKILL.md",
+      "source": "first-party",
+      "sourceRevision": "repository",
+      "sourceDigest": "96870c75b91543cf751afa47bd9a217f99c3d5e8d27ccdada6e1dcfec3af2096",
+      "license": "first-party",
+      "invocationClass": "model",
+      "descriptorDigest": "fdbac7ecb9ee93c32884fd3a553951d27415f7fbf3466bd264ca115ef6715a07"
+    },
+    {
+      "id": "receiving-code-review",
+      "skillPath": "skills/workflow-kit/receiving-code-review/SKILL.md",
+      "sourcePath": "skills/workflow-kit/receiving-code-review/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "091df1629510af1b92fc4abd6f96732ebedb4cb2c0f3457e8f2740b0504a2438",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "d2baa4ada27638d47bd1e12c9360f04e37401f7f1d87b9d99ff827e1a5647a30"
+    },
+    {
+      "id": "requesting-code-review",
+      "skillPath": "skills/workflow-kit/requesting-code-review/SKILL.md",
+      "sourcePath": "skills/workflow-kit/requesting-code-review/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "d71cc01ba56d2325cf8af5f7c11837819b63ecd57de0bfdb812f7f3ff7751df8",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "2afac737312532c5215e2cccad55f44fc4060db4ba7297e855a3853062135f28"
+    },
+    {
+      "id": "subagent-driven-development",
+      "skillPath": "skills/workflow-kit/subagent-driven-development/SKILL.md",
+      "sourcePath": "skills/workflow-kit/subagent-driven-development/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "8dd1b8e698edec3700c6d89517dbe96febd3bacd3f6ea21c1a3569c62ea104b5",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "660be22b0737d829f39109b3edfcbed8cd855bbf229ac6985a3e5796a9a0b6d7"
+    },
+    {
+      "id": "systematic-debugging",
+      "skillPath": "skills/workflow-kit/systematic-debugging/SKILL.md",
+      "sourcePath": "skills/workflow-kit/systematic-debugging/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "808fc5717aa88ad65efff312b11c186294d3e6ee301afb584e2f86599b137787",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "be211fb9e703c1119c8de0a05a0bb6433a3756a6efba9d8f9e84be431b682dd6"
+    },
+    {
+      "id": "test-driven-development",
+      "skillPath": "skills/workflow-kit/test-driven-development/SKILL.md",
+      "sourcePath": "skills/workflow-kit/test-driven-development/SKILL.md",
+      "source": "https://github.com/obra/superpowers",
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "bf1b8216e523851a411e91d429a7c1c2a173e79d88957bc78e348218d50edd54",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "c3d3324cf1966bcdcc3ae37013e8dbb606421b2dd28aa2538693be7136ca0112"
     },
     {
       "id": "using-git-worktrees",
       "skillPath": "skills/workflow-kit/using-git-worktrees/SKILL.md",
+      "sourcePath": "skills/workflow-kit/using-git-worktrees/SKILL.md",
       "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "8cfb86f121269e8f7f12361e6795c4f6738828340e28964c9229d365666c9edd",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "9f321809fcad1831fbb54a0f396288a56bcccd0b10f0927b6d348916e8fddad2"
     },
     {
       "id": "using-superpowers",
       "skillPath": "skills/workflow-kit/using-superpowers/SKILL.md",
+      "sourcePath": "skills/workflow-kit/using-superpowers/SKILL.md",
       "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "30f2ab78e20ddc27ee7158ae8d4a2abe161c360981c7cc3548070913142d3dc3",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "e58cd899f4c5fd48443033784d63565032d9d4f630649aef22de0b5d37eaa0df"
     },
     {
       "id": "verification-before-completion",
       "skillPath": "skills/workflow-kit/verification-before-completion/SKILL.md",
+      "sourcePath": "skills/workflow-kit/verification-before-completion/SKILL.md",
       "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "2befe7fc55bcadaa3d97dd9e8efeb633d2561c0ebe74c5a8b17c4d9e7e4520b3",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "2aaf635f5c3342f11feb7156c45fdb68262ed6692761cd65347d933540f00757"
     },
     {
       "id": "writing-plans",
       "skillPath": "skills/workflow-kit/writing-plans/SKILL.md",
+      "sourcePath": "skills/workflow-kit/writing-plans/SKILL.md",
       "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "48508f44bbfd7d24b029fbf3a314f3cd14c9615599059366e922f47b8dc08cf2",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "f3a92dda1d1fd101eee5816f7d14bbce6628e2e96286f2e33189246a6fe19e04"
     },
     {
       "id": "writing-skills",
       "skillPath": "skills/workflow-kit/writing-skills/SKILL.md",
+      "sourcePath": "skills/workflow-kit/writing-skills/SKILL.md",
       "source": "https://github.com/obra/superpowers",
-      "license": "MIT"
+      "sourceRevision": "6.3.0",
+      "sourceDigest": "d34db5c8aed6a4e0440132bd0613aace70a693ec7819d5637ad77481d8e10d1b",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "8f46c36280f5909dd36affb1564d9053f8e0188d6ebc584aee3a79a5b76e695c"
+    }
+  ],
+  "shadowedSkills": [
+    {
+      "id": "domain-modeling",
+      "skillPath": "skills/discovery/domain-modeling/SKILL.md",
+      "sourcePath": "skills/discovery/domain-modeling/SKILL.md",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+      "sourceDigest": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "a2bc2c768147ac51f7f858cffd579312eb0ec923d78fa111d17f01bc4d6e8328"
+    },
+    {
+      "id": "grill-with-docs",
+      "skillPath": "skills/discovery/grill-with-docs/SKILL.md",
+      "sourcePath": "skills/discovery/grill-with-docs/SKILL.md",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+      "sourceDigest": "610d091047bcfb9db0f75c057d15538481a721111579fc5ec7f83ad9131a2165",
+      "license": "MIT",
+      "invocationClass": "user",
+      "descriptorDigest": "6a7197f3ff20a0b14349780eeebadfc0074592867a9b284717a97004eae13cf3"
+    },
+    {
+      "id": "grilling",
+      "skillPath": "skills/discovery/grilling/SKILL.md",
+      "sourcePath": "skills/discovery/grilling/SKILL.md",
+      "source": "https://github.com/mattpocock/skills",
+      "sourceRevision": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+      "sourceDigest": "fa5c1e5ee76b1c8f1ae56101f52c9e239de75d5c578adc61227b92d10b7e52ef",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "5f47f87aeb564113b7f8f8c1bfd4448f3400f50d1d938f0230aa30fcadaacd7e"
     }
   ],
   "files": [
@@ -364,6 +793,314 @@
     {
       "path": "skills/hanoon/proportional-development-workflow/SKILL.md",
       "sha256": "96870c75b91543cf751afa47bd9a217f99c3d5e8d27ccdada6e1dcfec3af2096"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/engineering/domain-modeling/ADR-FORMAT.md",
+      "sha256": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/engineering/domain-modeling/agents/openai.yaml",
+      "sha256": "f6bf2aa996c6e6f53fdd0708e18a0d16a56aed8322cca59fedbe3c0d2c75f06b"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/engineering/domain-modeling/CONTEXT-FORMAT.md",
+      "sha256": "17ab16ce783e4d2801ee52fd9acdf550cbf44de65ae76797a93943bbedf22a13"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/engineering/domain-modeling/SKILL.md",
+      "sha256": "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/engineering/grill-with-docs/agents/openai.yaml",
+      "sha256": "94cd0ab161fb468a836349f5ed482ba58ce8e709a05c57ce533d739dbd35cca9"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/engineering/grill-with-docs/SKILL.md",
+      "sha256": "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/productivity/grilling/agents/openai.yaml",
+      "sha256": "1411d7df7d99b7e621a1ff8283c8133cc2464be63d064e52d8ce169c6800ee9b"
+    },
+    {
+      "path": "skills/matt-pocock/compatibility/productivity/grilling/SKILL.md",
+      "sha256": "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/ask-matt/agents/openai.yaml",
+      "sha256": "bdffbc5a0a99ed1b6ef3253d251d755fd18162b9845972e380007f844b09b05c"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/ask-matt/PHASE-BOUNDARIES.md",
+      "sha256": "a8aa20158609ef39e2b308b6ba0660c91066838d07a867202e63a7744a88a3ed"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/ask-matt/SKILL.md",
+      "sha256": "b25d86fb36b1d294eeead5d7db529f86135f9671f2afcd607579a63bb2213769"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/code-review/agents/openai.yaml",
+      "sha256": "8229ca854e11dc8e6aef2131ee03f31fb1561cf905fab9ccc325180cf3331352"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/code-review/SKILL.md",
+      "sha256": "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/codebase-design/agents/openai.yaml",
+      "sha256": "edebc9e4fcfe102114012575eaa9600b9b5fd08c311664f389c36e7bc717740f"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/codebase-design/DEEPENING.md",
+      "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/codebase-design/DESIGN-IT-TWICE.md",
+      "sha256": "8e740bf98446dbd4dfdc132ac4346d9a7eedaf93de6a495889171cf7f99f16bd"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/codebase-design/SKILL.md",
+      "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/diagnosing-bugs/agents/openai.yaml",
+      "sha256": "3e430dbe4334a87597488c060cb3dc3786bb00c9182877d6f5ec41f62490e90b"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/diagnosing-bugs/scripts/hitl-loop.template.sh",
+      "sha256": "35103539fc36873eea36074769ad454f9379d6fc8b2dc0e26ce987fd3bfe5503"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/diagnosing-bugs/SKILL.md",
+      "sha256": "77f3cf31bc99b2f49af943222526531fcc9fc41d047626d3640e875e85af3e84"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/implement/agents/openai.yaml",
+      "sha256": "8970a8596ade0c28ab427f41a4ea242d6bdf6186c59ebf55e1238dbecaab79dc"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/implement/SKILL.md",
+      "sha256": "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/improve-codebase-architecture/agents/openai.yaml",
+      "sha256": "c8cb20f68ebf0edb4e497bc11ae5fcaa196004e661cd189015b04f4109ced7f1"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/improve-codebase-architecture/HTML-REPORT.md",
+      "sha256": "581e8bb5a521e46bbda8ca7e19b15948bed882187108092ebb90c62513b77528"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/improve-codebase-architecture/SKILL.md",
+      "sha256": "d1ac25511a936ff4250a48dbcefda363837d6bb9321b3cba73df99fa37270a75"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/prototype/agents/openai.yaml",
+      "sha256": "5af65e43ab41a350436697b81e27b7f848d36782043b73c322bb2c9fa9cc55dc"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/prototype/LOGIC.md",
+      "sha256": "f61c7d249e786a79ef289018901c348271e1798dd0b0bc5607b5c6f4d4a01ab9"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/prototype/SKILL.md",
+      "sha256": "714de632d116bb73f65cdb5a882db15b9369a6713b9a47c0fad827848f0bfbe3"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/prototype/UI.md",
+      "sha256": "723211e878acbc7b6ff09755263f3295cde724ba902ff0064da41eed51d45ad3"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/research/agents/openai.yaml",
+      "sha256": "9b4c470d63221c1f68f22df70b83e2f12401b317babe0d1b7b5f24a974474d0d"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/research/SKILL.md",
+      "sha256": "985569f15739c713d6784887c3d186d4ef9ac85bec5ad9c068d25bf0739928e4"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/resolving-merge-conflicts/agents/openai.yaml",
+      "sha256": "a1f4f96838f2ed6282eb28abbbf99029cb8fadce552baf53da90a025b8bffddf"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/resolving-merge-conflicts/SKILL.md",
+      "sha256": "9d8114f8ef0b31f535a265fc05c364bd8cf2e2895a830040e06c22acb11f54b0"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/agents/openai.yaml",
+      "sha256": "9527de0110541c45712319025155aeab8dc7d77c6ed6e5e83271bab1851ab939"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/domain.md",
+      "sha256": "edc6d6131fdffc4b7135704f5262124fc43355c95f61b7399dc5a4db643e28ca"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/issue-tracker-github.md",
+      "sha256": "afd6852a80185217bd28aa5cbe456bef1e85be25be7bd1fba382d5b8ee428325"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/issue-tracker-gitlab.md",
+      "sha256": "ea175f73d193b3f55819c0ed9bbccf6ee0e70ad8f928e3d7607596c53380acd6"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/issue-tracker-local.md",
+      "sha256": "7dcda20a2eb4bdc89b95d1143423c0691309921cadae3132e6424f371030506e"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/SKILL.md",
+      "sha256": "2bcd89e97777cdb705914424e39c97d5db524c8eb4eafac8120778a07774f0ec"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/setup-matt-pocock-skills/triage-labels.md",
+      "sha256": "4f53c9b40ce2651e3611aa090eaedbd6dbc9b71ef8c5f7e65eac0d8263190d0d"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/tdd/agents/openai.yaml",
+      "sha256": "ea6f01cf1b8c06a4b0f5b649d74b1b8ce8685e72af1b38d70d877693e092af0b"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/tdd/mocking.md",
+      "sha256": "3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/tdd/SKILL.md",
+      "sha256": "cb01f66bebfaa25fa1f88e6b7e769cd9fd9f35b1120b8563749820738814c927"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/tdd/tests.md",
+      "sha256": "859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/to-spec/agents/openai.yaml",
+      "sha256": "1c5b4d1e3d8e52287ef19cc2742fdbbfae1914ac75d33af3e4c8174f08cc55bb"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/to-spec/SKILL.md",
+      "sha256": "43ad9cf318e5e7d3d1fa360253a37021796dc87a0c2e595ad262661a10f85088"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/to-tickets/agents/openai.yaml",
+      "sha256": "21bc6215fffcd7614e9f772bb1760e87cc5fc7dcc707e7d282bc9414267a6090"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/to-tickets/SKILL.md",
+      "sha256": "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/triage/AGENT-BRIEF.md",
+      "sha256": "7f5f87fed3033df1b06e083c480f3e847b1fbb0647746b8a4c6a50f9f26ef44f"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/triage/agents/openai.yaml",
+      "sha256": "2e683717720cf456d165d0bb1a68bb600d0b6a8ccb61841c172e50d26f95351c"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/triage/OUT-OF-SCOPE.md",
+      "sha256": "1fbf9b432130c6380aa65813b55553cfda150309b27c595e183f8e335b8a190d"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/triage/SKILL.md",
+      "sha256": "623a2ed692bdc77d2090e2a3dea3b627dd722ad3bbaca0be83aada75292c8fc4"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/wayfinder/agents/openai.yaml",
+      "sha256": "88bc81a11a6d52ac67aeaa76b8b619e387020d47c5133a4dd4927fd15c4ad073"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/wayfinder/SKILL.md",
+      "sha256": "fee6e1d0c50f0e736b4ef8a599060c959afae904c9a97d82c97f049fcc3aa0f1"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/wizard/agents/openai.yaml",
+      "sha256": "98f44d682d58e262f160dc59a8befc365e0aa65820dd0261864af26aa8e59d83"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/wizard/SKILL.md",
+      "sha256": "bdf31d48211ea559878f95a4f344aeabf8d85897488ba564382bab0b000daac1"
+    },
+    {
+      "path": "skills/matt-pocock/engineering/wizard/template.sh",
+      "sha256": "33cbe9dfb1d0e9185b60248a52aabed14bc64785a00cac695e302e739dd6c153"
+    },
+    {
+      "path": "skills/matt-pocock/LICENSE",
+      "sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/grill-me/agents/openai.yaml",
+      "sha256": "c061e39c3e0f9d865fb1b97556d485704af2a8a58f4b8221a8917a5c2074a32b"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/grill-me/SKILL.md",
+      "sha256": "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/handoff/agents/openai.yaml",
+      "sha256": "5c479fd562c691851690e8b18c8501045bef0943c10743d636b2fae26add1d28"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/handoff/SKILL.md",
+      "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/teach/agents/openai.yaml",
+      "sha256": "5856f3ae8aec742f1499c640aecdd5f1d6af5fa210a7c6ec794de8263a6f733f"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/teach/GLOSSARY-FORMAT.md",
+      "sha256": "9b99859ec28437668130d8f2ce5a342938970f8a1ed4fd38c3eab4f4b5fff210"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/teach/LEARNING-RECORD-FORMAT.md",
+      "sha256": "701fa34b6748aa89e6c960ffb815257f481a7d77fb2900f9028f7edf3fdd6052"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/teach/MISSION-FORMAT.md",
+      "sha256": "8cacbb3c0644d3ae0ea4965564797099401a6930a23f7cf462918576587f2418"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/teach/RESOURCES-FORMAT.md",
+      "sha256": "e9cacf34026e11a8d1c8f9de88abe5bcbf654f4ebdb25cae8c0de0d5f48f44ec"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/teach/SKILL.md",
+      "sha256": "a32df9dcdfc0c4fdc1c98e1ed3940c5f56b84c1aa90ff60346f32b8b53915b43"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/to-questionnaire/agents/openai.yaml",
+      "sha256": "9e8a06c38c8842eea8d4922cb9d1ead8e3ace647bab259b943c994a1b4742bc2"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/to-questionnaire/SKILL.md",
+      "sha256": "b5eb929842ee0e93d867c5e906d183d350f2f2d149eaeaa86967d94d8eda1d3b"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/wait-what/agents/openai.yaml",
+      "sha256": "b41faadf741d51e4ea184148b2d1854d93f947aaf754c7844f70a00f04194999"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/wait-what/SKILL.md",
+      "sha256": "e3f44e3ccbc0e7b62f20ba70b295fc9c9f4aa3f96c77168faee1c71bacbf4215"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/writing-for-agents/agents/openai.yaml",
+      "sha256": "eacb24b2a618cfb81dacb0416f4fdd75ddf3a8060f8ddb99aae1b1e301907e4b"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/writing-for-agents/SKILL-MECHANICS.md",
+      "sha256": "c768e6307c7c10728c401c213f2c4ba71c542127eeb7ad2956aabd15a0fa0059"
+    },
+    {
+      "path": "skills/matt-pocock/productivity/writing-for-agents/SKILL.md",
+      "sha256": "551adca942227b44192edba88acd4e8db911f0121ce58ad16944ccf6a896a74a"
+    },
+    {
+      "path": "skills/matt-pocock/PROVENANCE.json",
+      "sha256": "3ccf9e3df290abcab4248c87d541f7877fd550dcd6ddae4a8e572e674c280c0b"
+    },
+    {
+      "path": "skills/matt-pocock/UPSTREAM_MANIFEST.json",
+      "sha256": "e531ddc6560515397ac32d93334fa3eb586b6b6bcc2e472c3646641fd3d2b951"
     },
     {
       "path": "skills/pstack/LICENSE",

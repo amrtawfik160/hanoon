@@ -136,62 +136,51 @@ This release deliberately exposes no promotion-evidence append method, CLI input
 
 ## Agent skill runtime
 
-The BB manifest registers six local skill roots. Five are vendored from reviewed permissively licensed upstreams. The sixth is first-party Hanoon guidance:
+The repository locks one reviewed 35-skill admitted catalog and a temporary recipe-v1 compatibility catalog. The admitted catalog combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with ten retained platform, guard, delivery, writing, and communication skills. Fifteen legacy-only workflow ids remain executable only so existing recipe jobs can finish. No runtime path downloads or repairs skills.
 
-| Root | Upstream | Licence | Contents |
-| --- | --- | --- | --- |
-| `skills/workflow-kit` | [obra/superpowers](https://github.com/obra/superpowers), pinned `6.3.0` | MIT | 14 workflow skills |
-| `skills/guards` | [amElnagdy/guard-skills](https://github.com/amElnagdy/guard-skills) | MIT | `clean-code-guard`, `test-guard`, `docs-guard` |
-| `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | Apache-2.0 | `pr-writer` |
-| `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills), pinned `1.2.3` at revision `84fdeffd12f2ee307994d1eb6feb48173b6e0502` | MIT | `grill-with-docs`, `grilling`, `domain-modeling` |
-| `skills/hanoon` | first-party; `blast-radius` is adapted from the MIT-licensed pstack skill of [cursor/plugins](https://github.com/cursor/plugins) at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | first-party | `blast-radius`, `checking-system-logs`, `driving-bb`, `durable-boundary-audit`, `proportional-development-workflow` |
-| `skills/pstack` | [cursor/plugins](https://github.com/cursor/plugins), pinned at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | MIT | `unslop`, `technical-writing` |
+BB reads one level of child directories from every plugin skill root. The package therefore registers both Matt Pocock buckets, not their common parent. The three promoted ids that overlap the historical discovery root remain digest-locked under an unregistered compatibility subtree, leaving one runtime source for every id while recipe-v1 drains. The promoted descriptors stay admitted for the later navigator-v1 execution slice. No navigator-v1 worker is enabled by this expansion alone.
 
-A root's licence is recorded per root rather than per bundle, because the vendored roots do not share one licence: folding Apache-2.0 material under an MIT notice would misstate its terms. The Hanoon root is owned by this plugin and is not a third-party vendor copy. A skill there that was adapted from a permissively licensed upstream rather than written from nothing records that upstream, its revision, and its licence in `skills/hanoon/NOTICE`, and carries the licence with it. All 28 catalog entries are committed in this repository, so the plugin has no runtime dependency on another skill plugin and never downloads a skill while starting a thread.
+| Registered root | Source | Purpose during expansion |
+| --- | --- | --- |
+| `skills/workflow-kit` | pinned legacy workflow kit | 14 legacy-only recipe skills |
+| `skills/guards` | [guard-skills](https://github.com/amElnagdy/guard-skills) | `clean-code-guard`, `test-guard`, `docs-guard` |
+| `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | `pr-writer` |
+| `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills) at the historical revision | recipe-v1 copies of `grill-with-docs`, `grilling`, and `domain-modeling` |
+| `skills/matt-pocock/engineering` | [mattpocock/skills](https://github.com/mattpocock/skills) at the reviewed revision | promoted engineering skills |
+| `skills/matt-pocock/productivity` | same reviewed source | promoted productivity skills |
+| `skills/hanoon` | first-party, with source notices where adapted | four retained platform skills and one legacy router |
+| `skills/pstack` | [cursor/plugins](https://github.com/cursor/plugins) at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | `unslop` and `technical-writing` |
 
-The existing single `bb.agents.configure` callback keeps the controller and worker boundaries separate. Its exact role-selection matrix is:
+Each lock record binds the skill id, source path, source revision, source digest, descriptor digest, license, and invocation class. The three discovery collisions also have exact shadow records, proving which historical source remains first for legacy execution without admitting a second capability identity. The 35-skill admission catalog allows model-invoked skills in general workers and requires an explicit navigator or owner route for user-invoked skills.
+
+The existing recipe-v1 role matrix remains unchanged during expansion:
 
 | Verified role/context | Selected skill ids |
 | --- | --- |
-| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`; controller tools and `CONTROLLER_INSTRUCTIONS`. Conduct requires unslop on every owner-facing message. |
+| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
 | planner | `unslop`, `writing-plans`, `docs-guard` |
 | critic | `unslop` |
 | implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
 | review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius` |
 | documentation | `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
-| validation, merge, deploy, canary | none; these are deterministic stages, not skill-bearing worker roles |
+| validation, merge, deploy, canary | none; these remain deterministic stages |
 
-The guards judge the code the change contains. `blast-radius` goes only to the two roles whose verdict can carry a change to merge, because the risk they weigh is the breakage outside the diff. It tells the reviewer to prove the one fact the change is safe because of by running real code, keep proof scripts out of the worktree that both the review handler and the merge gate require clean, and state an unproven safety fact in the verdict rather than smooth it away.
-
-### Fail-closed worker selection
-
-The resolver first checks structural context. The origin must be non-fork (`origin.kind === null`) and belong to plugin `telegram-agent`; the project must be `standard`; and the environment must be a `managed-worktree`. The thread title must match the anchored production protocol exactly:
-
-```text
-Telegram <jobId> <role-token> <attemptId>
-```
-
-The parser accepts job ids of 1–256 `[A-Za-z0-9_-]` characters and attempt ids of 1–264 `[A-Za-z0-9_.:-]` characters. The only role tokens are `implementation`, `plan`, `critique`, `review`, `docs`, and `final-review`, mapped respectively to implementation, planner, critic, review, documentation, and final-review.
-
-It then checks durable ownership. Implementation, review, and final-review titles must use an `attempt:` id and an exact durable attempt of kind `implementation` or `review`; planner, critic, and documentation titles must use a `stage:` id and an exact durable stage role `PLAN`, `CRITIQUE`, or `DOCS`. The id after that prefix is looked up as the exact job effect idempotency key, and its effect must be respectively `spawn_implementation`, `spawn_review`, `spawn_final_review`, `spawn_plan`, `spawn_critique`, or `spawn_docs`. The job must exist and belong to the current project. Its persisted environment id, when non-null, and persisted worker thread id, when non-null, must equal the current context. A null binding is allowed only for the first start; it is not a wildcard after persistence. Title, job, attempt, role, effect, project, environment, thread, origin, project-kind, or workspace mismatches all return no tools and no skills. There is no fallback to a newest job, parent thread, or title-only inference.
-
-The controller branch is independently exact: it requires the active durable controller, matching project and host, the plugin origin, an allowed controller provider, a personal project and personal workspace, and the stable controller title. It receives controller tools, the two first-party guidance skills, the three discovery skills, and `CONTROLLER_INSTRUCTIONS`. A spoofed or unrecognized context cannot inherit either controller tools or a worker profile.
+Role selection still requires the exact durable attempt or stage, project, managed worktree, thread title, effect, environment, and routing mode. A mismatch returns no tools and no skills. Historical capability descriptors and registry digests remain unchanged, so existing receipts and nonterminal recipe jobs retain their original interpretation.
 
 ### Bundle integrity and maintenance
 
-`npm run skills:verify` runs the synchronous verifier used by activation. It requires the manifest roots and `skills/skills.lock.json` schema version 1, bounds the lock to 1 MiB, the bundle to 64 skills and 512 locked files, rejects symlinks/non-regular or over-256 KiB files, and requires every discovered file to be locked exactly once with a SHA-256 digest. It also checks lexical safe paths, skill directory/frontmatter/lock-name agreement, nested local Markdown links that stay within their registered root and resolve to a regular file or a directory inside it, and the recorded provenance and licence of all four vendored roots (including pinned workflow-kit `6.3.0` and discovery kit `1.2.3`) plus the first-party Hanoon root. Success prints a bundle digest and skill count.
+`npm run skills:verify` checks the package root order, schema 2 lock, exact active, legacy, and shadow catalogs, bounded regular files, complete SHA-256 coverage, frontmatter identity, invocation metadata, nested local Markdown resources, and all source provenance and licenses. Build and activation run this verifier before registration. Drift, missing support files, a path escape, a symlink, malformed metadata, a duplicate catalog entry, or an admitted `do-*` id stops activation. The verifier never changes the bundle.
 
-The package `build` script runs `npm run skills:verify` before `bb plugin build`; `server.ts` runs the same verification before `createPlugin` can register services, tools, schedules, or commands. Any malformed lock, missing root/skill/resource, unlocked or escaped path, frontmatter/provenance mismatch, symlink, size/count limit, or digest mismatch stops the build or activation. There is no runtime download, replacement, or repair path.
-
-Synchronization is a maintainer-only, network-free operation from an already-reviewed absolute checkout. The checkout must identify the `superpowers` package at version `6.3.0`, contain `LICENSE` and `skills/`, and carry the reviewed MIT license. The exact command is:
+Synchronization is a maintainer-only operation from a clean absolute checkout at the reviewed full commit:
 
 ```bash
-WORKFLOW_KIT_SOURCE=/absolute/path/to/superpowers-6.3.0
-npm run skills:sync -- --source "$WORKFLOW_KIT_SOURCE" --version 6.3.0
+MATT_SKILLS_SOURCE=/absolute/path/to/mattpocock-skills
+MATT_SKILLS_REVISION=6654f6b60cd9d5be8b54c6fafe44346dabeb3b76
+npm run skills:sync -- --source "$MATT_SKILLS_SOURCE" --revision "$MATT_SKILLS_REVISION"
 ```
 
-It rewrites only the local `skills/workflow-kit` tree and `skills/skills.lock.json`; ordinary plugin startup never invokes it.
+The command verifies source identity, package and plugin metadata, the MIT license, the exact promoted manifest, invocation frontmatter, OpenAI metadata, tree bounds, and cleanliness. It stages the complete promoted subtrees and atomically replaces only `skills/matt-pocock` and `skills/skills.lock.json`.
 
 ## BB threads and worktrees
 
