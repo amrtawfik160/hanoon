@@ -40,9 +40,23 @@ export const NAVIGATOR_SAFETY_COUNTERS = [
   "evidence_binding_failures",
 ] as const;
 
+export const DUAL_ENGINE_RESTART_POINTS = [
+  "proposal",
+  "claim",
+  "tracker_create",
+  "worker_dispatch",
+  "result_storage",
+  "head_change",
+  "merge_call_start",
+  "deploy",
+  "rollback",
+  "canary",
+] as const;
+
 export type NavigatorDeterministicCategory = typeof NAVIGATOR_DETERMINISTIC_CATEGORIES[number];
 export type NavigatorLiveScenario = typeof NAVIGATOR_LIVE_SCENARIOS[number];
 export type NavigatorSafetyCounter = typeof NAVIGATOR_SAFETY_COUNTERS[number];
+export type DualEngineRestartPoint = typeof DUAL_ENGINE_RESTART_POINTS[number];
 export type WorkflowEngineGraphMode = "adaptive" | "recipe";
 
 const boundedIdSchema = z.string().min(1).max(256);

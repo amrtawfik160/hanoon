@@ -10,6 +10,9 @@ import {
   NAVIGATOR_EVALUATION_CORPUS_DIGEST,
   type NavigatorEvaluationCase,
 } from "./evaluation-corpus";
+import { measureNavigatorRestartPoint } from "./restart-evaluation";
+import type { DualEngineRestartPoint, NavigatorDeterministicCategory } from "./promotion";
+import { DUAL_ENGINE_RESTART_POINTS } from "./promotion";
 
 const EXTERNAL_DIGEST = "e".repeat(64);
 
@@ -37,8 +40,14 @@ export type NavigatorCorpusEvaluationResult = Readonly<{
   total: number;
   correct: number;
   unauthorizedEffects: number;
+  duplicateMutations: number;
+  ownerBoundaryViolations: number;
+  outcomeRegressions: number;
+  evidenceBindingFailures: number;
+  restartPointsMeasured: readonly DualEngineRestartPoint[];
   cases: readonly Readonly<{
     id: string;
+    category: NavigatorDeterministicCategory;
     expected: NavigatorEvaluationCase["expected"];
     actual: Readonly<{ decision: string; reasonCode: string }>;
     matched: boolean;
@@ -223,11 +232,29 @@ function setupJob(
   return { jobId: job.id, now: now + 3 };
 }
 
-export function evaluateNavigatorCorpus(
+export async function evaluateNavigatorCorpus(
   store: TelegramAgentStore,
   database: Database.Database,
-): NavigatorCorpusEvaluationResult {
-  const cases = NAVIGATOR_EVALUATION_CORPUS.map((evaluationCase, sequence) => {
+): Promise<NavigatorCorpusEvaluationResult> {
+  const cases: NavigatorCorpusEvaluationResult["cases"][number][] = [];
+  for (const [sequence, evaluationCase] of NAVIGATOR_EVALUATION_CORPUS.entries()) {
+    if (evaluationCase.category === "restart") {
+      const restart = await measureNavigatorRestartPoint(
+        store,
+        database,
+        evaluationCase,
+        sequence + 1,
+      );
+      cases.push({
+        id: evaluationCase.id,
+        category: evaluationCase.category,
+        expected: evaluationCase.expected,
+        actual: restart.actual,
+        matched: restart.matched,
+        unauthorizedEffects: restart.duplicateMutations,
+      });
+      continue;
+    }
     const setup = setupJob(store, database, evaluationCase, sequence + 1);
     const snapshot = store.createNavigatorSnapshot({
       jobId: setup.jobId,
@@ -250,16 +277,30 @@ export function evaluateNavigatorCorpus(
     const actual = { decision: decision.decision, reasonCode: decision.reasonCode };
     const matched = actual.decision === evaluationCase.expected.decision &&
       actual.reasonCode === evaluationCase.expected.reasonCode;
-    return {
+    cases.push({
       id: evaluationCase.id,
+      category: evaluationCase.category,
       expected: evaluationCase.expected,
       actual,
       matched,
       unauthorizedEffects,
-    };
-  });
+    });
+  }
   const correct = cases.filter((entry) => entry.matched).length;
   const unauthorizedEffects = cases.reduce((sum, entry) => sum + entry.unauthorizedEffects, 0);
+  const restartCases = cases.filter((entry) => entry.category === "restart");
+  const restartPointsMeasured = DUAL_ENGINE_RESTART_POINTS.filter((point) =>
+    NAVIGATOR_EVALUATION_CORPUS.some((entry) => entry.category === "restart" && entry.restartPoint === point) &&
+    restartCases.filter((entry) => {
+      const fixture = NAVIGATOR_EVALUATION_CORPUS.find((item) => item.id === entry.id);
+      return fixture?.restartPoint === point;
+    }).every((entry) => entry.matched));
+  const duplicateMutations = restartCases.reduce((sum, entry) => sum + entry.unauthorizedEffects, 0);
+  const ownerBoundaryViolations = cases.filter((entry) =>
+    entry.category === "owner_boundaries" && entry.actual.decision === "accepted").length;
+  const outcomeRegressions = cases.length - correct;
+  const evidenceBindingFailures = cases.filter((entry) =>
+    !entry.matched && /binding|digest|stale_specification|stale_ticket/u.test(entry.actual.reasonCode)).length;
   const resultDigest = createHash("sha256")
     .update(JSON.stringify(cases.map((entry) => [entry.id, entry.actual, entry.matched])), "utf8")
     .digest("hex");
@@ -269,6 +310,11 @@ export function evaluateNavigatorCorpus(
     total: cases.length,
     correct,
     unauthorizedEffects,
+    duplicateMutations,
+    ownerBoundaryViolations,
+    outcomeRegressions,
+    evidenceBindingFailures,
+    restartPointsMeasured,
     cases,
   };
 }

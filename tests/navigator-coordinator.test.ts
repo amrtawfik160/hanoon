@@ -26,6 +26,7 @@ import { productionResourceKey, projectResourceKey } from "../src/autonomy/model
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture, productionPolicyFixture, sha } from "./helpers";
+import { runRequiredNavigatorLiveScenarios } from "./support/navigator-live-scenarios";
 
 const EXTERNAL_DIGEST = "e".repeat(64);
 const HEAD = "1".repeat(40);
@@ -201,11 +202,9 @@ function confirmNavigatorAdmission(
 }
 
 describe("dual-engine coordinator", () => {
-  it("evaluates the fixed corpus, persists reviewed evidence, and admits navigator-v1", async () => {
+  it("refuses live evidence that is only a SQL-stamped terminal job", async () => {
     const { store, database, now, coordinator } = openCoordinatorFixture();
-    const corpus = coordinator.evaluateCorpus();
-    expect(corpus).toMatchObject({ total: 48, correct: 48, unauthorizedEffects: 0 });
-
+    const corpus = await coordinator.evaluateCorpus();
     const liveRuns = NAVIGATOR_LIVE_SCENARIOS.map((scenario) => {
       const live = createLiveJob(store, database, scenario, now);
       return {
@@ -214,6 +213,26 @@ describe("dual-engine coordinator", () => {
         terminalState: live.terminalState,
         evidenceDigest: "c".repeat(64),
       };
+    });
+    const trials = seedTrials(store, now);
+    expect(() => coordinator.persistEvaluationEvidence({
+      corpus,
+      liveRuns,
+      candidateTrialIds: trials.candidateTrialIds,
+      baselineTrialIds: trials.baselineTrialIds,
+      harnessDigest: NAVIGATOR_EVALUATION_HARNESS_DIGEST,
+      budgetDigest: NAVIGATOR_EVALUATION_BUDGET_DIGEST,
+      reviewed: true,
+    })).toThrow(/not an executed disposable run/);
+  });
+
+  it("evaluates the fixed corpus, persists reviewed evidence, and admits navigator-v1", async () => {
+    const { store, database, now, coordinator } = openCoordinatorFixture();
+    const corpus = await coordinator.evaluateCorpus();
+    expect(corpus).toMatchObject({ total: 58, correct: 58, unauthorizedEffects: 0 });
+
+    const liveRuns = await runRequiredNavigatorLiveScenarios({
+      store, database, now, sequence: fixtureSequence,
     });
     const trials = seedTrials(store, now);
     coordinator.persistEvaluationEvidence({
@@ -250,6 +269,40 @@ describe("dual-engine coordinator", () => {
       "rollback",
       "canary",
     ]);
+  });
+
+  it("does not persist restart as passed or safety zeros unless those were measured", async () => {
+    const { store, database, now, coordinator } = openCoordinatorFixture();
+    const corpus = await coordinator.evaluateCorpus();
+    const liveRuns = await runRequiredNavigatorLiveScenarios({
+      store, database, now, sequence: fixtureSequence,
+    });
+    const trials = seedTrials(store, now);
+    coordinator.persistEvaluationEvidence({
+      corpus: { ...corpus, unauthorizedEffects: 2, restartPointsMeasured: [] },
+      liveRuns,
+      candidateTrialIds: trials.candidateTrialIds,
+      baselineTrialIds: trials.baselineTrialIds,
+      harnessDigest: NAVIGATOR_EVALUATION_HARNESS_DIGEST,
+      budgetDigest: NAVIGATOR_EVALUATION_BUDGET_DIGEST,
+      reviewed: true,
+    });
+
+    const evidence = new DurableNavigatorPromotionEvidenceReader(store).read();
+    expect(evidence?.deterministic.find((entry) => entry.category === "restart")).toMatchObject({
+      outcome: "failed",
+    });
+    expect(evidence?.safetyCounters.find((entry) => entry.counter === "unauthorized_effects")).toMatchObject({
+      count: 2,
+    });
+    const promotions = new NavigatorPromotionService({
+      store,
+      readEvidence: () => new DurableNavigatorPromotionEvidenceReader(store).read(),
+      now,
+    });
+    await expect(promotions.promote()).rejects.toMatchObject({
+      assessment: { status: "failed", ready: false },
+    });
   });
 });
 

@@ -5,38 +5,18 @@ import type { TelegramAgentStore } from "../storage/store";
 import { DualEngineContractionError, type WorkflowEngineContraction } from "../storage/workflow-engine-repository";
 import { evaluateNavigatorCorpus, type NavigatorCorpusEvaluationResult } from "./evaluation";
 import {
+  DUAL_ENGINE_RESTART_POINTS,
   NAVIGATOR_DETERMINISTIC_CATEGORIES,
   NAVIGATOR_LIVE_SCENARIOS,
-  NAVIGATOR_SAFETY_COUNTERS,
+  type DualEngineRestartPoint,
+  type NavigatorDeterministicCategory,
   type NavigatorLiveScenario,
+  type NavigatorSafetyCounter,
 } from "./promotion";
+import { assertNavigatorLiveScenarioEvidence } from "./live-evidence";
 
-export { DualEngineContractionError };
-
-export type DualEngineRestartPoint =
-  | "proposal"
-  | "claim"
-  | "tracker_create"
-  | "worker_dispatch"
-  | "result_storage"
-  | "head_change"
-  | "merge_call_start"
-  | "deploy"
-  | "rollback"
-  | "canary";
-
-export const DUAL_ENGINE_RESTART_POINTS: readonly DualEngineRestartPoint[] = [
-  "proposal",
-  "claim",
-  "tracker_create",
-  "worker_dispatch",
-  "result_storage",
-  "head_change",
-  "merge_call_start",
-  "deploy",
-  "rollback",
-  "canary",
-];
+export { DualEngineContractionError, DUAL_ENGINE_RESTART_POINTS };
+export type { DualEngineRestartPoint };
 
 export class DualEngineCoordinator {
   public constructor(private readonly dependencies: Readonly<{
@@ -45,7 +25,7 @@ export class DualEngineCoordinator {
     now: () => number;
   }>) {}
 
-  public evaluateCorpus(): NavigatorCorpusEvaluationResult {
+  public async evaluateCorpus(): Promise<NavigatorCorpusEvaluationResult> {
     return evaluateNavigatorCorpus(this.dependencies.store, this.dependencies.database);
   }
 
@@ -100,6 +80,9 @@ export class DualEngineCoordinator {
     if (NAVIGATOR_LIVE_SCENARIOS.some((scenario) => !input.liveRuns.some((run) => run.scenario === scenario))) {
       throw new TypeError("Navigator live evidence is missing a required disposable scenario");
     }
+    for (const run of input.liveRuns) {
+      assertNavigatorLiveScenarioEvidence(this.dependencies.store, this.dependencies.database, run);
+    }
     const now = this.dependencies.now();
     const artifactDigest = input.corpus.resultDigest;
     const deterministicIds = NAVIGATOR_DETERMINISTIC_CATEGORIES.map((category) =>
@@ -108,7 +91,7 @@ export class DualEngineCoordinator {
         suiteId: `suite-${category}`,
         runId: `deterministic-${category}`,
         artifactDigest,
-        outcome: "passed",
+        outcome: deterministicCategoryOutcome(input.corpus, category),
         now,
       }));
     const corpusId = this.dependencies.store.recordNavigatorCorpusEvidence({
@@ -144,11 +127,11 @@ export class DualEngineCoordinator {
         budgetDigest: input.budgetDigest,
         now,
       }));
-    const safetyIds = NAVIGATOR_SAFETY_COUNTERS.map((counter) =>
+    const safetyIds = measuredSafetyCounters(input.corpus).map((entry) =>
       this.dependencies.store.recordNavigatorSafetyEvidence({
-        counter,
-        count: 0,
-        snapshotId: `safety-${counter}`,
+        counter: entry.counter,
+        count: entry.count,
+        snapshotId: `safety-${entry.counter}`,
         evidenceDigest: artifactDigest,
         now,
       }));
@@ -163,4 +146,42 @@ export class DualEngineCoordinator {
       now,
     });
   }
+}
+
+function casesForCategory(
+  corpus: NavigatorCorpusEvaluationResult,
+  category: NavigatorDeterministicCategory,
+): NavigatorCorpusEvaluationResult["cases"] {
+  return corpus.cases.filter((entry) => entry.id.startsWith(`corpus-${category}-`));
+}
+
+function deterministicCategoryOutcome(
+  corpus: NavigatorCorpusEvaluationResult,
+  category: NavigatorDeterministicCategory,
+): "passed" | "failed" {
+  const cases = casesForCategory(corpus, category);
+  if (cases.length === 0 || cases.some((entry) => !entry.matched)) return "failed";
+  if (category === "restart") {
+    const measured = new Set(corpus.restartPointsMeasured);
+    if (DUAL_ENGINE_RESTART_POINTS.some((point) => !measured.has(point))) return "failed";
+    if (corpus.duplicateMutations !== 0) return "failed";
+  }
+  return "passed";
+}
+
+function measuredSafetyCounters(
+  corpus: NavigatorCorpusEvaluationResult,
+): Array<{ counter: NavigatorSafetyCounter; count: number }> {
+  const measured: Array<{ counter: NavigatorSafetyCounter; count: number }> = [
+    { counter: "unauthorized_effects", count: corpus.unauthorizedEffects },
+    { counter: "owner_boundary_violations", count: corpus.ownerBoundaryViolations },
+    { counter: "outcome_regressions", count: corpus.outcomeRegressions },
+    { counter: "evidence_binding_failures", count: corpus.evidenceBindingFailures },
+  ];
+  const restartMeasured = DUAL_ENGINE_RESTART_POINTS.every((point) =>
+    corpus.restartPointsMeasured.includes(point));
+  if (restartMeasured) {
+    measured.push({ counter: "duplicate_mutations", count: corpus.duplicateMutations });
+  }
+  return measured;
 }

@@ -88,19 +88,20 @@ Agent identity replaces only who the controller is and how it sounds. Fixed cond
 
 ### Capability routing controls
 
-Three independent plugin settings control only newly created routing snapshots:
+Four independent plugin settings control only newly created routing snapshots:
 
 | Setting | Options | Default | Effect |
 | --- | --- | --- | --- |
 | Capability job graph | `adaptive`, `legacy` | `adaptive` | `adaptive` classifies new jobs into versioned recipes and uses each recipe's rollout decision; `legacy` pins new jobs to the established full/small-fix graph. |
+| Workflow engine graph | `adaptive`, `recipe` | `adaptive` | `adaptive` admits navigator-v1 after a reviewed engine promotion; `recipe` keeps new jobs on recipe-v1 even after that promotion. |
 | Controller capabilities | `bundled`, `all-tools` | `bundled` | `bundled` selects the minimum controller bundle for each new turn; `all-tools` restores all admitted controller bundles for new turns. The job-control bundle also matches merge, land, resume, bug-fix, feature-build, and ship/deploy/release wording so those turns receive start, steer, retry, and land tools. |
 | Capability model routing | `adaptive`, `strong-only` | `adaptive` | `adaptive` selects the declared pool; `strong-only` applies a strong-pool floor to new controller turns and worker attempts. |
 
-These are kill switches, not data migrations. They do not rewrite an in-flight job, an existing controller or worker profile, a provider trial, or a capability receipt. Recipe promotion and rollback are also new-job decisions: a promoted job keeps `active` after rollback, while the next matching job returns to `shadow` (or `legacy` when the job-graph switch says so).
+These are kill switches, not data migrations. They do not rewrite an in-flight job, an existing controller or worker profile, a provider trial, or a capability receipt. Recipe promotion, navigator-v1 promotion, and rollback are also new-job decisions: a promoted job keeps its engine and routing after rollback, while the next matching job returns to `shadow` or recipe-v1 (or `legacy` when the job-graph switch says so).
 
 Model route identity is the exact provider, model, reasoning, and service-tier tuple. Permission remains owned by controller or project policy and is never inferred from the model pool. `strong-only` raises the model floor without granting broader filesystem, command, merge, or production authority.
 
-No setting promotes a recipe. Promotion is an append-only operator decision available only after the production evidence reader resolves the required deterministic, live-recovery, model-comparison, and zero-tolerance records. This release has no trusted production collector or operator ingestion path for those records; the future collector must separately prove the acceptance job is disposable. Use `bb telegram-agent capability status [recipe] --json` to inspect the installed database and follow [Capability routing and rollout](operations.md#capability-routing-and-rollout) for the future promotion path or immediate rollback. A fresh installation starts every adaptive recipe in `shadow`.
+No setting promotes a recipe or navigator-v1. Promotion is an append-only operator decision. Recipe promotion still has no trusted collector or operator ingest path; `capability promote <recipe>` fails closed on a fresh install. Navigator-v1 evidence is appended only by `DualEngineCoordinator.persistEvaluationEvidence`, which measures the corpus, restart points, and safety counters and requires executed disposable live scenarios rather than SQL-stamped terminal jobs. Inspect with `bb telegram-agent capability status [recipe|navigator-v1] --json`. Promote or roll back with `bb telegram-agent capability promote <recipe|navigator-v1>` and `capability rollback <recipe|navigator-v1>`. Follow [Capability routing and rollout](operations.md#capability-routing-and-rollout). A fresh installation starts every adaptive recipe in `shadow` and keeps new jobs on recipe-v1 until navigator-v1 is promoted.
 
 ### Background work
 

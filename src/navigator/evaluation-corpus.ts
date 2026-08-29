@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import {
+  DUAL_ENGINE_RESTART_POINTS,
   NAVIGATOR_DETERMINISTIC_CATEGORIES,
+  type DualEngineRestartPoint,
   type NavigatorDeterministicCategory,
 } from "./promotion";
 import type { WorkflowEngine } from "./models";
@@ -20,7 +22,7 @@ export const NAVIGATOR_EVALUATION_HARNESS_DIGEST = createHash("sha256")
   .update("navigator-evaluation-harness-v1", "utf8")
   .digest("hex");
 export const NAVIGATOR_EVALUATION_BUDGET_DIGEST = createHash("sha256")
-  .update("navigator-evaluation-budget-v1:48", "utf8")
+  .update("navigator-evaluation-budget-v1:58", "utf8")
   .digest("hex");
 
 export type NavigatorEvaluationArtifacts = "none" | "ticket" | "specification+ticket";
@@ -40,6 +42,7 @@ export type NavigatorEvaluationCase = Readonly<{
     decision: "accepted" | "rejected" | "shadowed";
     reasonCode: string;
   }>;
+  restartPoint?: DualEngineRestartPoint;
 }>;
 
 function caseId(category: NavigatorDeterministicCategory, index: number): string {
@@ -233,6 +236,18 @@ function buildCases(): NavigatorEvaluationCase[] {
     proposal: "unresolved", expected: { decision: "shadowed", reasonCode: "recipe_job_shadow" },
   });
 
+  for (const restartPoint of DUAL_ENGINE_RESTART_POINTS) {
+    push("restart", {
+      engine: "navigator-v1",
+      artifacts: "specification+ticket",
+      taskOutcome: "shipped_change",
+      jobState: null,
+      proposal: "invoke_research",
+      restartPoint,
+      expected: { decision: "accepted", reasonCode: "accepted" },
+    });
+  }
+
   return cases;
 }
 
@@ -243,5 +258,6 @@ export const NAVIGATOR_EVALUATION_CORPUS_DIGEST = createHash("sha256")
   .digest("hex");
 
 export function navigatorEvaluationCategoryCoverage(): readonly NavigatorDeterministicCategory[] {
-  return NAVIGATOR_DETERMINISTIC_CATEGORIES.filter((category) => category !== "restart");
+  const present = new Set(NAVIGATOR_EVALUATION_CORPUS.map((entry) => entry.category));
+  return NAVIGATOR_DETERMINISTIC_CATEGORIES.filter((category) => present.has(category));
 }
