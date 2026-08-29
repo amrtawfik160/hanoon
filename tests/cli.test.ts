@@ -7,6 +7,7 @@ import { openStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
 import { activeWorkerFixture, admitConfirmedJob, policyFixture, productionPolicyFixture } from "./helpers";
 import { insertResolvedPromotionLedgerFixture } from "./promotion-evidence-fixture";
+import { insertResolvedNavigatorPromotionLedger } from "./support/navigator-promotion-ledger";
 
 let pluginNumber = 0;
 
@@ -138,6 +139,7 @@ it.each([["--help"], ["help"]])("prints actionable command help for %s", async (
   expect(result.stdout).toContain("project list");
   expect(result.stdout).toContain("doctor [project-id]");
   expect(result.stdout).toContain("capability status");
+  expect(result.stdout).toContain("capability promote <recipe|navigator-v1>");
 });
 
 // The controller tool has always resumed a blocked review; the CLI threw
@@ -306,6 +308,61 @@ it("promotes through the production CLI only after the durable reader resolves a
     evidenceDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
   });
   expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("promote");
+});
+
+it("reports navigator-v1 engine status and refuses promotion without a reviewed evidence manifest", async () => {
+  const { harness, store } = await loadPlugin();
+
+  const status = await harness.behavior.runCli(["capability", "status", "navigator-v1", "--json"]);
+  expect(status.exitCode).toBe(0);
+  expect(parseJson(status.stdout)).toMatchObject({
+    settings: {
+      workflowEngineGraph: "adaptive",
+    },
+    engine: {
+      engine: "recipe-v1",
+      mode: "live",
+      promotion: { status: "incomplete", ready: false },
+      decision: null,
+    },
+  });
+  expect(store.listWorkflowEngineRolloutDecisions(10)).toEqual([]);
+
+  const refused = await harness.behavior.runCli(["capability", "promote", "navigator-v1", "--json"]);
+  expect(refused.exitCode).toBe(1);
+  expect(parseJson(refused.stdout)).toMatchObject({
+    engine: "navigator-v1",
+    status: "incomplete",
+    ready: false,
+  });
+  expect(store.getLatestWorkflowEngineRolloutDecision()).toBeNull();
+});
+
+it("promotes navigator-v1 through the CLI only after the durable engine reader resolves a reviewed ledger", async () => {
+  const { bb, harness, store } = await loadPlugin();
+  insertResolvedNavigatorPromotionLedger({
+    db: bb.storage.database(),
+    store,
+    prefix: "cli-navigator-reader",
+  });
+
+  const promoted = await harness.behavior.runCli(["capability", "promote", "navigator-v1", "--json"]);
+  expect(promoted.exitCode).toBe(0);
+  expect(parseJson(promoted.stdout)).toMatchObject({
+    engine: "navigator-v1",
+    action: "promote",
+    reasonCode: "promotion_gates_passed",
+    evidenceDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+  });
+  expect(store.getLatestWorkflowEngineRolloutDecision()?.action).toBe("promote");
+
+  const rolledBack = await harness.behavior.runCli(["capability", "rollback", "navigator-v1", "--json"]);
+  expect(rolledBack.exitCode).toBe(0);
+  expect(parseJson(rolledBack.stdout)).toMatchObject({
+    engine: "navigator-v1",
+    action: "rollback",
+  });
+  expect(store.getLatestWorkflowEngineRolloutDecision()?.action).toBe("rollback");
 });
 
 it("projects bounded inventory and receipt details without sources, subjects, or evidence payloads", async () => {

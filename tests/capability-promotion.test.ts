@@ -303,6 +303,7 @@ describe("new-attempt kill switches", () => {
       jobGraph: "legacy",
       controllerTools: "all-tools",
       modelRouting: "strong-only",
+      workflowEngineGraph: "adaptive",
     });
     expect(controllerExecutionProfile(parsed.value)).toEqual({
       model: "gpt-5.6-sol",
@@ -322,6 +323,7 @@ describe("new-attempt kill switches", () => {
       jobGraph: "adaptive",
       controllerTools: "bundled",
       modelRouting: "adaptive",
+      workflowEngineGraph: "adaptive",
     });
   });
 

@@ -47,6 +47,7 @@ function prepareReviewJob(
     riskReviewThreadId: string;
     attemptId: string;
     riskAttemptId: string;
+    workflow?: { engine: "navigator-v1"; mode: "deterministic" };
     headSha: string;
   },
 ) {
@@ -60,6 +61,7 @@ function prepareReviewJob(
     id: input.id,
     sourceUpdateId: input.sourceUpdateId,
     requestText: `review ${input.id}`,
+    ...(input.workflow === undefined ? {} : { workflow: input.workflow }),
     now: 1_000,
   });
   db.prepare(
@@ -261,11 +263,9 @@ it("returns a legacy navigator review pass to navigation when the exact diff req
     attemptId: "attempt_nav",
     riskAttemptId: "attempt_nav_risk",
     headSha,
+    workflow: { engine: "navigator-v1", mode: "deterministic" },
   });
-  db.prepare(
-    `UPDATE jobs SET workflow_engine = 'navigator-v1', workflow_mode = 'deterministic',
-       routing_mode = 'legacy' WHERE id = ?`,
-  ).run(job.id);
+  db.prepare("UPDATE jobs SET routing_mode = 'legacy' WHERE id = ?").run(job.id);
 
   harness.sdk.stub("environments.status", async () => ({
     outcome: "available",

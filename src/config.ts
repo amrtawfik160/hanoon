@@ -64,6 +64,7 @@ const globalConfigSchema = z.object({
   // gates decide. Meaningful only when self-diagnosis is on at all.
   selfDiagnosisMode: z.enum(["draft-pr", "pipeline"]).default("draft-pr"),
   capabilityJobGraph: z.enum(["adaptive", "legacy"]).default("adaptive"),
+  workflowEngineGraph: z.enum(["adaptive", "recipe"]).default("adaptive"),
   controllerCapabilityMode: z.enum(["bundled", "all-tools"]).default("bundled"),
   capabilityModelRouting: z.enum(["adaptive", "strong-only"]).default("adaptive"),
 });
@@ -91,6 +92,7 @@ export function parseGlobalConfig(values: {
   selfDiagnosisProjectId?: string;
   selfDiagnosisMode?: string;
   capabilityJobGraph?: string;
+  workflowEngineGraph?: string;
   controllerCapabilityMode?: string;
   capabilityModelRouting?: string;
 }): GlobalConfigResult {
@@ -230,11 +232,13 @@ export function capabilityRoutingSettings(config: GlobalConfig): Readonly<{
   jobGraph: "adaptive" | "legacy";
   controllerTools: "bundled" | "all-tools";
   modelRouting: "adaptive" | "strong-only";
+  workflowEngineGraph: "adaptive" | "recipe";
 }> {
   return Object.freeze({
     jobGraph: config.capabilityJobGraph,
     controllerTools: config.controllerCapabilityMode,
     modelRouting: config.capabilityModelRouting,
+    workflowEngineGraph: config.workflowEngineGraph,
   });
 }
 

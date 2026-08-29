@@ -8,7 +8,7 @@ import type { Job } from "../src/domain/models";
 import { NavigatorImplementationExecutor } from "../src/navigator/implementation-executor";
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
-import { ALL_MIGRATIONS, NAVIGATOR_RELEASE_MIGRATIONS } from "../src/storage/migrations";
+import { ALL_MIGRATIONS, NAVIGATOR_PROMOTION_MIGRATIONS, NAVIGATOR_RELEASE_MIGRATIONS } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
@@ -179,7 +179,10 @@ function startResolvedIntegration(
   ).run(now, fixture.job.id);
 }
 
-function ownedFixture(task = "Ship the accepted navigator tickets to production"): OwnedFixture {
+function ownedFixture(
+  task = "Ship the accepted navigator tickets to production",
+  options: Readonly<{ engine?: "recipe-v1" | "navigator-v1" }> = {},
+): OwnedFixture {
   fixtureSequence += 1;
   const { bb } = createFakePluginHost({ pluginId: `navigator-release-${fixtureSequence}` });
   let currentTime = 10_100;
@@ -189,6 +192,14 @@ function ownedFixture(task = "Ship the accepted navigator tickets to production"
   store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
   if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) throw new Error("owner pairing failed");
   store.upsertProjectPolicy(policy, 1_002);
+  if (options.engine !== "recipe-v1") {
+    store.appendWorkflowEngineRolloutDecision({
+      action: "promote",
+      reasonCode: "promotion_gates_passed",
+      evidenceDigest: "a".repeat(64),
+      now: 10_000,
+    });
+  }
   store.enqueueControllerTurn({
     controllerKey: "owner-7-controller",
     telegramUserId: "7",
@@ -214,9 +225,18 @@ function ownedFixture(task = "Ship the accepted navigator tickets to production"
     task,
     now: 10_001,
   });
-  bb.storage.database().prepare(
-    "UPDATE jobs SET workflow_engine = 'navigator-v1', workflow_mode = 'deterministic' WHERE id = ?",
-  ).run(created.id);
+  if (options.engine === "recipe-v1") {
+    return {
+      bb,
+      store,
+      database: bb.storage.database(),
+      job: created,
+      specificationId: "recipe-spec",
+      ticketIds: ["recipe-ticket-1", "recipe-ticket-2"],
+      leaseGeneration: lease.generation,
+      now,
+    };
+  }
   const selected = store.getJob(created.id);
   if (!selected) throw new Error("converted navigator job is missing");
   const { bound, specificationId, ticketIds } = bindNavigatorTickets(store, selected, now);
@@ -453,7 +473,8 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("appends the navigator release migration after the ticket 41 policy intent migrations", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-2)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");
@@ -700,10 +721,7 @@ describe("navigator exact-head release", () => {
   });
 
   it("keeps recipe jobs failed after a successful rollback", async () => {
-    const fixture = ownedFixture();
-    fixture.database.prepare(
-      "UPDATE jobs SET workflow_engine = 'recipe-v1', workflow_mode = 'live' WHERE id = ?",
-    ).run(fixture.job.id);
+    const fixture = ownedFixture("Ship a recipe production rollback", { engine: "recipe-v1" });
     await runLeasedProduction(fixture, seedProductionEffect(fixture, "deploying"), failedStage("deploy", "pass"));
     expect(fixture.store.getJob(fixture.job.id)?.state).toBe("production_failed");
     expect(fixture.store.getOutbox(`job:${fixture.job.id}:production-incident:deploy`)).toBeNull();

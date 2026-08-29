@@ -73,6 +73,20 @@ import {
   type CapabilityJobGraphMode,
   type RecipeRolloutDecision,
 } from "../capabilities/promotion";
+import {
+  workflowIdentityForNewAdmission,
+  type AppendWorkflowEngineRolloutDecisionInput,
+  type NavigatorDeterministicCategory,
+  type NavigatorLiveScenario,
+  type NavigatorSafetyCounter,
+  type WorkflowEngineGraphMode,
+  type WorkflowEngineRolloutDecision,
+} from "../navigator/promotion";
+import {
+  WorkflowEngineRepository,
+  type WorkflowEngineContraction,
+} from "./workflow-engine-repository";
+export { DualEngineContractionError } from "./workflow-engine-repository";
 import type { TaskRecipe } from "../domain/recipes";
 import type { CapabilityInventoryItem, InventoryHealth } from "../capabilities/inventory";
 import { CAPABILITY_BY_ID } from "../capabilities/catalog";
@@ -358,11 +372,13 @@ type LegacyControllerQuestionRow = Readonly<{
 export type CapabilityDispatchSettings = Readonly<{
   jobGraph: CapabilityJobGraphMode;
   controllerTools: "bundled" | "all-tools";
+  workflowEngineGraph?: WorkflowEngineGraphMode;
 }>;
 
 const DEFAULT_CAPABILITY_DISPATCH_SETTINGS: CapabilityDispatchSettings = Object.freeze({
   jobGraph: "adaptive",
   controllerTools: "bundled",
+  workflowEngineGraph: "adaptive",
 });
 
 export type PairingResult =
@@ -3236,6 +3252,61 @@ export interface TelegramAgentStore {
   appendRecipeRolloutDecision(input: AppendRecipeRolloutDecisionInput): RecipeRolloutDecision;
   listRecipeRolloutDecisions(recipe: TaskRecipe, limit: number): RecipeRolloutDecision[];
   getLatestRecipeRolloutDecision(recipe: TaskRecipe): RecipeRolloutDecision | null;
+  appendWorkflowEngineRolloutDecision(input: AppendWorkflowEngineRolloutDecisionInput): WorkflowEngineRolloutDecision;
+  listWorkflowEngineRolloutDecisions(limit: number): WorkflowEngineRolloutDecision[];
+  getLatestWorkflowEngineRolloutDecision(): WorkflowEngineRolloutDecision | null;
+  readDurableNavigatorPromotionEvidenceSnapshot(): unknown | null;
+  recordNavigatorDeterministicEvidence(input: Readonly<{
+    category: NavigatorDeterministicCategory;
+    suiteId: string;
+    runId: string;
+    artifactDigest: string;
+    outcome: "passed" | "failed";
+    now: number;
+  }>): string;
+  recordNavigatorCorpusEvidence(input: Readonly<{
+    corpusDigest: string;
+    runId: string;
+    resultDigest: string;
+    total: number;
+    correct: number;
+    unauthorizedEffects: number;
+    now: number;
+  }>): string;
+  recordNavigatorLiveEvidence(input: Readonly<{
+    runId: string;
+    jobId: string;
+    scenario: NavigatorLiveScenario;
+    terminalState: "complete" | "merged" | "cancelled";
+    evidenceDigest: string;
+    now: number;
+  }>): string;
+  recordNavigatorModelTrialEvidence(input: Readonly<{
+    cohort: "candidate" | "baseline";
+    modelTrialId: string;
+    harnessDigest: string;
+    budgetDigest: string;
+    now: number;
+  }>): string;
+  recordNavigatorSafetyEvidence(input: Readonly<{
+    counter: NavigatorSafetyCounter;
+    count: number;
+    snapshotId: string;
+    evidenceDigest: string;
+    now: number;
+  }>): string;
+  publishNavigatorPromotionManifest(input: Readonly<{
+    deterministicIds: readonly string[];
+    corpusId: string | null;
+    liveRunIds: readonly string[];
+    candidateModelRefIds: readonly string[];
+    baselineModelRefIds: readonly string[];
+    safetyIds: readonly string[];
+    reviewed: boolean;
+    now: number;
+  }>): string;
+  listNonterminalRecipeJobs(): Job[];
+  contractRecipeEngine(now: number): WorkflowEngineContraction;
   createPairingCode(codeHash: string, createdAt: number, expiresAt: number): void;
   pairOwnerWithCode(
     codeHash: string,
@@ -5483,6 +5554,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly taskAuthorityRepository: TaskAuthorityRepository;
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
+  private readonly workflowEngineRepository: WorkflowEngineRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -5503,6 +5575,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.taskAuthorityRepository = new TaskAuthorityRepository(db);
     this.releaseAuthorityRepository = new ReleaseAuthorityRepository(db);
     this.ownerBoundaryRepository = new OwnerBoundaryRepository(db);
+    this.workflowEngineRepository = new WorkflowEngineRepository(db);
   }
 
   private createOwnerTaskAuthority(input: Readonly<{
@@ -6060,6 +6133,106 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.capabilityRepository.getLatestRecipeRolloutDecision(recipe);
   }
 
+  public appendWorkflowEngineRolloutDecision(
+    input: AppendWorkflowEngineRolloutDecisionInput,
+  ): WorkflowEngineRolloutDecision {
+    return this.workflowEngineRepository.appendWorkflowEngineRolloutDecision(input);
+  }
+
+  public listWorkflowEngineRolloutDecisions(limit: number): WorkflowEngineRolloutDecision[] {
+    return this.workflowEngineRepository.listWorkflowEngineRolloutDecisions(limit);
+  }
+
+  public getLatestWorkflowEngineRolloutDecision(): WorkflowEngineRolloutDecision | null {
+    return this.workflowEngineRepository.getLatestWorkflowEngineRolloutDecision();
+  }
+
+  public readDurableNavigatorPromotionEvidenceSnapshot(): unknown | null {
+    return this.workflowEngineRepository.readDurableNavigatorPromotionEvidenceSnapshot();
+  }
+
+  public recordNavigatorDeterministicEvidence(input: Readonly<{
+    category: NavigatorDeterministicCategory;
+    suiteId: string;
+    runId: string;
+    artifactDigest: string;
+    outcome: "passed" | "failed";
+    now: number;
+  }>): string {
+    return this.workflowEngineRepository.recordNavigatorDeterministicEvidence(input);
+  }
+
+  public recordNavigatorCorpusEvidence(input: Readonly<{
+    corpusDigest: string;
+    runId: string;
+    resultDigest: string;
+    total: number;
+    correct: number;
+    unauthorizedEffects: number;
+    now: number;
+  }>): string {
+    return this.workflowEngineRepository.recordNavigatorCorpusEvidence(input);
+  }
+
+  public recordNavigatorLiveEvidence(input: Readonly<{
+    runId: string;
+    jobId: string;
+    scenario: NavigatorLiveScenario;
+    terminalState: "complete" | "merged" | "cancelled";
+    evidenceDigest: string;
+    now: number;
+  }>): string {
+    return this.workflowEngineRepository.recordNavigatorLiveEvidence(input);
+  }
+
+  public recordNavigatorModelTrialEvidence(input: Readonly<{
+    cohort: "candidate" | "baseline";
+    modelTrialId: string;
+    harnessDigest: string;
+    budgetDigest: string;
+    now: number;
+  }>): string {
+    return this.workflowEngineRepository.recordNavigatorModelTrialEvidence(input);
+  }
+
+  public recordNavigatorSafetyEvidence(input: Readonly<{
+    counter: NavigatorSafetyCounter;
+    count: number;
+    snapshotId: string;
+    evidenceDigest: string;
+    now: number;
+  }>): string {
+    return this.workflowEngineRepository.recordNavigatorSafetyEvidence(input);
+  }
+
+  public publishNavigatorPromotionManifest(input: Readonly<{
+    deterministicIds: readonly string[];
+    corpusId: string | null;
+    liveRunIds: readonly string[];
+    candidateModelRefIds: readonly string[];
+    baselineModelRefIds: readonly string[];
+    safetyIds: readonly string[];
+    reviewed: boolean;
+    now: number;
+  }>): string {
+    return this.workflowEngineRepository.publishNavigatorPromotionManifest(input);
+  }
+
+  public listNonterminalRecipeJobs(): Job[] {
+    return this.workflowEngineRepository.listNonterminalRecipeJobs();
+  }
+
+  public contractRecipeEngine(now: number): WorkflowEngineContraction {
+    return this.workflowEngineRepository.contractRecipeEngine(now);
+  }
+
+  private admissionWorkflowIdentity(): Readonly<{ engine: "recipe-v1" | "navigator-v1"; mode: "live" | "shadow" | "deterministic" }> {
+    return workflowIdentityForNewAdmission(
+      this.capabilityDispatchSettings().workflowEngineGraph ?? "adaptive",
+      this.workflowEngineRepository.getLatestWorkflowEngineRolloutDecision(),
+    );
+  }
+
   public getActiveCapabilityProfile(
     subjectKind: CapabilitySubjectKind,
     subjectId: string,
@@ -6290,7 +6463,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const dispatchSettings = this.capabilityDispatchSettings();
     if (
       !["adaptive", "legacy"].includes(dispatchSettings.jobGraph) ||
-      !["bundled", "all-tools"].includes(dispatchSettings.controllerTools)
+      !["bundled", "all-tools"].includes(dispatchSettings.controllerTools) ||
+      (dispatchSettings.workflowEngineGraph !== undefined &&
+        dispatchSettings.workflowEngineGraph !== "adaptive" &&
+        dispatchSettings.workflowEngineGraph !== "recipe")
     ) throw new TypeError("Capability dispatch settings are invalid");
     // The offer a short reply accepts lives in the previous answer, so bundle
     // selection reads the conversation rather than the message alone. Folded
@@ -11817,13 +11993,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         dispatchSettings.jobGraph,
         this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
       );
+      const workflowIdentity = this.admissionWorkflowIdentity();
       this.db.prepare(
         `INSERT INTO jobs (
            id, source_update_id, request_text, state, delivery_mode, task_recipe,
-           recipe_version, recipe_promotion_count, routing_mode, task_traits_json,
-           task_reason_codes_json, task_outcome, task_constraints_json,
+           recipe_version, recipe_promotion_count, routing_mode, workflow_engine, workflow_mode,
+           task_traits_json, task_reason_codes_json, task_outcome, task_constraints_json,
            review_cycle, review_block_at, version, created_at, updated_at
-         ) VALUES (?, ?, ?, 'awaiting_project', ?, ?, 1, 0, ?, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
+         ) VALUES (?, ?, ?, 'awaiting_project', ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
       ).run(
         jobId,
         turn.telegram_update_id,
@@ -11831,6 +12008,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         deliveryMode,
         routing.recipe,
         routingMode,
+        workflowIdentity.engine,
+        workflowIdentity.mode,
         JSON.stringify(routing.traits),
         JSON.stringify(routing.reasonCodes),
         taskOutcome.outcome,
@@ -11942,15 +12121,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         dispatchSettings.jobGraph,
         this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
       );
+      const workflowIdentity = this.admissionWorkflowIdentity();
       this.db.prepare(
         `INSERT INTO jobs (
            id, source_update_id, request_text, state, delivery_mode, job_origin,
            adopted_branch, adopted_head_sha, pr_number, pr_url, pr_head_sha,
            task_recipe, recipe_version, recipe_promotion_count, routing_mode,
+           workflow_engine, workflow_mode,
            task_traits_json, task_reason_codes_json, task_outcome, task_constraints_json,
            review_cycle, review_block_at, version, created_at, updated_at
          ) VALUES (?, ?, ?, 'awaiting_project', 'full', 'adopted_pr', ?, ?, ?, ?, ?,
-                   ?, 1, 0, ?, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
+                   ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
       ).run(
         jobId,
         turn.telegram_update_id,
@@ -11962,6 +12143,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.headSha,
         routing.recipe,
         routingMode,
+        workflowIdentity.engine,
+        workflowIdentity.mode,
         JSON.stringify(routing.traits),
         JSON.stringify(routing.reasonCodes),
         taskOutcome.outcome,
@@ -12140,13 +12323,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         dispatchSettings.jobGraph,
         this.capabilityRepository.getLatestRecipeRolloutDecision(routing.recipe),
       );
+      const workflowIdentity = this.admissionWorkflowIdentity();
       this.db.prepare(
         `INSERT INTO jobs (
            id, source_update_id, request_text, state, delivery_mode, task_recipe,
-           recipe_version, recipe_promotion_count, routing_mode, task_traits_json,
-           task_reason_codes_json, autonomous_origin, review_cycle, review_block_at,
+           recipe_version, recipe_promotion_count, routing_mode, workflow_engine, workflow_mode,
+           task_traits_json, task_reason_codes_json, autonomous_origin, review_cycle, review_block_at,
            version, created_at, updated_at
-         ) VALUES (?, ?, ?, 'awaiting_project', ?, ?, 1, 0, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
+         ) VALUES (?, ?, ?, 'awaiting_project', ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, 0, 3, 1, ?, ?)`,
       ).run(
         jobId,
         sourceUpdateId,
@@ -12154,6 +12338,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         routing.recipe === "direct" ? "small_fix" : "full",
         routing.recipe,
         routingMode,
+        workflowIdentity.engine,
+        workflowIdentity.mode,
         JSON.stringify(routing.traits),
         JSON.stringify(routing.reasonCodes),
         input.origin,
