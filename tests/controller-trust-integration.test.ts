@@ -573,7 +573,6 @@ async function assertProductionWiring(
   );
   expect(configured.skills).toEqual([
     "driving-bb",
-    "proportional-development-workflow",
     "unslop",
     ...(pendingTurn ? [] : ["grill-with-docs", "grilling", "domain-modeling"]),
   ]);

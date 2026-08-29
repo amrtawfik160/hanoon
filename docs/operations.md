@@ -84,7 +84,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally. The expansion bundle admits 35 reviewed skill ids and keeps 15 additional legacy-only ids for recipe-v1 jobs. BB registers eight immediate roots, including the two promoted Matt Pocock buckets. Three promoted ids overlap the historical discovery catalog, so their reviewed copies stay locked under an unregistered compatibility subtree until navigator-v1 owns new jobs. Every registered runtime id has one plugin source during expansion.
+Skills are committed locally. The contracted bundle admits exactly 35 reviewed skill ids and no legacy-only Superpowers, discovery, or router ids. BB registers six immediate roots: the two promoted Matt Pocock buckets plus guards, delivery, Hanoon, and pstack. Every registered runtime id has one plugin source.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -92,7 +92,7 @@ Run the deterministic integrity gate from the repository root:
 npm run skills:verify
 ```
 
-The command checks package root order, schema 2 lock structure, active, legacy, and shadow descriptors, file bounds and regular-file type, complete SHA-256 coverage, frontmatter and directory names, invocation metadata, nested local Markdown resources, and every source license and provenance record. Success prints `bundleDigest`, `admittedSkillCount=35`, and `legacySkillCount=15`. Any malformed lock, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter mismatch, unsupported id, or digest mismatch exits nonzero. Build and activation run the same verifier before plugin registration.
+The command checks package root order, schema 2 lock structure, the 35-skill catalog with empty legacy and shadow lists, file bounds and regular-file type, complete SHA-256 coverage, frontmatter and directory names, invocation metadata, nested local Markdown resources, and every source license and provenance record. Success prints `bundleDigest`, `admittedSkillCount=35`, and `legacySkillCount=0`. Any malformed lock, leftover workflow or discovery kit, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter mismatch, unsupported id, or digest mismatch exits nonzero. Build and activation run the same verifier before plugin registration.
 
 Only a maintainer may synchronize the promoted portfolio. Use a clean, already-reviewed absolute checkout at the pinned revision:
 
@@ -208,7 +208,7 @@ bb telegram-agent capability promote navigator-v1 --json
 bb telegram-agent capability rollback navigator-v1 --json
 ```
 
-Promotion affects only newly created matching jobs. Recipe rollback returns only later matching jobs to `shadow`. Navigator rollback returns only later admissions to recipe-v1. Neither mutates the routing mode, model tuple, profile, receipts, or engine of a job already in flight. The independent **Capability job graph** setting can force later jobs onto `legacy` without deleting capability data. The independent **Workflow engine graph** setting can keep later jobs on recipe-v1 even after navigator-v1 is promoted. After a reviewed navigator promotion with that setting left at `adaptive`, the leased executor runs the live navigator, implementation, and release workers.
+Promotion affects only newly created matching jobs. Recipe rollback returns only later matching jobs to `shadow`. Navigator rollback records the operator decision without changing later admissions, which stay on navigator-v1. Neither mutates the routing mode, model tuple, profile, receipts, or engine of a job already in flight. The independent **Capability job graph** setting can force later jobs onto `legacy` without deleting capability data. The independent **Workflow engine graph** setting is a retired kill switch and is ignored for admission. The leased executor runs the live navigator, implementation, and release workers.
 
 For a known profile id, inspect its bounded selection and outcome receipts:
 

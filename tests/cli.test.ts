@@ -320,8 +320,8 @@ it("reports navigator-v1 engine status and refuses promotion without a reviewed 
       workflowEngineGraph: "adaptive",
     },
     engine: {
-      engine: "recipe-v1",
-      mode: "live",
+      engine: "navigator-v1",
+      mode: "deterministic",
       promotion: { status: "incomplete", ready: false },
       decision: null,
     },

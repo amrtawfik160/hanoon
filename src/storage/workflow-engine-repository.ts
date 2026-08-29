@@ -104,7 +104,7 @@ const RECIPE_TERMINAL_STATES = ["cancelled", "complete", "merged", "production_f
 
 export class DualEngineContractionError extends Error {
   public constructor(public readonly remainingJobIds: readonly string[]) {
-    super("Recipe-v1 jobs remain before contraction");
+    super("Recipe-v1 jobs remain before contraction; remaining jobs still require a legacy skill or state handler");
     this.name = "DualEngineContractionError";
   }
 }
@@ -422,11 +422,36 @@ export class WorkflowEngineRepository {
     return rows.map(parseJob);
   }
 
+  public getLatestWorkflowEngineContraction(): WorkflowEngineContraction | null {
+    const row = this.db.prepare(
+      `SELECT id, engine, remaining_job_ids_json, created_at
+         FROM workflow_engine_contractions
+        WHERE engine = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1`,
+    ).get(RECIPE_ENGINE_ID) as {
+      id: string;
+      engine: typeof RECIPE_ENGINE_ID;
+      remaining_job_ids_json: string;
+      created_at: number;
+    } | undefined;
+    if (!row) return null;
+    const remainingJobIds = z.tuple([]).parse(JSON.parse(row.remaining_job_ids_json));
+    return {
+      id: boundedIdSchema.parse(row.id),
+      engine: RECIPE_ENGINE_ID,
+      remainingJobIds,
+      createdAt: row.created_at,
+    };
+  }
+
   public contractRecipeEngine(now: number): WorkflowEngineContraction {
     const remaining = this.listNonterminalRecipeJobs();
     if (remaining.length > 0) {
       throw new DualEngineContractionError(remaining.map((job) => job.id));
     }
+    const existing = this.getLatestWorkflowEngineContraction();
+    if (existing) return existing;
     const createdAt = nonNegativeIntegerSchema.parse(now);
     const id = `engine_contract:${randomUUID()}`;
     this.db.prepare(

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CAPABILITY_BY_ID } from "../capabilities/catalog";
+import { capabilityDescriptorById } from "../capabilities/catalog";
 import { guardRequirementBindings } from "../capabilities/guards";
 import type { Job, ProjectPolicy } from "../domain/models";
 import { verificationContractMarkdown } from "./pipeline-handoffs";
@@ -82,7 +82,7 @@ function validateCapabilityEnvelope(capability: CapabilityWorkOrderEnvelope, job
     throw new TypeError("Capability work-order assignments must be a bounded unique set");
   }
   for (const assignment of assignments) {
-    const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+    const descriptor = capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest);
     if (!descriptor || descriptor.status !== "admitted" || descriptor.route !== "worker" ||
       descriptor.digest !== assignment.descriptorDigest ||
       (descriptor.evidence.requirement === "mandatory") !== assignment.mandatory) {
@@ -256,7 +256,7 @@ export function buildReviewPacket(
   const diffDigest = createHash("sha256").update(diff, "utf8").digest("hex");
   const selectedGuards = reviewLens === "quality"
     ? (capability?.assignments ?? []).filter((assignment) =>
-        CAPABILITY_BY_ID.get(assignment.capabilityId)?.evidence.receiptType === "guard")
+        capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest)?.evidence.receiptType === "guard")
     : [];
   const guardContract = capability?.mode === "active" && selectedGuards.length > 0
     ? {
@@ -266,7 +266,7 @@ export function buildReviewPacket(
         reviewedHeadSha: remoteHeadSha,
         diffDigest,
         selectedGuards: selectedGuards.map((assignment) => {
-          const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+          const descriptor = capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest);
           if (!descriptor) throw new TypeError(`Selected guard ${assignment.capabilityId} disappeared`);
           return {
             ...assignment,

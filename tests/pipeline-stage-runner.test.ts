@@ -4,8 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { BbRunner } from "../src/bb/runner";
 import { parseWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import {
-  CAPABILITY_GRAPH_DIGEST,
-  CAPABILITY_REGISTRY_DIGEST,
+  HISTORICAL_RECIPE_GRAPH_DIGEST,
+  HISTORICAL_RECIPE_REGISTRY_DIGEST,
 } from "../src/capabilities/catalog";
 import { selectCapabilityProfile } from "../src/capabilities/profiles";
 import {
@@ -132,8 +132,8 @@ it("persists mandatory docs outcomes before an active docs transition", () => {
     threadId: null,
     recipeId: "bounded",
     recipeVersion: 1,
-    registryDigest: CAPABILITY_REGISTRY_DIGEST,
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active",
     model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
     assignments: selected.assignments.map((assignment) => ({

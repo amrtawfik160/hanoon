@@ -151,25 +151,25 @@ describe("navigator promotion evidence", () => {
 });
 
 describe("new-job workflow engine routing", () => {
-  it("keeps new admissions on recipe-v1 until a reviewed promote, then rollback restores recipe-v1", () => {
+  it("admits navigator-v1 for new work even after rollback or the retired recipe kill switch", () => {
     const promoted = { action: "promote", reasonCode: "promotion_gates_passed" } as const;
     const rolledBack = { action: "rollback", reasonCode: "operator_requested" } as const;
 
     expect(workflowIdentityForNewAdmission("adaptive", null)).toEqual({
-      engine: "recipe-v1",
-      mode: "live",
+      engine: "navigator-v1",
+      mode: "deterministic",
     });
     expect(workflowIdentityForNewAdmission("adaptive", promoted)).toEqual({
       engine: "navigator-v1",
       mode: "deterministic",
     });
     expect(workflowIdentityForNewAdmission("adaptive", rolledBack)).toEqual({
-      engine: "recipe-v1",
-      mode: "live",
+      engine: "navigator-v1",
+      mode: "deterministic",
     });
     expect(workflowIdentityForNewAdmission("recipe", promoted)).toEqual({
-      engine: "recipe-v1",
-      mode: "live",
+      engine: "navigator-v1",
+      mode: "deterministic",
     });
   });
 
@@ -207,8 +207,8 @@ describe("new-job workflow engine routing", () => {
     const rollback = service.rollback();
     expect(service.rollback()).toEqual(rollback);
     expect(service.routingStatus()).toMatchObject({
-      engine: "recipe-v1",
-      mode: "live",
+      engine: "navigator-v1",
+      mode: "deterministic",
     });
     expect(service.listDecisions(10)).toHaveLength(2);
   });
@@ -227,6 +227,6 @@ describe("new-job workflow engine routing", () => {
     });
 
     await expect(service.promote()).rejects.toMatchObject({ assessment: { status: "incomplete" } });
-    expect(service.routingStatus()).toMatchObject({ engine: "recipe-v1", mode: "live" });
+    expect(service.routingStatus()).toMatchObject({ engine: "navigator-v1", mode: "deterministic" });
   });
 });

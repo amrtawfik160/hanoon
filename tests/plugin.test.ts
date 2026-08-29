@@ -7,8 +7,8 @@ import { CONTROLLER_PHASE_TEXT } from "../src/controller/models";
 import { hashSecret } from "../src/crypto";
 import { ApprovalService } from "../src/services/approval-service";
 import {
-  CAPABILITY_GRAPH_DIGEST,
-  CAPABILITY_REGISTRY_DIGEST,
+  HISTORICAL_RECIPE_GRAPH_DIGEST,
+  HISTORICAL_RECIPE_REGISTRY_DIGEST,
 } from "../src/capabilities/catalog";
 import { selectCapabilityProfile } from "../src/capabilities/profiles";
 import { openStore } from "../src/storage/store";
@@ -653,8 +653,8 @@ it.each([
     threadId: null,
     recipeId: "bounded",
     recipeVersion: 1,
-    registryDigest: CAPABILITY_REGISTRY_DIGEST,
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active",
     model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
     assignments: selected.assignments.map((assignment) => ({
@@ -862,8 +862,8 @@ it("persists every selected active guard outcome before advancing the review gro
     threadId: null,
     recipeId: "bounded",
     recipeVersion: 1,
-    registryDigest: CAPABILITY_REGISTRY_DIGEST,
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active",
     model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
     assignments: selected.assignments.map((assignment) => ({

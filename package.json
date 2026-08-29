@@ -15,10 +15,8 @@
     },
     "server": "./server.ts",
     "skills": [
-      "skills/workflow-kit",
       "skills/guards",
       "skills/delivery",
-      "skills/discovery",
       "skills/matt-pocock/engineering",
       "skills/matt-pocock/productivity",
       "skills/hanoon",

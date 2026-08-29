@@ -1,8 +1,8 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import {
-  CAPABILITY_GRAPH_DIGEST,
-  CAPABILITY_REGISTRY_DIGEST,
+  HISTORICAL_RECIPE_GRAPH_DIGEST,
+  HISTORICAL_RECIPE_REGISTRY_DIGEST,
 } from "../src/capabilities/catalog";
 import {
   recordDocumentationCapabilityOutcomes,
@@ -28,8 +28,8 @@ function fixture(recipe: "bounded" | "skill-authoring" = "bounded") {
     threadId: null,
     recipeId: recipe,
     recipeVersion: 1,
-    registryDigest: CAPABILITY_REGISTRY_DIGEST,
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active",
     model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
     assignments: selected.assignments.map((assignment) => ({
@@ -186,8 +186,8 @@ describe("mandatory documentation capability outcomes", () => {
       threadId: null,
       recipeId: "bounded",
       recipeVersion: 1,
-      registryDigest: CAPABILITY_REGISTRY_DIGEST,
-      graphDigest: CAPABILITY_GRAPH_DIGEST,
+      registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+      graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
       mode: "active",
       model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
       assignments: selected.assignments.map((assignment) => ({

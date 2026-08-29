@@ -7,20 +7,16 @@ import { CAPABILITY_CATALOG } from "../src/capabilities/catalog";
 
 const repositoryRoot = new URL("..", import.meta.url).pathname;
 const registeredRoots = [
-  "skills/workflow-kit",
   "skills/guards",
   "skills/delivery",
-  "skills/discovery",
   "skills/matt-pocock/engineering",
   "skills/matt-pocock/productivity",
   "skills/hanoon",
   "skills/pstack",
 ] as const;
 const lockedRoots = [
-  "skills/workflow-kit",
   "skills/guards",
   "skills/delivery",
-  "skills/discovery",
   "skills/matt-pocock",
   "skills/hanoon",
   "skills/pstack",
@@ -37,8 +33,8 @@ type LockSkill = Readonly<{
 type SkillLock = Readonly<{
   schemaVersion: number;
   mattPocockKit: Readonly<Record<string, string>>;
-  workflowKit: Readonly<Record<string, string>>;
-  discoveryKit: Readonly<Record<string, string>>;
+  workflowKit?: Readonly<Record<string, string>>;
+  discoveryKit?: Readonly<Record<string, string>>;
   guardKit: Readonly<Record<string, string>>;
   deliveryKit: Readonly<Record<string, string>>;
   hanoonKit: Readonly<Record<string, string>>;
@@ -73,7 +69,7 @@ function recursiveFiles(directory: string): string[] {
 }
 
 describe("committed agent skill bundle", () => {
-  test("registers exactly one runtime source for every skill id during expansion", () => {
+  test("registers exactly one runtime source for every skill id", () => {
     const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
       bb: { skills: unknown };
     };
@@ -81,9 +77,11 @@ describe("committed agent skill bundle", () => {
     expect(manifest.bb.skills).toEqual(registeredRoots);
     const candidates = pluginSkillCandidates();
     expect([...candidates.values()].every((paths) => paths.length === 1)).toBe(true);
-    for (const id of ["domain-modeling", "grill-with-docs", "grilling"]) {
-      expect(candidates.get(id)?.[0]).toBe(`skills/discovery/${id}/SKILL.md`);
-    }
+    expect(candidates.get("grill-with-docs")?.[0]).toBe("skills/matt-pocock/engineering/grill-with-docs/SKILL.md");
+    expect(candidates.get("domain-modeling")?.[0]).toBe("skills/matt-pocock/engineering/domain-modeling/SKILL.md");
+    expect(candidates.get("grilling")?.[0]).toBe("skills/matt-pocock/productivity/grilling/SKILL.md");
+    expect(candidates.has("using-superpowers")).toBe(false);
+    expect(candidates.has("proportional-development-workflow")).toBe(false);
   });
 
   test("locks every active, compatibility, and archived bundle file by SHA-256", () => {
@@ -100,28 +98,27 @@ describe("committed agent skill bundle", () => {
     }
   });
 
-  test("keeps the exact recipe compatibility descriptors while admitting the new portfolio separately", () => {
+  test("locks the contracted 35-skill catalog without leftover workflow or discovery kits", () => {
     const lock = readLock();
     const catalogSkills = new Map(
       CAPABILITY_CATALOG
         .filter((descriptor) => descriptor.kind === "skill")
         .map((descriptor) => [descriptor.id, descriptor]),
     );
-    const retained = lock.skills.filter((skill) => skill.source !== "https://github.com/mattpocock/skills");
-    const compatibilityBound = [...lock.legacySkills, ...retained];
 
-    expect(compatibilityBound).toHaveLength(25);
-    expect(catalogSkills.size).toBe(28);
-    for (const skill of compatibilityBound) {
+    expect(lock.skills).toHaveLength(35);
+    expect(lock.legacySkills).toEqual([]);
+    expect(lock.shadowedSkills).toEqual([]);
+    expect(lock.workflowKit).toBeUndefined();
+    expect(lock.discoveryKit).toBeUndefined();
+    expect(catalogSkills.size).toBe(35);
+    for (const skill of lock.skills) {
       const descriptor = catalogSkills.get(skill.id);
-      expect(descriptor, `${skill.id} has a compatibility descriptor`).toBeDefined();
+      expect(descriptor, `${skill.id} has a live descriptor`).toBeDefined();
       expect(descriptor?.sourceDigest).toBe(skill.sourceDigest);
     }
-    for (const id of ["domain-modeling", "grill-with-docs", "grilling"]) {
-      expect(catalogSkills.get(id), `${id} keeps its historical recipe descriptor`).toBeDefined();
-      expect(lock.shadowedSkills.find((skill) => skill.id === id)?.sourceDigest)
-        .toBe(catalogSkills.get(id)?.sourceDigest);
-    }
+    expect(catalogSkills.has("using-superpowers")).toBe(false);
+    expect(catalogSkills.has("writing-plans")).toBe(false);
   });
 
   test("records current and archived source provenance without conflating licenses", () => {
@@ -134,16 +131,8 @@ describe("committed agent skill bundle", () => {
       license: "MIT",
       licensePath: "skills/matt-pocock/LICENSE",
     });
-    expect(lock.workflowKit).toMatchObject({
-      version: "6.3.0",
-      sourceUrl: "https://github.com/obra/superpowers",
-      license: "MIT",
-      licensePath: "skills/workflow-kit/LICENSE",
-    });
-    expect(lock.discoveryKit).toMatchObject({
-      revision: "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
-      licensePath: "skills/discovery/LICENSE",
-    });
+    expect(lock.workflowKit).toBeUndefined();
+    expect(lock.discoveryKit).toBeUndefined();
     expect(lock.guardKit.licensePath).toBe("skills/guards/LICENSE");
     expect(lock.deliveryKit.licensePath).toBe("skills/delivery/LICENSE");
     expect(lock.hanoonKit.licensePath).toBe("skills/hanoon/NOTICE");
@@ -152,10 +141,8 @@ describe("committed agent skill bundle", () => {
 
   test("ships every source license and notice", () => {
     for (const licensePath of [
-      "skills/workflow-kit/LICENSE",
       "skills/guards/LICENSE",
       "skills/delivery/LICENSE",
-      "skills/discovery/LICENSE",
       "skills/matt-pocock/LICENSE",
       "skills/hanoon/NOTICE",
       "skills/pstack/LICENSE",
@@ -166,14 +153,14 @@ describe("committed agent skill bundle", () => {
     }
   });
 
-  test("keeps existing recipe role profiles executable during the expansion", () => {
+  test("keeps navigator role profiles executable from the contracted catalog", () => {
     const lock = readLock();
-    const executableIds = new Set([...lock.skills, ...lock.legacySkills].map((skill) => skill.id));
+    const executableIds = new Set(lock.skills.map((skill) => skill.id));
 
     for (const id of Object.values(ROLE_SKILLS).flat()) {
       expect(executableIds, `${id} remains executable`).toContain(id);
     }
-    expect(ROLE_SKILLS.planner).toEqual(["unslop", "writing-plans", "docs-guard"]);
+    expect(ROLE_SKILLS.planner).toEqual(["unslop", "writing-for-agents", "docs-guard"]);
     expect(ROLE_SKILLS.critic).toEqual(["unslop"]);
   });
 });

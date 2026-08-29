@@ -55,6 +55,13 @@ export class DualEngineCoordinator {
     return { cancelled, remaining };
   }
 
+  public assertContractionAllowed(): void {
+    const remaining = this.listNonterminalRecipeJobs();
+    if (remaining.length > 0) {
+      throw new DualEngineContractionError(remaining.map((job) => job.id));
+    }
+  }
+
   public contractRecipeEngine(): WorkflowEngineContraction {
     const drain = this.drainRecipeJobs();
     if (drain.remaining.length > 0) {

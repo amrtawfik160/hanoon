@@ -1906,7 +1906,7 @@ function capabilityRollback(
   if (subject === NAVIGATOR_ENGINE_ID) {
     const decision = deps.enginePromotions.rollback();
     deps.notify?.();
-    return success(decision, "new admissions use recipe-v1", json);
+    return success(decision, "new admissions stay on navigator-v1", json);
   }
   const recipe = capabilityRecipe(subject, "recipe");
   const decision = deps.capabilityPromotions.rollback(recipe);

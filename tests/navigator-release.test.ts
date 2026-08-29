@@ -192,14 +192,45 @@ function ownedFixture(
   store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
   if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) throw new Error("owner pairing failed");
   store.upsertProjectPolicy(policy, 1_002);
-  if (options.engine !== "recipe-v1") {
-    store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: 10_000,
+  const lease = store.acquireExecutorLease("executor", 10_000, 120_000);
+  if (!lease.acquired) throw new Error("missing executor lease");
+  if (options.engine === "recipe-v1") {
+    const leftover = store.createJob({
+      id: `recipe-job-${String(fixtureSequence).padStart(10, "0")}`,
+      sourceUpdateId: 43_000 + fixtureSequence,
+      requestText: task,
+      now: 10_001,
     });
+    const selected = store.applyJobEvent(leftover.id, leftover.version, {
+      type: "PROJECT_SELECTED",
+      projectId: policy.projectId,
+      policyVersion: 1,
+      policy,
+    }, 10_002);
+    store.queueAdmission({
+      jobId: selected.id,
+      expectedVersion: selected.version,
+      projectId: policy.projectId,
+      resumeEvent: "CONFIRMED",
+      now: 10_003,
+    });
+    return {
+      bb,
+      store,
+      database: bb.storage.database(),
+      job: selected,
+      specificationId: "recipe-spec",
+      ticketIds: ["recipe-ticket-1", "recipe-ticket-2"],
+      leaseGeneration: lease.generation,
+      now,
+    };
   }
+  store.appendWorkflowEngineRolloutDecision({
+    action: "promote",
+    reasonCode: "promotion_gates_passed",
+    evidenceDigest: "a".repeat(64),
+    now: 10_000,
+  });
   store.enqueueControllerTurn({
     controllerKey: "owner-7-controller",
     telegramUserId: "7",
@@ -208,8 +239,6 @@ function ownedFixture(
     inputText: task,
     now: 2_000,
   });
-  const lease = store.acquireExecutorLease("executor", 10_000, 120_000);
-  if (!lease.acquired) throw new Error("missing executor lease");
   const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
   if (!turn) throw new Error("missing controller turn");
   if (!store.markControllerSpawned({
@@ -225,18 +254,6 @@ function ownedFixture(
     task,
     now: 10_001,
   });
-  if (options.engine === "recipe-v1") {
-    return {
-      bb,
-      store,
-      database: bb.storage.database(),
-      job: created,
-      specificationId: "recipe-spec",
-      ticketIds: ["recipe-ticket-1", "recipe-ticket-2"],
-      leaseGeneration: lease.generation,
-      now,
-    };
-  }
   const selected = store.getJob(created.id);
   if (!selected) throw new Error("converted navigator job is missing");
   const { bound, specificationId, ticketIds } = bindNavigatorTickets(store, selected, now);

@@ -284,18 +284,12 @@ export function assessNavigatorPromotion(evidence: NavigatorPromotionEvidence): 
 
 export function workflowIdentityForNewAdmission(
   graphMode: WorkflowEngineGraphMode,
-  latestDecision: Pick<WorkflowEngineRolloutDecision, "action" | "reasonCode"> | null,
+  _latestDecision: Pick<WorkflowEngineRolloutDecision, "action" | "reasonCode"> | null,
 ): Readonly<{ engine: WorkflowEngine; mode: WorkflowMode }> {
   if (graphMode !== "adaptive" && graphMode !== "recipe") {
     throw new TypeError(`Unknown workflow engine graph mode ${String(graphMode)}`);
   }
-  if (graphMode === "recipe") {
-    return { engine: RECIPE_ENGINE_ID, mode: "live" };
-  }
-  if (latestDecision?.action === "promote") {
-    return { engine: NAVIGATOR_ENGINE_ID, mode: "deterministic" };
-  }
-  return { engine: RECIPE_ENGINE_ID, mode: "live" };
+  return { engine: NAVIGATOR_ENGINE_ID, mode: "deterministic" };
 }
 
 export class NavigatorPromotionIncompleteError extends Error {

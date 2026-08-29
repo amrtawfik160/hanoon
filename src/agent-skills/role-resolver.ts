@@ -1,9 +1,10 @@
 import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
 import {
-  CAPABILITY_SKILL_IDS,
+  ADMITTED_CAPABILITY_SKILL_IDS,
   type CapabilitySkillId,
 } from "../capabilities/catalog";
 import type { RoutingMode } from "../domain/models";
+import type { WorkflowEngine } from "../navigator/models";
 
 export type WorkerSkillRole =
   | "planner"
@@ -15,20 +16,18 @@ export type WorkerSkillRole =
 
 export const COMMUNICATION_SKILL_ID = "unslop";
 export const TECHNICAL_WRITING_SKILL_ID = "technical-writing";
-export const PROPORTIONAL_WORKFLOW_SKILL_ID = "proportional-development-workflow";
 export const GRILL_WITH_DOCS_SKILL_ID = "grill-with-docs";
 export const GRILLING_SKILL_ID = "grilling";
 export const DOMAIN_MODELING_SKILL_ID = "domain-modeling";
 
 export const CONTROLLER_SKILL_IDS = [
   COMMUNICATION_SKILL_ID,
-  PROPORTIONAL_WORKFLOW_SKILL_ID,
   GRILL_WITH_DOCS_SKILL_ID,
   GRILLING_SKILL_ID,
   DOMAIN_MODELING_SKILL_ID,
 ] as const;
 
-export const BUNDLED_SKILL_IDS = CAPABILITY_SKILL_IDS;
+export const BUNDLED_SKILL_IDS = ADMITTED_CAPABILITY_SKILL_IDS;
 
 export type BundledSkillId = CapabilitySkillId;
 
@@ -37,13 +36,12 @@ export const ROLE_SKILLS = {
   // commands, so its claims are checkable against the repository the same way a
   // README's are. That is docs-guard's job, and a wrong command here is only
   // discovered much later, when the verification it promised does not run.
-  planner: [COMMUNICATION_SKILL_ID, "writing-plans", "docs-guard"],
+  planner: [COMMUNICATION_SKILL_ID, "writing-for-agents", "docs-guard"],
   critic: [COMMUNICATION_SKILL_ID],
   implementation: [
     COMMUNICATION_SKILL_ID,
-    "systematic-debugging",
-    "test-driven-development",
-    "verification-before-completion",
+    "diagnosing-bugs",
+    "tdd",
     "clean-code-guard",
     "test-guard",
     // The generic guards judge whether code is clean and tested. This one judges
@@ -57,6 +55,42 @@ export const ROLE_SKILLS = {
   // The guards judge the code the change contains. This one judges what the
   // change can break outside it, which is the risk a verdict carries when it
   // lets the change merge unattended.
+  review: [
+    COMMUNICATION_SKILL_ID,
+    "clean-code-guard",
+    "test-guard",
+    "durable-boundary-audit",
+    "blast-radius",
+    "code-review",
+  ],
+  documentation: [
+    COMMUNICATION_SKILL_ID,
+    TECHNICAL_WRITING_SKILL_ID,
+    "docs-guard",
+  ],
+  "final-review": [
+    COMMUNICATION_SKILL_ID,
+    "clean-code-guard",
+    "test-guard",
+    "docs-guard",
+    "durable-boundary-audit",
+    "blast-radius",
+  ],
+} as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
+
+export const HISTORICAL_ROLE_SKILLS = {
+  planner: [COMMUNICATION_SKILL_ID, "writing-plans", "docs-guard"],
+  critic: [COMMUNICATION_SKILL_ID],
+  implementation: [
+    COMMUNICATION_SKILL_ID,
+    "systematic-debugging",
+    "test-driven-development",
+    "verification-before-completion",
+    "clean-code-guard",
+    "test-guard",
+    "durable-boundary-audit",
+    "pr-writer",
+  ],
   review: [
     COMMUNICATION_SKILL_ID,
     "clean-code-guard",
@@ -80,6 +114,10 @@ export const ROLE_SKILLS = {
   ],
 } as const satisfies Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>>;
 
+export function roleSkillsForEngine(_engine?: WorkflowEngine): Readonly<Record<WorkerSkillRole, readonly BundledSkillId[]>> {
+  return ROLE_SKILLS;
+}
+
 export type WorkerTitleIdentity = Readonly<{
   jobId: string;
   attemptId: string;
@@ -91,6 +129,7 @@ export type DurableWorkerIdentity = WorkerTitleIdentity & Readonly<{
   environmentId: string | null;
   threadId: string | null;
   routingMode?: RoutingMode;
+  workflowEngine?: WorkflowEngine;
   persistedSkillProfile?: Readonly<{
     profileId: string;
     profileRevision: number;
@@ -168,17 +207,17 @@ function verifiedWorkerInstructions(
 }
 
 export function buildWorkerInstructions(
-  profile: Readonly<Pick<WorkerSkillProfile, "role">>,
+  profile: Readonly<Pick<WorkerSkillProfile, "role"> & { workflowEngine?: WorkflowEngine }>,
 ): string {
-  return verifiedWorkerInstructions(profile.role, ROLE_SKILLS[profile.role]);
+  return verifiedWorkerInstructions(profile.role, roleSkillsForEngine(profile.workflowEngine)[profile.role]);
 }
 
 function exactPersistedSkills(identity: DurableWorkerIdentity): readonly BundledSkillId[] | null {
-  if (identity.routingMode !== "active") return ROLE_SKILLS[identity.role];
+  if (identity.routingMode !== "active") return roleSkillsForEngine(identity.workflowEngine)[identity.role];
   const profile = identity.persistedSkillProfile;
   if (!profile || !/^[A-Za-z0-9_.:-]{1,256}$/u.test(profile.profileId) ||
     !Number.isSafeInteger(profile.profileRevision) || profile.profileRevision < 1) return null;
-  const known = new Set<string>(CAPABILITY_SKILL_IDS);
+  const known = new Set<string>(ADMITTED_CAPABILITY_SKILL_IDS);
   if (new Set(profile.skills).size !== profile.skills.length || profile.skills.some((skill) => !known.has(skill))) {
     return null;
   }
@@ -215,6 +254,9 @@ export function resolveWorkerSkillProfile(input: Readonly<{
     skills,
     instructions: durableIdentity.routingMode === "active"
       ? verifiedWorkerInstructions(titleIdentity.role, skills)
-      : buildWorkerInstructions({ role: titleIdentity.role }),
+      : buildWorkerInstructions({
+        role: titleIdentity.role,
+        workflowEngine: durableIdentity.workflowEngine,
+      }),
   };
 }

@@ -54,7 +54,6 @@ export const CONTROLLER_DEFAULT_SKILLS = [
   // capability id: the two ways a turn can be configured should not hand the
   // agent the same skills in two different orders.
   "driving-bb",
-  "proportional-development-workflow",
   // Unslop is standing, not a match. Conduct and telegram_agent_respond also
   // require it. Do not move it to an intent list.
   "unslop",
@@ -228,7 +227,6 @@ function profileAssignments(input: {
 }): ControllerCapabilityProfileSelection["assignments"] {
   const capabilityIds = new Set<string>([
     ...input.skills,
-    `recipe-${input.recipeId}`,
     `model-pool-${input.modelPool}`,
     "controller-bundle-metadata",
     ...input.bundleIds.map((bundleId) => `controller-bundle-${bundleId}`),

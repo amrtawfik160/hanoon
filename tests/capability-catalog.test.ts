@@ -6,44 +6,55 @@ import {
   type CapabilityDescriptor,
 } from "../src/capabilities/contracts";
 import {
+  ADMITTED_CAPABILITY_SKILL_IDS,
   CAPABILITY_CATALOG,
   CAPABILITY_GRAPH_DIGEST,
   CAPABILITY_REGISTRY_DIGEST,
   CONTROLLER_BUNDLE_TOOLS,
   CONTROLLER_METADATA_TOOL_IDS,
   CONTROLLER_PROTOCOL_TOOL_IDS,
+  HISTORICAL_RECIPE_CAPABILITY_CATALOG,
+  HISTORICAL_RECIPE_GRAPH_DIGEST,
+  HISTORICAL_RECIPE_REGISTRY_DIGEST,
 } from "../src/capabilities/catalog";
 import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 
 const EXPECTED_SKILL_ROUTES = {
+  "ask-matt": "manual-only",
   "blast-radius": "worker",
-  brainstorming: "worker",
   "checking-system-logs": "worker",
   "clean-code-guard": "worker",
-  "dispatching-parallel-agents": "hanoon-native",
+  "code-review": "worker",
+  "codebase-design": "worker",
+  "diagnosing-bugs": "worker",
   "docs-guard": "worker",
-  "domain-modeling": "manual-only",
+  "domain-modeling": "worker",
   "driving-bb": "worker",
   "durable-boundary-audit": "worker",
-  "executing-plans": "hanoon-native",
-  "finishing-a-development-branch": "hanoon-native",
+  "grill-me": "manual-only",
   "grill-with-docs": "manual-only",
-  grilling: "manual-only",
-  "technical-writing": "worker",
-  unslop: "worker",
+  grilling: "worker",
+  handoff: "manual-only",
+  implement: "manual-only",
+  "improve-codebase-architecture": "manual-only",
   "pr-writer": "worker",
-  "proportional-development-workflow": "worker",
-  "receiving-code-review": "worker",
-  "requesting-code-review": "hanoon-native",
-  "subagent-driven-development": "hanoon-native",
-  "systematic-debugging": "worker",
-  "test-driven-development": "worker",
+  prototype: "worker",
+  research: "worker",
+  "resolving-merge-conflicts": "worker",
+  "setup-matt-pocock-skills": "manual-only",
+  tdd: "worker",
+  teach: "manual-only",
+  "technical-writing": "worker",
   "test-guard": "worker",
-  "using-git-worktrees": "hanoon-native",
-  "using-superpowers": "hanoon-native",
-  "verification-before-completion": "worker",
-  "writing-plans": "worker",
-  "writing-skills": "worker",
+  "to-questionnaire": "manual-only",
+  "to-spec": "manual-only",
+  "to-tickets": "manual-only",
+  triage: "manual-only",
+  unslop: "worker",
+  "wait-what": "manual-only",
+  wayfinder: "manual-only",
+  wizard: "worker",
+  "writing-for-agents": "worker",
 } as const;
 
 function cloneCatalog(): CapabilityDescriptor[] {
@@ -55,17 +66,23 @@ function redigest(descriptor: CapabilityDescriptor): CapabilityDescriptor {
 }
 
 describe("capability catalog", () => {
-  it("keeps the recipe compatibility registry stable during skill expansion", () => {
-    expect(CAPABILITY_REGISTRY_DIGEST)
+  it("freezes the historical recipe registry while the live catalog admits 35 navigator skills", () => {
+    expect(HISTORICAL_RECIPE_REGISTRY_DIGEST)
       .toBe("d14130f744f1ca484beec08d8956a20e16db854b88a304f9576fcc79bdaa0481");
-    expect(CAPABILITY_GRAPH_DIGEST)
+    expect(HISTORICAL_RECIPE_GRAPH_DIGEST)
       .toBe("665deccc825d74de0d814e94a3799ea50aab2d18176ea6aacbc779651eebf64e");
+    expect(CAPABILITY_REGISTRY_DIGEST).not.toBe(HISTORICAL_RECIPE_REGISTRY_DIGEST);
+    expect(CAPABILITY_GRAPH_DIGEST).not.toBe(HISTORICAL_RECIPE_GRAPH_DIGEST);
+    expect(HISTORICAL_RECIPE_CAPABILITY_CATALOG.some((entry) => entry.id === "using-superpowers")).toBe(true);
+    expect(CAPABILITY_CATALOG.some((entry) => entry.id === "using-superpowers")).toBe(false);
+    expect(CAPABILITY_CATALOG.some((entry) => entry.kind === "recipe")).toBe(false);
+    expect(CAPABILITY_CATALOG.some((entry) => entry.kind === "native-adapter")).toBe(false);
   });
 
   it("describes every bundled skill exactly once with its approved route", () => {
     const skills = CAPABILITY_CATALOG.filter((entry) => entry.kind === "skill");
     expect(skills.map((entry) => entry.id).sort())
-      .toEqual(Object.keys(EXPECTED_SKILL_ROUTES).sort());
+      .toEqual([...ADMITTED_CAPABILITY_SKILL_IDS].sort());
     expect(Object.fromEntries(skills.map((entry) => [entry.id, entry.route])))
       .toEqual(EXPECTED_SKILL_ROUTES);
   });

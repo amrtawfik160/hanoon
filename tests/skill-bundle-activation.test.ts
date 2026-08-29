@@ -156,23 +156,20 @@ test("rejects a corrupted locked skill before the BB host is accessed", async ()
 test("verifies the real committed bundle", () => {
   const verified = verifySkillBundle(repositoryRoot);
 
-  expect(verified.skillIds).toHaveLength(50);
+  expect(verified.skillIds).toHaveLength(35);
   expect(verified.admittedSkillIds).toHaveLength(35);
-  expect(verified.legacySkillIds).toHaveLength(15);
+  expect(verified.legacySkillIds).toHaveLength(0);
   expect(verified.skillIds).toEqual(expect.arrayContaining([
     "blast-radius",
-    "brainstorming",
     "clean-code-guard",
     "docs-guard",
     "domain-modeling",
     "grill-with-docs",
     "grilling",
-    "proportional-development-workflow",
     "technical-writing",
     "test-guard",
     "pr-writer",
     "unslop",
-    "writing-skills",
     "ask-matt",
     "code-review",
     "diagnosing-bugs",
@@ -180,20 +177,24 @@ test("verifies the real committed bundle", () => {
     "tdd",
     "wayfinder",
   ]));
+  expect(verified.skillIds).not.toEqual(expect.arrayContaining([
+    "brainstorming",
+    "proportional-development-workflow",
+    "writing-skills",
+    "using-superpowers",
+  ]));
   expect(verified.bundleDigest).toMatch(/^[a-f0-9]{64}$/);
 });
 
-test("rejects tampered discovery-kit provenance", () => {
+test("rejects leftover workflow-kit or discovery-kit lock fields", () => {
   const root = copiedBundleRoot();
   const lockPath = join(root, "skills/skills.lock.json");
-  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
-    discoveryKit: { revision: string };
-  };
-  lock.discoveryKit.revision = "unreviewed";
+  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as Record<string, unknown>;
+  lock.workflowKit = { version: "6.3.0" };
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 
   expect(() => verifySkillBundle(root)).toThrow(
-    "Skill bundle integrity error: malformed discovery-kit provenance",
+    "Skill bundle integrity error: malformed lock schema",
   );
 });
 
@@ -279,10 +280,16 @@ test("rejects a changed promoted license even when the file lock is recomputed",
 test("rejects an admitted id that collides with the legacy compatibility catalog", () => {
   const root = copiedBundleRoot();
   updateLock(root, (lock) => {
-    const record = lock.legacySkills.find((skill) => skill.id === "brainstorming");
-    if (!record) throw new Error("Missing brainstorming fixture record");
-    record.id = "ask-matt";
+    const source = lock.skills.find((skill) => skill.id === "unslop");
+    if (!source) throw new Error("Missing unslop fixture record");
+    const record: MutableSkillRecord = {
+      ...source,
+      id: "ask-matt",
+      skillPath: "skills/guards/ask-matt-legacy/SKILL.md",
+      sourcePath: "skills/guards/ask-matt-legacy/SKILL.md",
+    };
     redigestSkillRecord(record);
+    lock.legacySkills.push(record);
   });
 
   expect(() => verifySkillBundle(root)).toThrow(
@@ -291,8 +298,8 @@ test("rejects an admitted id that collides with the legacy compatibility catalog
 });
 
 test.each([
-  ["inline", "[escape](../../workflow-kit/LICENSE)"],
-  ["reference-style", "[escape]: ../../workflow-kit/LICENSE"],
+  ["inline", "[escape](../../pstack/LICENSE)"],
+  ["reference-style", "[escape]: ../../pstack/LICENSE"],
 ])("rejects a %s Markdown resource that escapes its registered skill root", (_variant, link) => {
   const root = copiedBundleRoot();
   const skillPath = "skills/guards/clean-code-guard/SKILL.md";
@@ -301,7 +308,7 @@ test.each([
   updateSkillDigests(root, skillPath);
 
   expect(() => verifySkillBundle(root)).toThrow(
-    `Skill bundle integrity error: Markdown link escapes registered skill root: ${skillPath} -> ../../workflow-kit/LICENSE`,
+    `Skill bundle integrity error: Markdown link escapes registered skill root: ${skillPath} -> ../../pstack/LICENSE`,
   );
 });
 
@@ -334,10 +341,8 @@ test.each([
 ])("enforces the total bundle-entry boundary at %i entries", (limit, rejected) => {
   const root = copiedBundleRoot();
   const roots = [
-    join(root, "skills/workflow-kit"),
     join(root, "skills/guards"),
     join(root, "skills/delivery"),
-    join(root, "skills/discovery"),
     join(root, "skills/matt-pocock"),
     join(root, "skills/hanoon"),
     join(root, "skills/pstack"),
@@ -366,16 +371,16 @@ test.each([
 });
 
 test.each([
-  ["missing workflow id", (root: string) => {
-    const prefix = "skills/workflow-kit/brainstorming/";
-    rmSync(join(root, "skills/workflow-kit/brainstorming"), { recursive: true, force: true });
+  ["missing admitted id", (root: string) => {
+    const prefix = "skills/guards/clean-code-guard/";
+    rmSync(join(root, "skills/guards/clean-code-guard"), { recursive: true, force: true });
     updateLock(root, (lock) => {
-      lock.legacySkills = lock.legacySkills.filter((skill) => skill.id !== "brainstorming");
+      lock.skills = lock.skills.filter((skill) => skill.id !== "clean-code-guard");
       lock.files = lock.files.filter((file) => !file.path.startsWith(prefix));
     });
   }],
-  ["extra workflow id", (root: string) => {
-    const skillPath = "skills/workflow-kit/unreviewed/SKILL.md";
+  ["extra admitted id", (root: string) => {
+    const skillPath = "skills/guards/unreviewed/SKILL.md";
     mkdirSync(dirname(join(root, skillPath)), { recursive: true });
     writeFileSync(join(root, skillPath), "---\nname: unreviewed\ndescription: fixture\n---\n");
     updateLock(root, (lock) => {
@@ -384,28 +389,28 @@ test.each([
         id: "unreviewed",
         skillPath,
         sourcePath: skillPath,
-        source: "https://github.com/obra/superpowers",
-        sourceRevision: "6.3.0",
+        source: "https://github.com/amElnagdy/guard-skills",
+        sourceRevision: "vendored",
         sourceDigest,
         descriptorDigest: "",
         license: "MIT",
         invocationClass: "model",
       };
       redigestSkillRecord(record);
-      lock.legacySkills.push(record);
+      lock.skills.push(record);
       lock.files.push({ path: skillPath, sha256: createHash("sha256").update(readFileSync(join(root, skillPath))).digest("hex") });
     });
   }],
-  ["guard id in the workflow root", (root: string) => {
+  ["guard id in the hanoon root", (root: string) => {
     const oldPrefix = "skills/guards/clean-code-guard/";
-    const newPrefix = "skills/workflow-kit/clean-code-guard/";
+    const newPrefix = "skills/hanoon/clean-code-guard/";
     renameSync(join(root, oldPrefix), join(root, newPrefix));
     updateLock(root, (lock) => {
       const skill = lock.skills.find((record) => record.id === "clean-code-guard");
       if (!skill) throw new Error("Missing clean-code-guard fixture record");
       skill.skillPath = `${newPrefix}SKILL.md`;
-      skill.source = "https://github.com/obra/superpowers";
-      skill.license = "MIT";
+      skill.source = "first-party";
+      skill.license = "first-party";
       redigestSkillRecord(skill);
       for (const file of lock.files) {
         if (file.path.startsWith(oldPrefix)) file.path = `${newPrefix}${file.path.slice(oldPrefix.length)}`;

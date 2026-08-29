@@ -18,6 +18,13 @@ import { MergeHandler } from "../src/services/merge-handler";
 import { runJobExecutorService, type JobExecutorTelegram } from "../src/services/job-executor-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { hashSecret } from "../src/crypto";
+import { deriveTaskOutcome } from "../src/domain/task-authority";
+import {
+  TaskAuthorityRepository,
+  taskArtifactGraphDigest,
+  taskAuthorityIdForJob,
+  taskPolicyDigest,
+} from "../src/storage/task-authority-repository";
 import { privateMessage, policyFixture } from "./helpers";
 import { runProductionStage } from "../src/services/production-runner";
 
@@ -487,7 +494,7 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       },
       environment: {
         status: async () => {
-          const current = store.getJob("e2e-job-000000000000") ?? store.getActiveJob();
+          const current = store.getJob("e2eTelegramMergeJob001") ?? store.getActiveJob();
           return { available: true, clean: true, headSha: current?.prHeadSha };
         },
       },
@@ -656,10 +663,45 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
       time,
     )).toBe(true);
     expect(store.releaseExecutorLease("controller-setup", controllerLease.generation, ++time)).toBe(true);
-    let job = store.createConfirmedControllerJob({
-      controllerThreadId: "thr_controller",
+    const leftoverTask = "Implement the bounded Telegram task, but do not deploy it";
+    let job = store.createJob({
+      id: "e2eTelegramMergeJob001",
+      sourceUpdateId: controllerTurn.updateId,
+      requestText: leftoverTask,
+      now: ++time,
+    });
+    const leftoverOutcome = deriveTaskOutcome(leftoverTask);
+    bb.storage.database().prepare(
+      "UPDATE jobs SET task_outcome = ?, task_constraints_json = ? WHERE id = ?",
+    ).run(leftoverOutcome.outcome, JSON.stringify(leftoverOutcome.constraints), job.id);
+    job = store.applyJobEvent(job.id, job.version, {
+      type: "PROJECT_SELECTED",
       projectId: "proj_1",
-      task: "Implement the bounded Telegram task, but do not deploy it",
+      policyVersion: 1,
+      policy,
+    }, ++time);
+    new TaskAuthorityRepository(bb.storage.database()).create({
+      authorityId: taskAuthorityIdForJob(job.id),
+      jobId: job.id,
+      ownerUserId: "7",
+      ownerChatId: "70",
+      controllerKey: controllerTurn.controllerKey,
+      sourceUpdateId: controllerTurn.updateId,
+      requestDigest: leftoverOutcome.requestDigest,
+      projectId: "proj_1",
+      outcome: leftoverOutcome.outcome,
+      scopeDigest: leftoverOutcome.scopeDigest,
+      constraints: leftoverOutcome.constraints,
+      policyVersion: 1,
+      policyDigest: taskPolicyDigest(JSON.stringify(policy)),
+      artifactGraphDigest: taskArtifactGraphDigest([]),
+      now: time,
+    });
+    store.queueAdmission({
+      jobId: job.id,
+      expectedVersion: job.version,
+      projectId: "proj_1",
+      resumeEvent: "CONFIRMED",
       now: ++time,
     });
     const status = await telegram.sendMessage("70", { text: "Job started." });

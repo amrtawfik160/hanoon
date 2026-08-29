@@ -1,13 +1,11 @@
 import { createHash } from "node:crypto";
 import { buildWorkerThreadTitle, type WorkerSkillRole } from "../agent-skills/role-resolver";
 import {
-  CAPABILITY_BY_ID,
-  CAPABILITY_GRAPH_DIGEST,
-  CAPABILITY_REGISTRY_DIGEST,
+  capabilityCatalogView,
 } from "../capabilities/catalog";
 import {
   capabilityProfileDigest,
-  selectCapabilityProfile,
+  selectWorkerCapabilityProfile,
   type WorkerProfileStage,
 } from "../capabilities/profiles";
 import { changedPathsFromGitDiff } from "../capabilities/change-surface";
@@ -755,11 +753,13 @@ export class EffectRunner {
       throw new PermanentEffectError("Capability selection requires immutable project policy context");
     }
     const traits = selectedWorkerTraits(job, role, stage, extraTraits);
-    const selected = selectCapabilityProfile({
+    const catalog = capabilityCatalogView(job.workflowEngine);
+    const selected = selectWorkerCapabilityProfile({
       role,
       recipe: job.taskRecipe,
       stage,
       traits,
+      engine: job.workflowEngine,
     });
     const pipelineRole = role === "planner" || role === "critic" || role === "documentation";
     const risk = job.taskRecipe === "architectural" || job.taskTraits.some((trait) => trait.id === "high-risk")
@@ -790,8 +790,8 @@ export class EffectRunner {
       const expectedIdentity = JSON.stringify({
         recipeId: job.taskRecipe,
         recipeVersion: job.recipeVersion,
-        registryDigest: CAPABILITY_REGISTRY_DIGEST,
-        graphDigest: CAPABILITY_GRAPH_DIGEST,
+        registryDigest: catalog.registryDigest,
+        graphDigest: catalog.graphDigest,
         mode,
         reasonCodes,
         traits,
@@ -822,8 +822,8 @@ export class EffectRunner {
           threadId: null,
           recipeId: job.taskRecipe,
           recipeVersion: job.recipeVersion,
-          registryDigest: CAPABILITY_REGISTRY_DIGEST,
-          graphDigest: CAPABILITY_GRAPH_DIGEST,
+          registryDigest: catalog.registryDigest,
+          graphDigest: catalog.graphDigest,
           mode,
           model,
           assignments,
@@ -840,8 +840,8 @@ export class EffectRunner {
         threadId: null,
         recipeId: job.taskRecipe,
         recipeVersion: job.recipeVersion,
-        registryDigest: CAPABILITY_REGISTRY_DIGEST,
-        graphDigest: CAPABILITY_GRAPH_DIGEST,
+        registryDigest: catalog.registryDigest,
+        graphDigest: catalog.graphDigest,
         mode,
         model,
         assignments,
@@ -854,7 +854,7 @@ export class EffectRunner {
     if (!profile) throw new Error("Capability profile disappeared before worker dispatch");
     const receipts = this.dependencies.store.listCapabilityReceipts(profile.id, 256);
     for (const denial of selected.denied) {
-      const descriptor = CAPABILITY_BY_ID.get(denial.capabilityId);
+      const descriptor = catalog.byId.get(denial.capabilityId);
       if (!descriptor) continue;
       if (receipts.some((receipt) => receipt.eventType === "denied" &&
         receipt.capabilityId === denial.capabilityId && receipt.reasonCode === denial.reasonCode)) continue;

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createSecret } from "./crypto";
 import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
-import { CAPABILITY_BY_ID } from "./capabilities/catalog";
+import { capabilityDescriptorById } from "./capabilities/catalog";
 import {
   guardRequirementBindings,
   persistBlockedGuardSettlement,
@@ -50,6 +50,7 @@ import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
 import { transcribeWithBb } from "./telegram/voice";
 import { referenceBriefingFor } from "./reference/briefing";
+import { DualEngineCoordinator } from "./navigator/coordinator";
 import { openStore, type TelegramAgentStore } from "./storage/store";
 import { AutonomyRepository } from "./storage/autonomy-repository";
 import { DEFAULT_MAX_CONCURRENT_JOBS } from "./autonomy/models";
@@ -416,7 +417,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     workflowEngineGraph: {
       type: "select",
       label: "Workflow engine graph",
-      description: "Adaptive admits navigator-v1 after a reviewed promotion. Recipe keeps recipe-v1 for new jobs even after that promotion.",
+      description: "Retired new-job kill switch. Contraction ignores this setting; new admissions always use navigator-v1.",
       options: ["adaptive", "recipe"],
       default: "adaptive",
     },
@@ -496,6 +497,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       workflowEngineGraph: "adaptive",
     },
   );
+  const engineCoordinator = new DualEngineCoordinator({
+    store,
+    database: bb.storage.database(),
+    now: clock,
+  });
+  engineCoordinator.assertContractionAllowed();
+  store.contractRecipeEngine(clock());
   const retiredLivePollers = retireLiveWorkPollingSchedules(store, clock());
   if (retiredLivePollers > 0) {
     bb.log.warn(`Retired ${retiredLivePollers} controller schedule(s) that polled live work`);
@@ -1951,7 +1959,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         if (!fenceCurrent()) return;
       }
       const guardAssignments = profile?.assignments.filter((assignment) =>
-        CAPABILITY_BY_ID.get(assignment.capabilityId)?.evidence.receiptType === "guard") ?? [];
+        capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest)?.evidence.receiptType === "guard") ?? [];
       const requiredGuards = diff === null ? [] : [...requiredGuardsForChangeSurface(diff)];
       const selectedGuardIds = guardAssignments.map((assignment) => assignment.capabilityId)
         .sort((left, right) => left.localeCompare(right));
@@ -1959,7 +1967,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         profile.recipeId === current.taskRecipe && profile.recipeVersion === current.recipeVersion &&
         profile.mode === current.routingMode &&
         JSON.stringify(selectedGuardIds) === JSON.stringify(requiredGuards) &&
-        guardAssignments.every((assignment) => CAPABILITY_BY_ID.get(assignment.capabilityId)?.digest === assignment.descriptorDigest);
+        guardAssignments.every((assignment) => capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest)?.digest === assignment.descriptorDigest);
       if (!profileMatches || diff === null) {
         if (!fenceCurrent()) return;
         applyExecutorEvent(job.id, current.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
@@ -1972,7 +1980,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
           reviewedHeadSha: current.prHeadSha,
           diffDigest: createHash("sha256").update(diff, "utf8").digest("hex"),
           selectedGuards: guardAssignments.map((assignment) => {
-            const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+            const descriptor = capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest);
             if (!descriptor) throw new Error("Selected guard disappeared before review settlement");
             return {
               capabilityId: assignment.capabilityId,

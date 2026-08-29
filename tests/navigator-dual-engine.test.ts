@@ -82,27 +82,13 @@ function confirmControllerJob(
 }
 
 describe("navigator dual-engine admission", () => {
-  it("stamps new controller jobs as recipe-v1 until a durable engine promotion", () => {
+  it("stamps new controller jobs as navigator-v1 after contraction", () => {
     const { store, now } = openFixture();
     const { job } = confirmControllerJob(store, { task: "Fix the copy", updateId: 43_001, now: now() });
-    expect(job).toMatchObject({ workflowEngine: "recipe-v1", workflowMode: "live" });
+    expect(job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
   });
 
-  it("admits new work as navigator-v1 only after promotion, and keeps the recipe kill switch independent", () => {
-    const promoted = openFixture();
-    promoted.store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: promoted.now(),
-    });
-    const admitted = confirmControllerJob(promoted.store, {
-      task: "Navigate the effort",
-      updateId: 43_002,
-      now: promoted.now(),
-    });
-    expect(admitted.job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
-
+  it("ignores the retired recipe kill switch for later admissions", () => {
     const killed = openFixture(() => ({
       jobGraph: "adaptive",
       controllerTools: "bundled",
@@ -114,12 +100,12 @@ describe("navigator dual-engine admission", () => {
       evidenceDigest: "a".repeat(64),
       now: killed.now(),
     });
-    const blocked = confirmControllerJob(killed.store, {
-      task: "Stay on recipe-v1",
+    const admitted = confirmControllerJob(killed.store, {
+      task: "Stay on the workflow navigator",
       updateId: 43_003,
       now: killed.now(),
     });
-    expect(blocked.job).toMatchObject({ workflowEngine: "recipe-v1", workflowMode: "live" });
+    expect(admitted.job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
   });
 
   it("records shadow navigator proposals on recipe jobs without live effects", () => {
@@ -218,7 +204,7 @@ describe("navigator dual-engine admission", () => {
     expect(store.getJob(job.id)?.workflowEngine).toBe("recipe-v1");
   });
 
-  it("routes new work back to recipe-v1 after rollback without rewriting navigator history", () => {
+  it("keeps later admissions on navigator-v1 after rollback without rewriting navigator history", () => {
     const { store, now } = openFixture();
     store.appendWorkflowEngineRolloutDecision({
       action: "promote",
@@ -253,7 +239,7 @@ describe("navigator dual-engine admission", () => {
       now: now(),
       leaseGeneration: first.leaseGeneration,
     });
-    expect(second.job).toMatchObject({ workflowEngine: "recipe-v1", workflowMode: "live" });
+    expect(second.job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
     expect(store.getJob(first.job.id)?.workflowEngine).toBe("navigator-v1");
   });
 });

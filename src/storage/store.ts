@@ -89,7 +89,7 @@ import {
 export { DualEngineContractionError } from "./workflow-engine-repository";
 import type { TaskRecipe } from "../domain/recipes";
 import type { CapabilityInventoryItem, InventoryHealth } from "../capabilities/inventory";
-import { CAPABILITY_BY_ID } from "../capabilities/catalog";
+import { capabilityDescriptorById } from "../capabilities/catalog";
 import {
   nativeAdapterRequirementForEvent,
   validateNativeAdapterTransition,
@@ -3306,6 +3306,7 @@ export interface TelegramAgentStore {
     now: number;
   }>): string;
   listNonterminalRecipeJobs(): Job[];
+  getLatestWorkflowEngineContraction(): WorkflowEngineContraction | null;
   contractRecipeEngine(now: number): WorkflowEngineContraction;
   createPairingCode(codeHash: string, createdAt: number, expiresAt: number): void;
   pairOwnerWithCode(
@@ -6222,6 +6223,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.workflowEngineRepository.listNonterminalRecipeJobs();
   }
 
+  public getLatestWorkflowEngineContraction(): WorkflowEngineContraction | null {
+    return this.workflowEngineRepository.getLatestWorkflowEngineContraction();
+  }
+
   public contractRecipeEngine(now: number): WorkflowEngineContraction {
     return this.workflowEngineRepository.contractRecipeEngine(now);
   }
@@ -6683,7 +6688,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ): void => {
         for (const bundleId of input.bundleIds) {
           const capabilityId = `controller-bundle-${bundleId}`;
-          const descriptor = CAPABILITY_BY_ID.get(capabilityId);
+          const descriptor = capabilityDescriptorById(capabilityId);
           if (!descriptor || descriptor.kind !== "bundle") continue;
           this.capabilityRepository.appendReceipt({
             profileId: profile.id,
@@ -11986,7 +11991,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         .digest("base64url")
         .slice(0, 22);
       const routing = classifyTaskTraits({ origin: "requested", text: input.task });
-      const deliveryMode = routing.recipe === "direct" ? "small_fix" : "full";
+      const deliveryMode = "full";
       const dispatchSettings = this.capabilityDispatchSettings();
       const routingMode = routingModeForNewAttempt(
         routing.recipe,
@@ -12335,7 +12340,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         jobId,
         sourceUpdateId,
         input.task,
-        routing.recipe === "direct" ? "small_fix" : "full",
+        "full",
         routing.recipe,
         routingMode,
         workflowIdentity.engine,
@@ -17435,7 +17440,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const profile = this.getLatestCapabilityProfile("worker_attempt", attempt.id);
       if (!profile || profile.mode !== "active") return false;
       const guardAssignments = profile.assignments.filter((assignment) =>
-        CAPABILITY_BY_ID.get(assignment.capabilityId)?.evidence.receiptType === "guard");
+        capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest)?.evidence.receiptType === "guard");
       if (guardAssignments.length === 0) continue;
       if (attempt.resultJson === null) return false;
       let raw: unknown;

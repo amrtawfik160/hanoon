@@ -27,15 +27,11 @@ export const HANOON_ROOT = "skills/hanoon";
 export const PSTACK_ROOT = "skills/pstack";
 export const LOCK_PATH = "skills/skills.lock.json";
 
-// BB discovers only immediate child skill directories. Legacy discovery stays
-// registered for recipe-v1, while its three promoted overlaps live in the
-// unregistered compatibility subtree. Navigator attempts can later overlay the
-// reviewed promoted copy without changing a legacy job in place.
+// BB discovers only immediate child skill directories. The contracted bundle
+// registers the reviewed Matt Pocock buckets plus retained first-party roots.
 export const REGISTERED_ROOTS = Object.freeze([
-  WORKFLOW_ROOT,
   GUARDS_ROOT,
   DELIVERY_ROOT,
-  DISCOVERY_ROOT,
   MATT_POCOCK_ENGINEERING_ROOT,
   MATT_POCOCK_PRODUCTIVITY_ROOT,
   HANOON_ROOT,
@@ -43,10 +39,8 @@ export const REGISTERED_ROOTS = Object.freeze([
 ]);
 
 export const LOCKED_ROOTS = Object.freeze([
-  WORKFLOW_ROOT,
   GUARDS_ROOT,
   DELIVERY_ROOT,
-  DISCOVERY_ROOT,
   MATT_POCOCK_ROOT,
   HANOON_ROOT,
   PSTACK_ROOT,
@@ -77,8 +71,7 @@ const retainedHanoonSkillIds = [
   "driving-bb",
   "durable-boundary-audit",
 ];
-const legacyHanoonSkillIds = ["proportional-development-workflow"];
-const hanoonSkillIds = [...retainedHanoonSkillIds, ...legacyHanoonSkillIds];
+const hanoonSkillIds = [...retainedHanoonSkillIds];
 const pstackSkillIds = ["technical-writing", "unslop"];
 
 const promotedMattSkills = [
@@ -108,11 +101,6 @@ const promotedMattSkills = [
   { bucket: "productivity", id: "wait-what", invocationClass: "user" },
   { bucket: "productivity", id: "writing-for-agents", invocationClass: "model" },
 ];
-const mattSkillsShadowedByLegacyDiscovery = new Set([
-  "domain-modeling",
-  "grill-with-docs",
-  "grilling",
-]);
 
 export const WORKFLOW_KIT = Object.freeze({
   version: "6.3.0",
@@ -221,39 +209,21 @@ export const REQUIRED_PSTACK_SKILLS = Object.freeze(pstackSkillIds.map((id) =>
     invocationClass: id === "technical-writing" ? "user" : "model",
   })));
 
-export const REQUIRED_MATT_POCOCK_SKILLS = Object.freeze(promotedMattSkills.map(({ bucket, id, invocationClass }) => {
-  const bundleBucket = mattSkillsShadowedByLegacyDiscovery.has(id)
-    ? `compatibility/${bucket}`
-    : bucket;
-  return Object.freeze({
+export const REQUIRED_MATT_POCOCK_SKILLS = Object.freeze(promotedMattSkills.map(({ bucket, id, invocationClass }) =>
+  Object.freeze({
     id,
-    skillPath: `${MATT_POCOCK_ROOT}/${bundleBucket}/${id}/SKILL.md`,
+    skillPath: `${MATT_POCOCK_ROOT}/${bucket}/${id}/SKILL.md`,
     sourcePath: `skills/${bucket}/${id}`,
     sourceRevision: MATT_POCOCK_KIT.revision,
     invocationClass,
     ...MATT_POCOCK_PROVENANCE,
-  });
-}));
+  })));
 
 export const REQUIRED_RETAINED_HANOON_SKILLS = Object.freeze(retainedHanoonSkillIds.map((id) =>
   localSkill({ id, root: HANOON_ROOT, provenance: HANOON_PROVENANCE, sourceRevision: "repository" })));
 
-export const REQUIRED_LEGACY_SKILLS = Object.freeze([
-  ...REQUIRED_WORKFLOW_SKILLS.map((skill) => Object.freeze({
-    ...skill,
-    sourcePath: skill.skillPath,
-    sourceRevision: WORKFLOW_KIT.version,
-    invocationClass: "model",
-  })),
-  ...legacyHanoonSkillIds.map((id) => localSkill({
-    id, root: HANOON_ROOT, provenance: HANOON_PROVENANCE, sourceRevision: "repository",
-  })),
-]);
-
-// These exact legacy descriptors bind recipe-v1 to its historical source. The
-// promoted counterparts remain admitted and digest-locked under the
-// unregistered compatibility subtree until navigator-v1 owns new jobs.
-export const REQUIRED_SHADOWED_SKILLS = REQUIRED_DISCOVERY_SKILLS;
+export const REQUIRED_LEGACY_SKILLS = Object.freeze([]);
+export const REQUIRED_SHADOWED_SKILLS = Object.freeze([]);
 
 export const REQUIRED_SKILLS = Object.freeze([
   ...REQUIRED_MATT_POCOCK_SKILLS,

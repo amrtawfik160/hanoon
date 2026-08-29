@@ -18,7 +18,6 @@ import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
   DELIVERY_KIT,
-  DISCOVERY_KIT,
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
@@ -32,7 +31,6 @@ import {
   REQUIRED_MATT_POCOCK_SKILLS,
   REQUIRED_SHADOWED_SKILLS,
   REQUIRED_SKILLS,
-  WORKFLOW_KIT,
 } from "../src/agent-skills/bundle-contract.js";
 import { skillFrontmatter } from "../src/agent-skills/frontmatter.js";
 
@@ -344,7 +342,7 @@ function sortedSkillRecords(rootByPublicPath, requiredSkills) {
 }
 
 function assertSkillCatalog(skills, legacySkills, shadowedSkills) {
-  if (skills.length !== 35 || legacySkills.length !== 15 || shadowedSkills.length !== 3 ||
+  if (skills.length !== 35 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
     skills.length + legacySkills.length + shadowedSkills.length > MAX_SKILLS) {
     fail("required active, legacy, or shadowed skill catalog differs");
   }
@@ -387,8 +385,6 @@ function buildLock(stagedMatt) {
     deliveryKit: DELIVERY_KIT,
     hanoonKit: HANOON_KIT,
     pstackKit: PSTACK_KIT,
-    workflowKit: WORKFLOW_KIT,
-    discoveryKit: DISCOVERY_KIT,
     skills,
     legacySkills,
     shadowedSkills,
@@ -493,6 +489,10 @@ function syncBundle(syncRequest, sourceMetadata) {
 }
 
 function main() {
+  if (process.argv[2] === "--rebuild-lock") {
+    writeFileSync(lockDestination, buildLock(join(pluginRoot, MATT_POCOCK_ROOT)));
+    return;
+  }
   const syncRequest = readArguments(process.argv.slice(2));
   const sourceMetadata = validatedSource(syncRequest);
   syncBundle(syncRequest, sourceMetadata);

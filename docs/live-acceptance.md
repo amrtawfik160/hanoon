@@ -31,7 +31,7 @@ The production promotion reader and append-only evidence ledger are wired. It re
 
 Recipe promotion still has no trusted live collector. Treat that gate as **not run/incomplete** and keep every recipe in `shadow` while following this runbook. Do not turn a passing local suite into a recipe receipt, insert evidence with ad hoc SQL, or enable a recipe to make this runbook easier to complete.
 
-Navigator-v1 evidence is different. `DualEngineCoordinator.persistEvaluationEvidence` appends the measured corpus, restart and safety counters, and the required disposable live scenarios. It rejects a job whose terminal state was only SQL-stamped. `capability status navigator-v1` and `capability promote navigator-v1` / `capability rollback navigator-v1` consume that ledger. The **Workflow engine graph** setting must stay `adaptive` for new admissions to follow that promotion. After promotion, the leased executor runs the live navigator, implementation, and release workers.
+Navigator-v1 evidence is different. `DualEngineCoordinator.persistEvaluationEvidence` appends the measured corpus, restart and safety counters, and the required disposable live scenarios. It rejects a job whose terminal state was only SQL-stamped. `capability status navigator-v1` and `capability promote navigator-v1` / `capability rollback navigator-v1` consume that ledger. After contraction, new admissions always use navigator-v1 even if the **Workflow engine graph** setting still says `recipe`. The leased executor runs the live navigator, implementation, and release workers.
 
 ## Token configuration pause
 
@@ -228,7 +228,7 @@ bb telegram-agent capability status <recipe> --json
 
 Only a future `passed` and `ready: true` result may permit `capability promote <recipe>`. After promotion, create a new matching job and prove it is `active`; the acceptance job used as evidence must not be retroactively rewritten. Exercise `capability rollback <recipe>` and prove that the in-flight active job stays pinned while a later matching job returns to `shadow`. Record both append-only decisions. Do not promote the next recipe until every earlier recipe remains active.
 
-For navigator-v1, `capability promote navigator-v1` is allowed only after the dual-engine collector has written a reviewed manifest whose restart and safety records were measured. `capability rollback navigator-v1` returns later admissions to recipe-v1 without rewriting in-flight navigator jobs.
+For navigator-v1, `capability promote navigator-v1` is allowed only after the dual-engine collector has written a reviewed manifest whose restart and safety records were measured. `capability rollback navigator-v1` records the operator decision without returning later admissions to recipe-v1 or rewriting in-flight navigator jobs.
 
 ## Final acceptance decision
 

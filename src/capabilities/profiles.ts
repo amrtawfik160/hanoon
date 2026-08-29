@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import type { WorkerSkillRole } from "../agent-skills/role-resolver";
+import { ROLE_SKILLS, type WorkerSkillRole } from "../agent-skills/role-resolver";
 import type { TaskRecipe } from "../domain/recipes";
 import {
   CAPABILITY_BY_ID,
-  CAPABILITY_CATALOG,
+  HISTORICAL_RECIPE_CAPABILITY_BY_ID,
+  HISTORICAL_RECIPE_CAPABILITY_CATALOG,
+  capabilityDescriptorById,
   type CapabilitySkillId,
 } from "./catalog";
 import type { CapabilityDescriptor, CapabilityRoute } from "./contracts";
@@ -183,7 +185,7 @@ export function selectCapabilityProfile(input: CapabilityProfileSelectionInput):
   const selected = new Map<string, CapabilityDescriptor>();
 
   for (const capabilityId of [...desired].sort((left, right) => left.localeCompare(right))) {
-    const descriptor = CAPABILITY_BY_ID.get(capabilityId);
+    const descriptor = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(capabilityId);
     if (!descriptor || descriptor.kind !== "skill") {
       addDenial(denied, capabilityId, "unknown_capability");
       continue;
@@ -265,6 +267,40 @@ export function selectCapabilityProfile(input: CapabilityProfileSelectionInput):
   };
 }
 
+export function selectWorkerCapabilityProfile(input: CapabilityProfileSelectionInput & {
+  engine: "recipe-v1" | "navigator-v1";
+}): SelectedCapabilityProfile {
+  if (input.engine === "recipe-v1") return selectCapabilityProfile(input);
+  const selected = new Map<string, CapabilityDescriptor>();
+  for (const capabilityId of ROLE_SKILLS[input.role]) {
+    const descriptor = CAPABILITY_BY_ID.get(capabilityId);
+    if (!descriptor || descriptor.kind !== "skill") {
+      throw new TypeError(`Navigator worker role ${input.role} references unknown skill ${capabilityId}`);
+    }
+    selected.set(capabilityId, descriptor);
+  }
+  const skills = [...ROLE_SKILLS[input.role]];
+  const assignments = skills.map((capabilityId): CapabilityProfileAssignment => {
+    const descriptor = selected.get(capabilityId);
+    if (!descriptor) throw new Error(`Selected capability ${capabilityId} disappeared`);
+    return {
+      capabilityId,
+      descriptorDigest: descriptor.digest,
+      route: descriptor.route,
+      mandatory: descriptor.evidence.requirement === "mandatory",
+    };
+  });
+  return {
+    role: input.role,
+    recipe: input.recipe,
+    stage: input.stage,
+    skills,
+    assignments,
+    denied: [],
+    digest: capabilityProfileDigest(assignments),
+  };
+}
+
 function sameIdentity(
   persisted: PersistedWorkerCapabilityProfile,
   expected: ExpectedWorkerProfileIdentity,
@@ -292,7 +328,7 @@ export function resolvePersistedWorkerProfile(input: Readonly<{
   for (const assignment of input.persisted.assignments) {
     if (seen.has(assignment.capabilityId) || assignment.route !== "worker") return null;
     seen.add(assignment.capabilityId);
-    const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+    const descriptor = capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest);
     if (!descriptor || descriptor.kind !== "skill" || descriptor.route !== "worker" ||
       descriptor.digest !== assignment.descriptorDigest ||
       (descriptor.evidence.requirement === "mandatory") !== assignment.mandatory) {
@@ -306,5 +342,5 @@ export function resolvePersistedWorkerProfile(input: Readonly<{
 }
 
 export const WORKER_SKILL_DESCRIPTORS = Object.freeze(
-  CAPABILITY_CATALOG.filter((descriptor) => descriptor.kind === "skill" && descriptor.route === "worker"),
+  HISTORICAL_RECIPE_CAPABILITY_CATALOG.filter((descriptor) => descriptor.kind === "skill" && descriptor.route === "worker"),
 );

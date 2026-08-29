@@ -512,7 +512,9 @@ export class BbRunner {
         {
           type: "text",
           text: this.withReferenceBriefing(
-            "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
+            job.workflowEngine === "recipe-v1"
+              ? "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes."
+              : "Read the attached work order and docs packet. Use the docs-guard, technical-writing, and unslop skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
             project,
           ),
           mentions: [],

@@ -229,7 +229,9 @@ export function buildDocsPacket(job: Job): HandoffArtifact {
     prNumber: job.prNumber,
     prUrl: job.prUrl,
     reviewedHeadSha: job.prHeadSha,
-    requiredSkills: ["docs-guard", "verification-before-completion"],
+    requiredSkills: job.workflowEngine === "recipe-v1"
+      ? ["docs-guard", "verification-before-completion"]
+      : ["unslop", "technical-writing", "docs-guard"],
     rules: {
       inspectChangedBehavior: true,
       updateNecessaryDocumentationOnly: true,
