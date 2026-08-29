@@ -13,6 +13,7 @@ import {
   type ControllerInteractionRemote,
 } from "../src/controller/interaction-service";
 import { controllerInteractionToken } from "../src/controller/questions";
+import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
 
 const FENCE = { ownerId: "executor", generation: 1, now: 2_000 };
 type DeliveryStage = "before-get" | "before-resolve" | "before-mark";
@@ -121,6 +122,7 @@ function setup() {
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
   db.pragma("foreign_keys = ON");
+  registerWorkArtifactRelationshipValidation(db);
   for (const migration of ALL_MIGRATIONS) db.exec(migration);
   const controllerKey = "owner-7-controller";
   const turnId = "turn_service_1";

@@ -6,7 +6,7 @@ export type TerminalScope =
   | { kind: "host_path"; hostId: string; cwd: string | null };
 
 export type CommandResult =
-  | { outcome: "exited"; exitCode: number; output: string }
+  | { outcome: "exited"; exitCode: number; output: string; outputTruncated?: true }
   | { outcome: "timed_out" }
   | { outcome: "aborted" };
 
@@ -21,7 +21,9 @@ export interface TerminalRunInput {
   scope: TerminalScope;
   title: string;
   command: string;
+  stdin?: string;
   timeoutMs: number;
+  maxOutputBytes?: number;
   signal?: AbortSignal;
   onObservation?: (observation: TerminalObservation) => void;
 }
@@ -40,6 +42,7 @@ type TerminalClient = {
     nextSeq?: number;
     truncated?: boolean;
   }>;
+  input(input: { terminalId: string; dataBase64: string }): Promise<unknown>;
   close(input: { terminalId: string; mode: "force" }): Promise<unknown>;
 };
 
@@ -50,9 +53,17 @@ type BoundedResult<T> =
   | { outcome: "timed_out" }
   | { outcome: "aborted" };
 
+type TerminalOutputBuffer = Readonly<{
+  nextSeq: number;
+  output: string;
+  truncated: boolean;
+}>;
+
 const POLL_INTERVAL_MS = 250;
-const TAIL_BYTES = 65_536;
+const DEFAULT_OUTPUT_BYTES = 65_536;
+const MAX_OUTPUT_BYTES = 8_388_608;
 const RESULT_MARKER_PREFIX = "__BB_TELEGRAM_AGENT_RESULT_";
+const EMPTY_TERMINAL_OUTPUT: TerminalOutputBuffer = { nextSeq: 0, output: "", truncated: false };
 
 function stripAnsi(terminalOutput: string): string {
   return terminalOutput
@@ -132,12 +143,16 @@ export function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function commandEnvelope(command: string, marker: string): string {
+function commandEnvelope(command: string, marker: string, stdinBytes: number | null): string {
   if (command.includes("\0")) throw new TypeError("command must not contain NUL bytes");
   return [
+    ...(stdinBytes === null ? [] : ["stty raw -echo || exit 125", `printf '\\n${marker}_STDIN_READY\\n'`]),
     `__bb_telegram_agent_command=${shellSingleQuote(command)}`,
-    '"${SHELL:-/bin/sh}" -lc "$__bb_telegram_agent_command"',
+    stdinBytes === null
+      ? '"${SHELL:-/bin/sh}" -lc "$__bb_telegram_agent_command"'
+      : `head -c ${stdinBytes} | "\${SHELL:-/bin/sh}" -lc "$__bb_telegram_agent_command"`,
     "__bb_telegram_agent_exit=$?",
+    ...(stdinBytes === null ? [] : ["stty sane"]),
     `printf '\\n${marker}:%s\\n' "$__bb_telegram_agent_exit"`,
     "IFS= read -r __bb_telegram_agent_release",
     'exit "$__bb_telegram_agent_exit"',
@@ -156,9 +171,18 @@ function parseCommandResult(output: string, marker: string): { exitCode: number;
   };
 }
 
-function appendBounded(current: string, next: string): string {
+function appendBounded(
+  current: string,
+  next: string,
+  maximumBytes: number,
+): Readonly<{ output: string; truncated: boolean }> {
   const bytes = Buffer.from(current + next, "utf8");
-  return bytes.length <= TAIL_BYTES ? bytes.toString("utf8") : bytes.subarray(bytes.length - TAIL_BYTES).toString("utf8");
+  return bytes.length <= maximumBytes
+    ? { output: bytes.toString("utf8"), truncated: false }
+    : {
+        output: bytes.subarray(bytes.length - maximumBytes).toString("utf8"),
+        truncated: true,
+      };
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -193,11 +217,17 @@ export class TerminalCommandRunner {
     }
   }
 
-  private async collect(terminalId: string, sinceSeq: number, signal?: AbortSignal): Promise<{ nextSeq: number; output: string }> {
-    const result = await this.terminals().output({ terminalId, sinceSeq, tailBytes: TAIL_BYTES, signal });
+  private async collect(
+    terminalId: string,
+    sinceSeq: number,
+    maximumBytes: number,
+    signal?: AbortSignal,
+  ): Promise<TerminalOutputBuffer> {
+    const result = await this.terminals().output({ terminalId, sinceSeq, tailBytes: maximumBytes, signal });
     return {
       nextSeq: result.nextSeq ?? sinceSeq,
       output: collectOutput(result.chunks),
+      truncated: result.truncated === true,
     };
   }
 
@@ -207,7 +237,14 @@ export class TerminalCommandRunner {
       cols: 120,
       rows: 40,
       scope: input.scope,
-      start: { mode: "command", command: commandEnvelope(input.command, marker) },
+      start: {
+        mode: "command",
+        command: commandEnvelope(
+          input.command,
+          marker,
+          input.stdin === undefined ? null : Buffer.byteLength(input.stdin, "utf8"),
+        ),
+      },
       title: input.title,
     });
     return { id: session.id, marker };
@@ -263,10 +300,29 @@ export class TerminalCommandRunner {
     signal: AbortSignal | undefined,
     closeOnce: () => void,
     resultMarker: string,
+    maximumBytes: number,
     onObservation?: (observation: TerminalObservation) => void,
+    initialBuffer = EMPTY_TERMINAL_OUTPUT,
   ): Promise<CommandResult> {
-    let nextSeq = 0;
-    let output = "";
+    let nextSeq = initialBuffer.nextSeq;
+    let output = initialBuffer.output;
+    let outputTruncated = initialBuffer.truncated;
+    const completedResult = (): CommandResult | null => {
+      const commandResult = parseCommandResult(output, resultMarker);
+      if (!commandResult) return null;
+      onObservation?.({
+        id: terminalId,
+        status: "exited",
+        updatedAt: Date.now(),
+        exitCode: commandResult.exitCode,
+      });
+      closeOnce();
+      return {
+        outcome: "exited",
+        ...commandResult,
+        ...(outputTruncated ? { outputTruncated: true as const } : {}),
+      };
+    };
     while (true) {
       if (signal?.aborted) {
         closeOnce();
@@ -276,6 +332,8 @@ export class TerminalCommandRunner {
         closeOnce();
         return { outcome: "timed_out" };
       }
+      const bufferedResult = completedResult();
+      if (bufferedResult) return bufferedResult;
 
       const statusResult = await this.bounded(
         () => this.terminals().get({ terminalId, signal }),
@@ -298,10 +356,15 @@ export class TerminalCommandRunner {
           outcome: "exited",
           exitCode: status.exitCode ?? 1,
           output,
+          ...(outputTruncated ? { outputTruncated: true as const } : {}),
         };
       }
 
-      const outputResult = await this.bounded(() => this.collect(terminalId, nextSeq, signal), deadline, signal);
+      const outputResult = await this.bounded(
+        () => this.collect(terminalId, nextSeq, maximumBytes, signal),
+        deadline,
+        signal,
+      );
       if (outputResult.outcome === "aborted") {
         closeOnce();
         return { outcome: "aborted" };
@@ -311,18 +374,11 @@ export class TerminalCommandRunner {
         return { outcome: "timed_out" };
       }
       nextSeq = outputResult.value.nextSeq;
-      output = appendBounded(output, outputResult.value.output);
-      const commandResult = parseCommandResult(output, resultMarker);
-      if (commandResult) {
-        onObservation?.({
-          id: terminalId,
-          status: "exited",
-          updatedAt: Date.now(),
-          exitCode: commandResult.exitCode,
-        });
-        closeOnce();
-        return { outcome: "exited", ...commandResult };
-      }
+      const appended = appendBounded(output, outputResult.value.output, maximumBytes);
+      output = appended.output;
+      outputTruncated ||= outputResult.value.truncated || appended.truncated;
+      const streamedResult = completedResult();
+      if (streamedResult) return streamedResult;
 
       try {
         const remaining = deadline - Date.now();
@@ -346,10 +402,100 @@ export class TerminalCommandRunner {
     }
   }
 
+  private async waitForStdinReady(
+    terminalId: string,
+    marker: string,
+    deadline: number,
+    signal: AbortSignal | undefined,
+    closeOnce: () => void,
+    maximumBytes: number,
+  ): Promise<
+    | Readonly<{ outcome: "ready"; buffer: TerminalOutputBuffer }>
+    | Readonly<{ outcome: "timed_out" | "aborted" }>
+  > {
+    let nextSeq = 0;
+    let output = "";
+    let outputTruncated = false;
+    const readyMarker = `${marker}_STDIN_READY`;
+    while (true) {
+      if (signal?.aborted) {
+        closeOnce();
+        return { outcome: "aborted" };
+      }
+      if (deadline <= Date.now()) {
+        closeOnce();
+        return { outcome: "timed_out" };
+      }
+      const outputResult = await this.bounded(
+        () => this.collect(terminalId, nextSeq, maximumBytes, signal),
+        deadline,
+        signal,
+      );
+      if (outputResult.outcome !== "value") {
+        closeOnce();
+        return { outcome: outputResult.outcome };
+      }
+      nextSeq = outputResult.value.nextSeq;
+      const appended = appendBounded(output, outputResult.value.output, maximumBytes);
+      output = appended.output;
+      outputTruncated ||= outputResult.value.truncated || appended.truncated;
+      const readyMarkerStart = output.indexOf(readyMarker);
+      if (readyMarkerStart !== -1) {
+        const markerEnd = readyMarkerStart + readyMarker.length;
+        const suffixStart = output.startsWith("\r\n", markerEnd)
+          ? markerEnd + 2
+          : output.startsWith("\n", markerEnd)
+            ? markerEnd + 1
+            : markerEnd;
+        return {
+          outcome: "ready",
+          buffer: {
+            nextSeq,
+            output: output.slice(suffixStart),
+            truncated: outputTruncated,
+          },
+        };
+      }
+
+      const statusResult = await this.bounded(
+        () => this.terminals().get({ terminalId, signal }),
+        deadline,
+        signal,
+      );
+      if (statusResult.outcome !== "value") {
+        closeOnce();
+        return { outcome: statusResult.outcome };
+      }
+      if (statusResult.value.status === "exited") {
+        closeOnce();
+        throw new Error("terminal command exited before it accepted stdin");
+      }
+      const delayResult = await this.bounded(
+        () => abortableDelay(Math.min(POLL_INTERVAL_MS, deadline - Date.now()), signal),
+        deadline,
+        signal,
+      );
+      if (delayResult.outcome !== "value") {
+        closeOnce();
+        return { outcome: delayResult.outcome };
+      }
+    }
+  }
+
   public async run(input: TerminalRunInput): Promise<CommandResult> {
     if (input.signal?.aborted) return { outcome: "aborted" };
     if (!Number.isFinite(input.timeoutMs) || input.timeoutMs < 0) {
       throw new TypeError("timeoutMs must be a finite non-negative number");
+    }
+    const maximumBytes = input.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES;
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || maximumBytes > MAX_OUTPUT_BYTES) {
+      throw new TypeError(`maxOutputBytes must be an integer between 1 and ${MAX_OUTPUT_BYTES}`);
+    }
+    if (
+      input.stdin !== undefined &&
+      (typeof input.stdin !== "string" || Buffer.byteLength(input.stdin, "utf8") > 1_048_576)
+    ) {
+      throw new TypeError("stdin must be a string of at most 1048576 UTF-8 bytes");
     }
     const deadline = Date.now() + input.timeoutMs;
     let terminalId: string | null = null;
@@ -372,6 +518,41 @@ export class TerminalCommandRunner {
     if (startResult.outcome === "timed_out") return { outcome: "timed_out" };
     terminalId = startResult.value.id;
     input.onObservation?.({ id: terminalId, status: "starting", updatedAt: Date.now() });
-    return this.waitForExit(terminalId, deadline, input.signal, closeOnce, startResult.value.marker, input.onObservation);
+    let initialBuffer = EMPTY_TERMINAL_OUTPUT;
+    if (input.stdin !== undefined) {
+      const stdin = input.stdin;
+      const ready = await this.waitForStdinReady(
+        terminalId,
+        startResult.value.marker,
+        deadline,
+        input.signal,
+        closeOnce,
+        maximumBytes,
+      );
+      if (ready.outcome !== "ready") return ready;
+      initialBuffer = ready.buffer;
+      const sent = await this.bounded(
+        () => this.terminals().input({
+          terminalId: terminalId as string,
+          dataBase64: Buffer.from(stdin, "utf8").toString("base64"),
+        }),
+        deadline,
+        input.signal,
+      );
+      if (sent.outcome !== "value") {
+        closeOnce();
+        return { outcome: sent.outcome };
+      }
+    }
+    return this.waitForExit(
+      terminalId,
+      deadline,
+      input.signal,
+      closeOnce,
+      startResult.value.marker,
+      maximumBytes,
+      input.onObservation,
+      initialBuffer,
+    );
   }
 }
