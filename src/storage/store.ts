@@ -6,6 +6,7 @@ import {
   isResumableConfigurationBlock,
   isReviewedPrCompletionBlock,
   PRODUCTION_NOT_CONFIGURED,
+  productionHasRollbackCommand,
   projectPolicySchema,
   type AutonomousJobOrigin,
   type Job,
@@ -307,6 +308,12 @@ import type {
   NavigatorWorkflowStepOutcome,
   WorkflowMode,
 } from "../navigator/models";
+import {
+  NAVIGATOR_RELEASE_STATES,
+  type NavigatorReleaseAttempt,
+  type NavigatorReleaseIncidentPhase,
+  type NavigatorReleaseRollbackOutcome,
+} from "../navigator/release-contracts";
 
 /**
  * A tapped controller button. `replayed` is a Telegram redelivery of a callback
@@ -1515,6 +1522,7 @@ const TASK_AUTHORITY_EFFECT_REQUIREMENTS: Readonly<Record<JobEffect["kind"], rea
   steer_implementation: ["worktree_write", "commit", "push", "pull_request"],
   run_navigator_skill: ["artifact_write"],
   run_navigator_ticket_worker: ["worktree_write", "commit", "push", "pull_request"],
+  run_navigator_release: ["commit", "push", "pull_request"],
   reconcile_job: ["read"],
 };
 
@@ -1566,6 +1574,7 @@ const FENCED_JOB_EVENT_TYPES: ReadonlySet<JobEvent["type"]> = new Set([
   "DEPLOY_FAILED",
   "CANARY_SUCCEEDED",
   "CANARY_FAILED",
+  "PRODUCTION_INCIDENT_RECOVERED",
   "WORKER_RECOVERY_REQUESTED",
   "WORKER_RECOVERY_REQUEUED",
 ]);
@@ -3926,6 +3935,28 @@ export interface TelegramAgentStore {
     now: number;
     leaseMs: number;
   }): StoredEffect | null;
+  leaseNavigatorReleaseEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null;
+  getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null;
+  recordNavigatorReleaseIncident(input: {
+    jobId: string;
+    workflowStepId: string | null;
+    phase: NavigatorReleaseIncidentPhase;
+    failureSignature: string;
+    rollbackOutcome: NavigatorReleaseRollbackOutcome;
+    now: number;
+  }): void;
+  countNavigatorReleaseIncidents(input: {
+    jobId: string;
+    phase: NavigatorReleaseIncidentPhase;
+    failureSignature: string;
+    rollbackOutcome?: NavigatorReleaseRollbackOutcome;
+  }): number;
+  recordExecutorProductionRecoveryObservation(input: PolicyBoundaryObservationInput): boolean;
   bindNavigatorSkillAttemptResource(input: {
     attemptId: string;
     effectIdempotencyKey: string;
@@ -5334,13 +5365,19 @@ function authoritySupportsPolicyBoundary(
     authority.outcome === "shipped_change";
 }
 
+function policyRequiresShippedTaskBoundary(policy: ProjectPolicy | null | undefined): boolean {
+  if (policy == null) return false;
+  if (policy.production === undefined) return policy.autonomy?.mergeWithoutProduction !== true;
+  return !productionHasRollbackCommand(policy);
+}
+
 function jobNeedsPolicyBoundary(
   job: Job,
   authority: TaskAuthority,
   affectedEffectIdempotencyKey: string,
 ): boolean {
   return job.state === "awaiting_merge_approval" && job.policy !== null &&
-    job.policy.production === undefined && job.policy.autonomy?.mergeWithoutProduction !== true &&
+    policyRequiresShippedTaskBoundary(job.policy) &&
     taskPolicyDigest(JSON.stringify(job.policy)) === authority.policyDigest &&
     affectedEffectIdempotencyKey === `${job.id}:${job.version + 1}:merge_pr`;
 }
@@ -12414,6 +12451,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.leaseSkillEffect(input);
   }
 
+  public leaseNavigatorReleaseEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null {
+    return this.navigatorRepository.leaseReleaseEffect(input);
+  }
+
+  public getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null {
+    return this.navigatorRepository.getReleaseAttempt(id);
+  }
+
+  public recordNavigatorReleaseIncident(input: {
+    jobId: string;
+    workflowStepId: string | null;
+    phase: NavigatorReleaseIncidentPhase;
+    failureSignature: string;
+    rollbackOutcome: NavigatorReleaseRollbackOutcome;
+    now: number;
+  }): void {
+    assertControllerIdentifier(input.jobId, "release incident job id");
+    if (input.workflowStepId !== null) assertControllerIdentifier(input.workflowStepId, "release incident step");
+    if (typeof input.failureSignature !== "string" || input.failureSignature.length === 0 || input.failureSignature.length > 500) {
+      throw new TypeError("release incident signature must be a bounded non-empty string");
+    }
+    assertNonNegativeInteger(input.now, "now");
+    this.db.prepare(
+      `INSERT INTO navigator_release_incidents (
+         job_id, workflow_step_id, phase, failure_signature, rollback_outcome, recorded_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.jobId,
+      input.workflowStepId,
+      input.phase,
+      input.failureSignature,
+      input.rollbackOutcome,
+      input.now,
+    );
+  }
+
+  public countNavigatorReleaseIncidents(input: {
+    jobId: string;
+    phase: NavigatorReleaseIncidentPhase;
+    failureSignature: string;
+    rollbackOutcome?: NavigatorReleaseRollbackOutcome;
+  }): number {
+    assertControllerIdentifier(input.jobId, "release incident job id");
+    const row = input.rollbackOutcome === undefined
+      ? this.db.prepare(
+        `SELECT COUNT(*) AS count FROM navigator_release_incidents
+          WHERE job_id = ? AND phase = ? AND failure_signature = ?`,
+      ).get(input.jobId, input.phase, input.failureSignature) as { count: number }
+      : this.db.prepare(
+        `SELECT COUNT(*) AS count FROM navigator_release_incidents
+          WHERE job_id = ? AND phase = ? AND failure_signature = ? AND rollback_outcome = ?`,
+      ).get(input.jobId, input.phase, input.failureSignature, input.rollbackOutcome) as { count: number };
+    return row.count;
+  }
+
   public bindNavigatorSkillAttemptResource(input: {
     attemptId: string;
     effectIdempotencyKey: string;
@@ -12849,8 +12946,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (effect.kind !== "issue_approval") return effect;
     const job = this.readJobById(effect.jobId);
     const authority = this.taskAuthorityRepository.get(effect.jobId);
-    if (!job || !authority || authority.outcome !== "shipped_change" || job.policy?.production ||
-      job.policy?.autonomy?.mergeWithoutProduction === true) return effect;
+    if (!job || !authority || authority.outcome !== "shipped_change" ||
+      !policyRequiresShippedTaskBoundary(job.policy)) return effect;
     const payload = policyApprovalIntentForLease(effect, job, authority);
     if (!payload) return null;
     if (policyApprovalIntentMatches(effect.payload, job, authority, `${job.id}:${job.version + 1}:merge_pr`)) {
@@ -13094,6 +13191,63 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  public recordExecutorProductionRecoveryObservation(input: PolicyBoundaryObservationInput): boolean {
+    this.assertExecutorFence(input);
+    assertControllerIdentifier(input.jobId, "production recovery job id");
+    assertControllerIdentifier(input.sourceEffectIdempotencyKey, "production recovery source effect");
+    assertControllerIdentifier(input.affectedEffectIdempotencyKey, "production recovery affected effect");
+    assertPositiveInteger(input.authorityRevision, "authorityRevision");
+    return this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const job = this.readJobById(input.jobId);
+      const authority = this.taskAuthorityRepository.get(input.jobId);
+      const sourceEffect = this.getEffect(input.jobId, input.sourceEffectIdempotencyKey);
+      if (
+        !job || !authority || !sourceEffect ||
+        authority.revision !== input.authorityRevision ||
+        authority.status !== "suspended" ||
+        authority.outcome !== "shipped_change" ||
+        job.state !== "production_failed" ||
+        (sourceEffect.kind !== "deploy_production" && sourceEffect.kind !== "verify_production") ||
+        sourceEffect.status !== "leased" ||
+        sourceEffect.leaseOwner !== input.ownerId ||
+        sourceEffect.leaseGeneration !== input.generation ||
+        sourceEffect.leaseExpiresAt === null ||
+        sourceEffect.leaseExpiresAt <= input.now ||
+        input.affectedEffectIdempotencyKey !== sourceEffect.idempotencyKey
+      ) return false;
+      const identity = [
+        job.id,
+        authority.authorityId,
+        String(authority.revision),
+        input.sourceEffectIdempotencyKey,
+        input.affectedEffectIdempotencyKey,
+      ].join("\u0000");
+      const observationId = `production_recovery_${createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 32)}`;
+      this.db.prepare(
+        `INSERT OR IGNORE INTO production_recovery_observations (
+           observation_id, job_id, authority_id, authority_revision, artifact_graph_digest, policy_digest,
+           source_effect_idempotency_key, affected_effect_idempotency_key, observed_job_version, observed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        observationId,
+        job.id,
+        authority.authorityId,
+        authority.revision,
+        authority.artifactGraphDigest,
+        authority.policyDigest,
+        input.sourceEffectIdempotencyKey,
+        input.affectedEffectIdempotencyKey,
+        job.version,
+        input.now,
+      );
+      return this.db.prepare(
+        `SELECT 1 FROM production_recovery_observations
+          WHERE observation_id = ? AND source_effect_idempotency_key = ?`,
+      ).get(observationId, input.sourceEffectIdempotencyKey) !== undefined;
+    }).immediate();
+  }
+
   public recordOwnerBoundary(
     input: OwnerBoundaryDraft & { jobId: string; authorityRevision: number; now: number },
   ): OwnerBoundaryRecord | null {
@@ -13259,6 +13413,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const transitioned = transition(current, event, now);
       persistJobTransition(this.db, jobId, expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, now);
+      this.settleNavigatorReleaseReturn(current, transitioned.job, event, now);
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(jobId, "head_changed", now);
         this.ownerBoundaryRepository.revokeForJob(jobId, "head_changed", now);
@@ -13329,6 +13484,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (terminalProductionState && productionClaimId === null) return null;
       persistJobTransition(this.db, input.jobId, input.expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, input.now);
+      this.settleNavigatorReleaseReturn(current, transitioned.job, input.event, input.now);
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(input.jobId, "head_changed", input.now);
         this.ownerBoundaryRepository.revokeForJob(input.jobId, "head_changed", input.now);
@@ -14361,6 +14517,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       for (const row of rows) {
         const effect = this.bindPolicyApprovalIntent(parseEffect(row), input.now);
         if (!effect) continue;
+        if (
+          effect.kind === "run_navigator_skill" ||
+          effect.kind === "run_navigator_ticket_worker" ||
+          effect.kind === "run_navigator_release"
+        ) continue;
         if (!admissionAllowsEffect(admission, effect, worker)) continue;
         const authorityEffects = taskAuthorityEffectsForJobEffect(effect);
         if (authorityEffects === null || authorityEffects.length === 0 || !authorityEffects.every((authorityEffect) => this.taskAuthorityRepository.admitEffect(
@@ -17126,6 +17287,54 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private markAdmissionDrainingForTerminal(job: Job, now: number): void {
     if (!isReleaseCandidate(job.state)) return;
     this.autonomyRepository.markDrainingInTransaction(job.id, now);
+  }
+
+  private settleNavigatorReleaseReturn(previous: Job, next: Job, event: JobEvent, now: number): void {
+    if (previous.workflowEngine !== "navigator-v1") return;
+    if (!(NAVIGATOR_RELEASE_STATES as readonly string[]).includes(previous.state)) return;
+    const returnedToNavigation = next.state === "implementing";
+    const releaseFinished = next.state === "complete" || next.state === "merged" || next.state === "production_failed";
+    if (!returnedToNavigation && !releaseFinished) return;
+    this.db.prepare(
+      `UPDATE jobs SET current_workflow_step_id = NULL, workflow_revision = workflow_revision + 1
+        WHERE id = ?`,
+    ).run(next.id);
+    next.currentWorkflowStepId = null;
+    next.workflowRevision += 1;
+    if (!returnedToNavigation) return;
+    const reasonCode = event.type === "VALIDATION_FAILED"
+      ? "validation_failed"
+      : event.type === "REVIEW_CHANGES_REQUESTED"
+        ? "review_changes_requested"
+        : event.type === "REVIEW_PASSED"
+          ? "documentation_required"
+          : event.type === "PRODUCTION_INCIDENT_RECOVERED"
+            ? "production_incident_recovered"
+            : "release_findings";
+    this.db.prepare(
+      `INSERT INTO navigator_release_findings (
+         job_id, workflow_step_id, reason_code, previous_state, recorded_at
+       ) VALUES (?, ?, ?, ?, ?)`,
+    ).run(next.id, previous.currentWorkflowStepId, reasonCode, previous.state, now);
+    if (event.type !== "PRODUCTION_INCIDENT_RECOVERED") return;
+    const owner = this.getOwner();
+    if (owner === null) return;
+    const phase = event.phase === "canary" ? "canary" : "deploy";
+    const text = phase === "canary"
+      ? "Production canary failed. The configured rollback restored the previous release. No action is required."
+      : "Production deploy failed. The configured rollback restored the previous release. No action is required.";
+    const item: OutboxInput = {
+      logicalKey: `job:${next.id}:production-incident:${phase}`,
+      chatId: owner.chatId,
+      payload: { text, disable_web_page_preview: true },
+    };
+    const payloadJson = serializeOutbox(item, now);
+    this.db.prepare(
+      `INSERT OR IGNORE INTO outbox (
+         logical_key, chat_id, message_id, payload_json, status, attempts,
+         next_attempt_at, created_at, updated_at
+       ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)`,
+    ).run(item.logicalKey, item.chatId, payloadJson, now, now, now);
   }
 
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {

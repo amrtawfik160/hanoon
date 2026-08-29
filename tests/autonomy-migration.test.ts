@@ -10,6 +10,7 @@ import {
   TASK_AUTHORITY_CLOSURE_MIGRATIONS,
   TASK_AUTHORITY_PUBLISH_MIGRATIONS,
   TASK_AUTHORITY_REVISION_MIGRATIONS,
+  NAVIGATOR_RELEASE_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   WorkArtifactRepository,
@@ -56,8 +57,9 @@ const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
   TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
   POLICY_APPROVAL_INTENT_MIGRATIONS.length;
+const TICKET_42_MIGRATION_COUNT = NAVIGATOR_RELEASE_MIGRATIONS.length;
 
-const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT;
+const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length - TICKET_41_MIGRATION_COUNT - TICKET_42_MIGRATION_COUNT;
 
 function legacyDatabase(pluginId: string) {
   const { bb } = createFakePluginHost({ pluginId });
@@ -111,7 +113,7 @@ function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
     0,
     -(
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
-      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -170,7 +172,7 @@ function insertRelationshipUpgradeArtifact(
 
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
   expect(PRE_TICKET_41_MIGRATION_COUNT).toBe(LEGACY_MIGRATION_COUNT + 64);
-  expect(ALL_MIGRATIONS).toHaveLength(PRE_TICKET_41_MIGRATION_COUNT + TICKET_41_MIGRATION_COUNT);
+  expect(ALL_MIGRATIONS).toHaveLength(PRE_TICKET_41_MIGRATION_COUNT + TICKET_41_MIGRATION_COUNT + TICKET_42_MIGRATION_COUNT);
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
   }
@@ -277,7 +279,8 @@ it("rolls back the boundary-source upgrade when active legacy evidence cannot be
   const { bb, db } = admissionUpgradeDatabase("owner-boundary-source-upgrade");
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
     0,
-    -(OWNER_BOUNDARY_SOURCE_MIGRATIONS.length + POLICY_APPROVAL_INTENT_MIGRATIONS.length),
+    -(OWNER_BOUNDARY_SOURCE_MIGRATIONS.length + POLICY_APPROVAL_INTENT_MIGRATIONS.length +
+      NAVIGATOR_RELEASE_MIGRATIONS.length),
   ));
   db.prepare(
     `INSERT INTO task_authorities (
@@ -337,7 +340,7 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
-      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -390,7 +393,7 @@ it("fails the authority upgrade when an older bound revision cannot be reconstru
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
-      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -451,7 +454,7 @@ it("reconstructs an older shipped revision from its authoritative release bindin
     -(
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
-      POLICY_APPROVAL_INTENT_MIGRATIONS.length
+      POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length
     ),
   ));
   db.prepare(

@@ -1,4 +1,4 @@
-import type { Job, ProjectPolicy } from "../domain/models";
+import { productionHasRollbackCommand, type Job, type ProjectPolicy } from "../domain/models";
 import { taskAuthorityAllowsEffect, type TaskConstraint, type TaskOutcome } from "../domain/task-authority";
 
 type TaskAuthorityEvidence = Readonly<{
@@ -183,6 +183,9 @@ export function decideAutoApproval(input: {
   // change, an unattended merge would be shipping into silence.
   if (!job.policy?.production && job.policy?.autonomy?.mergeWithoutProduction !== true) {
     return { outcome: "ask_owner", reason: "the project has no production configuration" };
+  }
+  if (job.policy?.production && !productionHasRollbackCommand(job.policy)) {
+    return { outcome: "ask_owner", reason: "the project has no production rollback command" };
   }
   if (job.reviewCycle >= REMEDIATION_ASK_THRESHOLD) {
     return decideRemediatedChange(job, input.consensus, live.source === "task");

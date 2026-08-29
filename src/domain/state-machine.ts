@@ -122,6 +122,16 @@ function clearHeadAndReceipts(job: Job, effects: JobEffect[]): void {
   emitEffect(job, effects, "revoke_approvals");
 }
 
+function isNavigatorJob(job: Pick<Job, "workflowEngine">): boolean {
+  return job.workflowEngine === "navigator-v1";
+}
+
+function returnNavigatorToNavigation(job: Job, effects: JobEffect[]): void {
+  clearHeadAndReceipts(job, effects);
+  job.state = "implementing";
+  emitEffect(job, effects, "render_status");
+}
+
 function enterLocatingPr(job: Job, effects: JobEffect[]): void {
   clearHeadAndReceipts(job, effects);
   job.state = "locating_pr";
@@ -478,6 +488,18 @@ function transitionCreatingImplementation(job: Job, event: JobEvent, effects: Jo
 }
 
 function transitionImplementing(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (isNavigatorJob(job)) {
+    if (event.type !== "RELEASE_STARTED") illegal(job, event);
+    if (!Number.isInteger(event.number) || event.number < 1) throw new TypeError("PR number must be positive");
+    assertNonEmpty(event.url, "url");
+    assertNonEmpty(event.environmentId, "environmentId");
+    job.prNumber = event.number;
+    job.prUrl = event.url;
+    job.environmentId = event.environmentId;
+    job.state = "resolving_pr_head";
+    emitEffect(job, effects, "resolve_pr_head", { number: event.number, url: event.url });
+    return;
+  }
   if (event.type !== "IMPLEMENTATION_IDLE") illegal(job, event);
   enterLocatingPr(job, effects);
 }
@@ -516,6 +538,19 @@ function transitionReviewPassed(job: Job, event: JobEvent, effects: JobEffect[])
   assertHeadSha(event.headSha);
   if (!headMatches(job, event.headSha)) {
     invalidateDriftedHead(job, effects);
+    return;
+  }
+  if (isNavigatorJob(job)) {
+    if (event.documentation?.required) {
+      returnNavigatorToNavigation(job, effects);
+      return;
+    }
+    if (job.policy?.production || mergesWithoutProduction(job.policy) || taskRequiresRelease(job)) {
+      job.state = "awaiting_merge_approval";
+      emitEffect(job, effects, "issue_approval", { headSha: event.headSha });
+      return;
+    }
+    completeReviewedWork(job, effects);
     return;
   }
   if (job.routingMode === "active") {
@@ -586,6 +621,10 @@ function transitionReviewChanges(job: Job, event: JobEvent, effects: JobEffect[]
     invalidateDriftedHead(job, effects);
     return;
   }
+  if (isNavigatorJob(job)) {
+    returnNavigatorToNavigation(job, effects);
+    return;
+  }
   enterPatch(job, effects, event.summary ?? "Review requested changes", {
     findings: event.findings,
     reasons: event.reasons,
@@ -642,6 +681,10 @@ function transitionValidationFailed(job: Job, event: JobEvent, effects: JobEffec
       invalidateDriftedHead(job, effects);
       return;
     }
+  }
+  if (isNavigatorJob(job)) {
+    returnNavigatorToNavigation(job, effects);
+    return;
   }
   enterPatch(job, effects, event.reason ?? "Validation failed");
 }
@@ -843,6 +886,12 @@ function enterProductionIncident(job: Job, effects: JobEffect[], reason: string)
 }
 
 function transitionDeploying(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "PRODUCTION_INCIDENT_RECOVERED") {
+    if (!isNavigatorJob(job) || event.phase !== "deploy") illegal(job, event);
+    assertSafeFailureSummary(event.reason);
+    returnNavigatorToNavigation(job, effects);
+    return;
+  }
   if (event.type === "DEPLOY_SUCCEEDED") {
     assertSummary(event.summary, "summary");
     assertNonEmpty(event.summary, "summary");
@@ -860,6 +909,12 @@ function transitionDeploying(job: Job, event: JobEvent, effects: JobEffect[]): v
 }
 
 function transitionVerifyingProduction(job: Job, event: JobEvent, effects: JobEffect[]): void {
+  if (event.type === "PRODUCTION_INCIDENT_RECOVERED") {
+    if (!isNavigatorJob(job) || event.phase !== "canary") illegal(job, event);
+    assertSafeFailureSummary(event.reason);
+    returnNavigatorToNavigation(job, effects);
+    return;
+  }
   if (event.type === "CANARY_SUCCEEDED") {
     assertSummary(event.summary, "summary");
     assertNonEmpty(event.summary, "summary");

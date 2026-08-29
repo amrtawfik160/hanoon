@@ -2014,7 +2014,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     );
     if (assessment.outcome === "pending") return;
     if (assessment.outcome === "pass") {
-      if (latest.routingMode === "active") {
+      if (latest.routingMode === "active" || latest.workflowEngine === "navigator-v1") {
         if (!latest.environmentId || !latest.policy) {
           applyExecutorEvent(job.id, latest.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
           return;

@@ -24,7 +24,7 @@ import {
   type NativeAdapterTransition,
   type NativeAdapterTransitionEnvelope,
 } from "../capabilities/native-adapters";
-import { isSmallFixJob, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
+import { isSmallFixJob, productionHasRollbackCommand, type Job, type JobEffect, type JobEvent, type ProjectPolicy, type ReviewFinding, type StoredEffect, type WorkerLiveness } from "../domain/models";
 import { resolveConsensusExecution, type PipelineStage } from "../domain/stage-execution";
 import { assessConsensusReview, type ReviewLens } from "../domain/review-lenses";
 import { jobStageExecution } from "../domain/stage-routing";
@@ -60,6 +60,10 @@ import {
   type ProductionPhase,
   type ProductionStageSnapshot,
 } from "./production-runner";
+import {
+  NAVIGATOR_RELEASE_INCIDENT_BUDGET,
+  type NavigatorReleaseRollbackOutcome,
+} from "../navigator/release-contracts";
 
 export class PermanentEffectError extends Error {
   public constructor(message: string) {
@@ -225,6 +229,7 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "steer_implementation": return ["implementing", "remediating"];
     case "run_navigator_skill": return [];
     case "run_navigator_ticket_worker": return [];
+    case "run_navigator_release": return [];
     case "reconcile_job": return [];
     default: {
       const unreachable: never = kind;
@@ -257,6 +262,7 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "steer_implementation",
   "run_navigator_skill",
   "run_navigator_ticket_worker",
+  "run_navigator_release",
   "reconcile_job",
 ]);
 
@@ -1936,54 +1942,45 @@ export class EffectRunner {
       policy: job.policy,
       evidence: { ...evidence, taskAuthority },
     });
-    // A shipped task with no configured production path is not allowed to
-    // silently fall back to a one-use merge approval. That would turn the
-    // owner's exact task grant into a broader release decision.
-    if (
-      liveGrant?.source === "task" &&
-      taskAuthority?.outcome === "shipped_change" &&
-      !job.policy?.production &&
-      job.policy?.autonomy?.mergeWithoutProduction !== true
-    ) {
-      const current = this.dependencies.store.getJob(job.id);
-      if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
-      const boundaryNow = this.now();
-      const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
-      if (!this.dependencies.store.recordExecutorPolicyBoundaryObservation({
-        jobId: current.id,
-        authorityRevision: taskAuthority.revision,
-        sourceEffectIdempotencyKey: effect.idempotencyKey,
-        affectedEffectIdempotencyKey,
-        ...this.executorFence(),
-      })) throw new Error("executor refused the policy boundary observation");
-      const boundary = this.dependencies.store.recordOwnerBoundary({
-        jobId: current.id,
-        authorityRevision: taskAuthority.revision,
-        code: "policy_change_required",
-        goal: "Complete the owner-requested shipped change",
-        blocker: "No production policy or merge-without-production permission is configured for this project",
-        priorChecks: [
-          "The pull-request head is the exact head that passed the review gate",
-          "The task authority is active for this job at its current revision",
-        ],
-        options: [
-          {
-            label: "Configure production",
-            consequence: "The task can continue through deploy and canary under project policy",
-          },
-          {
-            label: "Allow merge without production",
-            consequence: "The task can merge under its required checks and regression monitoring",
-          },
-        ],
-        recommendation: "Configure production because it preserves the requested shipped outcome",
-        pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
-        evidenceFacts: ["policy:change-required"],
-        affectedEffectIdempotencyKey,
-        now: boundaryNow,
-      });
-      if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
-      return;
+    // A shipped task with no configured production path, or with production and
+    // no rollback, is not allowed to silently fall back to a one-use merge
+    // approval. That would turn the owner's exact task grant into a broader
+    // release decision.
+    if (liveGrant?.source === "task" && taskAuthority?.outcome === "shipped_change") {
+      if (!job.policy?.production && job.policy?.autonomy?.mergeWithoutProduction !== true) {
+        this.pauseShippedTaskForPolicyChange(effect, job, taskAuthority, {
+          blocker: "No production policy or merge-without-production permission is configured for this project",
+          options: [
+            {
+              label: "Configure production",
+              consequence: "The task can continue through deploy and canary under project policy",
+            },
+            {
+              label: "Allow merge without production",
+              consequence: "The task can merge under its required checks and regression monitoring",
+            },
+          ],
+          recommendation: "Configure production because it preserves the requested shipped outcome",
+        });
+        return;
+      }
+      if (job.policy?.production && !productionHasRollbackCommand(job.policy)) {
+        this.pauseShippedTaskForPolicyChange(effect, job, taskAuthority, {
+          blocker: "This project deploys to production with no rollback command, so a failed unattended release cannot be restored",
+          options: [
+            {
+              label: "Configure rollback",
+              consequence: "A failed deploy or canary can restore the previous release under project policy",
+            },
+            {
+              label: "Remove production until rollback exists",
+              consequence: "The task stays paused rather than deploying with no way back",
+            },
+          ],
+          recommendation: "Configure a rollback command because unattended production requires a way back",
+        });
+        return;
+      }
     }
     // The owner already granted this merge in so many words, before the gate
     // was reached. Their word outranks the button: consuming it here is what
@@ -2065,6 +2062,47 @@ export class EffectRunner {
     });
   }
 
+  private pauseShippedTaskForPolicyChange(
+    effect: StoredEffect,
+    job: Job,
+    taskAuthority: { revision: number },
+    copy: {
+      blocker: string;
+      options: Array<{ label: string; consequence: string }>;
+      recommendation: string;
+    },
+  ): void {
+    const current = this.dependencies.store.getJob(job.id);
+    if (!current || current.state !== "awaiting_merge_approval" || current.prHeadSha !== job.prHeadSha) return;
+    const boundaryNow = this.now();
+    const affectedEffectIdempotencyKey = `${current.id}:${current.version + 1}:merge_pr`;
+    if (!this.dependencies.store.recordExecutorPolicyBoundaryObservation({
+      jobId: current.id,
+      authorityRevision: taskAuthority.revision,
+      sourceEffectIdempotencyKey: effect.idempotencyKey,
+      affectedEffectIdempotencyKey,
+      ...this.executorFence(),
+    })) throw new Error("executor refused the policy boundary observation");
+    const boundary = this.dependencies.store.recordOwnerBoundary({
+      jobId: current.id,
+      authorityRevision: taskAuthority.revision,
+      code: "policy_change_required",
+      goal: "Complete the owner-requested shipped change",
+      blocker: copy.blocker,
+      priorChecks: [
+        "The pull-request head is the exact head that passed the review gate",
+        "The task authority is active for this job at its current revision",
+      ],
+      options: copy.options,
+      recommendation: copy.recommendation,
+      pausedEffect: "The exact-head merge remains paused until this policy decision is recorded",
+      evidenceFacts: ["policy:change-required"],
+      affectedEffectIdempotencyKey,
+      now: boundaryNow,
+    });
+    if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
+  }
+
   private acceptTaskMerge(job: Job): void {
     if (!job.prHeadSha) throw new PermanentEffectError("task merge requires an authoritative pull-request head");
     const accepted = this.dependencies.store.acceptTaskAuthorityAndEnqueueMerge({
@@ -2122,7 +2160,113 @@ export class EffectRunner {
     return braked ? null : "The failure brake could not be recorded, so this project may still admit new work.";
   }
 
-  private applyProductionResult(job: Job, phase: ProductionPhase, result: ProductionStageSnapshot): void {
+  private classifyProductionRollback(result: ProductionStageSnapshot): NavigatorReleaseRollbackOutcome {
+    if (result.rollback === undefined || result.rollback === null) return "missing";
+    if (result.rollback.outcome === "pass") return "pass";
+    if (result.rollback.outcome === "fail") return "fail";
+    return "indeterminate";
+  }
+
+  private productionFailureSignature(result: ProductionStageSnapshot): string {
+    const signature = result.failedCommand ?? result.summary;
+    return signature.length <= 500 ? signature : signature.slice(0, 500);
+  }
+
+  private recordNavigatorProductionIncident(
+    job: Job,
+    phase: "deploy" | "canary",
+    failureSignature: string,
+    rollbackOutcome: NavigatorReleaseRollbackOutcome,
+  ): void {
+    this.dependencies.store.recordNavigatorReleaseIncident({
+      jobId: job.id,
+      workflowStepId: job.currentWorkflowStepId,
+      phase,
+      failureSignature,
+      rollbackOutcome,
+      now: this.now(),
+    });
+  }
+
+  private recordNavigatorProductionRecoveryBoundary(job: Job, effect: StoredEffect): void {
+    const authority = this.dependencies.store.getTaskAuthority(job.id);
+    const current = this.dependencies.store.getJob(job.id);
+    if (!authority || !current || current.state !== "production_failed") return;
+    const affectedEffectIdempotencyKey = effect.idempotencyKey;
+    if (!this.dependencies.store.recordExecutorProductionRecoveryObservation({
+      jobId: current.id,
+      authorityRevision: authority.revision,
+      sourceEffectIdempotencyKey: effect.idempotencyKey,
+      affectedEffectIdempotencyKey,
+      ...this.executorFence(),
+    })) throw new Error("executor refused the production recovery observation");
+    const boundary = this.dependencies.store.recordOwnerBoundary({
+      jobId: current.id,
+      authorityRevision: authority.revision,
+      code: "production_recovery_required",
+      goal: "Restore production after a failed release",
+      blocker: "Deploy or canary failed and rollback did not restore a known-good release",
+      priorChecks: [
+        "The production stage recorded a failure",
+        "Rollback was missing, failed, indeterminate, or already used for this failure",
+      ],
+      options: [
+        {
+          label: "Repair production",
+          consequence: "Unattended delivery can resume after production is known-good again",
+        },
+        {
+          label: "Pause this project",
+          consequence: "No further unattended work is admitted until you reopen it",
+        },
+      ],
+      recommendation: "Repair production before admitting more unattended work",
+      pausedEffect: "Unattended delivery stays braked until this recovery decision is recorded",
+      evidenceFacts: ["production:failed", "recovery:exhausted"],
+      affectedEffectIdempotencyKey,
+      now: this.now(),
+    });
+    if (boundary) this.enqueueStatus(current, { ownerBoundary: boundary.digest });
+  }
+
+  private failNavigatorProduction(
+    job: Job,
+    effect: StoredEffect,
+    phase: "deploy" | "canary",
+    reason: string,
+    failureSignature: string,
+    rollbackOutcome: NavigatorReleaseRollbackOutcome,
+  ): void {
+    this.recordNavigatorProductionIncident(job, phase, failureSignature, rollbackOutcome);
+    const brakeFailure = job.projectId === null
+      ? null
+      : this.withdrawUnattendedDelivery(
+        job.projectId,
+        rollbackOutcome === "pass"
+          ? `rollback budget exhausted after a bad ${phase}`
+          : rollbackOutcome === "fail"
+            ? `rollback failed after a bad ${phase}`
+            : rollbackOutcome === "indeterminate"
+              ? `production ${phase} outcome is unknown`
+              : `production ${phase} failed with no rollback configured`,
+      );
+    const reported = brakeFailure === null
+      ? reason
+      : `${brakeFailure} ${reason}`.slice(0, MAX_FAILURE_SUMMARY_LENGTH);
+    const current = this.dependencies.store.getJob(job.id);
+    if (!current || current.state !== (phase === "deploy" ? "deploying" : "verifying_production")) return;
+    this.applyEvent(job.id, current.version, phase === "deploy"
+      ? { type: "DEPLOY_FAILED", reason: reported }
+      : { type: "CANARY_FAILED", reason: reported });
+    this.recordNavigatorProductionRecoveryBoundary(current, effect);
+  }
+
+  private applyProductionResult(
+    job: Job,
+    phase: ProductionPhase,
+    result: ProductionStageSnapshot,
+    effect: StoredEffect,
+  ): void {
     const expectedState = phase === "deploy" ? "deploying" : "verifying_production";
     const current = this.dependencies.store.getJob(job.id);
     if (!current || current.state !== expectedState) return;
@@ -2130,6 +2274,34 @@ export class EffectRunner {
       this.applyEvent(job.id, current.version, phase === "deploy"
         ? { type: "DEPLOY_SUCCEEDED", summary: result.summary }
         : { type: "CANARY_SUCCEEDED", summary: result.summary });
+      return;
+    }
+    const rollbackOutcome = this.classifyProductionRollback(result);
+    const failureSignature = this.productionFailureSignature(result);
+    if (current.workflowEngine === "navigator-v1") {
+      const priorPassCount = this.dependencies.store.countNavigatorReleaseIncidents({
+        jobId: current.id,
+        phase,
+        failureSignature,
+        rollbackOutcome: "pass",
+      });
+      if (rollbackOutcome === "pass" && priorPassCount < NAVIGATOR_RELEASE_INCIDENT_BUDGET) {
+        this.recordNavigatorProductionIncident(current, phase, failureSignature, "pass");
+        this.applyEvent(job.id, current.version, {
+          type: "PRODUCTION_INCIDENT_RECOVERED",
+          phase,
+          reason: result.summary,
+        });
+        return;
+      }
+      this.failNavigatorProduction(
+        current,
+        effect,
+        phase,
+        result.summary,
+        failureSignature,
+        rollbackOutcome,
+      );
       return;
     }
     // A rollback that worked is a recovery: production is back, so unattended
@@ -2187,7 +2359,7 @@ export class EffectRunner {
       if (!productionReceiptCountIsValid(outcome, expectedReceiptCount)) {
         throw new PermanentEffectError("completed production stage receipt count is invalid");
       }
-      this.applyProductionResult(job, phase, outcome);
+      this.applyProductionResult(job, phase, outcome, effect);
       return;
     }
     if (effect.attempts > 1) {
@@ -2201,9 +2373,20 @@ export class EffectRunner {
       })) throw new Error("executor lease was lost before production failure persistence");
       const current = this.dependencies.store.getJob(job.id);
       if (current?.state === (phase === "deploy" ? "deploying" : "verifying_production")) {
-        this.applyEvent(job.id, current.version, phase === "deploy"
-          ? { type: "DEPLOY_FAILED", reason }
-          : { type: "CANARY_FAILED", reason });
+        if (current.workflowEngine === "navigator-v1") {
+          this.failNavigatorProduction(
+            current,
+            effect,
+            phase,
+            reason,
+            reason.slice(0, 500),
+            "indeterminate",
+          );
+        } else {
+          this.applyEvent(job.id, current.version, phase === "deploy"
+            ? { type: "DEPLOY_FAILED", reason }
+            : { type: "CANARY_FAILED", reason });
+        }
       }
       return;
     }
@@ -2280,7 +2463,7 @@ export class EffectRunner {
     });
     if (!completed) throw new Error("production stage completion lost its executor fence");
     this.assertFence();
-    this.applyProductionResult(job, phase, result);
+    this.applyProductionResult(job, phase, result, effect);
   }
 
   private async stopThread(effect: StoredEffect, job: Job): Promise<void> {
@@ -2575,6 +2758,8 @@ export class EffectRunner {
         throw new PermanentEffectError("navigator skill effects require the navigator executor");
       case "run_navigator_ticket_worker":
         throw new PermanentEffectError("navigator ticket effects require the navigator implementation executor");
+      case "run_navigator_release":
+        throw new PermanentEffectError("navigator release effects require the navigator release executor");
       case "reconcile_job":
         await this.reconcile(effect, job);
         return;

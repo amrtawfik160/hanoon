@@ -49,6 +49,7 @@ import {
   type NavigatorWorkflowStep,
   type NavigatorWorkflowStepOutcome,
 } from "./models";
+import { NAVIGATOR_RELEASE_STEP_SKILL_ID, type NavigatorReleaseAttempt } from "./release-contracts";
 
 type SqliteDatabase = Database.Database;
 
@@ -367,6 +368,35 @@ function proposalReason(
       !NAVIGATOR_SKILL_CATALOG.some((entry) => entry.id === skillId && entry.admitted))) return "capability_denied";
     return null;
   }
+  if (proposal.kind === "start_release") {
+    if (job.taskOutcome !== "shipped_change" && job.taskOutcome !== "reviewed_change") {
+      return "release_outcome_not_permitted";
+    }
+    const ticketIds = proposal.implementationTicketIds;
+    if (new Set(ticketIds).size !== ticketIds.length) return "malformed_proposal";
+    const boundIds = new Set(job.artifactBindings.map((binding) => binding.artifactId));
+    for (const artifactId of ticketIds) {
+      if (!boundIds.has(artifactId)) return "unauthorized_subject";
+      if (artifacts.getArtifact(artifactId)?.kind !== "implementation_ticket") return "unauthorized_subject";
+    }
+    return null;
+  }
+  if (proposal.kind === "finish") {
+    const boundIds = new Set(job.artifactBindings.map((binding) => binding.artifactId));
+    if (proposal.artifactIds.some((artifactId) => !boundIds.has(artifactId))) return "unauthorized_subject";
+    if (job.taskOutcome === "artifact") {
+      return proposal.artifactIds.every((artifactId) => artifacts.getResolution(artifactId)?.outcome === "resolved")
+        ? null
+        : "completion_evidence_missing";
+    }
+    if (job.taskOutcome === "reviewed_change") {
+      return job.state === "complete" ? null : "completion_evidence_missing";
+    }
+    if (job.taskOutcome === "shipped_change") {
+      return job.state === "complete" || job.state === "merged" ? null : "completion_evidence_missing";
+    }
+    return "completion_evidence_missing";
+  }
   if (proposal.kind !== "invoke_skill") return "unsupported_deterministic_action";
   const catalog = NAVIGATOR_SKILL_CATALOG.find((entry) => entry.id === proposal.skillId);
   const contract = navigatorStepContract(proposal.skillId);
@@ -663,7 +693,82 @@ export class NavigatorRepository {
         this.insertDecision(proposalId, job.id, input.snapshotId, "accepted", "owner_boundary_recorded", input.now);
         return this.requireDecision(proposalId);
       }
-      if (proposal?.kind !== "invoke_skill" && proposal?.kind !== "unresolved_next_step") {
+      if (proposal.kind === "finish") {
+        this.insertDecision(proposalId, job.id, input.snapshotId, "accepted", "completion_recorded", input.now);
+        return this.requireDecision(proposalId);
+      }
+      if (proposal.kind === "start_release") {
+        if (this.releasePrerequisitesIncomplete(job, proposal.implementationTicketIds)) {
+          this.insertDecision(
+            proposalId,
+            job.id,
+            input.snapshotId,
+            "rejected",
+            "release_prerequisites_incomplete",
+            input.now,
+          );
+          return this.requireDecision(proposalId);
+        }
+        const stepId = digestId("wfstep", proposalId, digest);
+        const attemptId = digestId("navrelease", stepId, NAVIGATOR_RELEASE_STEP_SKILL_ID);
+        const effectKey = `${job.id}:navigator:${stepId}:run_release`;
+        this.db.prepare(
+          `INSERT INTO workflow_steps (
+             id, job_id, proposal_id, snapshot_id, skill_id, job_version, workflow_revision, accepted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          stepId,
+          job.id,
+          proposalId,
+          input.snapshotId,
+          NAVIGATOR_RELEASE_STEP_SKILL_ID,
+          job.version,
+          job.workflowRevision,
+          input.now,
+        );
+        this.db.prepare(
+          `INSERT INTO effects (
+             idempotency_key, job_id, kind, payload_json, status, attempts,
+             next_attempt_at, created_at, updated_at
+           ) VALUES (?, ?, 'run_navigator_release', ?, 'pending', 0, ?, ?, ?)`,
+        ).run(
+          effectKey,
+          job.id,
+          serializeNavigatorJson({
+            workflowStepId: stepId,
+            attemptId,
+            snapshotId: input.snapshotId,
+          }, "navigator release effect"),
+          input.now,
+          input.now,
+          input.now,
+        );
+        this.db.prepare(
+          `INSERT INTO navigator_release_attempts (
+             id, job_id, workflow_step_id, effect_idempotency_key, implementation_ticket_ids_json,
+             snapshot_digest, job_version, workflow_revision, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          attemptId,
+          job.id,
+          stepId,
+          effectKey,
+          JSON.stringify(proposal.implementationTicketIds),
+          snapshot.identity.digest,
+          job.version,
+          job.workflowRevision,
+          input.now,
+          input.now,
+        );
+        const updated = this.db.prepare(
+          `UPDATE jobs SET current_workflow_step_id = ?, version = version + 1, updated_at = ?
+            WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
+        ).run(stepId, input.now, job.id, job.version);
+        if (updated.changes !== 1) throw new VersionConflictError(job.id, job.version);
+        this.insertDecision(proposalId, job.id, input.snapshotId, "accepted", "accepted", input.now);
+        return this.requireDecision(proposalId);
+      }
+      if (proposal.kind !== "invoke_skill" && proposal.kind !== "unresolved_next_step") {
         throw new Error("deterministic proposal validation was inconsistent");
       }
       const routingIdentity = proposal.kind === "unresolved_next_step"
@@ -1081,6 +1186,23 @@ export class NavigatorRepository {
     return row ? this.getRoutingDecision(row.decision_digest) : null;
   }
 
+  private releasePrerequisitesIncomplete(job: Job, implementationTicketIds: readonly string[]): boolean {
+    const integration = this.db.prepare(
+      "SELECT state FROM navigator_integrations WHERE job_id = ?",
+    ).get(job.id) as { state: string } | undefined;
+    if (
+      !integration ||
+      !["ready_for_pull_request", "publishing_pull_request", "ready_for_release"].includes(integration.state)
+    ) return true;
+    const tickets = this.db.prepare(
+      "SELECT artifact_id, state FROM navigator_integration_tickets WHERE job_id = ? ORDER BY ticket_order",
+    ).all(job.id) as Array<{ artifact_id: string; state: string }>;
+    if (tickets.length === 0 || tickets.some((ticket) => ticket.state !== "resolved")) return true;
+    const ticketIds = new Set(tickets.map((ticket) => ticket.artifact_id));
+    return ticketIds.size !== implementationTicketIds.length ||
+      implementationTicketIds.some((artifactId) => !ticketIds.has(artifactId));
+  }
+
   public leaseSkillEffect(input: Readonly<{
     ownerId: string;
     generation: number;
@@ -1150,6 +1272,98 @@ export class NavigatorRepository {
         .get(row.idempotency_key) as EffectRow;
       return parseStoredEffect(leased);
     }).immediate();
+  }
+
+  public leaseReleaseEffect(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null {
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    assertPositiveInteger(input.leaseMs, "leaseMs");
+    return this.db.transaction((): StoredEffect | null => {
+      if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return null;
+      const row = this.db.prepare(
+        `SELECT effect.*
+           FROM effects AS effect
+           JOIN navigator_release_attempts AS attempt ON attempt.effect_idempotency_key = effect.idempotency_key
+           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
+           JOIN jobs AS job ON job.id = effect.job_id
+          WHERE effect.kind = 'run_navigator_release'
+            AND job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
+            AND job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+            AND job.cancel_requested_at IS NULL
+            AND effect.job_id = attempt.job_id AND attempt.job_id = step.job_id
+            AND step.job_id = snapshot.job_id
+            AND attempt.job_version = step.job_version AND step.job_version = snapshot.job_version
+            AND attempt.workflow_revision = step.workflow_revision
+            AND step.workflow_revision = snapshot.workflow_revision
+            AND attempt.snapshot_digest = snapshot.digest
+            AND job.workflow_revision = step.workflow_revision
+            AND job.current_workflow_step_id = attempt.workflow_step_id
+            AND NOT EXISTS (
+              SELECT 1 FROM navigator_release_outcomes AS outcome WHERE outcome.attempt_id = attempt.id
+            )
+            AND ((effect.status IN ('pending', 'failed') AND effect.next_attempt_at <= ?)
+              OR (effect.status = 'leased' AND effect.lease_expires_at <= ?))
+          ORDER BY effect.created_at, effect.idempotency_key
+          LIMIT 1`,
+      ).get(input.now, input.now) as EffectRow | undefined;
+      if (!row) return null;
+      if (!(["commit", "push", "pull_request"] as const).every((operation) => this.taskAuthorities.admitEffect(
+        row.job_id,
+        row.idempotency_key,
+        operation,
+        input.now,
+      ))) return null;
+      const updated = this.db.prepare(
+        `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+             lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+          WHERE idempotency_key = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+            OR (status = 'leased' AND lease_expires_at <= ?))`,
+      ).run(
+        input.ownerId,
+        input.generation,
+        input.now + input.leaseMs,
+        input.now,
+        row.idempotency_key,
+        input.now,
+        input.now,
+      );
+      if (updated.changes !== 1) return null;
+      const leased = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?")
+        .get(row.idempotency_key) as EffectRow;
+      return parseStoredEffect(leased);
+    }).immediate();
+  }
+
+  public getReleaseAttempt(id: string): NavigatorReleaseAttempt | null {
+    assertIdentifier(id, "attemptId");
+    const row = this.db.prepare("SELECT * FROM navigator_release_attempts WHERE id = ?").get(id) as {
+      id: string;
+      job_id: string;
+      workflow_step_id: string;
+      effect_idempotency_key: string;
+      implementation_ticket_ids_json: string;
+      snapshot_digest: string;
+      job_version: number;
+      workflow_revision: number;
+    } | undefined;
+    if (!row) return null;
+    return {
+      id: row.id,
+      jobId: row.job_id,
+      workflowStepId: row.workflow_step_id,
+      effectIdempotencyKey: row.effect_idempotency_key,
+      implementationTicketIds: JSON.parse(row.implementation_ticket_ids_json) as readonly string[],
+      snapshotDigest: row.snapshot_digest,
+      jobVersion: row.job_version,
+      workflowRevision: row.workflow_revision,
+    };
   }
 
   public bindAttemptResource(input: Readonly<{
@@ -1491,11 +1705,13 @@ export class NavigatorRepository {
 
   private decisionForProposal(proposalId: string): NavigatorProposalDecision | null {
     const row = this.db.prepare(
-      `SELECT decision.*, step.id AS workflow_step_id, attempt.id AS attempt_id,
-              attempt.effect_idempotency_key
+      `SELECT decision.*, step.id AS workflow_step_id,
+              COALESCE(attempt.id, release_attempt.id) AS attempt_id,
+              COALESCE(attempt.effect_idempotency_key, release_attempt.effect_idempotency_key) AS effect_idempotency_key
          FROM navigator_decisions AS decision
          LEFT JOIN workflow_steps AS step ON step.proposal_id = decision.proposal_id
          LEFT JOIN navigator_skill_attempts AS attempt ON attempt.workflow_step_id = step.id
+         LEFT JOIN navigator_release_attempts AS release_attempt ON release_attempt.workflow_step_id = step.id
         WHERE decision.proposal_id = ?`,
     ).get(proposalId) as {
       snapshot_id: string;

@@ -283,9 +283,46 @@ function policySource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): bool
         AND revision.policy_digest = observation.policy_digest
         AND job.version = observation.observed_job_version
         AND job.state = 'awaiting_merge_approval'
-        AND json_extract(job.policy_json, '$.production') IS NULL
-        AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+        AND (
+          (
+            json_extract(job.policy_json, '$.production') IS NULL
+            AND COALESCE(json_extract(job.policy_json, '$.autonomy.mergeWithoutProduction'), 0) <> 1
+          ) OR (
+            json_extract(job.policy_json, '$.production') IS NOT NULL
+            AND json_extract(job.policy_json, '$.production.rollbackCommand') IS NULL
+          )
+        )
         AND source_effect.kind = 'issue_approval'
+     LIMIT 1`,
+  ).get(input.jobId, input.authorityId, input.authorityRevision, input.affectedEffectIdempotencyKey) !== undefined;
+}
+
+function productionRecoverySource(db: SqliteDatabase, input: CreateOwnerBoundaryInput): boolean {
+  if (!input.affectedEffectIdempotencyKey) return false;
+  return db.prepare(
+    `SELECT 1
+       FROM production_recovery_observations AS observation
+       JOIN task_authority_current AS current
+         ON current.job_id = observation.job_id
+        AND current.authority_id = observation.authority_id
+        AND current.revision = observation.authority_revision
+       JOIN task_authority_revisions AS revision
+         ON revision.authority_id = observation.authority_id
+        AND revision.revision = observation.authority_revision
+       JOIN jobs AS job ON job.id = observation.job_id
+       JOIN effects AS source_effect
+         ON source_effect.idempotency_key = observation.source_effect_idempotency_key
+        AND source_effect.job_id = observation.job_id
+      WHERE observation.job_id = ?
+        AND observation.authority_id = ?
+        AND observation.authority_revision = ?
+        AND observation.affected_effect_idempotency_key = ?
+        AND revision.status = 'suspended' AND revision.task_outcome = 'shipped_change'
+        AND revision.artifact_graph_digest = observation.artifact_graph_digest
+        AND revision.policy_digest = observation.policy_digest
+        AND job.version = observation.observed_job_version
+        AND job.state = 'production_failed'
+        AND source_effect.kind IN ('deploy_production', 'verify_production')
      LIMIT 1`,
   ).get(input.jobId, input.authorityId, input.authorityRevision, input.affectedEffectIdempotencyKey) !== undefined;
 }
@@ -300,7 +337,7 @@ const BOUNDARY_SOURCE_VALIDATORS = {
   irreversible_effect_required: unavailableSource,
   policy_change_required: policySource,
   technical_tradeoff_required: unavailableSource,
-  production_recovery_required: unavailableSource,
+  production_recovery_required: productionRecoverySource,
 } satisfies Record<OwnerBoundaryCode, BoundarySourceValidator>;
 
 function durableBoundaryFacts(db: SqliteDatabase, input: CreateOwnerBoundaryInput): readonly string[] {

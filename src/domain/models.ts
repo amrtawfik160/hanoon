@@ -162,7 +162,7 @@ export const projectPolicySchema = z
     // nobody is watching an unattended merge do it. A rollback command is the
     // one thing that turns that from an incident into a recovery, so it is
     // required before the owner's signature may be skipped.
-    if (policy.autonomy?.unattendedMerge && policy.production && !policy.production.rollbackCommand) {
+    if (policy.autonomy?.unattendedMerge && policy.production && !productionHasRollbackCommand(policy)) {
       context.addIssue({
         code: "custom",
         path: ["autonomy", "unattendedMerge"],
@@ -444,6 +444,10 @@ export function mergesWithoutProduction(policy: ProjectPolicy | null | undefined
   return policy?.production === undefined && policy?.autonomy?.mergeWithoutProduction === true;
 }
 
+export function productionHasRollbackCommand(policy: ProjectPolicy | null | undefined): boolean {
+  return policy?.production?.rollbackCommand !== undefined;
+}
+
 export function isReviewedPrCompletionBlock(
   job: Pick<Job, "state" | "blockedReason" | "lastError" | "prNumber" | "policy">,
 ): boolean {
@@ -594,6 +598,7 @@ export interface JobEffect {
     | "steer_implementation"
     | "run_navigator_skill"
     | "run_navigator_ticket_worker"
+    | "run_navigator_release"
     | "reconcile_job";
   payload: Record<string, unknown>;
 }
@@ -626,6 +631,7 @@ export type JobEvent =
   | { type: "CRITIQUE_NEEDS_REVISION"; attemptId: string; summary: string }
   | { type: "IMPLEMENTATION_CREATED"; threadId: string; environmentId: string }
   | { type: "IMPLEMENTATION_IDLE" }
+  | { type: "RELEASE_STARTED"; number: number; url: string; environmentId: string }
   | { type: "PR_LOCATED"; number: number; url: string }
   | { type: "PR_HEAD_RESOLVED"; headSha: string }
   | { type: "REVIEW_STARTED"; laneCount?: number }
@@ -669,6 +675,7 @@ export type JobEvent =
   | { type: "DEPLOY_FAILED"; reason: string }
   | { type: "CANARY_SUCCEEDED"; summary: string }
   | { type: "CANARY_FAILED"; reason: string }
+  | { type: "PRODUCTION_INCIDENT_RECOVERED"; phase: "deploy" | "canary"; reason: string }
   | { type: "THREAD_FAILED"; workerKind?: WorkerKind; error?: string }
   | {
       type: "WORKER_RECOVERY_REQUESTED";
