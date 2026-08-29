@@ -3923,6 +3923,35 @@ SELECT observation.observation_id, observation.job_id, observation.authority_id,
    AND boundary.authority_revision = observation.authority_revision
    AND boundary.affected_effect_idempotency_key = observation.affected_effect_idempotency_key
  WHERE boundary.status <> 'revoked';
+`, String.raw`
+CREATE TRIGGER policy_boundary_observations_require_live_executor_fence
+BEFORE INSERT ON policy_boundary_observations
+WHEN EXISTS (
+  SELECT 1
+    FROM effects AS source_effect
+    JOIN task_authority_effect_admissions AS admission
+      ON admission.effect_idempotency_key = source_effect.idempotency_key
+     AND admission.job_id = source_effect.job_id
+     AND admission.effect = 'read'
+     AND admission.effect_payload_json = source_effect.payload_json
+     AND admission.authority_id = NEW.authority_id
+     AND admission.authority_revision = NEW.authority_revision
+   WHERE source_effect.idempotency_key = NEW.source_effect_idempotency_key
+     AND source_effect.job_id = NEW.job_id
+) AND NOT EXISTS (
+  SELECT 1
+    FROM effects AS source_effect
+    JOIN executor_lease AS lease
+      ON lease.singleton = 1
+     AND lease.owner_id = source_effect.lease_owner
+     AND lease.generation = source_effect.lease_generation
+   WHERE source_effect.idempotency_key = NEW.source_effect_idempotency_key
+     AND source_effect.job_id = NEW.job_id
+     AND source_effect.status = 'leased'
+     AND source_effect.lease_expires_at > NEW.observed_at
+     AND lease.lease_expires_at > NEW.observed_at
+)
+BEGIN SELECT RAISE(ABORT, 'policy observation lacks a live executor fence'); END;
 `] as const;
 
 export const ALL_MIGRATIONS = [

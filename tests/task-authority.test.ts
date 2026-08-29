@@ -138,6 +138,46 @@ function policyApprovalPayload(
   };
 }
 
+function forgeCanonicalPolicyApprovalAdmission(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  policy: ReturnType<typeof policyFixture>,
+  key: string,
+  headSha: string,
+): void {
+  const db = fixture.bb.storage.database();
+  const authority = fixture.store.getTaskAuthority(fixture.job.id);
+  if (!authority) throw new Error("policy approval authority is missing");
+  const payloadJson = JSON.stringify(policyApprovalPayload(fixture, policy, headSha));
+  db.prepare("UPDATE effects SET payload_json = ? WHERE idempotency_key = ?").run(payloadJson, key);
+  db.prepare(
+    `INSERT INTO task_authority_effect_admissions (
+       effect_idempotency_key, job_id, authority_id, authority_revision, effect,
+       effect_payload_json, admitted_at
+     ) VALUES (?, ?, ?, 1, 'read', ?, 10004)`,
+  ).run(key, fixture.job.id, authority.authorityId, payloadJson);
+}
+
+function insertPolicyBoundaryObservationSql(
+  fixture: ReturnType<typeof ownerJobFixture>,
+  key: string,
+): void {
+  const authority = fixture.store.getTaskAuthority(fixture.job.id);
+  if (!authority) throw new Error("policy approval authority is missing");
+  fixture.bb.storage.database().prepare(
+    `INSERT INTO policy_boundary_observations (
+       observation_id, job_id, authority_id, authority_revision, artifact_graph_digest, policy_digest,
+       source_effect_idempotency_key, affected_effect_idempotency_key, observed_job_version, observed_at
+     ) VALUES ('forged_observation', ?, ?, 1, ?, ?, ?, ?, 2, 10005)`,
+  ).run(
+    fixture.job.id,
+    authority.authorityId,
+    authority.artifactGraphDigest,
+    authority.policyDigest,
+    key,
+    `${fixture.job.id}:3:merge_pr`,
+  );
+}
+
 async function runApprovalEffect(
   fixture: ReturnType<typeof ownerJobFixture>,
   key: string,
@@ -1296,6 +1336,76 @@ describe("owner task authority intake", () => {
       key,
       `${fixture.job.id}:3:merge_pr`,
     )).toThrow(/admitted policy approval source/u);
+  });
+
+  // ROOT-41-007: the accepted durable forgery is canonical payload, matching
+  // read admission, then observation. ROOT-41-003: SQLite must still fail closed.
+  it.each([
+    ["no live source lease", null],
+    ["a foreign source lease owner", {
+      lease_owner: "forged",
+      lease_generation: "current",
+      lease_expires_at: 40_004,
+    }],
+    ["a stale source lease generation", {
+      lease_owner: "executor",
+      lease_generation: "stale",
+      lease_expires_at: 40_004,
+    }],
+    ["an expired source lease", {
+      lease_owner: "executor",
+      lease_generation: "current",
+      lease_expires_at: 10_005,
+    }],
+  ] as const)("prevents direct SQL from recording a forged admitted policy observation with %s", (_scenario, forgedLease) => {
+    const policy = policyFixture({ production: undefined });
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policy);
+    const headSha = sha("e");
+    const key = prepareApprovalEffect(fixture, policy, headSha);
+    forgeCanonicalPolicyApprovalAdmission(fixture, policy, key, headSha);
+    if (forgedLease) {
+      fixture.bb.storage.database().prepare(
+        `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+           lease_expires_at = ?, updated_at = 10004
+         WHERE idempotency_key = ?`,
+      ).run(
+        forgedLease.lease_owner,
+        forgedLease.lease_generation === "current" ? fixture.leaseGeneration : fixture.leaseGeneration + 1,
+        forgedLease.lease_expires_at,
+        key,
+      );
+    }
+
+    expect(() => insertPolicyBoundaryObservationSql(fixture, key)).toThrow(/live executor fence/u);
+    expect(fixture.bb.storage.database().prepare(
+      "SELECT * FROM policy_boundary_observations WHERE job_id = ?",
+    ).all(fixture.job.id)).toEqual([]);
+  });
+
+  it("records a live-leased admitted policy observation and keeps it after restart", () => {
+    const fixture = ownerJobFixture("Fix and ship the retry loop", policyFixture({ production: undefined }));
+    const { sourceEffectIdempotencyKey, affectedEffectIdempotencyKey } = preparePolicyBoundaryObservation(fixture);
+    const observation = fixture.bb.storage.database().prepare(
+      `SELECT source_effect_idempotency_key, affected_effect_idempotency_key, observed_job_version
+         FROM policy_boundary_observations WHERE job_id = ?`,
+    ).get(fixture.job.id);
+    expect(observation).toEqual({
+      source_effect_idempotency_key: sourceEffectIdempotencyKey,
+      affected_effect_idempotency_key: affectedEffectIdempotencyKey,
+      observed_job_version: 2,
+    });
+
+    const reopened = openStore(fixture.bb.storage, fixture.bb.storage.kv, () => 10_000);
+    expect(reopened.recordOwnerBoundary({
+      ...boundaryInput(fixture.job.id),
+      affectedEffectIdempotencyKey,
+    })).toMatchObject({
+      jobId: fixture.job.id,
+      code: "policy_change_required",
+      status: "pending",
+      affectedEffectIdempotencyKey,
+    });
+    expect(reopened.listOwnerBoundaries(fixture.job.id)).toHaveLength(1);
   });
 
   it.each([
