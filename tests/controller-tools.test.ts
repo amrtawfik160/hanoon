@@ -4,11 +4,11 @@ import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { BUNDLED_SKILL_IDS, buildWorkerThreadTitle, type WorkerSkillRole } from "../src/agent-skills/role-resolver";
 import {
-  CAPABILITY_GRAPH_DIGEST,
-  CAPABILITY_REGISTRY_DIGEST,
+  HISTORICAL_RECIPE_CAPABILITY_BY_ID,
+  HISTORICAL_RECIPE_GRAPH_DIGEST,
+  HISTORICAL_RECIPE_REGISTRY_DIGEST,
   CONTROLLER_PROTOCOL_TOOL_IDS,
 } from "../src/capabilities/catalog";
-import { selectCapabilityProfile } from "../src/capabilities/profiles";
 import { hashSecret } from "../src/crypto";
 import { admitConfirmedJob, policyFixture, sha } from "./helpers";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -979,11 +979,13 @@ it("atomically creates one queued controller job with one confirmed admission", 
     state: "awaiting_confirmation",
     projectId: "proj_1",
     policyVersion: 1,
-    taskRecipe: "bug",
+    workflowEngine: "navigator-v1",
+    workflowMode: "deterministic",
+    routingMode: "legacy",
     recipeVersion: 1,
     recipePromotionCount: 0,
-    routingMode: "shadow",
   });
+  expect(job.taskRecipe).not.toBe("bug");
   expect(store.getAdmission(job.id)).toMatchObject({
     projectId: "proj_1",
     state: "queued",
@@ -1011,9 +1013,10 @@ it("does not let an explicit legacy small-fix hint downgrade behavioral work", (
   });
   expect(job).toMatchObject({
     deliveryMode: "full",
-    taskRecipe: "bounded",
-    routingMode: "shadow",
+    workflowEngine: "navigator-v1",
+    routingMode: "legacy",
   });
+  expect(job.taskRecipe).not.toBe("bounded");
 });
 
 it("creates an adopted-PR job with honest skipped planning stages", () => {
@@ -1033,13 +1036,14 @@ it("creates an adopted-PR job with honest skipped planning stages", () => {
   expect(job).toMatchObject({
     state: "awaiting_confirmation",
     origin: "adopted_pr",
-    taskRecipe: "adopted-pr",
-    routingMode: "shadow",
+    workflowEngine: "navigator-v1",
+    routingMode: "legacy",
     adoptedBranch: "telegram-agent/adopt-pr-17-aaaaaaaaaaaa",
     adoptedHeadSha: headSha,
     prNumber: 17,
     prHeadSha: headSha,
   });
+  expect(job.taskRecipe).not.toBe("adopted-pr");
   expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
     state: "skipped",
     outcome: { disposition: "skipped", reason: "existing_pull_request" },
@@ -1150,7 +1154,6 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   expect(new Set(selected.tools.map((tool) => tool.name))).toEqual(new Set(minimumTools));
   expect(selected.skills).toEqual([
     "driving-bb",
-    "proportional-development-workflow",
     "unslop",
   ]);
   expect(selected.instructions).toContain("You are the owner's teammate");
@@ -1533,9 +1536,8 @@ it("routes verified implementation attempts through their exact durable effect b
     tools: [],
     skills: [
       "unslop",
-      "systematic-debugging",
-      "test-driven-development",
-      "verification-before-completion",
+      "diagnosing-bugs",
+      "tdd",
       "clean-code-guard",
       "test-guard",
       "durable-boundary-audit",
@@ -1586,20 +1588,16 @@ it("routes an active worker from only its exact persisted capability profile", a
   if (!activeJob) throw new Error("active job missing");
   const attemptId = `attempt:${implementationEffect.idempotencyKey}`;
   store.createAttempt({ id: attemptId, jobId: job.id, kind: "implementation", ordinal: 1, now: 1_006 });
-  const selected = selectCapabilityProfile({
-    role: "implementation",
-    recipe: activeJob.taskRecipe,
-    stage: "implementation",
-    traits: ["behavioral-change"],
-  });
+  const unslop = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get("unslop");
+  if (!unslop) throw new Error("historical unslop descriptor missing");
   const persisted = store.createCapabilityProfile({
     subjectKind: "worker_attempt",
     subjectId: attemptId,
     threadId: null,
     recipeId: activeJob.taskRecipe,
     recipeVersion: activeJob.recipeVersion,
-    registryDigest: CAPABILITY_REGISTRY_DIGEST,
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active",
     model: {
       pool: "strong",
@@ -1608,12 +1606,12 @@ it("routes an active worker from only its exact persisted capability profile", a
       reasoning: "xhigh",
       serviceTier: "fast",
     },
-    assignments: selected.assignments.map((assignment) => ({
-      capabilityId: assignment.capabilityId,
-      descriptorDigest: assignment.descriptorDigest,
+    assignments: [{
+      capabilityId: "unslop",
+      descriptorDigest: unslop.digest,
       capabilityKind: "skill",
-      mandatory: assignment.mandatory,
-    })),
+      mandatory: unslop.evidence.requirement === "mandatory",
+    }],
     reasonCodes: ["worker_role:implementation", "worker_stage:implementation"],
     traits: ["behavioral-change"],
     now: 1_006,
@@ -1624,10 +1622,10 @@ it("routes an active worker from only its exact persisted capability profile", a
 
   expect(configuration).toMatchObject({
     tools: [],
-    skills: ["test-driven-development", "verification-before-completion"],
+    skills: ["unslop"],
   });
-  expect(configuration.instructions).toContain(`Selected skill ids: ${selected.skills.join(", ")}`);
-  expect(configuration.instructions).not.toContain("systematic-debugging");
+  expect(configuration.instructions).toContain("Selected skill ids: unslop");
+  expect(configuration.instructions).not.toContain("diagnosing-bugs");
   expect(store.getActiveCapabilityProfile("worker_attempt", attemptId)?.id).toBe(persisted.id);
 });
 
@@ -1651,7 +1649,7 @@ it("fails closed for an active worker whose persisted profile is missing or stal
     recipeId: activeJob.taskRecipe,
     recipeVersion: activeJob.recipeVersion,
     registryDigest: "0".repeat(64),
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active",
     model: { pool: "strong", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
     assignments: [],
@@ -1681,11 +1679,11 @@ it("routes review variants and pipeline stages only when their stored role and e
   store.createAttempt({ id: finalReviewId, jobId: finalReview.job.id, kind: "review", ordinal: 2, headSha: sha(), now: 2_101 });
 
   const cases = [
-    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit", "blast-radius"]],
+    [{ jobId: review.job.id, attemptId: reviewId, role: "review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "durable-boundary-audit", "blast-radius", "code-review"]],
     [{ jobId: finalReview.job.id, attemptId: finalReviewId, role: "final-review" as const }, undefined, ["unslop", "clean-code-guard", "test-guard", "docs-guard", "durable-boundary-audit", "blast-radius"]],
-    [{ jobId: implementation.job.id, attemptId: `stage:${planEffect.idempotencyKey}`, role: "planner" as const }, "thr_plan", ["unslop", "writing-plans", "docs-guard"]],
+    [{ jobId: implementation.job.id, attemptId: `stage:${planEffect.idempotencyKey}`, role: "planner" as const }, "thr_plan", ["unslop", "writing-for-agents", "docs-guard"]],
     [{ jobId: implementation.job.id, attemptId: `stage:${critiqueEffect.idempotencyKey}`, role: "critic" as const }, undefined, ["unslop"]],
-    [{ jobId: docs.job.id, attemptId: `stage:${docs.effect.idempotencyKey}`, role: "documentation" as const }, undefined, ["unslop", "technical-writing", "docs-guard", "verification-before-completion"]],
+    [{ jobId: docs.job.id, attemptId: `stage:${docs.effect.idempotencyKey}`, role: "documentation" as const }, undefined, ["unslop", "technical-writing", "docs-guard"]],
   ] as const;
   for (const [identity, threadId, skills] of cases) {
     const configuration = await harness.behavior.resolveAgentConfiguration(workerContext(bb.pluginId, identity, threadId === undefined ? {} : {

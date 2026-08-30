@@ -42,6 +42,7 @@ import {
   type WorkerTitleIdentity,
 } from "../agent-skills/role-resolver";
 import {
+  capabilityCatalogView,
   CAPABILITY_BY_ID,
   CAPABILITY_GRAPH_DIGEST,
   CAPABILITY_REGISTRY_DIGEST,
@@ -565,16 +566,17 @@ function durableWorkerIdentity(
   if (!job || job.projectId !== input.context.project.id) return null;
   let persistedSkillProfile: DurableWorkerIdentity["persistedSkillProfile"];
   if (job.routingMode === "active") {
+    const catalog = capabilityCatalogView(job.workflowEngine);
     const profile = store.getActiveCapabilityProfile("worker_attempt", input.title.attemptId);
     if (!profile || profile.subjectId !== input.title.attemptId || profile.recipeId !== job.taskRecipe ||
-      profile.recipeVersion !== job.recipeVersion || profile.registryDigest !== CAPABILITY_REGISTRY_DIGEST ||
-      profile.graphDigest !== CAPABILITY_GRAPH_DIGEST ||
+      profile.recipeVersion !== job.recipeVersion || profile.registryDigest !== catalog.registryDigest ||
+      profile.graphDigest !== catalog.graphDigest ||
       (profile.threadId !== null && profile.threadId !== input.threadId)) return null;
     const assignments = profile.assignments.flatMap((assignment) => {
-      const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+      const descriptor = catalog.byId.get(assignment.capabilityId);
       if (!descriptor || descriptor.kind !== "skill" || descriptor.route !== "worker" ||
-        !descriptor.routing.roles.includes(input.title.role) ||
-        !descriptor.routing.recipes.includes(job.taskRecipe)) return [];
+        !descriptor.routing.roles.includes(input.title.role)) return [];
+      if (job.workflowEngine === "recipe-v1" && !descriptor.routing.recipes.includes(job.taskRecipe)) return [];
       return [{
         capabilityId: assignment.capabilityId as CapabilitySkillId,
         descriptorDigest: assignment.descriptorDigest,
@@ -611,6 +613,7 @@ function durableWorkerIdentity(
     environmentId: job.environmentId,
     threadId: input.threadId,
     routingMode: job.routingMode,
+    workflowEngine: job.workflowEngine,
     persistedSkillProfile,
   };
 }

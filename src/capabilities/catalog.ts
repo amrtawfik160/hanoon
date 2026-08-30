@@ -57,12 +57,12 @@ const ADMITTED_SKILL_BUNDLE = {
   "codebase-design": { sourceDigest: "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2", bundleDescriptorDigest: "46460be29afb7f5ebdfc8bda398ad9c21199c5074850cf8a7707ec8378c70136", invocationClass: "model" },
   "diagnosing-bugs": { sourceDigest: "77f3cf31bc99b2f49af943222526531fcc9fc41d047626d3640e875e85af3e84", bundleDescriptorDigest: "2e9d27811a60afee0ee9951a75e459cf59489e712e1ac0832f663940184558f5", invocationClass: "model" },
   "docs-guard": { sourceDigest: "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef", bundleDescriptorDigest: "9cb8301e495687ad40ee11e8e1ccb508a0b2c331423880eb8fbb753a517a9f06", invocationClass: "model" },
-  "domain-modeling": { sourceDigest: "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e", bundleDescriptorDigest: "212f3ce6227d6e59255a7710fe818e03a80c1ba536214698730506235f3241ba", invocationClass: "model" },
+  "domain-modeling": { sourceDigest: "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e", bundleDescriptorDigest: "60fa9d0ae9095d4ebe066b51d5e78529ca8cb75302aed71de4181f0f946db8bb", invocationClass: "model" },
   "driving-bb": { sourceDigest: "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216", bundleDescriptorDigest: "956e67950b79a179ba0f814836a2812b12147bf76928c9ae39f6ae2b950a22bb", invocationClass: "model" },
   "durable-boundary-audit": { sourceDigest: "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f", bundleDescriptorDigest: "39270df4fabf5032e62eecc9cd4c99425afd533ce20492b321477aca9f08cd2f", invocationClass: "model" },
   "grill-me": { sourceDigest: "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637", bundleDescriptorDigest: "b60265b7de314625667b53857322f0a543502705a8453c0b2023bc0308bd1938", invocationClass: "user" },
-  "grill-with-docs": { sourceDigest: "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe", bundleDescriptorDigest: "3b123f6d7fb7568adddd55dbdf43d8530583774d0e439bb765fa07ac2b1c07ce", invocationClass: "user" },
-  grilling: { sourceDigest: "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2", bundleDescriptorDigest: "4f98e2ee6df7cab51bcba268d1373c521c9ccd44d150205dd44ccc2bcdbd876d", invocationClass: "model" },
+  "grill-with-docs": { sourceDigest: "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe", bundleDescriptorDigest: "164d91e3beb314fb449ce5aa004b63df3cde7971d9e35ea4c12cb4d8c4e99bf5", invocationClass: "user" },
+  grilling: { sourceDigest: "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2", bundleDescriptorDigest: "45ecfed1492a2c7647346d3b3f8e21c6a09552c078cf97c2748ab914621beeab", invocationClass: "model" },
   handoff: { sourceDigest: "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25", bundleDescriptorDigest: "423c22f3804d4033a4435e629187bad38242fe76199376cc2ee039bf025753ff", invocationClass: "user" },
   implement: { sourceDigest: "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3", bundleDescriptorDigest: "e41da514b2c2f671bff0efc0dee773a606842c84ae1dccb6e5f82d43595a80ef", invocationClass: "user" },
   "improve-codebase-architecture": { sourceDigest: "d1ac25511a936ff4250a48dbcefda363837d6bb9321b3cba73df99fa37270a75", bundleDescriptorDigest: "24732f0720aaa6b7dd37db3669e394722698d24ba0578098ed3990fab739ac9b", invocationClass: "user" },
@@ -589,7 +589,18 @@ const modelPoolDescriptors = (["fast", "standard", "strong"] as const).map((pool
   evidenceStrength: pool === "strong" ? "high" : "standard",
 }));
 
-export const CAPABILITY_CATALOG = validateCapabilityCatalog([
+function catalogDigests(catalog: readonly CapabilityDescriptor[]): Readonly<{ registry: string; graph: string }> {
+  return {
+    registry: createHash("sha256")
+      .update(JSON.stringify(catalog.map((entry) => [entry.id, entry.digest])), "utf8")
+      .digest("hex"),
+    graph: createHash("sha256")
+      .update(JSON.stringify(catalog.map((entry) => [entry.id, entry.composition])), "utf8")
+      .digest("hex"),
+  };
+}
+
+export const HISTORICAL_RECIPE_CAPABILITY_CATALOG = validateCapabilityCatalog([
   ...skillDescriptors,
   ...toolDescriptors,
   ...bundleDescriptors,
@@ -597,15 +608,266 @@ export const CAPABILITY_CATALOG = validateCapabilityCatalog([
   ...recipeDescriptors,
   ...modelPoolDescriptors,
 ]);
+export const HISTORICAL_RECIPE_CAPABILITY_BY_ID: ReadonlyMap<string, CapabilityDescriptor> = new Map(
+  HISTORICAL_RECIPE_CAPABILITY_CATALOG.map((entry) => [entry.id, entry]),
+);
+export const HISTORICAL_RECIPE_REGISTRY_DIGEST =
+  "d14130f744f1ca484beec08d8956a20e16db854b88a304f9576fcc79bdaa0481";
+export const HISTORICAL_RECIPE_GRAPH_DIGEST =
+  "665deccc825d74de0d814e94a3799ea50aab2d18176ea6aacbc779651eebf64e";
+
+const historicalDigests = catalogDigests(HISTORICAL_RECIPE_CAPABILITY_CATALOG);
+if (historicalDigests.registry !== HISTORICAL_RECIPE_REGISTRY_DIGEST) {
+  throw new Error("Historical recipe registry digest drifted");
+}
+if (historicalDigests.graph !== HISTORICAL_RECIPE_GRAPH_DIGEST) {
+  throw new Error("Historical recipe graph digest drifted");
+}
+
+const RETAINED_WORKER_SKILL_IDS = new Set<AdmittedCapabilitySkillId>([
+  "blast-radius", "checking-system-logs", "clean-code-guard", "docs-guard", "driving-bb",
+  "durable-boundary-audit", "pr-writer", "technical-writing", "test-guard", "unslop",
+]);
+
+function admittedSkillRoute(id: AdmittedCapabilitySkillId): CapabilityRoute {
+  if (RETAINED_WORKER_SKILL_IDS.has(id)) return "worker";
+  return ADMITTED_SKILL_BUNDLE[id].invocationClass === "user" ? "manual-only" : "worker";
+}
+
+function admittedSkillSource(id: AdmittedCapabilitySkillId): { source: string; version: string } {
+  if (["clean-code-guard", "docs-guard", "test-guard"].includes(id)) {
+    return { source: "https://github.com/amElnagdy/guard-skills", version: "pinned" };
+  }
+  if (id === "pr-writer") return { source: "https://github.com/getsentry/skills", version: "pinned" };
+  if (id === "technical-writing" || id === "unslop") {
+    return { source: "https://github.com/cursor/plugins", version: "pstack@60c641e4" };
+  }
+  if (["blast-radius", "checking-system-logs", "driving-bb", "durable-boundary-audit"].includes(id)) {
+    return { source: "first-party", version: "1" };
+  }
+  return { source: "https://github.com/mattpocock/skills", version: "1.2.3+6654f6b6" };
+}
+
+function admittedSkillRouting(id: AdmittedCapabilitySkillId): Pick<DescriptorInput,
+  "roles" | "stages" | "requiredTraits" | "forbiddenTraits" |
+  "prerequisites" | "conflicts" | "orderAfter" |
+  "evidenceRequirement" | "receiptType" | "evidenceStrength" | "modelPools" | "costClass"> {
+  switch (id) {
+    case "driving-bb":
+      return { roles: ["controller"], stages: ["intake"] };
+    case "unslop":
+      return {
+        roles: ["controller", "planner", "implementation", "documentation", "review"],
+        stages: ["communication"],
+        forbiddenTraits: ["strict-json"],
+      };
+    case "technical-writing":
+      return {
+        roles: ["documentation"],
+        stages: ["documentation"],
+        forbiddenTraits: ["strict-json"],
+      };
+    case "clean-code-guard":
+    case "test-guard":
+      return {
+        roles: ["review", "final-review"],
+        stages: ["review"],
+        evidenceRequirement: "mandatory",
+        receiptType: "guard",
+        evidenceStrength: "high",
+        modelPools: ["standard", "strong"],
+      };
+    case "docs-guard":
+      return {
+        roles: ["review", "final-review", "documentation"],
+        stages: ["review", "documentation"],
+        evidenceRequirement: "mandatory",
+        receiptType: "guard",
+        evidenceStrength: "high",
+        modelPools: ["standard", "strong"],
+      };
+    case "blast-radius":
+      return {
+        roles: ["review", "final-review"],
+        stages: ["review"],
+        evidenceRequirement: "mandatory",
+        receiptType: "guard",
+        evidenceStrength: "high",
+        modelPools: ["standard", "strong"],
+      };
+    case "pr-writer":
+      return {
+        roles: ["implementation"],
+        stages: ["delivery"],
+        receiptType: "worker",
+        modelPools: ["fast", "standard"],
+      };
+    case "durable-boundary-audit":
+      return {
+        roles: ["implementation", "review", "final-review"],
+        stages: ["implementation", "review"],
+        evidenceRequirement: "mandatory",
+        receiptType: "guard",
+        evidenceStrength: "high",
+        modelPools: ["standard", "strong"],
+      };
+    case "checking-system-logs":
+      return { roles: ["implementation"], stages: ["diagnosis"], modelPools: ["standard"] };
+    case "tdd":
+      return {
+        roles: ["implementation", "navigator"],
+        stages: ["workflow-step"],
+        evidenceRequirement: "mandatory",
+        receiptType: "worker",
+        modelPools: ["fast", "standard", "strong"],
+      };
+    case "diagnosing-bugs":
+      return {
+        roles: ["implementation", "navigator"],
+        stages: ["workflow-step"],
+        modelPools: ["standard", "strong"],
+      };
+    case "code-review":
+      return {
+        roles: ["review", "final-review", "navigator"],
+        stages: ["workflow-step"],
+        evidenceRequirement: "mandatory",
+        receiptType: "guard",
+        evidenceStrength: "high",
+        modelPools: ["standard", "strong"],
+      };
+    case "writing-for-agents":
+      return { roles: ["planner", "documentation", "navigator"], stages: ["workflow-step"] };
+    default:
+      return ADMITTED_SKILL_BUNDLE[id].invocationClass === "user"
+        ? { roles: ["navigator", "owner"], stages: ["workflow-step"] }
+        : { roles: ["implementation", "review", "navigator"], stages: ["workflow-step"] };
+  }
+}
+
+const admittedSkillDescriptors = ADMITTED_CAPABILITY_SKILL_IDS.map((id) => {
+  const route = admittedSkillRoute(id);
+  const source = admittedSkillSource(id);
+  return descriptor({
+    id,
+    kind: "skill",
+    route,
+    source: source.source,
+    version: source.version,
+    sourceDigest: ADMITTED_SKILL_BUNDLE[id].sourceDigest,
+    effectClass: "none",
+    dataClasses: route === "manual-only" ? ["owner-message", "repository"] : ["repository"],
+    workspaces: route === "manual-only" ? ["personal", "managed-worktree"] : ["managed-worktree"],
+    permissionModes: ["none"],
+    recipes: [],
+    ...admittedSkillRouting(id),
+  });
+});
+
+const liveToolDescriptors = toolDescriptors.map((entry) => descriptor({
+  id: entry.id,
+  kind: entry.kind,
+  source: entry.source,
+  version: entry.version,
+  sourceDigest: entry.sourceDigest,
+  route: entry.route,
+  roles: entry.routing.roles,
+  recipes: [],
+  stages: entry.routing.stages,
+  effectClass: entry.effects.class,
+  risk: entry.effects.risk,
+  dataClasses: entry.effects.dataClasses,
+  ownerApproval: entry.authority.ownerApproval,
+  egress: entry.authority.egress,
+  hosts: entry.authority.hosts,
+  workspaces: entry.authority.workspaces,
+  permissionModes: entry.authority.permissionModes,
+  inputSchema: entry.contract.inputSchema,
+  outputSchema: entry.contract.outputSchema,
+  timeoutMs: entry.contract.timeoutMs,
+  evidenceRequirement: entry.evidence.requirement,
+  receiptType: entry.evidence.receiptType,
+}));
+
+const liveBundleDescriptors = bundleDescriptors.map((entry) => descriptor({
+  id: entry.id,
+  kind: entry.kind,
+  source: entry.source,
+  version: entry.version,
+  sourceDigest: entry.sourceDigest,
+  route: entry.route,
+  roles: entry.routing.roles,
+  recipes: [],
+  stages: entry.routing.stages,
+  prerequisites: entry.composition.prerequisites,
+  effectClass: entry.effects.class,
+  dataClasses: entry.effects.dataClasses,
+  receiptType: entry.evidence.receiptType,
+}));
+
+const liveModelPoolDescriptors = modelPoolDescriptors.map((entry) => descriptor({
+  id: entry.id,
+  kind: entry.kind,
+  source: entry.source,
+  version: entry.version,
+  sourceDigest: entry.sourceDigest,
+  route: entry.route,
+  roles: entry.routing.roles,
+  recipes: [],
+  stages: entry.routing.stages,
+  effectClass: entry.effects.class,
+  risk: entry.effects.risk,
+  dataClasses: entry.effects.dataClasses,
+  egress: entry.authority.egress,
+  hosts: entry.authority.hosts,
+  workspaces: entry.authority.workspaces,
+  permissionModes: entry.authority.permissionModes,
+  costClass: entry.economics.costClass,
+  modelPools: entry.economics.modelPools,
+  evidenceRequirement: entry.evidence.requirement,
+  receiptType: entry.evidence.receiptType,
+  evidenceStrength: entry.evidence.strength,
+}));
+
+export const CAPABILITY_CATALOG = validateCapabilityCatalog([
+  ...admittedSkillDescriptors,
+  ...liveToolDescriptors,
+  ...liveBundleDescriptors,
+  ...liveModelPoolDescriptors,
+]);
 
 export const CAPABILITY_BY_ID: ReadonlyMap<string, CapabilityDescriptor> = new Map(
   CAPABILITY_CATALOG.map((entry) => [entry.id, entry]),
 );
 
-export const CAPABILITY_REGISTRY_DIGEST = createHash("sha256")
-  .update(JSON.stringify(CAPABILITY_CATALOG.map((entry) => [entry.id, entry.digest])), "utf8")
-  .digest("hex");
+export function capabilityDescriptorById(id: string, digest?: string): CapabilityDescriptor | undefined {
+  const live = CAPABILITY_BY_ID.get(id);
+  const historical = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(id);
+  if (digest !== undefined) {
+    if (live?.digest === digest) return live;
+    if (historical?.digest === digest) return historical;
+    return undefined;
+  }
+  return live ?? historical;
+}
 
-export const CAPABILITY_GRAPH_DIGEST = createHash("sha256")
-  .update(JSON.stringify(CAPABILITY_CATALOG.map((entry) => [entry.id, entry.composition])), "utf8")
-  .digest("hex");
+export const CAPABILITY_REGISTRY_DIGEST = catalogDigests(CAPABILITY_CATALOG).registry;
+export const CAPABILITY_GRAPH_DIGEST = catalogDigests(CAPABILITY_CATALOG).graph;
+
+export function capabilityCatalogView(engine: "recipe-v1" | "navigator-v1"): Readonly<{
+  byId: ReadonlyMap<string, CapabilityDescriptor>;
+  registryDigest: string;
+  graphDigest: string;
+}> {
+  return engine === "recipe-v1"
+    ? {
+      byId: HISTORICAL_RECIPE_CAPABILITY_BY_ID,
+      registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+      graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
+    }
+    : {
+      byId: CAPABILITY_BY_ID,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST,
+    };
+}

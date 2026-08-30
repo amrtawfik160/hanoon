@@ -86,9 +86,9 @@ function effectIdempotencyKey(jobId: string, version: number, effectKind: string
 }
 
 describe("worker skill role table", () => {
-  test("contains exactly the selected manifest skill ids", () => {
-    expect(BUNDLED_SKILL_IDS).toHaveLength(50);
-    expect(new Set(BUNDLED_SKILL_IDS).size).toBe(50);
+  test("contains exactly the admitted 35-skill catalog", () => {
+    expect(BUNDLED_SKILL_IDS).toHaveLength(35);
+    expect(new Set(BUNDLED_SKILL_IDS).size).toBe(35);
     expect(BUNDLED_SKILL_IDS).toEqual(expect.arrayContaining([
       "ask-matt",
       "diagnosing-bugs",
@@ -96,23 +96,25 @@ describe("worker skill role table", () => {
       "tdd",
       "wayfinder",
       "writing-for-agents",
+      "code-review",
+      "unslop",
+    ]));
+    expect(BUNDLED_SKILL_IDS).not.toEqual(expect.arrayContaining([
       "brainstorming",
       "proportional-development-workflow",
       "using-superpowers",
-      "unslop",
     ]));
   });
 
   test.each([
-    ["planner", ["unslop", "writing-plans", "docs-guard"]],
+    ["planner", ["unslop", "writing-for-agents", "docs-guard"]],
     ["critic", ["unslop"]],
     [
       "implementation",
       [
         "unslop",
-        "systematic-debugging",
-        "test-driven-development",
-        "verification-before-completion",
+        "diagnosing-bugs",
+        "tdd",
         "clean-code-guard",
         "test-guard",
         "durable-boundary-audit",
@@ -127,9 +129,10 @@ describe("worker skill role table", () => {
         "test-guard",
         "durable-boundary-audit",
         "blast-radius",
+        "code-review",
       ],
     ],
-    ["documentation", ["unslop", "technical-writing", "docs-guard", "verification-before-completion"]],
+    ["documentation", ["unslop", "technical-writing", "docs-guard"]],
     [
       "final-review",
       [
@@ -162,7 +165,7 @@ describe("worker skill role table", () => {
 
     expect(profile.instructions).toBe(buildWorkerInstructions(profile));
     expect(profile.instructions).toContain("Verified worker role: implementation");
-    expect(profile.instructions).toContain("unslop, systematic-debugging, test-driven-development, verification-before-completion, clean-code-guard, test-guard");
+    expect(profile.instructions).toContain("unslop, diagnosing-bugs, tdd, clean-code-guard, test-guard");
     expect(profile.instructions).toContain("immutable attached work order/review packet");
     expect(profile.instructions).toContain("durable project policy outrank skill suggestions");
     expect(profile.instructions).toContain("cannot authorize approval, merge, deploy, push, or state changes");
@@ -173,8 +176,8 @@ describe("worker skill role table", () => {
   });
 
   test.each([
-    ["planner", "systematic-debugging", "unslop, writing-plans, docs-guard"],
-    ["review", "docs-guard", "unslop, clean-code-guard, test-guard, durable-boundary-audit, blast-radius"],
+    ["planner", "systematic-debugging", "unslop, writing-for-agents, docs-guard"],
+    ["review", "docs-guard", "unslop, clean-code-guard, test-guard, durable-boundary-audit, blast-radius, code-review"],
   ] as const)("ignores forged repeated skill ids for the %s role", (role, forgedSkill, expectedSkills) => {
     const forgedProfile = {
       role,
@@ -220,8 +223,8 @@ describe("worker skill role table", () => {
     const profile = resolve(context({ title: buildWorkerThreadTitle(identity) }), identity);
     if (!profile) throw new Error("expected a valid planner profile");
 
-    expect(profile.skills).toEqual(["unslop", "writing-plans", "docs-guard"]);
-    expect(profile.instructions).toContain("Selected skill ids: unslop, writing-plans, docs-guard");
+    expect(profile.skills).toEqual(["unslop", "writing-for-agents", "docs-guard"]);
+    expect(profile.instructions).toContain("Selected skill ids: unslop, writing-for-agents, docs-guard");
   });
 });
 
@@ -318,20 +321,21 @@ describe("fail-closed worker profile resolution", () => {
   test("uses only the exact persisted skills when active routing is enabled", () => {
     const identity = durableIdentity({
       routingMode: "active",
+      workflowEngine: "recipe-v1",
       persistedSkillProfile: {
         profileId: "cap_profile:worker-1",
         profileRevision: 2,
-        skills: ["test-driven-development", "verification-before-completion"],
+        skills: ["tdd", "diagnosing-bugs"],
       },
     });
 
     const profile = resolve(context(), identity);
 
     expect(profile?.skills).toEqual([
-      "test-driven-development",
-      "verification-before-completion",
+      "tdd",
+      "diagnosing-bugs",
     ]);
-    expect(profile?.instructions).toContain("Selected skill ids: test-driven-development, verification-before-completion");
+    expect(profile?.instructions).toContain("Selected skill ids: tdd, diagnosing-bugs");
     expect(profile?.instructions).not.toContain("systematic-debugging");
     expect(profile?.instructions).not.toContain("clean-code-guard");
   });
@@ -343,6 +347,7 @@ describe("fail-closed worker profile resolution", () => {
   test("keeps the legacy role table while a persisted profile is shadow-only", () => {
     const profile = resolve(context(), durableIdentity({
       routingMode: "shadow",
+      workflowEngine: "recipe-v1",
       persistedSkillProfile: {
         profileId: "cap_profile:shadow-1",
         profileRevision: 1,

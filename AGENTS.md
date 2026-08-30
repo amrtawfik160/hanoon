@@ -34,7 +34,7 @@ For copy, styling, configuration, and clear mechanical changes:
 
 For clear changes to an existing flow:
 
-- Use the Superpowers bounded path
+- Use the workflow navigator
 - Present a short design in chat
 - Do not create specification or plan documents
 - Implement inline after approval
@@ -53,7 +53,7 @@ When product behavior, terminology, or important decisions are unclear:
 
 ### Architectural work
 
-Use the full Superpowers workflow only for:
+Use the full navigator workflow only for:
 
 - New systems or major architectural changes
 - Public API or schema changes
@@ -61,14 +61,14 @@ Use the full Superpowers workflow only for:
 - High-risk or multi-session work
 - Work explicitly requested as autonomous
 
-## Combining grill-with-docs and Superpowers
+## Combining grill-with-docs and the workflow navigator
 
 After a completed grilling session:
 
 - Stay in the same conversation
 - Summarize the resolved requirements and ask for confirmation
 - Treat confirmation as design approval
-- Skip Superpowers brainstorming
+- Skip extra brainstorming
 - Do not repeat the interview
 - Do not create competing specification documents
 
@@ -81,7 +81,7 @@ For architectural work:
 
 - Synthesize one specification from the grilling conversation
 - Review it once
-- Continue with Superpowers writing-plans
+- Continue with navigator planning
 - Default to inline execution
 
 Use subagent-driven development only for genuinely independent tasks, unattended execution, or high-risk work

@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { CAPABILITY_BY_ID } from "../src/capabilities/catalog";
+import { HISTORICAL_RECIPE_CAPABILITY_BY_ID } from "../src/capabilities/catalog";
 import {
   nativeAdapterActivationForTransition,
   nativeAdapterEnvelopeWithOutcome,
@@ -367,7 +367,7 @@ describe("atomic native-adapter transitions", () => {
     const selected = new Set(decisions.flatMap((decision) => decision.selectedCapabilityIds));
     const denied = new Map(decisions.flatMap((decision) =>
       decision.denied.map((entry) => [entry.capabilityId, entry.reasonCode] as const)));
-    const catalogAdapters = [...CAPABILITY_BY_ID.values()]
+    const catalogAdapters = [...HISTORICAL_RECIPE_CAPABILITY_BY_ID.values()]
       .filter((descriptor) => descriptor.kind === "native-adapter" && descriptor.route === "hanoon-native")
       .map((descriptor) => descriptor.id)
       .sort();
@@ -469,7 +469,7 @@ describe("atomic native-adapter transitions", () => {
         WHERE capability_kind = 'native-adapter' AND event_type = 'outcome'`,
     ).get()).toEqual({ count: 0 });
     for (const id of ["hanoon-native-using-git-worktrees", "hanoon-native-executing-plans"]) {
-      expect(CAPABILITY_BY_ID.get(id)?.route).toBe("hanoon-native");
+      expect(HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(id)?.route).toBe("hanoon-native");
     }
   });
 });

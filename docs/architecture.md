@@ -110,8 +110,8 @@ The capability control plane sits before provider work and reuses the delivery s
 
 ```mermaid
 flowchart LR
-    Request --> Classifier[Traits + six recipes]
-    Classifier --> JobSnapshot[Recipe + legacy/shadow/active mode]
+    Request --> Navigator[Navigator-v1 deterministic]
+    Navigator --> JobSnapshot[Job snapshot]
     JobSnapshot --> Profile[Immutable least-capability profile]
     Profile --> Route[Exact model tuple]
     Route --> Provider[BB provider boundary]
@@ -120,9 +120,9 @@ flowchart LR
     Gate --> Transition[Authoritative job transition]
 ```
 
-The pinned catalog validates every admitted skill, controller bundle, native adapter, model-pool marker, and recipe descriptor by digest and dependency graph. Profiles bind the catalog and graph digests, recipe/version, routing mode, exact model tuple, selected assignments, traits, and reason codes to one controller turn or worker attempt. A profile is written before its provider call. Selected mandatory capabilities receive exactly one terminal outcome before their stage may advance; native-adapter outcomes commit in the same SQLite transaction as the transition they authorize.
+The pinned catalog validates every admitted skill, controller bundle, native adapter, model-pool marker, and leftover recipe descriptor by digest and dependency graph. Profiles bind the catalog and graph digests, leftover recipe/version when present, routing mode, exact model tuple, selected assignments, traits, and reason codes to one controller turn or worker attempt. A profile is written before its provider call. Selected mandatory capabilities receive exactly one terminal outcome before their stage may advance; native-adapter outcomes commit in the same SQLite transaction as the transition they authorize.
 
-The six recipes are `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, and `architectural`. Their graphs express direct diff guards, approved-design implementation, diagnosis plus regression, skill baseline proof, adopted-pull-request inspection, and plan/critique plus task and integrated review respectively. Later evidence can raise rigor at most twice, never downgrade it, and the persisted job snapshot survives retry and restart.
+Leftover recipe-v1 still names six recipes: `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, and `architectural`. Those graphs remain readable for historical jobs. New work does not enter them.
 
 Active model routing pins provider, model, reasoning, and service tier before spawn. One equivalent provider failure retries the same tuple; a second escalates only the next provider call from `fast` to `standard` to `strong`. It never switches within an attempt or downgrades after restart. A second equivalent failure at `strong` blocks. Permission remains a separate policy field.
 
@@ -134,45 +134,43 @@ Rollout is per recipe. `shadow` computes candidate profiles and routing evidence
 
 Recipe promotion still has no trusted live collector, CLI ingest path, controller tool, or plugin callback that can manufacture those records. Typed pass/fail assertions cannot create a recipe ledger. A fresh installation therefore keeps every adaptive recipe in `shadow`, and `capability promote <recipe>` fails closed until a later collector proves a disposable live job.
 
-Navigator-v1 is a separate engine gate. `DualEngineCoordinator.persistEvaluationEvidence` is the trusted append seam: it records the fixed corpus, measured restart and safety counters, and the required disposable live scenarios, then writes one integrity-bound manifest. It refuses a SQL-stamped terminal job that was never executed. `capability promote navigator-v1` / `capability rollback navigator-v1` consume that ledger for new admissions only. The **Workflow engine graph** setting (`adaptive` or `recipe`, default `adaptive`) is an independent new-job kill switch: `recipe` keeps later admissions on recipe-v1 even after a reviewed navigator promotion. After that promotion, the leased executor runs the live navigator, implementation, and release workers. Jobs never change engines in place.
+Navigator-v1 is the admission engine. `DualEngineCoordinator.persistEvaluationEvidence` remains the trusted append seam for historical promotion evidence: it records the fixed corpus, measured restart and safety counters, and the required disposable live scenarios, then writes one integrity-bound manifest. It refuses a SQL-stamped terminal job that was never executed. `capability promote navigator-v1` / `capability rollback navigator-v1` still append those operator decisions, but contraction ignores them for later admissions. The **Workflow engine graph** setting (`adaptive` or `recipe`, default `adaptive`) is a retired kill switch: new jobs always use navigator-v1 in deterministic mode. The leased executor runs the live navigator, implementation, and release workers. Jobs never change engines in place. Historical recipe-v1 rows remain readable.
 
 ## Agent skill runtime
 
-The repository locks one reviewed 35-skill admitted catalog and a temporary recipe-v1 compatibility catalog. The admitted catalog combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with ten retained platform, guard, delivery, writing, and communication skills. Fifteen legacy-only workflow ids remain executable only so existing recipe jobs can finish. No runtime path downloads or repairs skills.
+The repository locks one reviewed 35-skill catalog. It combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with ten retained platform, guard, delivery, writing, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are absent from the installed bundle. No runtime path downloads or repairs skills.
 
-BB reads one level of child directories from every plugin skill root. The package therefore registers both Matt Pocock buckets, not their common parent. The three promoted ids that overlap the historical discovery root remain digest-locked under an unregistered compatibility subtree, leaving one runtime source for every id while recipe-v1 drains. The promoted descriptors stay admitted for navigator-v1. Skill expansion alone does not start those workers. New admissions reach navigator-v1 only after a reviewed promotion while **Workflow engine graph** is `adaptive`, and only then does the leased executor run the live navigator, implementation, and release workers.
+BB reads one level of child directories from every plugin skill root. The package therefore registers both Matt Pocock buckets, not their common parent. The three promoted ids that previously overlapped a historical discovery root now live in those registered buckets. New admissions always use navigator-v1. Historical recipe descriptors, registry digests, receipts, and columns remain readable and unchanged.
 
-| Registered root | Source | Purpose during expansion |
+| Registered root | Source | Purpose |
 | --- | --- | --- |
-| `skills/workflow-kit` | pinned legacy workflow kit | 14 legacy-only recipe skills |
 | `skills/guards` | [guard-skills](https://github.com/amElnagdy/guard-skills) | `clean-code-guard`, `test-guard`, `docs-guard` |
 | `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | `pr-writer` |
-| `skills/discovery` | [mattpocock/skills](https://github.com/mattpocock/skills) at the historical revision | recipe-v1 copies of `grill-with-docs`, `grilling`, and `domain-modeling` |
 | `skills/matt-pocock/engineering` | [mattpocock/skills](https://github.com/mattpocock/skills) at the reviewed revision | promoted engineering skills |
 | `skills/matt-pocock/productivity` | same reviewed source | promoted productivity skills |
-| `skills/hanoon` | first-party, with source notices where adapted | four retained platform skills and one legacy router |
+| `skills/hanoon` | first-party, with source notices where adapted | four retained platform skills |
 | `skills/pstack` | [cursor/plugins](https://github.com/cursor/plugins) at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | `unslop` and `technical-writing` |
 
-Each lock record binds the skill id, source path, source revision, source digest, descriptor digest, license, and invocation class. The three discovery collisions also have exact shadow records, proving which historical source remains first for legacy execution without admitting a second capability identity. The 35-skill admission catalog allows model-invoked skills in general workers and requires an explicit navigator or owner route for user-invoked skills.
+Each lock record binds the skill id, source path, source revision, source digest, descriptor digest, license, and invocation class. The 35-skill catalog allows model-invoked skills in general workers and requires an explicit navigator or owner route for user-invoked skills.
 
-The existing recipe-v1 role matrix remains unchanged during expansion:
+The contracted role matrix for new work is:
 
 | Verified role/context | Selected skill ids |
 | --- | --- |
-| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling` |
-| planner | `unslop`, `writing-plans`, `docs-guard` |
+| controller | `driving-bb`, `unslop`, and on an explicit grill request `grill-with-docs`, `grilling`, `domain-modeling` |
+| planner | `unslop`, `writing-for-agents`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
-| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius` |
-| documentation | `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion` |
+| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review` |
+| documentation | `unslop`, `technical-writing`, `docs-guard` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these remain deterministic stages |
 
-Role selection still requires the exact durable attempt or stage, project, managed worktree, thread title, effect, environment, and routing mode. A mismatch returns no tools and no skills. Historical capability descriptors and registry digests remain unchanged, so existing receipts and nonterminal recipe jobs retain their original interpretation.
+Role selection still requires the exact durable attempt or stage, project, managed worktree, thread title, effect, environment, and routing mode. A mismatch returns no tools and no skills. Historical recipe capability descriptors and registry digests remain unchanged, so existing receipts retain their original interpretation. Plugin start refuses while any nonterminal recipe-v1 job still needs a legacy skill or state handler.
 
 ### Bundle integrity and maintenance
 
-`npm run skills:verify` checks the package root order, schema 2 lock, exact active, legacy, and shadow catalogs, bounded regular files, complete SHA-256 coverage, frontmatter identity, invocation metadata, nested local Markdown resources, and all source provenance and licenses. Build and activation run this verifier before registration. Drift, missing support files, a path escape, a symlink, malformed metadata, a duplicate catalog entry, or an admitted `do-*` id stops activation. The verifier never changes the bundle.
+`npm run skills:verify` checks the package root order, schema 2 lock, the exact 35-skill catalog with empty legacy and shadow lists, bounded regular files, complete SHA-256 coverage, frontmatter identity, invocation metadata, nested local Markdown resources, and all source provenance and licenses. Build and activation run this verifier before registration. Drift, missing support files, a path escape, a symlink, malformed metadata, a leftover workflow or discovery kit, a duplicate catalog entry, or an admitted `do-*` id stops activation. The verifier never changes the bundle.
 
 Synchronization is a maintainer-only operation from a clean absolute checkout at the reviewed full commit:
 
@@ -182,7 +180,7 @@ MATT_SKILLS_REVISION=6654f6b60cd9d5be8b54c6fafe44346dabeb3b76
 npm run skills:sync -- --source "$MATT_SKILLS_SOURCE" --revision "$MATT_SKILLS_REVISION"
 ```
 
-The command verifies source identity, package and plugin metadata, the MIT license, the exact promoted manifest, invocation frontmatter, OpenAI metadata, tree bounds, and cleanliness. It stages the complete promoted subtrees and atomically replaces only `skills/matt-pocock` and `skills/skills.lock.json`.
+The command verifies source identity, package and plugin metadata, the MIT license, the exact promoted manifest, invocation frontmatter, OpenAI metadata, tree bounds, and cleanliness. It stages the complete promoted subtrees and atomically replaces only `skills/matt-pocock` and `skills/skills.lock.json`. `--rebuild-lock` is refused, so the lock cannot be rebuilt from the vendored tree outside that gate.
 
 ## BB threads and worktrees
 

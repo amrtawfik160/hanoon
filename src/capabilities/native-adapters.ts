@@ -5,9 +5,9 @@ import type {
 } from "../storage/capability-repository";
 import type { TelegramAgentStore } from "../storage/store";
 import {
-  CAPABILITY_BY_ID,
-  CAPABILITY_GRAPH_DIGEST,
-  CAPABILITY_REGISTRY_DIGEST,
+  HISTORICAL_RECIPE_CAPABILITY_BY_ID,
+  HISTORICAL_RECIPE_GRAPH_DIGEST,
+  HISTORICAL_RECIPE_REGISTRY_DIGEST,
 } from "./catalog";
 import { DEFAULT_MODEL_POOL_REGISTRY, selectModelRoute, type ModelPool } from "./models";
 import type { CapabilityTerminalOutcome } from "./contracts";
@@ -148,7 +148,7 @@ export function nativeAdapterRequirementForEvent(
   job: Job,
   event: JobEvent,
 ): NativeAdapterRequirement | null {
-  if (job.routingMode !== "active") return null;
+  if (job.workflowEngine !== "recipe-v1" || job.routingMode !== "active") return null;
   if (event.type === "PLAN_CREATED") {
     return {
       transition: "plan-worktree-created",
@@ -203,7 +203,7 @@ function adapterEvidence(
   transition: NativeAdapterTransition,
   operationDigest: string,
 ): string[] {
-  const adapter = CAPABILITY_BY_ID.get(capabilityId);
+  const adapter = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(capabilityId);
   const contract = ADAPTER_CONTRACTS[capabilityId];
   if (!adapter || adapter.kind !== "native-adapter" || adapter.route !== "hanoon-native" || !contract) {
     throw new TypeError(`Unknown native adapter ${capabilityId}`);
@@ -212,7 +212,7 @@ function adapterEvidence(
     throw new TypeError(`Native adapter ${capabilityId} must bind exactly one source skill`);
   }
   const sourceSkillId = adapter.composition.prerequisites[0];
-  const sourceSkill = CAPABILITY_BY_ID.get(sourceSkillId);
+  const sourceSkill = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(sourceSkillId);
   if (!sourceSkill || sourceSkill.kind !== "skill" || sourceSkill.route !== "hanoon-native") {
     throw new TypeError(`Native adapter ${capabilityId} has an invalid source skill`);
   }
@@ -238,7 +238,7 @@ export function prepareNativeAdapterTransition(input: Readonly<{
   minimumModelPool?: ModelPool;
   now: number;
 }>): NativeAdapterTransitionEnvelope | undefined {
-  if (input.job.routingMode !== "active") return undefined;
+  if (input.job.workflowEngine !== "recipe-v1" || input.job.routingMode !== "active") return undefined;
   const operationDigest = createHash("sha256").update(input.effectIdempotencyKey, "utf8").digest("hex");
   const activation = nativeAdapterActivationForTransition(input.job, input.transition, input.reviewLaneCount);
   const capabilityIds = [...activation.selectedCapabilityIds];
@@ -252,7 +252,7 @@ export function prepareNativeAdapterTransition(input: Readonly<{
     minimumPool: input.minimumModelPool,
   }, DEFAULT_MODEL_POOL_REGISTRY);
   const assignments = capabilityIds.map((capabilityId) => {
-    const descriptor = CAPABILITY_BY_ID.get(capabilityId);
+    const descriptor = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(capabilityId);
     if (!descriptor || descriptor.kind !== "native-adapter" || descriptor.route !== "hanoon-native") {
       throw new TypeError(`Native adapter ${capabilityId} is not an admitted exact descriptor`);
     }
@@ -271,8 +271,8 @@ export function prepareNativeAdapterTransition(input: Readonly<{
     subjectId,
     recipeId: input.job.taskRecipe,
     recipeVersion: input.job.recipeVersion,
-    registryDigest: CAPABILITY_REGISTRY_DIGEST,
-    graphDigest: CAPABILITY_GRAPH_DIGEST,
+    registryDigest: HISTORICAL_RECIPE_REGISTRY_DIGEST,
+    graphDigest: HISTORICAL_RECIPE_GRAPH_DIGEST,
     mode: "active" as const,
     model,
     assignments,
@@ -310,7 +310,7 @@ export function prepareNativeAdapterTransition(input: Readonly<{
     throw new TypeError(`Persisted native-adapter profile does not match immutable ${changed.join(",")}`);
   }
   for (const denial of activation.denied) {
-    const descriptor = CAPABILITY_BY_ID.get(denial.capabilityId);
+    const descriptor = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(denial.capabilityId);
     if (!descriptor || descriptor.kind !== "native-adapter" || descriptor.route !== "hanoon-native") {
       throw new TypeError(`Denied native adapter ${denial.capabilityId} is not an admitted exact descriptor`);
     }
@@ -347,7 +347,7 @@ export function prepareNativeAdapterTransition(input: Readonly<{
   }
   const settled = existingOutcomes.length === assignments.length;
   const outcomes = capabilityIds.map((capabilityId) => {
-    const descriptor = CAPABILITY_BY_ID.get(capabilityId);
+    const descriptor = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(capabilityId);
     if (!descriptor) throw new TypeError(`Native adapter ${capabilityId} disappeared`);
     return Object.freeze({
       capabilityId,
@@ -414,7 +414,7 @@ export function validateNativeAdapterTransition(input: Readonly<{
     profile.subjectKind !== "worker_attempt" ||
     profile.subjectId !== transitionSubjectId(input.job, requirement.transition, envelope.operationDigest) ||
     profile.recipeId !== input.job.taskRecipe || profile.recipeVersion !== input.job.recipeVersion ||
-    profile.registryDigest !== CAPABILITY_REGISTRY_DIGEST || profile.graphDigest !== CAPABILITY_GRAPH_DIGEST ||
+    profile.registryDigest !== HISTORICAL_RECIPE_REGISTRY_DIGEST || profile.graphDigest !== HISTORICAL_RECIPE_GRAPH_DIGEST ||
     profile.mode !== "active" || envelope.transition !== requirement.transition) {
     throw new TypeError("Native-adapter transition profile does not match the authoritative job transition");
   }
@@ -429,7 +429,7 @@ export function validateNativeAdapterTransition(input: Readonly<{
     const capabilityId = expectedIds[index];
     const assignment = assignments[index];
     const outcome = outcomes[index];
-    const descriptor = CAPABILITY_BY_ID.get(capabilityId);
+    const descriptor = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get(capabilityId);
     const outcomeAccepted = capabilityId === "hanoon-native-using-superpowers"
       ? outcome?.outcome === "passed"
       : outcome !== undefined && requirement.acceptedOutcomes.includes(outcome.outcome);

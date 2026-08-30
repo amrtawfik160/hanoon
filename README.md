@@ -96,32 +96,32 @@ The project policy chooses implementation/review providers and commands. The con
 
 ### Adaptive capability routing
 
-New jobs are classified into one of six versioned recipes: `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, or `architectural`. The job stores that recipe and its routing mode before admission. Every provider subject then gets an immutable least-capability profile, an exact provider/model/reasoning/service-tier tuple, and append-only selection and outcome receipts. Mandatory native adapters and review guards must settle before the authoritative state transition can advance.
+New jobs are admitted as navigator-v1 in deterministic mode. The classifier, recipe policy, stage projection, and recipe-keyed skill or model selection do not control or admit new work. A leftover `task_recipe` column may remain on the job row, but it does not route new work.
 
-The shipped rollout is conservative: adaptive recipes default to `shadow`, where candidate routing is observational and cannot control production behavior or manufacture success receipts. A recipe becomes active for new jobs only after an append-only promotion decision backed by a resolved durable evidence ledger. The production reader verifies recorded artifacts, an active post-merge job, failure/recovery chronology, and model trials against authoritative SQLite rows. This release exposes no operator or typed-envelope ingestion path and includes no trusted live collector, so a fresh installation cannot produce promotion evidence and no recipe is enabled merely because deterministic tests pass. See [Operations](docs/operations.md#capability-routing-and-rollout) for inspection and rollback commands.
+Historical recipe promotion still exists as leftover recipe-v1 history. Adaptive recipes defaulted to `shadow`, where candidate routing was observational and could not control production behavior or manufacture success receipts. A recipe became active for leftover jobs only after an append-only promotion decision backed by a resolved durable evidence ledger. The production reader verifies recorded artifacts, an active post-merge job, failure/recovery chronology, and model trials against authoritative SQLite rows. This release exposes no operator or typed-envelope ingestion path and includes no trusted live collector, so a fresh installation cannot produce promotion evidence and no leftover recipe is enabled merely because deterministic tests pass. See [Operations](docs/operations.md#capability-routing-and-rollout) for inspection and rollback commands.
 
 ## Bundled agent skills
 
-The plugin carries a deterministic 35-skill admitted catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus ten Hanoon, guard, delivery, writing, and communication skills. It also keeps 15 legacy-only skill ids while recipe-v1 jobs drain. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair.
+The plugin carries a deterministic 35-skill catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus ten Hanoon, guard, delivery, writing, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are not installed. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair, and it refuses to start while a nonterminal recipe-v1 job still needs a legacy skill or state handler.
 
-BB discovers skills one directory below each registered root, so the manifest registers the Matt Pocock `engineering` and `productivity` buckets separately. During expansion, the three promoted ids that overlap the historical discovery root stay digest-locked under an unregistered compatibility subtree. Every runtime skill id therefore has exactly one plugin source, while the promoted copies remain available for the later navigator-v1 execution slice. The final contraction removes the legacy roots only after legacy jobs drain.
+BB discovers skills one directory below each registered root, so the manifest registers the Matt Pocock `engineering` and `productivity` buckets separately. New work uses the workflow navigator. Historical recipe columns, descriptors, and receipts remain readable.
 
 | Verified context | Selected skill ids |
 | --- | --- |
-| controller | `driving-bb`, `unslop`, `proportional-development-workflow`, `grill-with-docs`, `grilling`, `domain-modeling`. Conduct requires unslop on every owner-facing message. |
-| planner | `unslop`, `writing-plans`, `docs-guard` |
+| controller | `driving-bb`, `unslop`, and on an explicit grill request `grill-with-docs`, `grilling`, `domain-modeling`. Conduct requires unslop on every owner-facing message. |
+| planner | `unslop`, `writing-for-agents`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
-| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius` |
-| documentation | `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion` |
+| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review` |
+| documentation | `unslop`, `technical-writing`, `docs-guard` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these stages remain deterministic |
 
-The legacy profiles above remain unchanged in this expansion slice. The separate admission catalog records whether each promoted skill is model-invoked or must be explicitly scheduled by the owner or workflow navigator. General worker selection rejects user-invoked skills. A skill never grants tools, credentials, merge authority, or production authority.
+The admission catalog records whether each skill is model-invoked or must be explicitly scheduled by the owner or workflow navigator. General worker selection rejects user-invoked skills. A skill never grants tools, credentials, merge authority, or production authority.
 
 Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1 to 256 characters from `[A-Za-z0-9_-]`; attempt ids are 1 to 264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact attempt or stage record, effect, project, environment, thread, role, and routing mode must match. Any mismatch receives no tools and no skills.
 
-`npm run skills:verify` validates the registered roots, the schema 2 lock, active, legacy, and intentionally shadowed descriptors, bounded regular files, frontmatter, nested local Markdown resources, provenance, licenses, and every SHA-256 file digest. Success prints a bounded `bundleDigest`, `admittedSkillCount`, and `legacySkillCount`. Build and activation run the same verifier before plugin code can register. A missing, unlocked, escaped, oversized, symlinked, malformed, or digest-mismatched bundle fails closed.
+`npm run skills:verify` validates the registered roots, the schema 2 lock, the 35-skill catalog with empty legacy and shadow lists, bounded regular files, frontmatter, nested local Markdown resources, provenance, licenses, and every SHA-256 file digest. Success prints a bounded `bundleDigest`, `admittedSkillCount`, and `legacySkillCount`. Build and activation run the same verifier before plugin code can register. A missing, unlocked, escaped, oversized, symlinked, malformed, leftover-kit, or digest-mismatched bundle fails closed.
 
 A maintainer can refresh the promoted portfolio only from an already-reviewed clean local checkout at the pinned full revision:
 

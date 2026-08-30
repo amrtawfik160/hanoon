@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
   DELIVERY_KIT,
-  DISCOVERY_KIT,
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
@@ -21,7 +20,6 @@ import {
   REQUIRED_SHADOWED_SKILLS,
   REQUIRED_SKILLS,
   SKILL_ID_PATTERN,
-  WORKFLOW_KIT,
 } from "./bundle-contract.js";
 import { skillFrontmatter } from "./frontmatter.js";
 
@@ -46,10 +44,8 @@ const requiredMattSkillRoots = REQUIRED_MATT_POCOCK_SKILLS.map((skill) =>
   skill.skillPath.slice(0, -"/SKILL.md".length));
 const expectedKits = [
   ["mattPocockKit", "matt-pocock-kit", MATT_POCOCK_KIT],
-  ["workflowKit", "workflow-kit", WORKFLOW_KIT],
   ["guardKit", "guard-kit", GUARD_KIT],
   ["deliveryKit", "delivery-kit", DELIVERY_KIT],
-  ["discoveryKit", "discovery-kit", DISCOVERY_KIT],
   ["hanoonKit", "hanoon-kit", HANOON_KIT],
   ["pstackKit", "pstack-kit", PSTACK_KIT],
 ];
@@ -159,7 +155,7 @@ function parseLock(pluginRoot) {
   if (decoded.schemaVersion !== LOCK_SCHEMA_VERSION) throw integrityError("unsupported lock schema version");
   if (!Array.isArray(decoded.files) || !Array.isArray(decoded.skills) || !Array.isArray(decoded.legacySkills) ||
     !Array.isArray(decoded.shadowedSkills) ||
-    !decoded.workflowKit || typeof decoded.workflowKit !== "object" ||
+    decoded.workflowKit !== undefined || decoded.discoveryKit !== undefined ||
     !decoded.mattPocockKit || typeof decoded.mattPocockKit !== "object") {
     throw integrityError("malformed lock schema");
   }

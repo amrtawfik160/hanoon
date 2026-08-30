@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CAPABILITY_BY_ID } from "./catalog";
+import { capabilityDescriptorById } from "./catalog";
 import type { CapabilityTerminalOutcome } from "./contracts";
 import type { CapabilityProfile } from "../storage/capability-repository";
 import type { TelegramAgentStore } from "../storage/store";
@@ -86,7 +86,7 @@ function requireCurrentProfile(store: TelegramAgentStore, profileId: string): Ca
   const profile = store.getCapabilityProfileById(profileId);
   if (!profile) throw new TypeError(`Unknown capability profile ${profileId}`);
   for (const assignment of profile.assignments) {
-    const descriptor = CAPABILITY_BY_ID.get(assignment.capabilityId);
+    const descriptor = capabilityDescriptorById(assignment.capabilityId, assignment.descriptorDigest);
     if (!descriptor || descriptor.digest !== assignment.descriptorDigest || descriptor.kind !== assignment.capabilityKind) {
       throw new TypeError(`Capability profile ${profileId} contains a stale assignment`);
     }

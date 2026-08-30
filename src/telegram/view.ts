@@ -616,7 +616,10 @@ export function renderJobStatus(
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
   ];
   if (policy) lines.push(`Base: <code>${html(policy.baseBranch, 120)}</code>`);
-  lines.push(`Recipe: <code>${html(`${job.taskRecipe}@${job.recipeVersion}`, 160)}</code>`);
+  lines.push(`Workflow navigator: <code>${html(`${job.workflowEngine}/${job.workflowMode}`, 160)}</code>`);
+  if (job.workflowEngine === "recipe-v1") {
+    lines.push(`Recipe: <code>${html(`${job.taskRecipe}@${job.recipeVersion}`, 160)}</code>`);
+  }
   lines.push(`Stage: <code>${html(queuedConfirmed ? "queued" : job.state, 80)}</code>`);
   if (job.recipePromotionCount > 0) {
     lines.push(`Rigor: promoted ${job.recipePromotionCount}/2`);

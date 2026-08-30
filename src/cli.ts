@@ -398,12 +398,20 @@ function safeJob(store: TelegramAgentStore, job: Job, now: number): JsonRecord {
   return {
     id: job.id,
     state: job.state,
-    recipe: {
-      id: job.taskRecipe,
-      version: job.recipeVersion,
-      promotionCount: job.recipePromotionCount,
-      routingMode: job.routingMode,
+    workflow: {
+      engine: job.workflowEngine,
+      mode: job.workflowMode,
     },
+    ...(job.workflowEngine === "recipe-v1"
+      ? {
+          recipe: {
+            id: job.taskRecipe,
+            version: job.recipeVersion,
+            promotionCount: job.recipePromotionCount,
+            routingMode: job.routingMode,
+          },
+        }
+      : {}),
     projectId: job.projectId,
     origin: job.origin,
     autonomousOrigin: job.autonomousOrigin,
@@ -1906,7 +1914,7 @@ function capabilityRollback(
   if (subject === NAVIGATOR_ENGINE_ID) {
     const decision = deps.enginePromotions.rollback();
     deps.notify?.();
-    return success(decision, "new admissions use recipe-v1", json);
+    return success(decision, "new admissions stay on navigator-v1", json);
   }
   const recipe = capabilityRecipe(subject, "recipe");
   const decision = deps.capabilityPromotions.rollback(recipe);

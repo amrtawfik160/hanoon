@@ -124,7 +124,7 @@ it("does not audit vendored third-party documentation", () => {
   // The skill bundle carries other people's docs, whose example paths describe
   // their own repositories. Auditing them reports drift this repo cannot fix.
   expect(analyseDocsStaleness({
-    docs: [{ path: "skills/workflow-kit/writing-skills/best-practices.md", text: "See `docs/file1.md`." }],
+    docs: [{ path: "skills/delivery/pr-writer/SKILL.md", text: "See `docs/file1.md`." }],
     trackedPaths: TRACKED,
   })).toEqual([]);
 });

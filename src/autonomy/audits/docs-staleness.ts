@@ -54,10 +54,9 @@ export const PROPOSAL_DOC_PREFIXES: readonly string[] = Object.freeze([
  * is audited normally.
  */
 export const VENDORED_DOC_PREFIXES: readonly string[] = Object.freeze([
-  "skills/workflow-kit/",
-  "skills/discovery/",
   "skills/delivery/",
   "skills/guards/",
+  "skills/matt-pocock/",
 ]);
 
 /** A reference has to look like a path before it is worth checking. */

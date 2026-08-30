@@ -393,6 +393,11 @@ function transitionAwaitingConfirmation(job: Job, event: JobEvent, effects: JobE
     });
     return;
   }
+  if (isNavigatorJob(job)) {
+    job.state = "implementing";
+    emitEffect(job, effects, "render_status");
+    return;
+  }
   if (job.routingMode === "active") {
     const policy = recipeExecutionPolicy(job.taskRecipe);
     if (policy.planning === "plan-and-critique") {

@@ -145,12 +145,12 @@ describe("read-only external inventory", () => {
     expect(() => admitInventoryItem(discovered, {
       descriptor: CAPABILITY_BY_ID.get("docs-guard")!,
       shadowTrials: 4,
-      mapping: { roles: ["documentation"], recipes: ["bounded"], stages: ["documentation"] },
+      mapping: { roles: ["documentation"], recipes: [], stages: ["documentation"] },
     })).toThrow(/shadow/i);
     expect(admitInventoryItem(discovered, {
       descriptor: CAPABILITY_BY_ID.get("docs-guard")!,
       shadowTrials: 5,
-      mapping: { roles: ["documentation"], recipes: ["bounded"], stages: ["documentation"] },
+      mapping: { roles: ["documentation"], recipes: [], stages: ["documentation"] },
     })).toMatchObject({ status: "admitted", admittedCapabilityId: "docs-guard" });
   });
 

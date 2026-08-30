@@ -111,12 +111,8 @@ describe("Matt Pocock maintainer sync", () => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(lock.skills).toHaveLength(35);
-    expect(lock.legacySkills).toHaveLength(15);
-    expect(lock.shadowedSkills.map((skill) => skill.id).sort()).toEqual([
-      "domain-modeling",
-      "grill-with-docs",
-      "grilling",
-    ]);
+    expect(lock.legacySkills).toEqual([]);
+    expect(lock.shadowedSkills).toEqual([]);
     expect(lock.mattPocockKit.revision).toBe(revision);
     expect(() => readFileSync(join(input.root, "skills", "matt-pocock", "stale.txt"))).toThrow();
   });

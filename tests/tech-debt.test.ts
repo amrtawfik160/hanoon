@@ -52,7 +52,7 @@ it("orders files with equal counts by name so a run is repeatable", () => {
 });
 
 it("ignores vendored code this repository did not write", () => {
-  expect(analyseTechDebt({ markers: [marker("skills/workflow-kit/x/SKILL.md")] })).toEqual([]);
+  expect(analyseTechDebt({ markers: [marker("skills/delivery/x/SKILL.md")] })).toEqual([]);
 });
 
 it("ignores markers under node_modules", () => {

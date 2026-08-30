@@ -287,7 +287,7 @@ export function admitInventoryItem(
   }
   const mapping = z.object({
     roles: z.array(z.string().min(1).max(128)).min(1).max(64),
-    recipes: z.array(z.string().min(1).max(128)).min(1).max(64),
+    recipes: z.array(z.string().min(1).max(128)).max(64),
     stages: z.array(z.string().min(1).max(128)).min(1).max(64),
   }).strict().parse(evidence.mapping);
   if (mapping.roles.some((role) => !descriptor.routing.roles.includes(role)) ||

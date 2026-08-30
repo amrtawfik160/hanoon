@@ -512,7 +512,9 @@ export class BbRunner {
         {
           type: "text",
           text: this.withReferenceBriefing(
-            "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
+            job.workflowEngine === "recipe-v1"
+              ? "Read the attached work order and docs packet. Use the docs-guard and verification-before-completion skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes."
+              : "Read the attached work order and docs packet. Use the docs-guard, technical-writing, and unslop skills exactly as required, update only necessary documentation, verify it, and return exactly one strict JSON object matching the docs packet output contract. Do not use Markdown fences or commentary. Do not commit, push, merge, or deploy — the executor publishes leftover documentation changes.",
             project,
           ),
           mentions: [],
@@ -557,7 +559,9 @@ export class BbRunner {
   ): Promise<ThreadResult> {
     const policy = selectedPolicy(job);
     const environmentId = requireEnvironmentId(job);
-    const parentThreadId = requireImplementationThreadId(job);
+    const parentThreadId = job.workflowEngine === "navigator-v1"
+      ? job.implementationThreadId ?? undefined
+      : requireImplementationThreadId(job);
     const snapshot = await this.getEnvironmentSnapshot(environmentId, policy.baseBranch);
     const pullRequest = await this.getPullRequestSnapshot(environmentId);
     requirePullRequestSnapshot(job, pullRequest);
@@ -571,9 +575,11 @@ export class BbRunner {
       reviewDiff.diff,
       attempt.reviewLens ?? "quality",
       attempt.capabilityProfile,
-      job.taskRecipe === "architectural"
-        ? role === "final-review" ? "integrated-review" : "task-review"
-        : job.taskRecipe === "direct" ? "diff-guards" : "review",
+      job.workflowEngine === "navigator-v1"
+        ? "review"
+        : job.taskRecipe === "architectural"
+          ? role === "final-review" ? "integrated-review" : "task-review"
+          : job.taskRecipe === "direct" ? "diff-guards" : "review",
       reviewDiff.source,
     );
     const project = projectId(job, policy);
@@ -581,7 +587,7 @@ export class BbRunner {
     recordHandoff(attempt, artifact, uploaded);
     const request = spawnRequest({
       projectId: project,
-      parentThreadId,
+      ...(parentThreadId === undefined ? {} : { parentThreadId }),
       title: buildWorkerThreadTitle({ jobId: job.id, attemptId: attempt.id, role }),
       visibility: "hidden",
       input: [

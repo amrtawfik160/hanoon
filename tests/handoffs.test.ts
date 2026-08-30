@@ -6,6 +6,25 @@ import { CAPABILITY_BY_ID } from "../src/capabilities/catalog";
 import { capabilityProfileDigest } from "../src/capabilities/profiles";
 import { jobFixture, policyFixture } from "./helpers";
 
+it("builds a navigator work order without recipe stage projection", () => {
+  const artifact = buildWorkOrder(jobFixture({
+    projectId: "proj_1",
+    policy: policyFixture(),
+    requestText: "Ship the confirmed navigator change.",
+    workflowEngine: "navigator-v1",
+    workflowMode: "deterministic",
+    routingMode: "legacy",
+  }), policyFixture());
+  const text = new TextDecoder().decode(artifact.bytes);
+
+  expect(text).toContain("Workflow navigator");
+  expect(text).toContain("navigator-v1/deterministic");
+  expect(text).toContain("Ship the confirmed navigator change.");
+  expect(text).not.toContain("## Recipe execution");
+  expect(text).not.toMatch(/Recipe: architectural@1/u);
+  expect(text).toContain("Do not commit, push, create a pull request, merge, or deploy");
+});
+
 it("builds a bug work order with the request, policy, workflow, and report contract", () => {
   const artifact = buildWorkOrder(
     jobFixture({

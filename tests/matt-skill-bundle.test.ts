@@ -80,15 +80,15 @@ function lock(): SkillLock {
 }
 
 describe("pinned Matt Pocock skill portfolio", () => {
-  test("registers promoted bucket roots after legacy discovery", () => {
+  test("registers promoted bucket roots without a discovery root", () => {
     const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
       bb: { skills: string[] };
     };
 
     expect(manifest.bb.skills).toContain("skills/matt-pocock/engineering");
     expect(manifest.bb.skills).toContain("skills/matt-pocock/productivity");
-    expect(manifest.bb.skills.indexOf("skills/discovery"))
-      .toBeLessThan(manifest.bb.skills.indexOf("skills/matt-pocock/engineering"));
+    expect(manifest.bb.skills).not.toContain("skills/discovery");
+    expect(manifest.bb.skills).not.toContain("skills/workflow-kit");
   });
 
   test("locks the exact reviewed revision and source artifacts", () => {
@@ -123,15 +123,12 @@ describe("pinned Matt Pocock skill portfolio", () => {
     const bundle = lock();
     const lockedFiles = new Map(bundle.files.map((file) => [file.path, file.sha256]));
     const promoted = bundle.skills.filter((skill) => skill.source === "https://github.com/mattpocock/skills");
-    const compatibilityIds = new Set(["domain-modeling", "grill-with-docs", "grilling"]);
 
     expect(promoted).toHaveLength(25);
     for (const skill of promoted) {
       expect(skill.sourceRevision).toBe(bundle.mattPocockKit.revision);
       const promotedPath = skill.sourcePath.slice("skills/".length);
-      const bundlePath = compatibilityIds.has(skill.id)
-        ? `skills/matt-pocock/compatibility/${promotedPath}`
-        : `skills/matt-pocock/${promotedPath}`;
+      const bundlePath = `skills/matt-pocock/${promotedPath}`;
       expect(skill.skillPath).toBe(`${bundlePath}/SKILL.md`);
       const prefix = `${bundlePath}/`;
       const subtree = [...lockedFiles.keys()].filter((path) => path.startsWith(prefix));
