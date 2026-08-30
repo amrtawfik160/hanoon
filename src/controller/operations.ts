@@ -14,6 +14,24 @@ import { encodeCallbackData } from "../telegram/view";
 const OPERATION_TTL_MS = 15 * 60_000;
 const STOPPABLE_STATUSES = new Set(["active", "starting", "stopping"]);
 
+/**
+ * Safe provider retry (`rateLimitRecovery` / `continueAfterRateLimit`) ships only
+ * on the BB SDK lines that carry it; other hosts omit these methods entirely. The
+ * executor feature-detects them so an owner-requested retry reports "not supported"
+ * instead of throwing an unhandled error when the host SDK lacks the API.
+ */
+interface RateLimitRecoveryThreads {
+  rateLimitRecovery?(args: { threadId: string }): Promise<{
+    reason: string;
+    candidate: { failedRequestId: string } | null;
+  }>;
+  continueAfterRateLimit?(args: {
+    threadId: string;
+    failedRequestId: string;
+    mode: "manual";
+  }): Promise<unknown>;
+}
+
 export type OperationRequest =
   | { kind: "steer_thread"; threadId: string; text: string; signal: AbortSignal }
   | { kind: "stop_thread" | "retry_thread"; threadId: string; signal: AbortSignal };
@@ -173,11 +191,18 @@ export class ThreadOperationService {
       await this.dependencies.sdk.threads.stop({ threadId: operation.threadId });
       return "Stop requested";
     }
-    const recovery = await this.dependencies.sdk.threads.rateLimitRecovery({ threadId: operation.threadId });
+    const threads = this.dependencies.sdk.threads as unknown as RateLimitRecoveryThreads;
+    if (
+      typeof threads.rateLimitRecovery !== "function" ||
+      typeof threads.continueAfterRateLimit !== "function"
+    ) {
+      return "Safe provider retry is not supported by this BB version";
+    }
+    const recovery = await threads.rateLimitRecovery({ threadId: operation.threadId });
     if (recovery.reason !== "eligible" || !recovery.candidate) {
       throw new Error("Thread is not eligible for a safe provider retry");
     }
-    await this.dependencies.sdk.threads.continueAfterRateLimit({
+    await threads.continueAfterRateLimit({
       threadId: operation.threadId,
       failedRequestId: recovery.candidate.failedRequestId,
       // The owner asked for this retry, so it is theirs rather than the
