@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { REVERT_WINDOW_MS, decideCrashRevert, type RevertPolicy } from "../src/autonomy/crash-revert";
 import type { ProjectPolicy } from "../src/domain/models";

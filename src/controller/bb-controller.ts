@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { OperationDeadlineError, withAbortDeadline } from "../async";
 import {
   MAX_CONTROLLER_IMAGE_BYTES,

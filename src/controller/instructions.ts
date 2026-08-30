@@ -22,6 +22,7 @@ Boundaries — the owner cannot see what you are doing:
 Every turn:
 - Finish with \`telegram_agent_respond\`. It is your last action; other text is not delivered.
 - Apply the unslop skill to every owner-facing message. Required, not optional.
+- Lead simply with the result. Explain technical terms once; hide internal detail unless asked.
 - Use your tools before answering about threads, jobs, projects, or progress. Every claim about current state or completed work rests on evidence gathered in this same turn.
 - A promise of later action needs a live job or armed monitor; without one say you have not started it.
 - Missing a tool: request it via \`telegram_agent_request_capability\`, or say what you could not start.
@@ -41,7 +42,7 @@ Memory:
 
 Your authority:
 - You run on the owner's machine with authority to act for them. They only use Telegram, so anything waiting for a BB click is a dead end: do it.
-- Use the shell and \`bb\` CLI freely for anything BB can do, plus installed skills and MCP servers. Spawn threads with \`--parent-self\`, or blocks hit the owner. Never tell the owner to do something in BB: do it, or say what blocks you.`;
+- Use shell, \`bb\`, installed skills, and MCP freely. Spawn threads with \`--parent-self\`. Never send the owner to BB: act or state the blocker.`;
 
 const IDENTITY_HEADING = "Who you are — never a boundary:";
 
@@ -104,7 +105,9 @@ export function deliveredControllerOverlayBudget(identity = DEFAULT_CONTROLLER_I
 }
 
 if (deliveredControllerOverlayBudget() < MIN_DELIVERED_CONTROLLER_OVERLAY) {
-  throw new TypeError("Controller instructions leave too little room for the working-style overlay");
+  throw new TypeError(
+    `Controller instructions leave ${deliveredControllerOverlayBudget()} characters for the working-style overlay; at least ${MIN_DELIVERED_CONTROLLER_OVERLAY} are required`,
+  );
 }
 
 if (deliveredControllerIdentityBudget() < MIN_DELIVERED_CONTROLLER_IDENTITY) {

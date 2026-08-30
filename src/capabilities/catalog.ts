@@ -50,16 +50,16 @@ type SkillAdmissionEvidence = Readonly<{
 
 const ADMITTED_SKILL_BUNDLE = {
   "ask-matt": { sourceDigest: "b25d86fb36b1d294eeead5d7db529f86135f9671f2afcd607579a63bb2213769", bundleDescriptorDigest: "4ef913dc61cc753023e96ebc2e8d2983e89bc606a250e81d18a5d7fdc75ea8d8", invocationClass: "user" },
-  "blast-radius": { sourceDigest: "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d", bundleDescriptorDigest: "373f332324ffebb43c1961fb3cb56dc0a8627a6c54056f1d6f396fc396a4b5d5", invocationClass: "model" },
-  "checking-system-logs": { sourceDigest: "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245", bundleDescriptorDigest: "e86dafdf371e580eea02fa6792141e2bcb1611491d8f6ee6fbcd9da59d8576cc", invocationClass: "model" },
+  "blast-radius": { sourceDigest: "efc3956ba00a6a0a06c8283fd3f8344f1b700d2923c65f73db801e05d50ac783", bundleDescriptorDigest: "6960af3e86855ebe7f58be640afa871fb2fefb032d098151399d35a83c6bed44", invocationClass: "model" },
+  "checking-system-logs": { sourceDigest: "76d6b6f8ff80a410b65a1c30a51e45b1d2cfa0e82267ce251462ac0c0b64bbaf", bundleDescriptorDigest: "76cb8c6f6d5add9fe66369d8d64ab4aca1e00f42a558021f8e6d90285a5fd510", invocationClass: "model" },
   "clean-code-guard": { sourceDigest: "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2", bundleDescriptorDigest: "539aa4075dc5a4142705238a0c4ef35b46b09a48fa4693300c6558804fe02b6d", invocationClass: "model" },
   "code-review": { sourceDigest: "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50", bundleDescriptorDigest: "700ee1661d4eff3add54f10baa5202851314d17b4538db818ca1bf572921bad3", invocationClass: "model" },
   "codebase-design": { sourceDigest: "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2", bundleDescriptorDigest: "46460be29afb7f5ebdfc8bda398ad9c21199c5074850cf8a7707ec8378c70136", invocationClass: "model" },
   "diagnosing-bugs": { sourceDigest: "77f3cf31bc99b2f49af943222526531fcc9fc41d047626d3640e875e85af3e84", bundleDescriptorDigest: "2e9d27811a60afee0ee9951a75e459cf59489e712e1ac0832f663940184558f5", invocationClass: "model" },
   "docs-guard": { sourceDigest: "8648f87ad021a87225d46a5c83c977e8e56594068a9f3fe4e4ad47da93f418ef", bundleDescriptorDigest: "9cb8301e495687ad40ee11e8e1ccb508a0b2c331423880eb8fbb753a517a9f06", invocationClass: "model" },
   "domain-modeling": { sourceDigest: "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e", bundleDescriptorDigest: "60fa9d0ae9095d4ebe066b51d5e78529ca8cb75302aed71de4181f0f946db8bb", invocationClass: "model" },
-  "driving-bb": { sourceDigest: "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216", bundleDescriptorDigest: "956e67950b79a179ba0f814836a2812b12147bf76928c9ae39f6ae2b950a22bb", invocationClass: "model" },
-  "durable-boundary-audit": { sourceDigest: "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f", bundleDescriptorDigest: "39270df4fabf5032e62eecc9cd4c99425afd533ce20492b321477aca9f08cd2f", invocationClass: "model" },
+  "driving-bb": { sourceDigest: "8ad1cb127379be028e01b3bfd07e3a91defd9971cf1da1b5c268c021470f34d4", bundleDescriptorDigest: "99e1b9d2f0d8be7ad1073cb81a58eb2b32907189259a7da03958b8230e9632ae", invocationClass: "model" },
+  "durable-boundary-audit": { sourceDigest: "bbe224ed820694e7b54b1030a5aa951d996b7a6d4a6758dcb5b941012484dd2c", bundleDescriptorDigest: "a145e28c30fc432520a1905f694d711f2ec8fb6827af21828c259588ae2e6b82", invocationClass: "model" },
   "grill-me": { sourceDigest: "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637", bundleDescriptorDigest: "b60265b7de314625667b53857322f0a543502705a8453c0b2023bc0308bd1938", invocationClass: "user" },
   "grill-with-docs": { sourceDigest: "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe", bundleDescriptorDigest: "164d91e3beb314fb449ce5aa004b63df3cde7971d9e35ea4c12cb4d8c4e99bf5", invocationClass: "user" },
   grilling: { sourceDigest: "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2", bundleDescriptorDigest: "45ecfed1492a2c7647346d3b3f8e21c6a09552c078cf97c2748ab914621beeab", invocationClass: "model" },
@@ -156,6 +156,16 @@ const HISTORICAL_DISCOVERY_SKILL_DIGESTS = {
   grilling: "fa5c1e5ee76b1c8f1ae56101f52c9e239de75d5c578adc61227b92d10b7e52ef",
 } as const;
 
+// recipe-v1 profiles are immutable snapshots. Updating a first-party skill
+// changes the live navigator catalog, never the digest an installed recipe-v1
+// job already recorded.
+const HISTORICAL_FIRST_PARTY_SKILL_DIGESTS = {
+  "blast-radius": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d",
+  "checking-system-logs": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245",
+  "driving-bb": "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216",
+  "durable-boundary-audit": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f",
+} as const;
+
 const WORKER_SKILLS = new Set<string>([
   "blast-radius", "brainstorming", "checking-system-logs", "clean-code-guard", "docs-guard",
   "driving-bb", "durable-boundary-audit", "pr-writer", "proportional-development-workflow",
@@ -175,6 +185,9 @@ const MANUAL_SKILLS = new Set<string>([
 function compatibilitySkillSourceDigest(id: CapabilitySkillId): string {
   if (id in HISTORICAL_DISCOVERY_SKILL_DIGESTS) {
     return HISTORICAL_DISCOVERY_SKILL_DIGESTS[id as keyof typeof HISTORICAL_DISCOVERY_SKILL_DIGESTS];
+  }
+  if (id in HISTORICAL_FIRST_PARTY_SKILL_DIGESTS) {
+    return HISTORICAL_FIRST_PARTY_SKILL_DIGESTS[id as keyof typeof HISTORICAL_FIRST_PARTY_SKILL_DIGESTS];
   }
   if (id in LEGACY_SKILL_DIGESTS) return LEGACY_SKILL_DIGESTS[id as LegacyCapabilitySkillId];
   return ADMITTED_SKILL_BUNDLE[id as AdmittedCapabilitySkillId].sourceDigest;

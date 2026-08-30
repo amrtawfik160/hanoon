@@ -1,5 +1,9 @@
 import { nextCronOccurrence } from "./monitor-service";
 import type { TelegramAgentStore } from "../storage/store";
+import {
+  ManagedAutomationService,
+  migrateLegacyClockMonitor,
+} from "./managed-automation-service";
 
 /**
  * Monitors the plugin sets for itself. The agent already knows how to act on a
@@ -74,6 +78,100 @@ export function installSystemMonitors(dependencies: SystemMonitorInstaller): num
       installed += 1;
     } catch (error) {
       dependencies.warn?.(`System monitor ${definition.systemKey} could not be installed`);
+    }
+  }
+  return installed;
+}
+
+export type SystemAutomationInstaller = Readonly<{
+  store: Pick<
+    TelegramAgentStore,
+    "getOwner" | "getControllerForOwner" | "listSystemMonitors" | "cancelMonitor"
+  >;
+  service: ManagedAutomationService;
+  providerId: string;
+  execution: Readonly<{
+    model: string;
+    reasoningLevel?: string;
+    serviceTier?: "default" | "fast";
+    permissionMode: "accept-edits" | "auto" | "full";
+  }>;
+  clock: { now(): number };
+  signal?: AbortSignal;
+  warn?: (message: string) => void;
+}>;
+
+/**
+ * Installs reasoning-based upkeep in BB's scheduler. Existing plugin-local
+ * schedules are handed over only after BB reads back an active next run.
+ */
+export async function installSystemAutomations(dependencies: SystemAutomationInstaller): Promise<number> {
+  const owner = dependencies.store.getOwner();
+  if (!owner) return 0;
+  const controller = dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
+  if (!controller?.projectId || !controller.hostId) return 0;
+  const now = dependencies.clock.now();
+  const legacy = new Map(
+    dependencies.store.listSystemMonitors().map((monitor) => [monitor.systemKey, monitor] as const),
+  );
+  let installed = 0;
+  for (const definition of SYSTEM_MONITORS) {
+    try {
+      const old = legacy.get(definition.systemKey);
+      if (old?.state === "armed") {
+        await migrateLegacyClockMonitor({
+          monitor: old,
+          store: dependencies.store,
+          service: dependencies.service,
+          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          projectId: controller.projectId,
+          controllerKey: controller.controllerKey,
+          providerId: dependencies.providerId,
+          model: dependencies.execution.model,
+          reasoningLevel: dependencies.execution.reasoningLevel,
+          serviceTier: dependencies.execution.serviceTier,
+          permissionMode: dependencies.execution.permissionMode,
+          hostId: controller.hostId,
+          now,
+          signal: dependencies.signal,
+        });
+      } else {
+        await dependencies.service.create({
+          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          controllerKey: controller.controllerKey,
+          sourceKey: definition.systemKey,
+          definition: {
+            mode: "agent",
+            projectId: controller.projectId,
+            name: `Hanoon ${definition.systemKey}`,
+            trigger: { kind: "cron", cron: definition.cron, timezone: "Etc/UTC" },
+            prompt: definition.instruction,
+            providerId: dependencies.providerId,
+            model: dependencies.execution.model,
+            ...(dependencies.execution.reasoningLevel
+              ? { reasoningLevel: dependencies.execution.reasoningLevel }
+              : {}),
+            ...(dependencies.execution.serviceTier
+              ? { serviceTier: dependencies.execution.serviceTier }
+              : {}),
+            permissionMode: dependencies.execution.permissionMode,
+            target: { kind: "project-default" },
+          },
+          authority: {
+            source: "system",
+            controllerKey: controller.controllerKey,
+            projectId: controller.projectId,
+            hostId: controller.hostId,
+            mayWidenAutomation: false,
+          },
+          notificationPolicy: "material",
+          now,
+          signal: dependencies.signal,
+        });
+      }
+      installed += 1;
+    } catch {
+      dependencies.warn?.(`System automation ${definition.systemKey} could not be installed`);
     }
   }
   return installed;

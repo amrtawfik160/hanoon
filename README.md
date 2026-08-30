@@ -234,10 +234,10 @@ npm run build
 bb plugin types --check .
 ```
 
-Type checking resolves `@bb/plugin-sdk` through `types/bb-plugin-sdk.d.ts`, which `bb plugin types` regenerates from your installed BB. Building needs only the `bb` CLI.
+Type checking resolves `@get-bb/plugin-sdk` from the exact version pinned in `devDependencies`. Run `bb plugin types --check` to confirm that this pin matches the installed BB; `bb plugin types` updates it when BB changes.
 
 > [!NOTE]
-> The test suite additionally imports `@bb/plugin-sdk/testing` at runtime. BB does not publish that package to a registry, so `npm test`, and therefore `npm run check`, only works where the package is installed. `npm run check` runs typecheck, tests, the plugin build, artifact verification, and the credential-broker TypeScript build. Type checking and building work from a clean clone.
+> The test suite also imports `@get-bb/plugin-sdk/testing` from that pinned package. `npm run check` runs typecheck, tests, the plugin build, artifact verification, and the credential-broker TypeScript build from a clean install.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change boundaries, documentation checks, and pull-request evidence.
 

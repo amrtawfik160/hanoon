@@ -1,12 +1,12 @@
 ---
 name: checking-system-logs
-description: "Find what this plugin actually did: its own log, the turns and messages it recorded, and a specific BB thread's history. Use when diagnosing a wrong reply, a message that did not arrive, a turn that failed, or any question of the form 'what did it do at 09:41'."
+description: "Trace what Hanoon actually did across its plugin log, durable turn/message store, and BB thread history. Use for a wrong reply, a missing message, a failed turn, or a time-specific incident."
 ---
 
 # Checking system logs
 
-Three surfaces, and the order matters. Most wrong answers about behaviour come
-from reading only the first one.
+Start with a time window or keyword and a concrete claim to settle. Then read
+the three surfaces in order; each proves something different.
 
 Always narrow by time or keyword. A tail of a busy log buries the thing you are
 looking for, and a wall of output in a transcript is worse than no output.
@@ -16,7 +16,7 @@ looking for, and a wall of output in a transcript is worse than no output.
 What the services logged: polling failures, refusals, warnings from the sweeps.
 
 ```bash
-bb plugin logs telegram-agent -n 200 | grep -iE "error|warn|refus"
+bb plugin logs telegram-agent -n 200 | rg -i "error|warn|refus"
 ```
 
 This is the only surface that shows a failure the plugin *handled*. A step that
@@ -28,10 +28,15 @@ The durable record: every turn taken, every message queued or sent. This is the
 authoritative answer to "what did it actually do", because the log can be silent
 while the store is not.
 
+Read `dataDir` from `bb status --json`, append
+`plugins/telegram-agent/data.db`, and pass that exact absolute path below. Do
+not assume the installation lives under `/root`.
+
 ```bash
-python3 - <<'EOF'
+python3 - '<absolute-data.db-path>' <<'EOF'
 import sqlite3, datetime
-c = sqlite3.connect('/root/.bb-server/plugins/telegram-agent/data.db')
+import sys
+c = sqlite3.connect(sys.argv[1])
 for r in c.execute("SELECT origin, state, created_at, substr(input_text,1,80) "
                    "FROM controller_turns ORDER BY created_at DESC LIMIT 12"):
     ts = datetime.datetime.fromtimestamp(r[2]/1000).strftime('%H:%M:%S')
@@ -69,3 +74,8 @@ work happened.
 
 When a surface is empty, say it is empty rather than treating that as proof. A
 missing log line means the log is missing a line.
+
+The trace is complete when the answer names the surface that supports each
+claim, gives the relevant time or durable id, and distinguishes queued from
+sent and started from completed. Keep raw prompts, credentials, and unrelated
+log lines out of the report.

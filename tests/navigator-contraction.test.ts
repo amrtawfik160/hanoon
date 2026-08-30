@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import plugin from "../server";
 import { ROLE_SKILLS } from "../src/agent-skills/role-resolver";

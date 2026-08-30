@@ -7,12 +7,14 @@ import type { TelegramAgentStore } from "../storage/store";
 import type { WorkArtifactClaim } from "../work-artifacts/models";
 import {
   NAVIGATOR_TICKET_STEP_CONTRACTS,
+  navigatorAcceptanceCriteriaAreSatisfied,
   navigatorCodeReviewResultSchema,
   navigatorGitObservationSchema,
   navigatorImplementationResultSchema,
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
   navigatorPullRequestRequestSchema,
+  navigatorReviewFindingSchema,
   navigatorTicketWorkerProfile,
   navigatorTicketWorkerProfileSchema,
   navigatorTicketWorkerResultSchema,
@@ -24,6 +26,7 @@ import {
   type NavigatorPullRequestRequest,
   type NavigatorGitObservation,
   type NavigatorPersistedTicketStepContract,
+  type NavigatorReviewFinding,
   type NavigatorTicketRepairSnapshot,
   type NavigatorTicketTaskEvidence,
   type NavigatorTicketWorkerProfile,
@@ -96,6 +99,20 @@ export type NavigatorIntegrationSnapshot = Readonly<{
   }> | null;
   attempts: readonly NavigatorTicketWorkerAttempt[];
   outcomes: readonly NavigatorTicketWorkerOutcome[];
+  findingLedger: readonly NavigatorFindingLedgerEntry[];
+}>;
+
+export type NavigatorFindingLedgerEntry = Readonly<{
+  rootCauseId: string;
+  sliceId: string;
+  sourceReviewAttemptId: string;
+  verificationAttemptId: string;
+  disposition: "must_fix" | "advisory";
+  state: "open" | "resolved" | "disputed";
+  occurrence: number;
+  blockingBurden: number;
+  headSha: string;
+  finding: NavigatorReviewFinding;
 }>;
 
 export interface NavigatorTicketWorkerRunner {
@@ -230,6 +247,34 @@ type OutcomeRow = Readonly<{
   recorded_at: number;
 }>;
 
+type FindingEventRow = Readonly<{
+  sequence: number;
+  id: string;
+  job_id: string;
+  slice_id: string;
+  source_review_attempt_id: string;
+  verification_attempt_id: string;
+  root_cause_id: string;
+  capability_id: string;
+  rule_id: string;
+  disposition: "must_fix" | "advisory";
+  event: "opened" | "reobserved" | "resolved" | "disputed";
+  head_sha: string;
+  finding_json: string;
+  evidence_refs_json: string;
+  occurrence: number;
+  blocking_burden: number;
+  created_at: number;
+}>;
+
+type ConvergenceRow = Readonly<{
+  slice_id: string;
+  last_blocking_burden: number;
+  plateau_recoveries: number;
+  review_cycles: number;
+  updated_at: number;
+}>;
+
 type NavigatorImplementationExecutorDependencies = Readonly<{
   store: TelegramAgentStore;
   database: Database.Database;
@@ -303,6 +348,23 @@ function retryDelay(
 
 function stableId(prefix: string, ...parts: readonly string[]): string {
   return `${prefix}_${createHash("sha256").update(parts.join("\0"), "utf8").digest("base64url").slice(0, 24)}`;
+}
+
+function findingDisposition(finding: NavigatorReviewFinding): "must_fix" | "advisory" {
+  return finding.severity === "critical" || finding.severity === "high" || finding.requirementId !== null
+    ? "must_fix"
+    : "advisory";
+}
+
+function findingState(event: FindingEventRow["event"]): NavigatorFindingLedgerEntry["state"] {
+  if (event === "opened" || event === "reobserved") return "open";
+  return event === "resolved" ? "resolved" : "disputed";
+}
+
+function sameRootCause(left: NavigatorReviewFinding, right: NavigatorReviewFinding): boolean {
+  return left.rootCauseId === right.rootCauseId && left.capabilityId === right.capabilityId &&
+    left.ruleId === right.ruleId && left.subject === right.subject && left.line === right.line &&
+    left.requirementId === right.requirementId;
 }
 
 function parseRepairSnapshot(rawSnapshot: unknown): NavigatorTicketRepairSnapshot {
@@ -1003,7 +1065,232 @@ export class NavigatorImplementationExecutor {
       activeSlice: activeSlice === null ? null : this.sliceValue(activeSlice),
       attempts: attempts.map(parseAttempt),
       outcomes: outcomes.map(parseOutcome),
+      findingLedger: this.currentFindingLedger(jobId),
     };
+  }
+
+  private currentFindingRows(jobId: string, sliceId?: string): FindingEventRow[] {
+    return this.db.prepare(
+      `SELECT event.*
+         FROM navigator_review_finding_events AS event
+        WHERE event.job_id = ?
+          AND (? IS NULL OR event.slice_id = ?)
+          AND event.sequence = (
+            SELECT MAX(newest.sequence)
+              FROM navigator_review_finding_events AS newest
+             WHERE newest.slice_id = event.slice_id
+               AND newest.root_cause_id = event.root_cause_id
+          )
+        ORDER BY event.slice_id, event.root_cause_id`,
+    ).all(jobId, sliceId ?? null, sliceId ?? null) as FindingEventRow[];
+  }
+
+  private currentFindingLedger(jobId: string, sliceId?: string): NavigatorFindingLedgerEntry[] {
+    return this.currentFindingRows(jobId, sliceId).map((row) => ({
+      rootCauseId: row.root_cause_id,
+      sliceId: row.slice_id,
+      sourceReviewAttemptId: row.source_review_attempt_id,
+      verificationAttemptId: row.verification_attempt_id,
+      disposition: row.disposition,
+      state: findingState(row.event),
+      occurrence: row.occurrence,
+      blockingBurden: row.blocking_burden,
+      headSha: row.head_sha,
+      finding: navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json)),
+    }));
+  }
+
+  private appendFindingEvent(input: Readonly<{
+    attempt: NavigatorTicketWorkerAttempt;
+    sourceReviewAttemptId: string;
+    finding: NavigatorReviewFinding;
+    disposition: "must_fix" | "advisory";
+    event: FindingEventRow["event"];
+    occurrence: number;
+    blockingBurden: number;
+    evidenceRefs: readonly string[];
+    now: number;
+  }>): void {
+    const eventId = stableId(
+      "navfinding",
+      input.attempt.id,
+      input.finding.rootCauseId,
+      input.event,
+    );
+    this.db.prepare(
+      `INSERT INTO navigator_review_finding_events (
+         id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
+         root_cause_id, capability_id, rule_id, disposition, event, head_sha,
+         finding_json, evidence_refs_json, occurrence, blocking_burden, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      eventId,
+      input.attempt.jobId,
+      input.attempt.sliceId,
+      input.sourceReviewAttemptId,
+      input.attempt.id,
+      input.finding.rootCauseId,
+      input.finding.capabilityId,
+      input.finding.ruleId,
+      input.disposition,
+      input.event,
+      input.attempt.workOrder.baseHeadSha,
+      JSON.stringify(input.finding),
+      JSON.stringify(boundedRefs(input.evidenceRefs)),
+      input.occurrence,
+      input.blockingBurden,
+      input.now,
+    );
+  }
+
+  private recordPassingReview(
+    attempt: NavigatorTicketWorkerAttempt,
+    result: Readonly<{ axes: { requirements: { evidenceRefs: readonly string[] }; standards: { evidenceRefs: readonly string[] } } }>,
+    now: number,
+  ): string | null {
+    const current = this.currentFindingRows(attempt.jobId, attempt.sliceId);
+    const convergence = this.db.prepare(
+      "SELECT * FROM navigator_review_convergence WHERE slice_id = ?",
+    ).get(attempt.sliceId) as ConvergenceRow | undefined;
+    const reviewCycles = (convergence?.review_cycles ?? 0) + 1;
+    if (reviewCycles > attempt.workOrder.projectPolicy.maxReviewCycles) return "review_cycle_limit";
+    for (const row of current) {
+      if (findingState(row.event) !== "open") continue;
+      const finding = navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json));
+      this.appendFindingEvent({
+        attempt,
+        sourceReviewAttemptId: attempt.id,
+        finding,
+        disposition: row.disposition,
+        event: "resolved",
+        occurrence: row.occurrence,
+        blockingBurden: 0,
+        evidenceRefs: mergeEvidenceRefs(
+          result.axes.requirements.evidenceRefs,
+          result.axes.standards.evidenceRefs,
+          [`navigator-result:${attempt.id}`],
+        ),
+        now,
+      });
+    }
+    this.db.prepare(
+      `INSERT INTO navigator_review_convergence (
+         slice_id, last_blocking_burden, plateau_recoveries, review_cycles, updated_at
+       ) VALUES (?, 0, ?, ?, ?)
+       ON CONFLICT(slice_id) DO UPDATE SET
+         last_blocking_burden = 0,
+         review_cycles = excluded.review_cycles,
+         updated_at = excluded.updated_at`,
+    ).run(attempt.sliceId, convergence?.plateau_recoveries ?? 0, reviewCycles, now);
+    return null;
+  }
+
+  private recordFindingVerification(
+    attempt: NavigatorTicketWorkerAttempt,
+    result: Readonly<{ findings: readonly NavigatorReviewFinding[] }>,
+    now: number,
+  ): Readonly<{ blockingBurden: number; policyFailureReason: string | null }> {
+    const verification = attempt.workOrder.verificationOf;
+    if (verification === undefined) return { blockingBurden: 0, policyFailureReason: "finding_verification_source_missing" };
+    const source = new Map(verification.findings.map((finding) => [finding.rootCauseId, finding]));
+    const confirmed = new Map<string, NavigatorReviewFinding>();
+    for (const finding of result.findings) {
+      const reported = source.get(finding.rootCauseId);
+      if (reported === undefined || confirmed.has(finding.rootCauseId) || !sameRootCause(reported, finding)) {
+        return { blockingBurden: 0, policyFailureReason: "finding_verification_mismatch" };
+      }
+      confirmed.set(finding.rootCauseId, finding);
+    }
+    const currentRows = this.currentFindingRows(attempt.jobId, attempt.sliceId);
+    const current = new Map(currentRows.map((row) => [row.root_cause_id, row]));
+    const next = new Map(currentRows.map((row) => [row.root_cause_id, {
+      disposition: row.disposition,
+      state: findingState(row.event),
+      occurrence: row.occurrence,
+    }]));
+    for (const finding of verification.findings) {
+      const prior = current.get(finding.rootCauseId);
+      const disposition = findingDisposition(finding);
+      const isConfirmed = confirmed.has(finding.rootCauseId);
+      next.set(finding.rootCauseId, {
+        disposition,
+        state: isConfirmed ? "open" as const : "disputed" as const,
+        occurrence: isConfirmed ? Math.min(3, (prior?.occurrence ?? 0) + 1) : prior?.occurrence ?? 0,
+      });
+    }
+    for (const row of currentRows) {
+      if (findingState(row.event) === "open" && !source.has(row.root_cause_id)) {
+        next.set(row.root_cause_id, {
+          disposition: row.disposition,
+          state: "resolved",
+          occurrence: row.occurrence,
+        });
+      }
+    }
+    const blockingBurden = [...next.values()].filter((entry) =>
+      entry.state === "open" && entry.disposition === "must_fix").length;
+    const evidenceRefs = mergeEvidenceRefs(
+      result.findings.flatMap((finding) => finding.evidenceRefs),
+      [`navigator-result:${attempt.id}`],
+      [`navigator-result:${verification.attemptId}`],
+    );
+    for (const finding of verification.findings) {
+      const prior = current.get(finding.rootCauseId);
+      const isConfirmed = confirmed.has(finding.rootCauseId);
+      this.appendFindingEvent({
+        attempt,
+        sourceReviewAttemptId: verification.attemptId,
+        finding: isConfirmed ? confirmed.get(finding.rootCauseId)! : finding,
+        disposition: findingDisposition(finding),
+        event: isConfirmed ? (prior && findingState(prior.event) === "open" ? "reobserved" : "opened") : "disputed",
+        occurrence: next.get(finding.rootCauseId)!.occurrence,
+        blockingBurden,
+        evidenceRefs,
+        now,
+      });
+    }
+    for (const row of currentRows) {
+      if (findingState(row.event) !== "open" || source.has(row.root_cause_id)) continue;
+      this.appendFindingEvent({
+        attempt,
+        sourceReviewAttemptId: verification.attemptId,
+        finding: navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json)),
+        disposition: row.disposition,
+        event: "resolved",
+        occurrence: row.occurrence,
+        blockingBurden,
+        evidenceRefs,
+        now,
+      });
+    }
+    const convergence = this.db.prepare(
+      "SELECT * FROM navigator_review_convergence WHERE slice_id = ?",
+    ).get(attempt.sliceId) as ConvergenceRow | undefined;
+    const reviewCycles = (convergence?.review_cycles ?? 0) + 1;
+    let plateauRecoveries = convergence?.plateau_recoveries ?? 0;
+    let policyFailureReason: string | null = null;
+    if ([...next.values()].some((entry) => entry.state === "open" && entry.occurrence >= 3)) {
+      policyFailureReason = "finding_recurrence_limit";
+    } else if (reviewCycles > attempt.workOrder.projectPolicy.maxReviewCycles) {
+      policyFailureReason = "review_cycle_limit";
+    } else if (
+      convergence !== undefined && convergence.last_blocking_burden > 0 &&
+      blockingBurden >= convergence.last_blocking_burden
+    ) {
+      if (plateauRecoveries === 0) plateauRecoveries = 1;
+      else policyFailureReason = "review_burden_plateau";
+    }
+    this.db.prepare(
+      `INSERT INTO navigator_review_convergence (
+         slice_id, last_blocking_burden, plateau_recoveries, review_cycles, updated_at
+       ) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(slice_id) DO UPDATE SET
+         last_blocking_burden = excluded.last_blocking_burden,
+         plateau_recoveries = excluded.plateau_recoveries,
+         review_cycles = excluded.review_cycles,
+         updated_at = excluded.updated_at`,
+    ).run(attempt.sliceId, blockingBurden, plateauRecoveries, reviewCycles, now);
+    return { blockingBurden, policyFailureReason };
   }
 
   private boundCurrentArtifact(
@@ -1178,6 +1465,11 @@ export class NavigatorImplementationExecutor {
     now: number;
     effectAttempts?: number;
     nextAttemptAt?: number;
+    verificationOf?: Readonly<{
+      attemptId: string;
+      resultDigest: string;
+      findings: readonly NavigatorReviewFinding[];
+    }>;
   }>): NavigatorTicketWorkerAttempt {
     const workOrder = navigatorTicketWorkOrderSchema.parse({
       kind: "navigator_ticket_work_order",
@@ -1203,6 +1495,7 @@ export class NavigatorImplementationExecutor {
       taskEvidence: input.taskEvidence,
       evidenceRefs: input.evidenceRefs,
       changedPaths: input.changedPaths,
+      ...(input.verificationOf === undefined ? {} : { verificationOf: input.verificationOf }),
     });
     const profile = navigatorTicketWorkerProfile({
       kind: input.kind,
@@ -1383,6 +1676,7 @@ export class NavigatorImplementationExecutor {
       const integration = this.integrationRow(attempt.jobId)!;
       let outcome: NavigatorTicketWorkerOutcome["outcome"] = "succeeded";
       let reasonCode = "accepted";
+      let verifiedBlockingBurden: number | null = null;
       let result: unknown = parsed.success ? parsed.data : { kind: "policy_failure", reasonCode: "malformed_result" };
       if (resultTooLarge) {
         outcome = "policy_failure";
@@ -1404,9 +1698,12 @@ export class NavigatorImplementationExecutor {
         outcome = "policy_failure";
         reasonCode = "git_observation_rejected";
       } else if (parsed.data.kind === "implementation_result") {
+        const ticketSnapshot = this.dependencies.store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId);
         if (
           parsed.data.baseHeadSha !== attempt.workOrder.baseHeadSha ||
           integration.current_head_sha !== attempt.workOrder.baseHeadSha ||
+          ticketSnapshot === null ||
+          !navigatorAcceptanceCriteriaAreSatisfied(ticketSnapshot, parsed.data.acceptanceCriteria) ||
           parsed.data.focusedVerification.some((receipt) => receipt.outcome !== "passed") ||
           parsed.data.fullVerification.some((receipt) => receipt.outcome !== "passed")
         ) {
@@ -1418,9 +1715,38 @@ export class NavigatorImplementationExecutor {
       } else if (parsed.data.reviewedHeadSha !== attempt.workOrder.baseHeadSha) {
         outcome = "policy_failure";
         reasonCode = "review_head_mismatch";
+      } else if (attempt.workOrder.verificationOf !== undefined) {
+        const sourceOutcome = this.getOutcome(attempt.workOrder.verificationOf.attemptId);
+        if (
+          sourceOutcome?.outcome !== "findings" ||
+          sourceOutcome.resultDigest !== attempt.workOrder.verificationOf.resultDigest ||
+          sourceOutcome.exactHeadSha !== attempt.workOrder.baseHeadSha
+        ) {
+          outcome = "policy_failure";
+          reasonCode = "finding_verification_source_mismatch";
+        } else {
+          const verified = this.recordFindingVerification(attempt, parsed.data, now);
+          verifiedBlockingBurden = verified.blockingBurden;
+          if (verified.policyFailureReason !== null) {
+            outcome = "policy_failure";
+            reasonCode = verified.policyFailureReason;
+          } else if (verified.blockingBurden > 0) {
+            outcome = "findings";
+            reasonCode = "confirmed_review_findings";
+          } else {
+            outcome = "succeeded";
+            reasonCode = parsed.data.findings.length > 0 ? "accepted_advisories" : "findings_disputed";
+          }
+        }
       } else if (parsed.data.outcome === "findings") {
         outcome = "findings";
-        reasonCode = "review_findings";
+        reasonCode = "review_findings_unverified";
+      } else {
+        const convergenceFailure = this.recordPassingReview(attempt, parsed.data, now);
+        if (convergenceFailure !== null) {
+          outcome = "policy_failure";
+          reasonCode = convergenceFailure;
+        }
       }
       const resultDigest = navigatorJsonDigest(result);
       const gitObservation = parsedGit.success ? parsedGit.data : null;
@@ -1452,7 +1778,12 @@ export class NavigatorImplementationExecutor {
       } else if (attempt.kind === "implementation") {
         const implementationResult = navigatorImplementationResultSchema.parse(result);
         this.acceptImplementation(attempt, implementationResult.headSha, implementationResult.changedPaths, now);
-      } else if (outcome === "findings") {
+      } else if (
+        outcome === "findings" && attempt.workOrder.verificationOf === undefined
+      ) {
+        const reviewResult = navigatorCodeReviewResultSchema.parse(result);
+        this.scheduleFindingVerification(attempt, reviewResult, resultDigest, now);
+      } else if (outcome === "findings" && verifiedBlockingBurden !== null) {
         this.db.prepare(
           "UPDATE navigator_ticket_slices SET state = 'repair_pending', updated_at = ? WHERE id = ?",
         ).run(now, attempt.sliceId);
@@ -1540,6 +1871,41 @@ export class NavigatorImplementationExecutor {
       changedPaths,
       baseHeadSha: headSha,
       comparisonBaseHeadSha: this.requireSlice(attempt.sliceId).integration_base_head_sha,
+      now,
+    });
+  }
+
+  private scheduleFindingVerification(
+    attempt: NavigatorTicketWorkerAttempt,
+    result: Readonly<{ findings: readonly NavigatorReviewFinding[] }>,
+    resultDigest: string,
+    now: number,
+  ): void {
+    const integration = this.integrationRow(attempt.jobId)!;
+    const ticket = this.requireTicket(attempt.jobId, attempt.workOrder.ticket.artifactId);
+    this.db.prepare(
+      "UPDATE navigator_ticket_slices SET state = 'review_pending', updated_at = ? WHERE id = ?",
+    ).run(now, attempt.sliceId);
+    this.createAttempt({
+      integration,
+      sliceId: attempt.sliceId,
+      ticket,
+      kind: "review",
+      ordinal: this.nextAttemptOrdinal(attempt.sliceId, "review"),
+      taskEvidence: attempt.workOrder.taskEvidence,
+      evidenceRefs: mergeEvidenceRefs(
+        attempt.workOrder.evidenceRefs,
+        [`navigator-result:${attempt.id}`],
+        [`navigator-verify:${attempt.id}`],
+      ),
+      changedPaths: attempt.workOrder.changedPaths,
+      baseHeadSha: attempt.workOrder.baseHeadSha,
+      comparisonBaseHeadSha: attempt.workOrder.comparisonBaseHeadSha,
+      verificationOf: {
+        attemptId: attempt.id,
+        resultDigest,
+        findings: result.findings,
+      },
       now,
     });
   }

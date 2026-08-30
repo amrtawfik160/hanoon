@@ -4,6 +4,7 @@ import { SKILL_ADMISSION_CATALOG } from "../capabilities/catalog";
 import { modelRouteSchema } from "../capabilities/models";
 import { projectPolicySchema } from "../domain/models";
 import { artifactBindingSchema } from "./models";
+import type { WorkArtifactSnapshot } from "../work-artifacts/models";
 
 const identifierSchema = z.string().trim().min(1).max(256);
 const boundedTextSchema = z.string().trim().min(1).max(8_000);
@@ -22,6 +23,19 @@ const taskEvidenceSchema = z.array(z.enum([
   "merge-conflict",
   "agent-instructions",
 ])).max(5);
+
+export const navigatorReviewFindingSchema = z.object({
+  rootCauseId: identifierSchema,
+  capabilityId: identifierSchema,
+  ruleId: identifierSchema,
+  severity: z.enum(["critical", "high", "medium", "low"]),
+  subject: projectPathSchema,
+  line: z.number().int().positive().nullable(),
+  requirementId: identifierSchema.nullable(),
+  summary: boundedTextSchema,
+  evidenceRefs: requiredEvidenceRefsSchema,
+}).strict();
+export type NavigatorReviewFinding = Readonly<z.infer<typeof navigatorReviewFindingSchema>>;
 
 const profileAssignmentSchema = z.object({
   capabilityId: identifierSchema,
@@ -59,6 +73,11 @@ export const navigatorTicketWorkOrderSchema = z.object({
   taskEvidence: taskEvidenceSchema,
   evidenceRefs: requiredEvidenceRefsSchema,
   changedPaths: z.array(projectPathSchema).max(512),
+  verificationOf: z.object({
+    attemptId: identifierSchema,
+    resultDigest: sha256Schema,
+    findings: z.array(navigatorReviewFindingSchema).min(1).max(128),
+  }).strict().optional(),
 }).strict().superRefine((workOrder, context) => {
   if (navigatorJsonDigest(workOrder.projectPolicy) !== workOrder.projectPolicyDigest) {
     context.addIssue({
@@ -82,6 +101,12 @@ const capabilityOutcomeSchema = z.object({
   evidenceRefs: requiredEvidenceRefsSchema,
 }).strict();
 
+const acceptanceCriterionResultSchema = z.object({
+  criterionId: identifierSchema,
+  outcome: z.enum(["passed", "blocked"]),
+  evidenceRefs: requiredEvidenceRefsSchema,
+}).strict();
+
 export const navigatorImplementationResultSchema = z.object({
   kind: z.literal("implementation_result"),
   baseHeadSha: gitShaSchema,
@@ -90,14 +115,8 @@ export const navigatorImplementationResultSchema = z.object({
   changedPaths: z.array(projectPathSchema).max(512),
   focusedVerification: z.array(verificationReceiptSchema).min(1).max(64),
   fullVerification: z.array(verificationReceiptSchema).min(1).max(64),
+  acceptanceCriteria: z.array(acceptanceCriterionResultSchema).max(128),
   capabilityOutcomes: z.array(capabilityOutcomeSchema).min(1).max(16),
-}).strict();
-
-export const navigatorReviewFindingSchema = z.object({
-  ruleId: identifierSchema,
-  severity: z.enum(["critical", "high", "medium", "low"]),
-  summary: boundedTextSchema,
-  evidenceRefs: requiredEvidenceRefsSchema,
 }).strict();
 
 export const navigatorCodeReviewResultSchema = z.object({
@@ -105,6 +124,16 @@ export const navigatorCodeReviewResultSchema = z.object({
   reviewedHeadSha: gitShaSchema,
   outcome: z.enum(["passed", "findings"]),
   summary: boundedTextSchema,
+  axes: z.object({
+    requirements: z.object({
+      outcome: z.enum(["passed", "findings"]),
+      evidenceRefs: requiredEvidenceRefsSchema,
+    }).strict(),
+    standards: z.object({
+      outcome: z.enum(["passed", "findings"]),
+      evidenceRefs: requiredEvidenceRefsSchema,
+    }).strict(),
+  }).strict(),
   findings: z.array(navigatorReviewFindingSchema).max(128),
   capabilityOutcomes: z.array(capabilityOutcomeSchema).min(1).max(16),
 }).strict().superRefine((result, context) => {
@@ -115,6 +144,14 @@ export const navigatorCodeReviewResultSchema = z.object({
       message: "a passing review has no findings and a findings review has at least one",
     });
   }
+  const axisHasFindings = result.axes.requirements.outcome === "findings" || result.axes.standards.outcome === "findings";
+  if ((result.outcome === "findings") !== axisHasFindings) {
+    context.addIssue({
+      code: "custom",
+      path: ["axes"],
+      message: "review outcome must match the separate requirements and standards axes",
+    });
+  }
 });
 
 export const navigatorTicketWorkerResultSchema = z.discriminatedUnion("kind", [
@@ -123,6 +160,27 @@ export const navigatorTicketWorkerResultSchema = z.discriminatedUnion("kind", [
 ]);
 
 export type NavigatorTicketWorkerResult = Readonly<z.infer<typeof navigatorTicketWorkerResultSchema>>;
+
+export type NavigatorAcceptanceCriterion = Readonly<{
+  id: string;
+  text: string;
+}>;
+
+export function navigatorAcceptanceCriteria(snapshot: WorkArtifactSnapshot): readonly NavigatorAcceptanceCriterion[] {
+  return snapshot.acceptanceCriteria.map((text, index) => ({
+    id: `ac:${String(index + 1)}:${createHash("sha256").update(text, "utf8").digest("hex").slice(0, 24)}`,
+    text,
+  }));
+}
+
+export function navigatorAcceptanceCriteriaAreSatisfied(
+  snapshot: WorkArtifactSnapshot,
+  results: readonly Readonly<{ criterionId: string; outcome: "passed" | "blocked" }>[],
+): boolean {
+  const expected = navigatorAcceptanceCriteria(snapshot).map((criterion) => criterion.id);
+  return JSON.stringify(results.map((result) => result.criterionId)) === JSON.stringify(expected) &&
+    results.every((result) => result.outcome === "passed");
+}
 
 export const navigatorTicketRepairSnapshotSchema = z.object({
   kind: z.literal("navigator_ticket_repair_snapshot"),
@@ -266,13 +324,13 @@ function ticketStepContract(
 export const NAVIGATOR_TICKET_STEP_CONTRACTS = Object.freeze({
   implementation: ticketStepContract({
     id: "navigator-ticket-implementation",
-    revision: 2,
+    revision: 3,
     skillId: "implement",
     freshContext: true,
     codeWriting: true,
     resourceClass: "managed_integration_worktree",
     resultSchema: "navigator-implementation-result-v1",
-    mandatoryEvidence: ["ticket_snapshot", "specification_snapshot", "focused_verification", "full_verification"],
+    mandatoryEvidence: ["ticket_snapshot", "specification_snapshot", "acceptance_criteria", "focused_verification", "full_verification"],
     modelPools: ["standard", "strong"],
     timeoutMs: 14_400_000,
     maximumResultBytes: 256_000,
@@ -283,13 +341,13 @@ export const NAVIGATOR_TICKET_STEP_CONTRACTS = Object.freeze({
   }),
   review: ticketStepContract({
     id: "navigator-ticket-code-review",
-    revision: 2,
+    revision: 3,
     skillId: "code-review",
     freshContext: true,
     codeWriting: false,
     resourceClass: "managed_integration_worktree",
     resultSchema: "navigator-code-review-result-v1",
-    mandatoryEvidence: ["ticket_snapshot", "specification_snapshot", "exact_head_review"],
+    mandatoryEvidence: ["ticket_snapshot", "specification_snapshot", "requirements_review", "standards_review", "exact_head_review"],
     modelPools: ["strong"],
     timeoutMs: 3_600_000,
     maximumResultBytes: 256_000,

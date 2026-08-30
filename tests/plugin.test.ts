@@ -1,4 +1,4 @@
-import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import plugin from "../server";

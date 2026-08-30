@@ -6,7 +6,7 @@ import { createConnection, type AddressInfo } from "node:net";
 import { createServer as createHttpsServer, request as httpsRequest, type Server as HttpsServer } from "node:https";
 import Database from "better-sqlite3";
 import { AuthExpiredError, RateLimitExceededError } from "@1password/sdk";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "../server";
 import { hashSecret } from "../src/crypto";

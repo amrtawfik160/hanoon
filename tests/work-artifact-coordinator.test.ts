@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

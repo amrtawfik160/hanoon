@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import {

@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import { lstat, readdir, rm, statfs } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -46,6 +46,7 @@ import {
 } from "./bb/realtime-events";
 import { environmentWorktreeIsClean, resolvePrHead, runValidation } from "./bb/validation";
 import { TerminalCommandRunner } from "./bb/terminal-command";
+import { TerminalBbAutomationAdapter } from "./bb/automation";
 import { TelegramClient, TelegramFileTooLargeError } from "./telegram/client";
 import { TelegramIngress } from "./telegram/ingress";
 import { transcribeWithBb } from "./telegram/voice";
@@ -122,7 +123,12 @@ import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { MemoryEmbeddingService } from "./services/memory-embedding-service";
-import { installSystemMonitors } from "./services/system-monitors";
+import { installSystemAutomations } from "./services/system-monitors";
+import {
+  ManagedAutomationReconciler,
+  ManagedAutomationService,
+} from "./services/managed-automation-service";
+import { ManagedAutomationRepository } from "./storage/managed-automation-repository";
 import { ProductionHealthService } from "./services/production-health-service";
 import { RegressionWatchService } from "./services/regression-watch-service";
 import { FailureLoopService } from "./services/failure-loop-service";
@@ -637,6 +643,19 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     clock: { now: clock },
     hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
   });
+  const terminal = new TerminalCommandRunner(bb.sdk);
+  const managedAutomationRepository = new ManagedAutomationRepository(bb.storage.database());
+  const managedAutomations = new ManagedAutomationService(
+    managedAutomationRepository,
+    new TerminalBbAutomationAdapter(terminal),
+  );
+  const managedAutomationReconciler = new ManagedAutomationReconciler({
+    repository: managedAutomationRepository,
+    service: managedAutomations,
+    store,
+    notify: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
   const toolDependencies: Parameters<typeof registerControllerTools>[1] = {
     store,
     sdk: bb.sdk,
@@ -659,6 +678,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     notify: () => executorNudge.notify(),
     now: clock,
     credentialAccess: credentialAccessService,
+    automations: managedAutomations,
     controllerProviderId: () => config.ok
       ? controllerProviderFor(controllerExecutionProfile(config.value).model)
       : undefined,
@@ -704,7 +724,6 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     toolDependencies.credentialAccess = credentialAccessService;
   });
 
-  const terminal = new TerminalCommandRunner(bb.sdk);
   const unpairNonceKey = createSecret(32);
   bb.cli.register({
     name: "telegram-agent",
@@ -1393,17 +1412,38 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   });
   let systemMonitorsInstalled = false;
   const systemMonitors = {
-    install: () => {
+    install: async () => {
       // Turning the setting off has to retire what is already armed, or the
       // owner keeps getting the daily sweep they just switched off.
       if (config.ok && !systemUpkeepEnabled(config.value)) {
         if (store.cancelSystemMonitors(clock()) > 0) systemMonitorsInstalled = false;
+        const owner = store.getOwner();
+        const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
+        if (controller?.hostId) {
+          for (const binding of managedAutomations.list(controller.controllerKey, false)) {
+            if (binding.authority.source !== "system") continue;
+            try {
+              await managedAutomations.retire({
+                id: binding.id,
+                scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+                now: clock(),
+              });
+              systemMonitorsInstalled = false;
+            } catch {
+              bb.log.warn(`System automation ${binding.id} could not be retired`);
+            }
+          }
+        }
         return;
       }
       if (systemMonitorsInstalled) return;
       if (!config.ok) return;
-      const installed = installSystemMonitors({
+      const execution = controllerExecutionProfile(config.value);
+      const installed = await installSystemAutomations({
         store,
+        service: managedAutomations,
+        providerId: controllerProviderFor(execution.model),
+        execution,
         clock: { now: clock },
         warn: (message) => bb.log.warn(message),
       });
@@ -2334,6 +2374,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       workspaceHousekeeping,
       audits,
       systemMonitors,
+      automations: managedAutomationReconciler,
       presence,
       laneSnapshots,
       waitForWork: (milliseconds, signal) => executorNudge.wait(milliseconds, signal),

@@ -1,5 +1,5 @@
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import {
   DETERMINISTIC_PROMOTION_CATEGORIES,

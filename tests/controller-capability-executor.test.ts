@@ -1196,7 +1196,7 @@ it("projects the remaining memory, monitor, health, scorecard, and style rows fr
   });
   expect(watching._hanoonEvidence).toMatchObject({
     outcome: "succeeded",
-    proofKinds: ["monitor_state", "obligation"],
+    proofKinds: ["monitor_state", "external_mutation", "obligation"],
     subjectRefs: [`monitor:${watching.watching.id}`],
   });
 

@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
@@ -11,6 +11,9 @@ import {
   NAVIGATOR_EVALUATION_BUDGET_DIGEST,
   NAVIGATOR_EVALUATION_HARNESS_DIGEST,
 } from "../src/navigator/evaluation-corpus";
+import {
+  navigatorAcceptanceCriteria,
+} from "../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
   type NavigatorTicketWorkerAttempt,
@@ -376,6 +379,7 @@ describe("disposable navigator live path", () => {
         const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
         await hooks.bindResource(resource);
         if (attempt.kind === "implementation") {
+          const ticketSnapshot = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
           return {
             resource,
             result: {
@@ -386,13 +390,32 @@ describe("disposable navigator live path", () => {
               changedPaths: ["src/app.ts"],
               focusedVerification: [{ command: "npm test", outcome: "passed" }],
               fullVerification: [{ command: "npm run check", outcome: "passed" }],
+              acceptanceCriteria: navigatorAcceptanceCriteria(ticketSnapshot).map(({ id }) => ({
+                criterionId: id,
+                outcome: "passed",
+                evidenceRefs: [`acceptance:${id}`],
+              })),
               capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
                 capabilityId, outcome: "passed", evidenceRefs: [`worker:${attempt.id}`],
               })),
             },
           };
         }
-        const needsRepair = attempt.workOrder.ticket.artifactId === firstTicketId && attempt.ordinal === 1;
+        const needsRepair = attempt.workOrder.verificationOf !== undefined ||
+          (attempt.workOrder.ticket.artifactId === firstTicketId && attempt.ordinal === 1);
+        const findings = needsRepair
+          ? attempt.workOrder.verificationOf?.findings ?? [{
+            rootCauseId: "dual-engine-repair",
+            capabilityId: "code-review",
+            ruleId: "SPEC-DUAL-REPAIR",
+            severity: "high" as const,
+            subject: "src/app.ts",
+            line: 1,
+            requirementId: "SPEC-DUAL-REPAIR",
+            summary: "Repair this finding.",
+            evidenceRefs: ["review:1"],
+          }]
+          : [];
         return {
           resource,
           result: {
@@ -400,12 +423,14 @@ describe("disposable navigator live path", () => {
             reviewedHeadSha: attempt.workOrder.baseHeadSha,
             outcome: needsRepair ? "findings" : "passed",
             summary: needsRepair ? "Repair the finding." : "Passed.",
-            findings: needsRepair ? [{
-              ruleId: "SPEC-DUAL-REPAIR",
-              severity: "high",
-              summary: "Repair this finding.",
-              evidenceRefs: ["review:1"],
-            }] : [],
+            axes: {
+              requirements: {
+                outcome: needsRepair ? "findings" : "passed",
+                evidenceRefs: [`requirements:${attempt.id}`],
+              },
+              standards: { outcome: "passed", evidenceRefs: [`standards:${attempt.id}`] },
+            },
+            findings,
             capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
               capabilityId,
               outcome: needsRepair ? "findings" : "passed",
@@ -543,6 +568,7 @@ describe("disposable navigator live path", () => {
       ownerId: "executor",
       generation: lease.generation,
     });
+    await executor.processOne(fence, new AbortController().signal);
     await executor.processOne(fence, new AbortController().signal);
     await executor.processOne(fence, new AbortController().signal);
     const firstSlice = executor.snapshot(draft.id);

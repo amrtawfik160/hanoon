@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";

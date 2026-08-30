@@ -1,5 +1,5 @@
 import { randomBytes as nodeRandomBytes } from "node:crypto";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { hashSecret } from "../crypto";
 import type { EffectFence } from "../services/effect-runner";
 import type {

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import type {
   ControllerAdapter,
@@ -234,7 +234,11 @@ function controllerConfigurationContext(pluginId: string): PluginAgentConfigurat
       branchName: null,
     },
     host: { id: "host_fixed", name: "Fixed controller host" },
-    provider: { id: "codex", model: "scripted-controller" },
+    provider: {
+      id: "codex",
+      model: "scripted-controller",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId },
   };
 }
@@ -456,17 +460,17 @@ function registeredToolSurface(agentTools: ReadonlyArray<{
   name: string;
   description: string;
   inputSchema: unknown;
-  experimentalStatusLabels: unknown;
+  presentation: unknown;
   instructions: string | null;
 }>) {
   const metadataToolNames = new Set<string>(CONTROLLER_METADATA_TOOL_NAMES);
   const tools = [...agentTools]
     .filter(({ name }) => !metadataToolNames.has(name))
-    .map(({ name, description, inputSchema, experimentalStatusLabels, instructions }) => ({
+    .map(({ name, description, inputSchema, presentation, instructions }) => ({
       name,
       description,
       inputSchema,
-      experimentalStatusLabels,
+      presentation,
       instructions,
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
@@ -1270,9 +1274,9 @@ async function runExtendedScenario(input: Readonly<{
       const result = parseScenarioToolResult(await harness.behavior.callAgentTool(
         "telegram_agent_watch",
         {
-          kind: "schedule",
-          cron: "0 1 * * *",
-          instruction: "Check whether thread_fixture_1 has finished.",
+          kind: "thread_idle",
+          threadId: externalTargetThreadId,
+          instruction: "Tell the owner when the watched thread finishes.",
         },
         toolContext,
       ));

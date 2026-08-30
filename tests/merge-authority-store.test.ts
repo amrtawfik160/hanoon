@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { resolveMergeGrant } from "../src/services/merge-authority";

@@ -6,6 +6,7 @@ import {
   isReviewedPrCompletionBlock,
   projectPolicySchema,
   type Job,
+  type JobState,
   type ProjectPolicy,
   type WorkerLiveness,
 } from "../domain/models";
@@ -225,6 +226,39 @@ function redact(value: string): string {
 function displayText(value: unknown, maxLength: number): string {
   const text = redact(typeof value === "string" ? value : String(value ?? ""));
   return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+const PLAIN_JOB_STATE: Readonly<Record<JobState, string>> = Object.freeze({
+  awaiting_project: "choosing a project",
+  awaiting_confirmation: "ready to start",
+  planning: "planning the change",
+  critiquing: "checking the plan",
+  creating_implementation: "preparing the work",
+  implementing: "coding and testing",
+  locating_pr: "checking the pull request",
+  resolving_pr_head: "checking the pull request",
+  reviewing: "reviewing the change",
+  remediating: "fixing review findings",
+  validating: "running checks",
+  documenting: "updating documentation",
+  resolving_docs_head: "checking the pull request",
+  final_validating: "running final checks",
+  final_reviewing: "running the final review",
+  awaiting_merge_approval: "waiting for merge approval",
+  merging: "merging the change",
+  deploying: "deploying the change",
+  verifying_production: "checking production",
+  recovering_worker: "recovering interrupted work",
+  production_failed: "production needs attention",
+  complete: "complete",
+  failed: "stopped by a problem",
+  blocked: "blocked",
+  cancelled: "cancelled",
+  merged: "merged",
+});
+
+function plainJobState(state: JobState): string {
+  return PLAIN_JOB_STATE[state];
 }
 
 function html(value: unknown, maxLength: number): string {
@@ -616,17 +650,7 @@ export function renderJobStatus(
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
   ];
   if (policy) lines.push(`Base: <code>${html(policy.baseBranch, 120)}</code>`);
-  lines.push(`Workflow navigator: <code>${html(`${job.workflowEngine}/${job.workflowMode}`, 160)}</code>`);
-  if (job.workflowEngine === "recipe-v1") {
-    lines.push(`Recipe: <code>${html(`${job.taskRecipe}@${job.recipeVersion}`, 160)}</code>`);
-  }
-  lines.push(`Stage: <code>${html(queuedConfirmed ? "queued" : job.state, 80)}</code>`);
-  if (job.recipePromotionCount > 0) {
-    lines.push(`Rigor: promoted ${job.recipePromotionCount}/2`);
-  }
-  if (context.materialModelPool) {
-    lines.push(`Model escalation: <code>${html(context.materialModelPool, 20)}</code>`);
-  }
+  lines.push(`Status: ${html(queuedConfirmed ? "waiting for a free slot" : plainJobState(job.state), 80)}`);
   lines.push(`Delivery: ${html(deliveryState(job), 80)}`);
   // Whoever reads this card should never have to wonder whether they asked for
   // this, so a job nobody asked for says so before it says anything else about
@@ -680,9 +704,6 @@ export function renderJobStatus(
       lines.push(`Diff: ${changedFiles} files, +${additions} / -${deletions}`);
     }
   }
-  if (job.implementationThreadId) lines.push(`Implementation thread: <code>${html(job.implementationThreadId, 120)}</code>`);
-  if (job.reviewThreadId) lines.push(`Review thread: <code>${html(job.reviewThreadId, 120)}</code>`);
-  if (job.documentationThreadId) lines.push(`Docs thread: <code>${html(job.documentationThreadId, 120)}</code>`);
   if (context.workerLiveness) {
     const worker = context.workerLiveness;
     const catchingUp = worker.state === "unknown" || worker.state === "stale";

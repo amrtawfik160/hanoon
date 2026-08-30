@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { createHash } from "node:crypto";
 import { expect, expectTypeOf, it } from "vitest";
 import type { ControllerTurnRecord } from "../src/controller/models";
@@ -16,6 +16,8 @@ import {
   TASK_AUTHORITY_REVISION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
+  NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  MANAGED_AUTOMATION_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -218,7 +220,9 @@ function expectDuplicateGenerationRepair(
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
   expect(ALL_MIGRATIONS).toHaveLength(
-    80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length + NAVIGATOR_PROMOTION_MIGRATIONS.length,
+    80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length +
+      NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
+      MANAGED_AUTOMATION_MIGRATIONS.length,
   );
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");

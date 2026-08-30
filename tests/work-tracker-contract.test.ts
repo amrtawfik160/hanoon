@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { hashSecret } from "../src/crypto";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import {

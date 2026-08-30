@@ -8,14 +8,15 @@ export type AnswerClauseId =
   | "no-invented-progress"
   | "bounded-uncertainty"
   | "no-dead-end-referral"
-  | "not-process-only";
+  | "not-process-only"
+  | "plain-language";
 
 export type AnswerClause = Readonly<{
   id: AnswerClauseId;
   question: string;
 }>;
 
-export const ANSWER_RUBRIC_VERSION = "answer-contract-hybrid-v1" as const;
+export const ANSWER_RUBRIC_VERSION = "answer-contract-hybrid-v2" as const;
 export const ANSWER_LIVE_GATE_SCHEMA_VERSION = "answer-live-gate-v2" as const;
 export const ANSWER_FINAL_INPUT_SCHEMA_VERSION = "answer-final-input-v1" as const;
 
@@ -53,6 +54,10 @@ export const ANSWER_CLAUSES: readonly AnswerClause[] = Object.freeze([
     id: "not-process-only",
     question: "Is this a finished answer rather than only a statement of intent to go and investigate?",
   }),
+  Object.freeze({
+    id: "plain-language",
+    question: "Does the answer use simple, direct language and briefly explain any necessary technical term, without making the owner decode internal state names or jargon?",
+  }),
 ]);
 
 export const ANSWER_DETERMINISTIC_RULES = Object.freeze([
@@ -62,6 +67,7 @@ export const ANSWER_DETERMINISTIC_RULES = Object.freeze([
   Object.freeze({ id: "bounded-uncertainty", version: 1, rule: "judge-only; no deterministic rejection" }),
   Object.freeze({ id: "no-dead-end-referral", version: 1, rule: "reject explicit owner delegation of a routine BB operation" }),
   Object.freeze({ id: "not-process-only", version: 1, rule: "reject an answer that only promises future investigation" }),
+  Object.freeze({ id: "plain-language", version: 1, rule: "judge-only; no deterministic rejection" }),
 ] as const);
 
 export const ANSWER_CLAUSE_IDS: readonly AnswerClauseId[] = Object.freeze(
@@ -78,27 +84,27 @@ const ANSWER_RELEASE_CASE_IDS = Object.freeze([
   "bad-news-plainly",
 ]);
 const ANSWER_RELEASE_GOLDEN_SHA256 = "43e2872b5f40fb8266760153dac1e6a9b4b049ddd2bce53b5a223eda5e9bb79b";
-const ANSWER_RELEASE_EXPECTATIONS_SHA256 = "de278dc8d2ad3531ee4c91b0cf1af1fa5d373d242a9f4692bca325c1515b4805";
+const ANSWER_RELEASE_EXPECTATIONS_SHA256 = "c7b7976220654b8f5983a029e897de3af789d9e37a9e55787726d8d29eccb281";
 const ANSWER_RELEASE_EXPECTATIONS: Readonly<Record<string, Readonly<{
   aggregate: "pass" | "fail";
   clauses: Readonly<Record<AnswerClauseId, boolean>>;
 }>>> = Object.freeze({
-  "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-  "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-  "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true } },
-  "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false } },
-  "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true } },
-  "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-  "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+  "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": false } },
+  "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+  "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false, "plain-language": true } },
+  "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true, "plain-language": true } },
+  "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+  "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
 });
 const ANSWER_RELEASE_FINAL_INPUT_SHA256_BY_CASE: Readonly<Record<string, string>> = Object.freeze({
-  "status-good": "ac42f28d2fd3424d35089edcdc7fc62413b4f75e68f37a358cb4dfbe868263e7",
-  "status-narrates-tools": "aeb2c944f476e2aff4b8f15b8c97b5c5406c5f0d242efd6fa3b7ad7609848a1d",
-  "status-invents-eta": "41e08624551192dac814c5b862043d98f8ea102a271f9b2a395fefa8a0bc8ec5",
-  "process-only": "9fd0d1d22fba72fae3efc40fc2e688925238ca2dee82d3c848013ec692559d08",
-  "dead-end-referral": "4c1666ef17f6f50fe85111faf029fa7e6591f6ab25a3530b2a612f3a8238acc7",
-  "bounded-uncertainty": "66555ac46d425beb362891f9b77bb0fc4c9b32c024b402d57f12edef602a4224",
-  "bad-news-plainly": "4d83b05669c617e256ea10611b6882ad152e84272b7b586e06feb896be7b661d",
+  "status-good": "00fc4673a97d1a64322023ad94f9e6dd4e67f15bdd687f77cf8d1d0608b0235e",
+  "status-narrates-tools": "da261219f86b197801c2bd172c5fae12076fa59ff151b7ebd8f15aceb38667c3",
+  "status-invents-eta": "245b55e224ead409c3d7edb4a64e5b4c2226692956fc10e2d726bfdecf5fcaaf",
+  "process-only": "cecdc106a8f079b140f44b7a92daa3af6088dc88d1e77ce1b40c712c0472d5b5",
+  "dead-end-referral": "bc4adb4cf979306ade8cfd04329fd6179c37a7b7397f167f51971991644949e3",
+  "bounded-uncertainty": "033855e9a157aa2fd7d234c7bba39ba0a0f5417eb4e8af9d05602df2c1ebb335",
+  "bad-news-plainly": "f0b48b13dfb7892792b516717d9536a18a9c332c2d439f334f26eb475dd5c212",
 });
 
 export type AnswerFinalInputBundle = Readonly<{
@@ -204,7 +210,7 @@ export const ANSWER_LIVE_GATE_RELEASE_CORPUS = Object.freeze({
   caseIds: ANSWER_RELEASE_CASE_IDS,
   goldenSha256: ANSWER_RELEASE_GOLDEN_SHA256,
   expectationsSha256: ANSWER_RELEASE_EXPECTATIONS_SHA256,
-  finalInputSha256: "6c12073920db9f216509dbc4ea6f058bea59d175cfb9aeb9af93d92f27ea9ad6",
+  finalInputSha256: "bcea109d7b7c3c78101a466fd4f26631ad012c023578f127d473ab9fff35d93b",
 } as const);
 
 export function isExactAnswerReleaseCorpus(input: {
@@ -572,6 +578,7 @@ export function detectExplicitClauseViolation(
       return null;
     case "outcome-first":
     case "bounded-uncertainty":
+    case "plain-language":
       return null;
   }
 }

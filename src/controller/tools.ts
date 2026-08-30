@@ -1,4 +1,4 @@
-import type { BbPluginApi, PluginAgentConfigurationContext, PluginAgentToolContext } from "@bb/plugin-sdk";
+import type { BbPluginApi, PluginAgentConfigurationContext, PluginAgentToolContext } from "@get-bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { redactError } from "../errors";
@@ -119,6 +119,11 @@ import {
 } from "./outbound-media";
 import { BROKER_BINDING_STATES, OPAQUE_ID_PATTERN } from "../credentials/protocol";
 import type { CredentialAccessService } from "../credentials/service";
+import type {
+  ManagedAutomationMutation,
+  ManagedAutomationService,
+} from "../services/managed-automation-service";
+import type { ManagedAutomationBinding } from "../storage/managed-automation-repository";
 
 export { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 export const CONTROLLER_METADATA_TOOL_NAMES = CONTROLLER_METADATA_TOOL_IDS;
@@ -151,6 +156,8 @@ type ToolDependencies = {
   now(): number;
   /** Absent exactly when credential mode is disabled; the three access tools fail closed. */
   credentialAccess?: CredentialAccessService;
+  /** BB's scheduler. Absent means clock-based work fails closed. */
+  automations?: Pick<ManagedAutomationService, "create" | "get" | "list" | "retire">;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
   /** Current controller execution tuple, used when this turn opens a child thread. */
@@ -733,6 +740,21 @@ function monitorProjection(monitor: MonitorRecord) {
   };
 }
 
+function automationProjection(binding: ManagedAutomationBinding) {
+  const definition = binding.definition;
+  return {
+    id: binding.id,
+    kind: "schedule" as const,
+    threadId: null,
+    cron: definition.trigger.kind === "cron" ? definition.trigger.cron : null,
+    instruction: definition.mode === "agent" ? definition.prompt : definition.name,
+    state: binding.state,
+    lastError: binding.lastError,
+    nextDueAt: binding.observed?.nextRunAt ?? null,
+    fireCount: binding.observed?.runCount ?? 0,
+  };
+}
+
 /**
  * A monitor's instruction is a paragraph the agent wrote to itself, and this
  * result has a hard byte limit. Sixty-odd of them overran it, and an overrun
@@ -775,6 +797,30 @@ function packMonitorList(monitors: MonitorRecord[]) {
     bytes += size;
   }
   return { monitors: packed, omitted: ordered.length - packed.length };
+}
+
+function packWatchList(monitors: MonitorRecord[], automations: ManagedAutomationBinding[]) {
+  const local = packMonitorList(monitors);
+  const automated = automations.map(automationProjection);
+  const rows = [...automated, ...local.monitors];
+  const packed: typeof rows = [];
+  let bytes = 0;
+  for (const row of rows) {
+    const clipped = {
+      ...row,
+      instruction: clipInstruction(
+        row.instruction,
+        row.state === "active" || row.state === "armed" || row.state === "failed"
+          ? LIVE_INSTRUCTION_CHARS
+          : SETTLED_INSTRUCTION_CHARS,
+      ),
+    };
+    const size = Buffer.byteLength(JSON.stringify(clipped), "utf8");
+    if (packed.length > 0 && bytes + size > MONITOR_LIST_BUDGET_BYTES) break;
+    packed.push(clipped);
+    bytes += size;
+  }
+  return { monitors: packed, omitted: automations.length + monitors.length - packed.length };
 }
 
 /**
@@ -854,6 +900,7 @@ type TrustedScopeState = {
   operationId?: string;
   memoryId?: string;
   monitorId?: string;
+  automationBindingId?: string;
   delegationId?: string;
 };
 
@@ -1012,12 +1059,21 @@ async function resolveTrustedScope(
       }
       const cron = String(params.cron);
       const valid = nextCronOccurrence(cron, dependencies.now()) !== null;
-      return exactScope([`schedule:${sha256ControllerJson(cron)}`], valid);
+      return exactScope(
+        [`project:${context.projectId}`, `schedule:${sha256ControllerJson(cron)}`],
+        valid,
+      );
     }
     case "telegram_agent_cancel_watch": {
       const id = String(params.id);
       const monitor = dependencies.store.getControllerMonitor(authorized.controller.controllerKey, id);
-      return exactScope([`monitor:${id}`], monitor !== null);
+      const automation = dependencies.automations?.get(id) ?? null;
+      const ownsAutomation = automation !== null &&
+        automation.controllerKey === authorized.controller.controllerKey &&
+        automation.state !== "retired";
+      return exactScope([`monitor:${id}`], monitor !== null || ownsAutomation, {
+        ...(ownsAutomation ? { automationBindingId: id } : {}),
+      });
     }
     case "telegram_agent_delegate": {
       const tasks = params.tasks as Array<{ projectId: string }>;
@@ -1592,28 +1648,47 @@ async function projectTrustedEvidence(
       const watching = recordValue(domain.watching);
       const id = typeof watching?.id === "string" ? watching.id : null;
       const monitor = id ? dependencies.store.getControllerMonitor(authorized.controller.controllerKey, id) : null;
-      const capturedId = trustedState(resolution).monitorId;
-      const armed = monitor?.state === "armed" && monitor.kind === params.kind &&
+      const automation = id ? dependencies.automations?.get(id) ?? null : null;
+      const capturedId = trustedState(resolution).monitorId ?? trustedState(resolution).automationBindingId;
+      const localArmed = monitor?.state === "armed" && monitor.kind === params.kind &&
         monitor.instruction === params.instruction &&
         monitor.threadId === (params.kind === "thread_idle" ? params.threadId : null) &&
         monitor.cron === (params.kind === "schedule" ? params.cron : null) &&
         (capturedId === undefined || capturedId === monitor.id);
+      const automated = params.kind === "schedule" && automation?.state === "active" &&
+        automation.controllerKey === authorized.controller.controllerKey &&
+        automation.projectId === context.projectId && automation.definition.mode === "agent" &&
+        automation.definition.prompt === params.instruction && automation.definition.trigger.kind === "cron" &&
+        automation.definition.trigger.cron === params.cron &&
+        (capturedId === undefined || capturedId === automation.id);
+      const armed = localArmed || automated;
       if (!armed) throw new Error("monitor proof is not bound to the exact authorized watch");
       return {
         outcome: armed ? "succeeded" : "observed",
-        proofKinds: armed ? ["monitor_state", "obligation"] : [],
-        subjectRefs: monitor ? [`monitor:${monitor.id}`, ...(monitor.threadId ? [`thread:${monitor.threadId}`] : [])] : [],
+        proofKinds: automated
+          ? ["monitor_state", "external_mutation", "obligation"]
+          : ["monitor_state", "obligation"],
+        subjectRefs: monitor
+          ? [`monitor:${monitor.id}`, ...(monitor.threadId ? [`thread:${monitor.threadId}`] : [])]
+          : automation ? [`monitor:${automation.id}`] : [],
       };
     }
     case "telegram_agent_list_watches": {
       const refs = refIds(domain.monitors, "monitor");
       const armed = objectArray(domain.monitors).some((monitor) =>
         typeof monitor.id === "string" &&
-        dependencies.store.getControllerMonitor(authorized.controller.controllerKey, monitor.id)?.state === "armed");
+        (dependencies.store.getControllerMonitor(authorized.controller.controllerKey, monitor.id)?.state === "armed" ||
+          dependencies.automations?.get(monitor.id)?.state === "active"));
       return { outcome: "observed", proofKinds: armed ? ["monitor_state", "obligation"] : ["monitor_state"], subjectRefs: refs };
     }
     case "telegram_agent_cancel_watch":
-      return { outcome: domain.cancelled === true ? "succeeded" : "observed", proofKinds: ["monitor_state"], subjectRefs: resolution.scope.entityRefs };
+      return {
+        outcome: domain.cancelled === true ? "succeeded" : "observed",
+        proofKinds: trustedState(resolution).automationBindingId
+          ? ["monitor_state", "external_mutation"]
+          : ["monitor_state"],
+        subjectRefs: resolution.scope.entityRefs,
+      };
     case "telegram_agent_health": {
       const report = recordValue(domain);
       return {
@@ -1753,7 +1828,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: ControllerToolName;
     description: string;
     parameters: Schema;
-    experimental_statusLabels?: { pending: string; completed: string };
+    presentation?: { label: { pending: string; completed: string } };
     execute(
       params: z.output<Schema>,
       context: PluginAgentToolContext,
@@ -1955,7 +2030,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[5],
     description: "List current visible BB threads with project, runtime, environment, branch, elapsed time, and last activity. Completion ETA is reported as unavailable rather than guessed.",
-    experimental_statusLabels: { pending: "Checking BB threads", completed: "Checked BB threads" },
+    presentation: { label: { pending: "Checking BB threads", completed: "Checked BB threads" } },
     parameters: z.object({
       projectId: z.string().min(1).max(256).optional(),
       status: z.enum(["active", "idle", "error", "all"]).default("active"),
@@ -1977,7 +2052,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[6],
     description: "Read the current status and truthful progress signals for one visible BB thread. BB does not provide a reliable completion ETA.",
-    experimental_statusLabels: { pending: "Checking thread", completed: "Checked thread" },
+    presentation: { label: { pending: "Checking thread", completed: "Checked thread" } },
     parameters: z.object({ threadId: z.string().min(1).max(256) }).strict(),
     execute: async (params, context) => {
       authorizedController(dependencies.store, context);
@@ -1993,7 +2068,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[7],
     description: "Read what one visible BB thread is doing right now: its current step, goal, todo list, running commands, and latest message. Use this before judging whether a thread is stuck or slow.",
-    experimental_statusLabels: { pending: "Reading thread", completed: "Read thread" },
+    presentation: { label: { pending: "Reading thread", completed: "Read thread" } },
     parameters: z.object({ threadId: z.string().min(1).max(256) }).strict(),
     execute: async (params, context) => {
       authorizedController(dependencies.store, context);
@@ -2009,7 +2084,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[8],
     description: "Start a new BB thread in one of the owner's projects for exploratory or read-only work, or for an owner-authorized repository operation that needs that project's checkout or credentials. If the owner just sent a photo, set attachOwnerImage to pass that image into the new thread. Guarded code changes still belong to telegram_agent_start_job; never use this tool to merge, deploy, or bypass a one-use approval.",
-    experimental_statusLabels: { pending: "Starting thread", completed: "Started thread" },
+    presentation: { label: { pending: "Starting thread", completed: "Started thread" } },
     parameters: z.object({
       projectId: z.string().min(1).max(256),
       title: z.string().trim().min(1).max(120),
@@ -2044,7 +2119,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[9],
     description: "Send a message to one visible BB thread and let it continue working. Messaging a thread is a decision made with the owner's authority, so say in `ask` what you are asking for and why: that line is what he is told afterwards. If the owner just sent a photo, set attachOwnerImage to pass that image with the message.",
-    experimental_statusLabels: { pending: "Messaging thread", completed: "Messaged thread" },
+    presentation: { label: { pending: "Messaging thread", completed: "Messaged thread" } },
     parameters: z.object({
       threadId: z.string().min(1).max(256),
       text: z.string().trim().min(1).max(4_000),
@@ -2102,7 +2177,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[10],
     description: "Request a stop or eligible provider retry for one visible BB thread. No action runs until the paired owner accepts an expiring one-use Telegram confirmation.",
-    experimental_statusLabels: { pending: "Preparing confirmation", completed: "Confirmation sent" },
+    presentation: { label: { pending: "Preparing confirmation", completed: "Confirmation sent" } },
     parameters: z.object({
       kind: z.enum(["stop_thread", "retry_thread"]),
       threadId: z.string().min(1).max(256),
@@ -2138,7 +2213,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[11],
     description: "Remember something durable about the owner: a standing preference, a decision they made, or a correction of yours. It survives restarts and is recalled automatically in later conversations. Do not store passing chatter or anything you can look up.",
-    experimental_statusLabels: { pending: "Remembering", completed: "Remembered" },
+    presentation: { label: { pending: "Remembering", completed: "Remembered" } },
     parameters: z.object({
       subject: z.string().trim().min(1).max(120),
       body: z.string().trim().min(1).max(1_000),
@@ -2166,7 +2241,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[12],
     description: "Search everything you remember about the owner. Relevant memories are already injected each turn; use this only to dig for something older or more specific.",
-    experimental_statusLabels: { pending: "Recalling", completed: "Recalled" },
+    presentation: { label: { pending: "Recalling", completed: "Recalled" } },
     parameters: z.object({
       query: z.string().trim().min(1).max(500),
       projectId: z.string().min(1).max(256).optional(),
@@ -2195,7 +2270,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[13],
     description: "Forget one memory by id, when the owner says it is wrong or no longer applies.",
-    experimental_statusLabels: { pending: "Forgetting", completed: "Forgot" },
+    presentation: { label: { pending: "Forgetting", completed: "Forgot" } },
     parameters: z.object({ id: z.string().min(1).max(256) }).strict(),
     execute: (params, context, _resolution, authorized) => {
       authorizedController(dependencies.store, context);
@@ -2208,8 +2283,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[14],
-    description: "Set a durable monitor that wakes you later so you can act without the owner asking again. Use thread_idle to watch any visible BB thread until it finishes or fails, whether or not you started it — the plugin already hears BB events in real time. Threads started or messaged through the controller thread tools are watched automatically. CLI-created work is followed automatically only when controller evidence records its exact thread:<id> reference; set thread_idle yourself when that evidence may be absent. Use a schedule only for clock time, never to poll a running thread or job. Write the instruction to your future self, in full, because you will only receive that text.",
-    experimental_statusLabels: { pending: "Setting a monitor", completed: "Monitor set" },
+    description: "Set a durable monitor that wakes you later so you can act without the owner asking again. Use thread_idle to watch any visible BB thread until it finishes or fails, whether or not you started it — the plugin already hears BB events in real time. Threads started or messaged through the controller thread tools are watched automatically. CLI-created work is followed automatically only when controller evidence records its exact thread:<id> reference; set thread_idle yourself when that evidence may be absent. Clock schedules are owned by BB Automations, survive plugin restarts, and run as fresh agent work. Use a schedule only for clock time, never to poll a running thread or job. Write the instruction to your future self in full.",
+    presentation: { label: { pending: "Setting a monitor", completed: "Monitor set" } },
     parameters: z.discriminatedUnion("kind", [
       z.object({
         kind: z.literal("thread_idle"),
@@ -2218,42 +2293,86 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       }).strict(),
       z.object({
         kind: z.literal("schedule"),
-        cron: z.string().trim().min(1).max(120).describe("5-field cron, server-local time"),
+        cron: z.string().trim().min(1).max(120).describe("5-field cron in UTC"),
         instruction: z.string().trim().min(1).max(1_000),
       }).strict(),
     ]),
-    execute: (params, context, resolution, authorized) => {
+    execute: async (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
       if (params.kind === "schedule" && isLiveWorkPollingSchedule(params.instruction)) {
         throw new Error(
           "A repeating schedule cannot poll live work. Watch the worker BB thread with thread_idle; job progress is already event-driven.",
         );
       }
-      const monitor = runControllerMutation(dependencies, authorized, context, (now) =>
-        params.kind === "thread_idle"
+      if (params.kind === "thread_idle") {
+        const monitor = runControllerMutation(dependencies, authorized, context, (now) =>
           // A thread already watched for the agent keeps its one watch and
           // takes the instruction the agent just wrote, rather than gaining a
           // second watch that would wake it twice for the same landing.
-          ? dependencies.store.ensureThreadWatch({
+          dependencies.store.ensureThreadWatch({
             controllerKey: controller.controllerKey,
             threadId: params.threadId,
             instruction: params.instruction,
             dueAt: now + THREAD_WATCH_SETTLE_MS,
             now,
             mode: "explicit",
-          })
-          : dependencies.store.createMonitor({
-            controllerKey: controller.controllerKey,
-            kind: "schedule",
-            cron: params.cron,
-            instruction: params.instruction,
-            dueAt: requireCronOccurrence(params.cron, now),
-            now,
           }));
-      if (monitor === null) throw new Error("That watch could not be armed; cancel one you no longer need first");
-      trustedState(resolution).monitorId = monitor.id;
+        if (monitor === null) throw new Error("That watch could not be armed; cancel one you no longer need first");
+        trustedState(resolution).monitorId = monitor.id;
+        dependencies.notify();
+        return { watching: monitorProjection(monitor) };
+      }
+
+      const automations = dependencies.automations;
+      const execution = dependencies.controllerExecution?.();
+      const providerId = dependencies.controllerProviderId?.();
+      if (!automations || !execution || !providerId) {
+        throw new Error("BB Automations is not configured for this controller");
+      }
+      requireCronOccurrence(params.cron, dependencies.now());
+      if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
+      const now = dependencies.now();
+      const identity = sha256ControllerJson({
+        turnId: authorized.turn.id,
+        projectId: context.projectId,
+        cron: params.cron,
+        instruction: params.instruction,
+      });
+      const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
+        runControllerMutation(dependencies, authorized, context, () => mutation());
+      const binding = await automations.create({
+        scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+        controllerKey: controller.controllerKey,
+        sourceKey: `owner-schedule:${identity}`,
+        definition: {
+          mode: "agent",
+          projectId: context.projectId,
+          name: `Hanoon schedule ${identity.slice(0, 12)}`,
+          trigger: { kind: "cron", cron: params.cron, timezone: "Etc/UTC" },
+          prompt: params.instruction,
+          providerId,
+          model: execution.model,
+          reasoningLevel: execution.reasoningLevel,
+          serviceTier: execution.serviceTier,
+          permissionMode: execution.permissionMode,
+          target: { kind: "project-default" },
+        },
+        authority: {
+          source: "owner",
+          controllerKey: controller.controllerKey,
+          turnId: authorized.turn.id,
+          projectId: context.projectId,
+          hostId: controller.hostId,
+          mayWidenAutomation: false,
+        },
+        notificationPolicy: "material",
+        now,
+        mutate,
+        signal: context.signal,
+      });
+      trustedState(resolution).automationBindingId = binding.id;
       dependencies.notify();
-      return { watching: monitorProjection(monitor) };
+      return { watching: automationProjection(binding) };
     },
   });
 
@@ -2263,7 +2382,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     parameters: z.object({ includeFinished: z.boolean().default(false) }).strict(),
     execute: (params, context) => {
       const controller = authorizedController(dependencies.store, context);
-      return packMonitorList(dependencies.store.listMonitors(controller.controllerKey, params.includeFinished));
+      return packWatchList(
+        dependencies.store.listMonitors(controller.controllerKey, params.includeFinished),
+        dependencies.automations?.list(controller.controllerKey, params.includeFinished) ?? [],
+      );
     },
   });
 
@@ -2271,8 +2393,23 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     name: CONTROLLER_TOOL_NAMES[16],
     description: "Cancel one monitor by id.",
     parameters: z.object({ id: z.string().min(1).max(256) }).strict(),
-    execute: (params, context, _resolution, authorized) => {
+    execute: async (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
+      if (trustedState(resolution).automationBindingId) {
+        const automations = dependencies.automations;
+        if (!automations) throw new Error("BB Automations is not configured for this controller");
+        if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
+        const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
+          runControllerMutation(dependencies, authorized, context, () => mutation());
+        await automations.retire({
+          id: params.id,
+          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          now: dependencies.now(),
+          mutate,
+          signal: context.signal,
+        });
+        return { cancelled: true };
+      }
       return {
         cancelled: runControllerMutation(dependencies, authorized, context, (now) =>
           dependencies.store.cancelControllerMonitor(controller.controllerKey, params.id, now)),
@@ -2283,7 +2420,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[17],
     description: "Check your own plumbing: executor, queued work, undelivered messages, Telegram intake, monitors, memory search, and database integrity. Use this when the owner says something seems stuck or slow.",
-    experimental_statusLabels: { pending: "Checking health", completed: "Checked health" },
+    presentation: { label: { pending: "Checking health", completed: "Checked health" } },
     parameters: z.object({}).strict(),
     execute: (_params, context) => {
       authorizedController(dependencies.store, context);
@@ -2294,7 +2431,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[18],
     description: "Send several independent pieces of work out at once and get one combined result back. Each task opens its own BB thread; when they have all finished you are woken with their outputs and the instruction you wrote here. Use this instead of working through independent questions one at a time. Guarded code changes still belong to telegram_agent_start_job.",
-    experimental_statusLabels: { pending: "Delegating work", completed: "Delegated work" },
+    presentation: { label: { pending: "Delegating work", completed: "Delegated work" } },
     parameters: z.object({
       instruction: z.string().trim().min(1).max(1_000)
         .describe("What to do once every task has finished. You will receive only this text and their results."),
@@ -2377,7 +2514,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[19],
     description: "Read the durable autonomy scorecard: work completed and blocked, decisions the owner was asked for, remediation cycles, delivery retries, memory health, and monitors. Every number comes from committed state, so report what it says and never a rate it does not support.",
-    experimental_statusLabels: { pending: "Reading the scorecard", completed: "Read the scorecard" },
+    presentation: { label: { pending: "Reading the scorecard", completed: "Read the scorecard" } },
     parameters: z.object({
       windowDays: z.number().int().min(1).max(90).default(7),
     }).strict(),
@@ -2393,7 +2530,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[20],
     description: "Record how the owner wants you to work — terser answers, always show the PR link, a habit they keep asking for. This is standing behaviour, not a fact: it is applied to every later turn. Replace it wholesale each time; send empty text to clear it. Use telegram_agent_remember for things you need to know rather than ways you should act.",
-    experimental_statusLabels: { pending: "Adjusting how you work", completed: "Adjusted how you work" },
+    presentation: { label: { pending: "Adjusting how you work", completed: "Adjusted how you work" } },
     parameters: z.object({
       text: z.string().max(MAX_CONTROLLER_OVERLAY),
     }).strict(),
@@ -2446,7 +2583,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[23],
     description: "Send a clear owner follow-up into the current admitted implementation instead of creating another job. Use this for corrections, constraints, and extra acceptance details that belong to work already underway.",
-    experimental_statusLabels: { pending: "Updating implementation", completed: "Implementation updated" },
+    presentation: { label: { pending: "Updating implementation", completed: "Implementation updated" } },
     parameters: z.object({
       jobId: z.string().min(1).max(256).optional(),
       text: z.string().trim().min(1).max(4_000),
@@ -2485,7 +2622,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[24],
     description: "Adopt an existing open, non-draft pull request as a guarded full job. The plugin verifies the selected repository, base branch, PR identity, exact remote head, and a deterministic local branch before queuing review and finish work. Planning and critique are recorded as skipped.",
-    experimental_statusLabels: { pending: "Verifying pull request", completed: "Adopted pull request" },
+    presentation: { label: { pending: "Verifying pull request", completed: "Adopted pull request" } },
     parameters: z.object({
       projectId: z.string().min(1).max(256),
       prNumber: z.number().int().positive(),
@@ -2565,7 +2702,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[28],
     description: "Answer a block on a thread you started, so it carries on working. Use it when a system turn tells you one of your threads is waiting: pass decision for an approval, or answers for a question. Threads you started are yours to run end to end; the owner is not asked. Refused for a thread the owner opened themselves, and for the decisions reserved to them.",
-    experimental_statusLabels: { pending: "Answering thread", completed: "Answered thread" },
+    presentation: { label: { pending: "Answering thread", completed: "Answered thread" } },
     parameters: z.object({
       threadId: z.string().min(1).max(256),
       interactionId: z.string().min(1).max(256),
@@ -2596,7 +2733,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[29],
     description: "Send the owner a screenshot or screen recording from one of your threads, when a picture answers better than a sentence: a page you just changed, a UI bug, a test failing visually. Give the thread that produced the file and its absolute path on that thread's machine. Send it before your reply, then say in words what it shows. A picture is not proof: it never lets you claim tests, validation, or a deployment succeeded, which still need real evidence.",
-    experimental_statusLabels: { pending: "Sending picture", completed: "Sent picture" },
+    presentation: { label: { pending: "Sending picture", completed: "Sent picture" } },
     parameters: z.object({
       threadId: z.string().min(1).max(256).describe("The thread whose machine holds the file."),
       path: z.string().min(1).max(1_024).describe("Absolute path on that machine. Screenshots and recordings only."),
@@ -2668,7 +2805,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[30],
     description: "Queue the guarded merge for a job the owner explicitly told you to merge or land. Use it at once for an unambiguous instruction about a job waiting on approval. A generic instruction works only when exactly one job is waiting; when several are waiting, the owner must name the job. Deployment language is not merge approval. Everything the pipeline checks still runs; this replaces their tap, nothing else, and does not mean the merge has landed.",
-    experimental_statusLabels: { pending: "Queuing the merge", completed: "Merge queued" },
+    presentation: { label: { pending: "Queuing the merge", completed: "Merge queued" } },
     parameters: z.object({
       jobId: z.string().min(1).max(256).describe("The job waiting on merge approval."),
     }).strict(),
@@ -2721,7 +2858,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[31],
     description: "Lift the failure brake on a paused project so its queued work starts again. Use it the moment you find a project paused: this is yours to do, never something to ask the owner for. Refused only when the same failure has already been cleared once and come back, which is the loop the brake exists to catch and the one thing here worth their decision.",
-    experimental_statusLabels: { pending: "Starting the project again", completed: "Project taking work" },
+    presentation: { label: { pending: "Starting the project again", completed: "Project taking work" } },
     parameters: z.object({
       projectId: z.string().min(1).max(256),
     }).strict(),
@@ -2745,7 +2882,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[32],
     description: "File a specification the owner gave you, so the work done on that project is done against it. Give the whole document text. Sending it again under the same title replaces it and reports which sections moved: there is never a second live copy of one spec. Omit projectId only for something that genuinely applies everywhere, like a company style guide.",
-    experimental_statusLabels: { pending: "Filing the specification", completed: "Specification filed" },
+    presentation: { label: { pending: "Filing the specification", completed: "Specification filed" } },
     parameters: z.object({
       title: z.string().trim().min(1).max(256),
       text: z.string().min(1).max(4_000_000),
@@ -2788,7 +2925,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   registerTool({
     name: CONTROLLER_TOOL_NAMES[33],
     description: "Search the specifications filed for a project, and the global ones, for what they actually say. Use it before answering anything the spec governs and before planning work on that project. What comes back is what a document says, never proof that any of our own work succeeded.",
-    experimental_statusLabels: { pending: "Reading the specification", completed: "Specification read" },
+    presentation: { label: { pending: "Reading the specification", completed: "Specification read" } },
     parameters: z.object({
       query: z.string().trim().min(1).max(512),
       projectId: z.string().min(1).max(256).optional(),
@@ -2830,7 +2967,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   bb.agents.registerTool({
     name: CONTROLLER_METADATA_TOOL_NAMES[0],
     description: "Show the bounded capability profile for this controller turn: selected bundles, eligible additions, recent denials, and inventory availability. This never changes authority.",
-    experimental_statusLabels: { pending: "Reading capabilities", completed: "Read capabilities" },
+    presentation: { label: { pending: "Reading capabilities", completed: "Read capabilities" } },
     parameters: z.object({}).strict(),
     execute: (_params, context) => {
       const { turn, profile } = authorizedControllerCapabilityContext(dependencies.store, context);
@@ -2890,7 +3027,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
   bb.agents.registerTool({
     name: CONTROLLER_METADATA_TOOL_NAMES[1],
     description: "Request one additive batch of controller tool bundles. A compatible grant is persisted but becomes usable only in a fresh provider session; this tool never performs the requested domain operation.",
-    experimental_statusLabels: { pending: "Checking capability request", completed: "Checked capability request" },
+    presentation: { label: { pending: "Checking capability request", completed: "Checked capability request" } },
     parameters: z.object({
       bundleIds: z.array(z.enum(CONTROLLER_BUNDLE_IDS)).min(1).max(CONTROLLER_BUNDLE_IDS.length),
     }).strict(),

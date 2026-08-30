@@ -1,9 +1,12 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import type { ModelRoute } from "../capabilities/models";
+import { buildPublishPullRequestCommand, parsePublishedPullRequest } from "../bb/pr-publish";
 import { PR_HEAD_COMMAND, parseLsRemoteHead } from "../bb/validation";
 import { TerminalCommandRunner, shellSingleQuote, type CommandResult } from "../bb/terminal-command";
+import { modelRouteSpawnArgs } from "../domain/stage-execution";
 import type { TelegramAgentStore } from "../storage/store";
+import type { WorkArtifactSnapshot } from "../work-artifacts/models";
 import {
   NavigatorWorkflowExecutor,
   type NavigatorSkillRunner,
@@ -11,6 +14,7 @@ import {
 } from "./executor";
 import {
   NavigatorImplementationExecutor,
+  NavigatorTicketWorkerUnavailableError,
   type NavigatorGitObserver,
   type NavigatorGitObservationRequest,
   type NavigatorPullRequestPublisher,
@@ -20,7 +24,11 @@ import {
 import { NavigatorReleaseExecutor } from "./release-executor";
 import { DeterministicWorkflowNavigator } from "./deterministic-navigator";
 import type { NavigatorInferenceObservation, NavigatorSkillAttempt, NavigatorSnapshot } from "./models";
-import type { NavigatorPullRequestRecord, NavigatorPullRequestRequest } from "./implementation-contracts";
+import {
+  navigatorAcceptanceCriteria,
+  type NavigatorPullRequestRecord,
+  type NavigatorPullRequestRequest,
+} from "./implementation-contracts";
 
 type BbSdk = BbPluginApi["sdk"];
 
@@ -85,6 +93,138 @@ function gitIsAncestor(result: CommandResult): boolean {
   return result.outcome === "exited" && result.exitCode === 0;
 }
 
+function workerSnapshot(
+  store: TelegramAgentStore,
+  binding: Readonly<{ artifactId: string; snapshotId: string; snapshotDigest: string }>,
+  label: string,
+): WorkArtifactSnapshot {
+  const snapshot = store.getWorkArtifactSnapshot(binding.snapshotId);
+  if (
+    snapshot === null || snapshot.artifactId !== binding.artifactId ||
+    snapshot.snapshotDigest !== binding.snapshotDigest ||
+    !store.isWorkArtifactSnapshotValid(binding.snapshotId)
+  ) throw new Error(`navigator ${label} snapshot is unavailable or stale`);
+  return snapshot;
+}
+
+function workerInstruction(attempt: NavigatorTicketWorkerAttempt): string {
+  const assignments = attempt.profile.assignments.map((entry) => `/${entry.capabilityId}`).join(", ");
+  const contract = attempt.kind === "implementation"
+    ? [
+      "Implement only the attached ticket in the reused integration worktree.",
+      "Run focused and full verification, commit the finished change on the existing branch, and leave the worktree clean.",
+      "Do not push, open or edit a pull request, merge, deploy, or use credentials outside the worktree.",
+      "Return exactly one JSON object matching navigator-implementation-result-v1. Do not use Markdown fences or commentary.",
+    ]
+    : [
+      attempt.workOrder.verificationOf === undefined
+        ? "Review the attached ticket against both its accepted requirements and the listed repository guards at the exact current head."
+        : "Independently verify only the reported root causes in workOrder.verificationOf against the exact current head. Return only root causes you can confirm with fresh evidence.",
+      "Do not edit files, commit, push, open or edit a pull request, merge, deploy, or use credentials.",
+      "Return exactly one JSON object matching navigator-code-review-result-v1. Do not use Markdown fences or commentary.",
+    ];
+  return [
+    ...contract,
+    `Required capabilities: ${assignments}.`,
+    "The attached packet is immutable. Treat its work order, specification, ticket, acceptance criteria, profiles, and result schema as authoritative.",
+  ].join("\n");
+}
+
+function workerPacket(
+  store: TelegramAgentStore,
+  attempt: NavigatorTicketWorkerAttempt,
+): Readonly<{ filename: string; bytes: Uint8Array }> {
+  const specification = workerSnapshot(store, attempt.workOrder.specification, "specification");
+  const ticket = workerSnapshot(store, attempt.workOrder.ticket, "ticket");
+  const acceptanceCriteria = navigatorAcceptanceCriteria(ticket);
+  const resultContract = attempt.kind === "implementation"
+    ? {
+      kind: "implementation_result",
+      baseHeadSha: attempt.workOrder.baseHeadSha,
+      headSha: "40-character Git commit SHA after the implementation commit",
+      summary: "plain-language outcome",
+      changedPaths: ["project-relative/path"],
+      focusedVerification: [{ command: "exact command", outcome: "passed" }],
+      fullVerification: [{ command: "exact command", outcome: "passed" }],
+      acceptanceCriteria: acceptanceCriteria.map((criterion) => ({
+        criterionId: criterion.id,
+        outcome: "passed",
+        evidenceRefs: [`acceptance:${criterion.id}`],
+      })),
+      capabilityOutcomes: attempt.profile.assignments.map((entry) => ({
+        capabilityId: entry.capabilityId,
+        outcome: "passed",
+        evidenceRefs: [`worker:${attempt.id}:${entry.capabilityId}`],
+      })),
+    }
+    : {
+      kind: "code_review_result",
+      reviewedHeadSha: attempt.workOrder.baseHeadSha,
+      outcome: "passed or findings",
+      summary: "plain-language review result",
+      axes: {
+        requirements: { outcome: "passed or findings", evidenceRefs: ["requirements evidence"] },
+        standards: { outcome: "passed or findings", evidenceRefs: ["standards evidence"] },
+      },
+      findings: [{
+        rootCauseId: "stable-root-cause-id",
+        capabilityId: "selected guard capability id",
+        ruleId: "stable-rule-id",
+        severity: "critical, high, medium, or low",
+        subject: "project-relative/path",
+        line: null,
+        requirementId: null,
+        summary: "one independently checkable root cause",
+        evidenceRefs: ["file:path:line or command evidence"],
+      }],
+      capabilityOutcomes: attempt.profile.assignments.map((entry) => ({
+        capabilityId: entry.capabilityId,
+        outcome: "passed",
+        evidenceRefs: [`worker:${attempt.id}:${entry.capabilityId}`],
+      })),
+    };
+  const bytes = Buffer.from(JSON.stringify({
+    kind: "navigator_ticket_worker_packet",
+    attemptId: attempt.id,
+    workOrder: attempt.workOrder,
+    workOrderDigest: attempt.workOrderDigest,
+    stepContract: attempt.stepContract,
+    profile: attempt.profile,
+    specification,
+    ticket,
+    acceptanceCriteria,
+    resultContract,
+  }, null, 2), "utf8");
+  return { filename: `${attempt.id}.json`, bytes };
+}
+
+async function waitForWorker(
+  sdk: BbSdk,
+  threadId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  let current: Awaited<ReturnType<BbSdk["threads"]["get"]>>;
+  try {
+    current = await sdk.threads.get({ threadId, signal });
+  } catch {
+    throw new NavigatorTicketWorkerUnavailableError("missing");
+  }
+  if (current.status === "idle") return;
+  if (current.status === "error") throw new Error("navigator ticket worker ended in error");
+  const settled = new AbortController();
+  const waitSignal = AbortSignal.any([signal, settled.signal]);
+  try {
+    await Promise.race([
+      sdk.threads.wait({ threadId, status: "idle", signal: waitSignal }),
+      sdk.threads.wait({ threadId, status: "error", signal: waitSignal }).then(() => {
+        throw new Error("navigator ticket worker ended in error");
+      }),
+    ]);
+  } finally {
+    settled.abort();
+  }
+}
+
 class PluginNavigatorSkillRunner implements NavigatorSkillRunner {
   public constructor(private readonly sdk: BbSdk) {}
 
@@ -118,8 +258,11 @@ class PluginNavigatorSkillRunner implements NavigatorSkillRunner {
   }
 }
 
-class PluginNavigatorTicketWorkerRunner implements NavigatorTicketWorkerRunner {
-  public constructor(private readonly sdk: BbSdk) {}
+export class PluginNavigatorTicketWorkerRunner implements NavigatorTicketWorkerRunner {
+  public constructor(
+    private readonly sdk: BbSdk,
+    private readonly store: TelegramAgentStore,
+  ) {}
 
   public async run(
     attempt: NavigatorTicketWorkerAttempt,
@@ -129,9 +272,57 @@ class PluginNavigatorTicketWorkerRunner implements NavigatorTicketWorkerRunner {
     resource: { kind: "bb_thread"; id: string };
     result: unknown;
   }>> {
-    const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_ticket_${attempt.id}` };
+    let resource = attempt.resource;
+    if (resource === null) {
+      const title = `Hanoon ${attempt.kind} ${attempt.id}`.slice(0, 120);
+      const matching = (await this.sdk.threads.list({
+        projectId: attempt.workOrder.projectPolicy.projectId,
+        includeHidden: true,
+        archived: false,
+        limit: 100,
+        signal,
+      })).filter((thread) =>
+        thread.title === title && thread.environmentId === attempt.workOrder.worktreeId &&
+        thread.deletedAt === null && thread.archivedAt === null);
+      if (matching.length > 1) throw new Error("navigator worker recovery found duplicate BB threads");
+      if (matching.length === 1) {
+        resource = { kind: "bb_thread", id: matching[0]!.id };
+      } else {
+        const packet = workerPacket(this.store, attempt);
+        const uploaded = await this.sdk.projects.attachments.upload({
+          projectId: attempt.workOrder.projectPolicy.projectId,
+          clientFile: packet.bytes,
+          filename: packet.filename,
+          mimeType: "application/json",
+        });
+        if (uploaded.type !== "localFile") throw new Error("navigator worker packet upload did not return a local file");
+        const route = attempt.modelRoute;
+        const permissionMode = attempt.kind === "implementation"
+          ? attempt.workOrder.projectPolicy.implementation.permissionMode
+          : attempt.workOrder.projectPolicy.review.permissionMode;
+        const thread = await this.sdk.threads.spawn({
+          projectId: attempt.workOrder.projectPolicy.projectId,
+          title,
+          visibility: "hidden",
+          input: [
+            { type: "text", text: workerInstruction(attempt), mentions: [] },
+            uploaded,
+          ],
+          environment: { type: "reuse", environmentId: attempt.workOrder.worktreeId },
+          ...modelRouteSpawnArgs({
+            providerId: route.providerId,
+            modelId: route.modelId,
+            reasoning: route.reasoning,
+            serviceTier: route.serviceTier,
+            ...(permissionMode === undefined ? {} : { permissionMode }),
+          }),
+        } as Parameters<BbSdk["threads"]["spawn"]>[0]);
+        resource = { kind: "bb_thread", id: thread.id };
+      }
+    }
     await hooks.bindResource(resource);
-    const output = await this.sdk.threads.output({ threadId: resource.id, signal }).catch(() => ({ output: "{}" }));
+    await waitForWorker(this.sdk, resource.id, signal);
+    const output = await this.sdk.threads.output({ threadId: resource.id, signal });
     return { resource, result: parseThreadJson(output) };
   }
 
@@ -205,14 +396,40 @@ export class PluginNavigatorGitObserver implements NavigatorGitObserver {
   }
 }
 
-class PluginNavigatorPullRequestPublisher implements NavigatorPullRequestPublisher {
+export class PluginNavigatorPullRequestPublisher implements NavigatorPullRequestPublisher {
   public constructor(private readonly sdk: BbSdk) {}
 
   public async createOrRefresh(request: NavigatorPullRequestRequest): Promise<NavigatorPullRequestRecord> {
+    const status = await this.sdk.environments.status({ environmentId: request.gitObservation.worktreeId });
+    const checkout = status.outcome === "available" ? status.workspace.checkout : null;
+    const workingTreeState = status.outcome === "available" ? status.workspace.workingTree.state : null;
+    if (
+      checkout === null || checkout.kind !== "branch" ||
+      checkout.branchName !== request.integrationBranch || checkout.headSha !== request.headSha ||
+      workingTreeState !== "clean"
+    ) throw new Error("navigator pull request checkout changed before publication");
+    const publish = await new TerminalCommandRunner(this.sdk).run({
+      scope: { kind: "environment", environmentId: request.gitObservation.worktreeId },
+      title: `Navigator publish pull request ${request.jobId}`,
+      command: buildPublishPullRequestCommand({
+        baseBranch: request.baseBranch,
+        title: request.title,
+        body: request.body,
+      }),
+      timeoutMs: 180_000,
+    });
+    const parsed = publish.outcome === "exited" && publish.exitCode === 0
+      ? parsePublishedPullRequest(publish.output)
+      : null;
+    if (parsed === null) throw new Error("navigator pull request could not be created or refreshed");
     const snapshot = await this.sdk.environments.pullRequest({
       environmentId: request.gitObservation.worktreeId,
     });
-    if (snapshot.outcome !== "available") {
+    if (
+      snapshot.outcome !== "available" || snapshot.pullRequest.number !== parsed.number ||
+      snapshot.pullRequest.url !== parsed.url || snapshot.pullRequest.baseRefName !== request.baseBranch ||
+      snapshot.pullRequest.headRefName !== request.integrationBranch
+    ) {
       throw new Error("navigator pull request snapshot is unavailable");
     }
     const headSha = await readPullRequestHeadSha(this.sdk, {
@@ -222,8 +439,8 @@ class PluginNavigatorPullRequestPublisher implements NavigatorPullRequestPublish
     return {
       operationId: request.operationId,
       jobId: request.jobId,
-      number: snapshot.pullRequest.number,
-      url: snapshot.pullRequest.url,
+      number: parsed.number,
+      url: parsed.url,
       headSha,
     };
   }
@@ -360,7 +577,7 @@ export function createNavigatorRuntime(input: Readonly<{
     implementation: new NavigatorImplementationExecutor({
       store: input.store,
       database: input.database,
-      workerRunner: new PluginNavigatorTicketWorkerRunner(input.sdk),
+      workerRunner: new PluginNavigatorTicketWorkerRunner(input.sdk, input.store),
       gitObserver: new PluginNavigatorGitObserver(input.sdk),
       pullRequests: new PluginNavigatorPullRequestPublisher(input.sdk),
       modelRoute: () => input.modelRoute(),

@@ -1,8 +1,11 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import {
+  navigatorAcceptanceCriteria,
+  navigatorAcceptanceCriteriaAreSatisfied,
+  navigatorCodeReviewResultSchema,
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
 } from "../src/navigator/implementation-contracts";
@@ -250,7 +253,12 @@ function fixture(
   };
 }
 
-function implementationResult(attempt: NavigatorTicketWorkerAttempt, headSha: string) {
+function implementationResult(
+  attempt: NavigatorTicketWorkerAttempt,
+  headSha: string,
+  store: TelegramAgentStore,
+) {
+  const ticket = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
   return {
     kind: "implementation_result" as const,
     baseHeadSha: attempt.workOrder.baseHeadSha,
@@ -259,6 +267,11 @@ function implementationResult(attempt: NavigatorTicketWorkerAttempt, headSha: st
     changedPaths: ["src/navigator/implementation-executor.ts", "tests/navigator-implementation.test.ts"],
     focusedVerification: [{ command: "npm test -- navigator-implementation", outcome: "passed" as const }],
     fullVerification: [{ command: "npm run check", outcome: "passed" as const }],
+    acceptanceCriteria: navigatorAcceptanceCriteria(ticket).map(({ id }) => ({
+      criterionId: id,
+      outcome: "passed" as const,
+      evidenceRefs: [`acceptance:${id}`],
+    })),
     capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
       capabilityId,
       outcome: "passed" as const,
@@ -271,17 +284,29 @@ function reviewResult(
   attempt: NavigatorTicketWorkerAttempt,
   outcome: "passed" | "findings",
 ) {
+  const findings = outcome === "findings"
+    ? attempt.workOrder.verificationOf?.findings ?? [{
+      rootCauseId: "restart-durability",
+      capabilityId: "code-review",
+      ruleId: "SPEC-40-RESTART",
+      severity: "high" as const,
+      subject: "src/navigator/implementation-executor.ts",
+      line: 1,
+      requirementId: "SPEC-40-RESTART",
+      summary: "The interrupted worker path is not yet durable.",
+      evidenceRefs: [`head:${attempt.workOrder.baseHeadSha}`],
+    }]
+    : [];
   return {
     kind: "code_review_result" as const,
     reviewedHeadSha: attempt.workOrder.baseHeadSha,
     outcome,
     summary: outcome === "passed" ? "The exact head passes review." : "One exact-head finding needs repair.",
-    findings: outcome === "findings" ? [{
-      ruleId: "SPEC-40-RESTART",
-      severity: "high" as const,
-      summary: "The interrupted worker path is not yet durable.",
-      evidenceRefs: [`head:${attempt.workOrder.baseHeadSha}`],
-    }] : [],
+    axes: {
+      requirements: { outcome, evidenceRefs: [`requirements:${attempt.id}`] },
+      standards: { outcome: "passed" as const, evidenceRefs: [`standards:${attempt.id}`] },
+    },
+    findings,
     capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
       capabilityId,
       outcome: outcome === "findings" ? "findings" as const : "passed" as const,
@@ -310,6 +335,30 @@ function validGitObserver(): NavigatorGitObserver {
 }
 
 describe("navigator ticket integration executor", () => {
+  it("requires every stable acceptance criterion and both review axes", () => {
+    const value = fixture();
+    const ticket = value.store.getCurrentWorkArtifactSnapshot(value.ticketIds[0])!;
+    const criteria = navigatorAcceptanceCriteria(ticket);
+    expect(navigatorAcceptanceCriteriaAreSatisfied(ticket, criteria.map(({ id }) => ({
+      criterionId: id,
+      outcome: "passed" as const,
+    })))).toBe(true);
+    expect(navigatorAcceptanceCriteriaAreSatisfied(ticket, [])).toBe(false);
+    expect(navigatorAcceptanceCriteriaAreSatisfied(ticket, criteria.map(({ id }) => ({
+      criterionId: id,
+      outcome: "blocked" as const,
+    })))).toBe(false);
+
+    expect(navigatorCodeReviewResultSchema.safeParse({
+      kind: "code_review_result",
+      reviewedHeadSha: SHA.ticketOne,
+      outcome: "passed",
+      summary: "Standards pass without a requirements review.",
+      findings: [],
+      capabilityOutcomes: [{ capabilityId: "code-review", outcome: "passed", evidenceRefs: ["review:standards"] }],
+    }).success).toBe(false);
+  });
+
   it("appends the navigator persistence upgrade after the shipped implementation migration", () => {
     const implementationMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_IMPLEMENTATION_MIGRATIONS[0]);
     const upgradeMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS[0]);
@@ -392,7 +441,7 @@ describe("navigator ticket integration executor", () => {
       run: vi.fn(async (attempt, hooks) => {
         const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
         await hooks.bindResource(resource);
-        return { resource, result: implementationResult(attempt, SHA.ticketOne) };
+        return { resource, result: implementationResult(attempt, SHA.ticketOne, value.store) };
       }),
       reconcileUnavailableResource: vi.fn(),
     };
@@ -671,7 +720,7 @@ describe("navigator ticket integration executor", () => {
         value.database.prepare(
           "UPDATE work_artifact_claims SET owner_id = 'stolen-executor', generation = 100 WHERE id = ?",
         ).run(claimId);
-        return { resource, result: implementationResult(attempt, SHA.ticketOne) };
+        return { resource, result: implementationResult(attempt, SHA.ticketOne, value.store) };
       }),
       reconcileUnavailableResource: vi.fn(),
     };
@@ -721,7 +770,7 @@ describe("navigator ticket integration executor", () => {
   });
 
   it("sequentially integrates fresh ticket workers, repairs review findings, and publishes one pull request", async () => {
-    const value = fixture(ALL_MIGRATIONS.length - 1);
+    const value = fixture();
     let firstAttemptInterrupted = true;
     let secondAttemptMissing = true;
     const resourceEvents: string[] = [];
@@ -747,9 +796,10 @@ describe("navigator ticket integration executor", () => {
             : attempt.workOrder.ticket.artifactId === value.ticketIds[0]
               ? SHA.repair
               : SHA.ticketTwo;
-          return { resource, result: implementationResult(attempt, head) };
+          return { resource, result: implementationResult(attempt, head, value.store) };
         }
-        const needsRepair = attempt.workOrder.ticket.artifactId === value.ticketIds[0] && attempt.ordinal === 1;
+        const needsRepair = attempt.workOrder.verificationOf !== undefined ||
+          (attempt.workOrder.ticket.artifactId === value.ticketIds[0] && attempt.ordinal === 1);
         return { resource, result: reviewResult(attempt, needsRepair ? "findings" : "passed") };
       }),
       reconcileUnavailableResource: vi.fn(async (resource, reason) => {
@@ -839,7 +889,18 @@ describe("navigator ticket integration executor", () => {
     value.advance(500);
     await executor.processOne(fence, new AbortController().signal);
     await executor.processOne(fence, new AbortController().signal);
-    expect(executor.snapshot(value.jobId).activeSlice?.state).toBe("repair_pending");
+    await executor.processOne(fence, new AbortController().signal);
+    const confirmedFinding = executor.snapshot(value.jobId);
+    expect(confirmedFinding.activeSlice?.state).toBe("repair_pending");
+    expect(confirmedFinding.findingLedger).toEqual([
+      expect.objectContaining({
+        rootCauseId: "restart-durability",
+        disposition: "must_fix",
+        state: "open",
+        occurrence: 1,
+        blockingBurden: 1,
+      }),
+    ]);
     const repairSnapshot = executor.prepareRepairNavigation({
       jobId: value.jobId,
       ticketArtifactId: value.ticketIds[0],
@@ -870,6 +931,15 @@ describe("navigator ticket integration executor", () => {
     await executor.processOne(fence, new AbortController().signal);
     const firstAccepted = executor.snapshot(value.jobId);
     expect(firstAccepted.activeSlice?.state).toBe("accepted");
+    expect(firstAccepted.findingLedger).toEqual([
+      expect.objectContaining({
+        rootCauseId: "restart-durability",
+        disposition: "must_fix",
+        state: "resolved",
+        occurrence: 1,
+        blockingBurden: 0,
+      }),
+    ]);
     const firstReview = [...firstAccepted.attempts].reverse().find((attempt) => attempt.kind === "review")!;
     expect(firstReview.stepContract).toMatchObject({
       skillId: "code-review",
@@ -954,6 +1024,93 @@ describe("navigator ticket integration executor", () => {
     );
   });
 
+  it("blocks the third confirmed recurrence of one root cause", async () => {
+    const value = fixture();
+    const workerRunner: NavigatorTicketWorkerRunner = {
+      run: vi.fn(async (attempt, hooks) => {
+        const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        await hooks.bindResource(resource);
+        if (attempt.kind === "implementation") {
+          return {
+            resource,
+            result: implementationResult(attempt, String(attempt.ordinal + 1).repeat(40), value.store),
+          };
+        }
+        return { resource, result: reviewResult(attempt, "findings") };
+      }),
+      reconcileUnavailableResource: vi.fn(),
+    };
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner,
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: (kind) => kind === "implementation"
+        ? ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard })
+        : ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40:recurrence"],
+    });
+    executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:recurrence:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+    for (let occurrence = 1; occurrence <= 3; occurrence += 1) {
+      await executor.processOne(fence, new AbortController().signal);
+      await executor.processOne(fence, new AbortController().signal);
+      await executor.processOne(fence, new AbortController().signal);
+      const snapshot = executor.snapshot(value.jobId);
+      if (occurrence === 3) {
+        expect(snapshot.integration.state).toBe("invalidated");
+        expect(snapshot.findingLedger).toEqual([
+          expect.objectContaining({ rootCauseId: "restart-durability", occurrence: 3, state: "open" }),
+        ]);
+        expect(snapshot.outcomes.at(-1)).toMatchObject({
+          outcome: "policy_failure",
+          reasonCode: "finding_recurrence_limit",
+        });
+        break;
+      }
+      expect(snapshot.activeSlice?.state).toBe("repair_pending");
+      const repairSnapshot = executor.prepareRepairNavigation({
+        jobId: value.jobId,
+        ticketArtifactId: value.ticketIds[0],
+        evidenceRefs: [`review-finding:recurrence:${String(occurrence)}`],
+      });
+      const repairDecision = executor.recordRepairProposal({
+        snapshotId: repairSnapshot.snapshotId,
+        rawProposal: {
+          kind: "implementation",
+          basedOn: { snapshotId: repairSnapshot.snapshotId, digest: repairSnapshot.digest },
+          objective: "Repair the recurring root cause.",
+          taskEvidence: ["behavioral-change"],
+          evidenceRefs: [`review-finding:recurrence:${String(occurrence)}`],
+        },
+      });
+      executor.scheduleRepair({
+        jobId: value.jobId,
+        ticketArtifactId: value.ticketIds[0],
+        proposalId: repairDecision.proposalId,
+      });
+    }
+  });
+
   it("invalidates a running ticket when its specification snapshot changes", async () => {
     const value = fixture();
     const workerRunner: NavigatorTicketWorkerRunner = {
@@ -974,7 +1131,7 @@ describe("navigator ticket integration executor", () => {
           relationships: snapshot.relationships,
           observedAt: value.now(),
         });
-        return { resource, result: implementationResult(attempt, SHA.ticketOne) };
+        return { resource, result: implementationResult(attempt, SHA.ticketOne, value.store) };
       }),
       reconcileUnavailableResource: vi.fn(),
     };

@@ -7,6 +7,7 @@ import type { ProductionStageSnapshot } from "../services/production-runner";
 import type { TelegramAgentStore } from "../storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../work-artifacts/repository";
 import { trackerCreateDigest } from "../work-artifacts/tracker";
+import { navigatorAcceptanceCriteria } from "./implementation-contracts";
 import {
   NavigatorImplementationExecutor,
   type NavigatorGitObservationRequest,
@@ -107,8 +108,9 @@ function gitObservation(request: NavigatorGitObservationRequest) {
   };
 }
 
-function workerResult(attempt: NavigatorTicketWorkerAttempt) {
+function workerResult(attempt: NavigatorTicketWorkerAttempt, store: TelegramAgentStore) {
   if (attempt.kind === "implementation") {
+    const ticketSnapshot = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
     return {
       kind: "implementation_result" as const,
       baseHeadSha: attempt.workOrder.baseHeadSha,
@@ -117,6 +119,11 @@ function workerResult(attempt: NavigatorTicketWorkerAttempt) {
       changedPaths: ["src/app.ts"],
       focusedVerification: [{ command: "npm test", outcome: "passed" as const }],
       fullVerification: [{ command: "npm run check", outcome: "passed" as const }],
+      acceptanceCriteria: navigatorAcceptanceCriteria(ticketSnapshot).map(({ id }) => ({
+        criterionId: id,
+        outcome: "passed" as const,
+        evidenceRefs: [`acceptance:${id}`],
+      })),
       capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
         capabilityId, outcome: "passed" as const, evidenceRefs: [`worker:${attempt.id}`],
       })),
@@ -127,6 +134,10 @@ function workerResult(attempt: NavigatorTicketWorkerAttempt) {
     reviewedHeadSha: attempt.workOrder.baseHeadSha,
     outcome: "passed" as const,
     summary: "Passed.",
+    axes: {
+      requirements: { outcome: "passed" as const, evidenceRefs: [`requirements:${attempt.id}`] },
+      standards: { outcome: "passed" as const, evidenceRefs: [`standards:${attempt.id}`] },
+    },
     findings: [],
     capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
       capabilityId, outcome: "passed" as const, evidenceRefs: [`worker:${attempt.id}`],
@@ -261,7 +272,7 @@ function implementationExecutor(
       run: async (attempt, hooks) => {
         const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
         await hooks.bindResource(resource);
-        return { resource, result: workerResult(attempt) };
+        return { resource, result: workerResult(attempt, store) };
       },
       reconcileUnavailableResource: async (resource) => ({
         resource,

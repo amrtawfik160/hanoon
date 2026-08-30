@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { MAX_AUTO_CONTINUES } from "../src/autonomy/job-continuation";
 import { JobContinuationService } from "../src/services/job-continuation-service";

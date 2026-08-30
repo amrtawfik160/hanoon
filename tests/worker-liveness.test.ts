@@ -8,7 +8,7 @@ import {
   projectWorkerLiveness,
   workerRegistrationGeneration,
 } from "../src/services/worker-liveness";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 
 let fixtureNumber = 0;
