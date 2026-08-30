@@ -278,6 +278,16 @@ export class TelegramIngress {
           text: "Telegram Agent paired. Talk naturally with Luna, or use /help for recovery controls.",
           disable_web_page_preview: true,
         });
+      } else {
+        // A failed code must not fall silent: an owner who opened an expired or
+        // already-used pairing link would otherwise get no reply and assume the
+        // bot is dead. Tell them why and how to recover.
+        await this.telegram.sendMessage(identity.chatId, {
+          text: result.reason === "already_paired"
+            ? "This bot is already paired with an owner. Unpair the current owner before pairing another account."
+            : "That pairing link is invalid or has expired. Pairing links last 10 minutes — generate a fresh one and open it right away.",
+          disable_web_page_preview: true,
+        });
       }
       return;
     }
