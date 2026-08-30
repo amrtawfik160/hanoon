@@ -36,6 +36,12 @@ import {
   RecipePromotionIncompleteError,
   type RecipePromotionService,
 } from "./capabilities/promotion";
+import {
+  NAVIGATOR_ENGINE_ID,
+  NavigatorPromotionIncompleteError,
+  type NavigatorPromotionService,
+  type WorkflowEngineGraphMode,
+} from "./navigator/promotion";
 import { TASK_RECIPES, type TaskRecipe } from "./domain/recipes";
 import { BROKER_BINDING_STATES, type BrokerBindingState } from "./credentials/protocol";
 import type { CredentialReadinessCheck } from "./credentials/topology";
@@ -56,10 +62,15 @@ export type TelegramAgentCliDependencies = {
     RecipePromotionService,
     "status" | "promote" | "rollback" | "routingStatus" | "listDecisions"
   >;
+  enginePromotions: Pick<
+    NavigatorPromotionService,
+    "status" | "promote" | "rollback" | "routingStatus" | "listDecisions"
+  >;
   capabilitySettings: () => Readonly<{
     jobGraph: "adaptive" | "legacy";
     controllerTools: "bundled" | "all-tools";
     modelRouting: "adaptive" | "strong-only";
+    workflowEngineGraph: WorkflowEngineGraphMode;
   }>;
   credentialAccess: Pick<CredentialAccessService, "list" | "status">;
   runtime: () => ActivationHealth;
@@ -207,12 +218,12 @@ Commands:
   job spend <job-id> [--json]
   job retry <job-id> [--json]
   job cancel <job-id> [--json]
-  capability status [recipe] [--json]
+  capability status [recipe|navigator-v1] [--json]
   capability inventory [--host <scope>] [--limit <1-100>] [--json]
   capability receipts <profile-id> [--limit <1-100>] [--json]
   memory import --file <absolute-path> [--host <host-id>] [--scope <scope>] [--json]
-  capability promote <recipe> [--json]
-  capability rollback <recipe> [--json]
+  capability promote <recipe|navigator-v1> [--json]
+  capability rollback <recipe|navigator-v1> [--json]
   access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
   access status [binding-id] [--json]
   reference <search|show|list> ... [--project <project-id>] [--json]
@@ -1690,10 +1701,39 @@ async function capabilityStatus(
   json: boolean,
 ): Promise<PluginCliResult> {
   if (parsed.positionals.length > 1) throw new CliInputError("capability status accepts at most one recipe");
+  const settings = deps.capabilitySettings();
+  const enginePromotion = await deps.enginePromotions.status();
+  const engineRouting = deps.enginePromotions.routingStatus(settings.workflowEngineGraph);
+  const engine = {
+    engine: engineRouting.engine,
+    mode: engineRouting.mode,
+    promotion: {
+      status: enginePromotion.status,
+      ready: enginePromotion.ready,
+      reasonCodes: enginePromotion.reasonCodes.slice(0, 32),
+      evidenceDigest: enginePromotion.evidenceDigest,
+      candidateSuccesses: enginePromotion.candidateSuccesses,
+      baselineSuccesses: enginePromotion.baselineSuccesses,
+    },
+    decision: engineRouting.decision ? {
+      id: engineRouting.decision.id,
+      action: engineRouting.decision.action,
+      reasonCode: engineRouting.decision.reasonCode,
+      evidenceDigest: engineRouting.decision.evidenceDigest,
+      createdAt: engineRouting.decision.createdAt,
+    } : null,
+  };
+  if (parsed.positionals[0] === NAVIGATOR_ENGINE_ID) {
+    return success(
+      { settings, engine },
+      `${engine.engine}/${engine.mode}; promotion ${engine.promotion.status}` +
+      (engine.decision ? ` (${engine.decision.action})` : ""),
+      json,
+    );
+  }
   const recipes = parsed.positionals[0]
     ? [capabilityRecipe(parsed.positionals[0], "recipe")]
     : [...RECIPE_PROMOTION_ORDER];
-  const settings = deps.capabilitySettings();
   const rows = await Promise.all(recipes.map(async (recipe) => {
     const promotion = await deps.capabilityPromotions.status(recipe);
     const routing = deps.capabilityPromotions.routingStatus(recipe, settings.jobGraph);
@@ -1718,11 +1758,14 @@ async function capabilityStatus(
     };
   }));
   return success(
-    { settings, recipes: rows },
-    rows.map((row) =>
-      `${row.recipe}: ${row.routingMode}; promotion ${row.promotion.status}` +
-      (row.decision ? ` (${row.decision.action})` : ""),
-    ).join("\n"),
+    { settings, recipes: rows, engine },
+    [
+      ...rows.map((row) =>
+        `${row.recipe}: ${row.routingMode}; promotion ${row.promotion.status}` +
+        (row.decision ? ` (${row.decision.action})` : "")),
+      `${engine.engine}/${engine.mode}; promotion ${engine.promotion.status}` +
+      (engine.decision ? ` (${engine.decision.action})` : ""),
+    ].join("\n"),
     json,
   );
 }
@@ -1806,7 +1849,31 @@ async function capabilityPromote(
   parsed: ParsedFlags,
   json: boolean,
 ): Promise<PluginCliResult> {
-  const recipe = capabilityRecipe(onePositional(parsed, "capability promote"), "recipe");
+  const subject = onePositional(parsed, "capability promote");
+  if (subject === NAVIGATOR_ENGINE_ID) {
+    try {
+      const decision = await deps.enginePromotions.promote();
+      deps.notify?.();
+      return success(decision, "navigator-v1 is active for new admissions", json);
+    } catch (error) {
+      if (!(error instanceof NavigatorPromotionIncompleteError)) throw error;
+      const output = {
+        engine: NAVIGATOR_ENGINE_ID,
+        status: error.assessment.status,
+        ready: false,
+        reasonCodes: error.assessment.reasonCodes.slice(0, 32),
+        evidenceDigest: error.assessment.evidenceDigest,
+      };
+      return json
+        ? { exitCode: 1, stdout: serialize(output), stderr: "" }
+        : {
+            exitCode: 1,
+            stdout: "",
+            stderr: `Promotion ${error.assessment.status}: ${error.assessment.reasonCodes.slice(0, 8).join(", ")}\n`,
+          };
+    }
+  }
+  const recipe = capabilityRecipe(subject, "recipe");
   try {
     const decision = await deps.capabilityPromotions.promote(recipe);
     deps.notify?.();
@@ -1835,7 +1902,13 @@ function capabilityRollback(
   parsed: ParsedFlags,
   json: boolean,
 ): PluginCliResult {
-  const recipe = capabilityRecipe(onePositional(parsed, "capability rollback"), "recipe");
+  const subject = onePositional(parsed, "capability rollback");
+  if (subject === NAVIGATOR_ENGINE_ID) {
+    const decision = deps.enginePromotions.rollback();
+    deps.notify?.();
+    return success(decision, "new admissions use recipe-v1", json);
+  }
+  const recipe = capabilityRecipe(subject, "recipe");
   const decision = deps.capabilityPromotions.rollback(recipe);
   deps.notify?.();
   return success(decision, `${recipe} is shadow-only for new attempts`, json);

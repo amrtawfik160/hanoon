@@ -34,6 +34,9 @@ import {
   RecipePromotionService,
 } from "./capabilities/promotion";
 import { DurableRecipePromotionEvidenceReader } from "./capabilities/promotion-evidence";
+import { NavigatorPromotionService } from "./navigator/promotion";
+import { DurableNavigatorPromotionEvidenceReader } from "./navigator/promotion-evidence";
+import { createNavigatorRuntime } from "./navigator/plugin-runtime";
 import { DEFAULT_CONTROLLER_CAPABILITY_MODEL } from "./capabilities/controller-bundles";
 import { BbRunner, environmentDiffText } from "./bb/runner";
 import {
@@ -410,6 +413,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       options: ["adaptive", "legacy"],
       default: "adaptive",
     },
+    workflowEngineGraph: {
+      type: "select",
+      label: "Workflow engine graph",
+      description: "Adaptive admits navigator-v1 after a reviewed promotion. Recipe keeps recipe-v1 for new jobs even after that promotion.",
+      options: ["adaptive", "recipe"],
+      default: "adaptive",
+    },
     controllerCapabilityMode: {
       type: "select",
       label: "Controller capabilities",
@@ -483,6 +493,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     () => config.ok ? capabilityRoutingSettings(config.value) : {
       jobGraph: "adaptive",
       controllerTools: "bundled",
+      workflowEngineGraph: "adaptive",
     },
   );
   const retiredLivePollers = retireLiveWorkPollingSchedules(store, clock());
@@ -494,6 +505,22 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     store,
     readEvidence: (recipe) => promotionEvidence.read(recipe),
     now: clock,
+  });
+  const enginePromotionEvidence = new DurableNavigatorPromotionEvidenceReader(store);
+  const enginePromotions = new NavigatorPromotionService({
+    store,
+    readEvidence: () => enginePromotionEvidence.read(),
+    now: clock,
+  });
+  const navigatorRuntime = createNavigatorRuntime({
+    store,
+    database: bb.storage.database(),
+    sdk: bb.sdk,
+    modelRoute: () => {
+      if (!config.ok) throw new Error(config.message);
+      return backgroundCapabilityModelRoute(config.value);
+    },
+    clock: { now: clock },
   });
   const scheduler = new AutonomyScheduler(new AutonomyRepository(bb.storage.database()), store);
   const executorNudge = new ExecutorNudge();
@@ -679,7 +706,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--confirm <nonce>] [--json]" },
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
-      { name: "capability", summary: "Inspect capability evidence and control recipe rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
+      { name: "capability", summary: "Inspect capability evidence and control recipe and navigator-v1 rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
       { name: "access", summary: "Inspect read-only credential broker bindings and status", usage: "bb telegram-agent access <list|status> [binding-id] [--json]" },
       { name: "reference", summary: "Read the specifications filed for a project", usage: "bb telegram-agent reference <search|show|list> ... [--project <project-id>] [--json]" },
       { name: "doctor", summary: "Check Telegram, BB, host, provider, GitHub, and credential broker readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
@@ -692,10 +719,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       getBotToken: () => config.ok ? config.value.botToken : undefined,
       createTelegramClient: (token) => telegramForToken(token),
       capabilityPromotions: recipePromotions,
+      enginePromotions,
       capabilitySettings: () => config.ok ? capabilityRoutingSettings(config.value) : {
         jobGraph: "adaptive",
         controllerTools: "bundled",
         modelRouting: "adaptive",
+        workflowEngineGraph: "adaptive",
       },
       credentialAccess: credentialAccessService,
       runtime: runtimeHealth,
@@ -2282,6 +2311,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       releaseOnShutdown: true,
       controller,
       operations: threadOperations,
+      navigator: navigatorRuntime.navigator,
+      navigatorImplementation: navigatorRuntime.implementation,
+      navigatorRelease: navigatorRuntime.release,
       monitors,
       threadNotices,
       jobMemory,

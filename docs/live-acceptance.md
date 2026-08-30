@@ -29,7 +29,9 @@ The automated fake-host suite exercises all six recipe graphs, active-mode failu
 
 The production promotion reader and append-only evidence ledger are wired. It reads only the newest manifest and accepts it only when its integrity-bound artifact, job, receipt, model-trial, chronology, and safety references resolve to stored rows. The status command reports `incomplete` for missing, corrupt, duplicate, non-causal, or mismatched data, and typed envelopes alone cannot create evidence.
 
-The trusted production collector is not implemented or exposed in this release. Treat the live promotion gate as **not run/incomplete** and keep every recipe in `shadow` while following this runbook. Do not turn a passing local suite into a live receipt, insert evidence with ad hoc SQL, or enable a recipe to make this runbook easier to complete.
+Recipe promotion still has no trusted live collector. Treat that gate as **not run/incomplete** and keep every recipe in `shadow` while following this runbook. Do not turn a passing local suite into a recipe receipt, insert evidence with ad hoc SQL, or enable a recipe to make this runbook easier to complete.
+
+Navigator-v1 evidence is different. `DualEngineCoordinator.persistEvaluationEvidence` appends the measured corpus, restart and safety counters, and the required disposable live scenarios. It rejects a job whose terminal state was only SQL-stamped. `capability status navigator-v1` and `capability promote navigator-v1` / `capability rollback navigator-v1` consume that ledger. The **Workflow engine graph** setting must stay `adaptive` for new admissions to follow that promotion. After promotion, the leased executor runs the live navigator, implementation, and release workers.
 
 ## Token configuration pause
 
@@ -210,7 +212,13 @@ A later trusted acceptance collector—not an operator CLI argument—must deriv
 - all five zero-tolerance safety counter snapshots;
 - one manifest that references those exact stored records.
 
-The bundle write must be transactional. If any job, receipt, trial, artifact, recipe, chronology, or identity does not resolve, the write must leave no partial manifest. The current release has no such collector, so stop here and mark this gate **incomplete**; do not substitute direct database inserts.
+The bundle write must be transactional. If any job, receipt, trial, artifact, recipe, chronology, or identity does not resolve, the write must leave no partial manifest. Recipe promotion still has no such collector, so stop here for recipes and mark this gate **incomplete**; do not substitute direct database inserts.
+
+Navigator-v1 collection is the dual-engine persist seam, not this recipe step. It still must not accept SQL-stamped terminal jobs. Inspect that engine separately:
+
+```bash
+bb telegram-agent capability status navigator-v1 --json
+```
 
 Inspect the result before any rollout decision:
 
@@ -220,11 +228,15 @@ bb telegram-agent capability status <recipe> --json
 
 Only a future `passed` and `ready: true` result may permit `capability promote <recipe>`. After promotion, create a new matching job and prove it is `active`; the acceptance job used as evidence must not be retroactively rewritten. Exercise `capability rollback <recipe>` and prove that the in-flight active job stays pinned while a later matching job returns to `shadow`. Record both append-only decisions. Do not promote the next recipe until every earlier recipe remains active.
 
+For navigator-v1, `capability promote navigator-v1` is allowed only after the dual-engine collector has written a reviewed manifest whose restart and safety records were measured. `capability rollback navigator-v1` returns later admissions to recipe-v1 without rewriting in-flight navigator jobs.
+
 ## Final acceptance decision
 
 Accept the base live run only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, canary, and promotion conclusions separate. The four role-specific capability rows must contain real thread ids, profiles, selected ids, bundle digest, exact model tuple, and mandatory terminal outcomes; deterministic bundle verification alone cannot satisfy them.
 
-A recipe promotion is a separate acceptance decision. It remains **incomplete** until step 13 has a resolved durable manifest and the status command reports `ready: true`. If the owner did not configure the token, production commands, disposable projects, or trusted collection harness needed for every case, report the affected live acceptance as **not run**, never successful. This release cannot create that manifest because the trusted collector is absent; do not approve a recipe for activation from local evidence.
+A recipe promotion is a separate acceptance decision. It remains **incomplete** until step 13 has a resolved durable manifest and the status command reports `ready: true`. If the owner did not configure the token, production commands, disposable projects, or trusted collection harness needed for every case, report the affected live acceptance as **not run**, never successful. This release cannot create that recipe manifest because the trusted recipe collector is absent; do not approve a recipe for activation from local evidence.
+
+Navigator-v1 promotion is also separate. Report it **not run** unless `capability status navigator-v1` shows a resolved measured ledger and a new admission actually ran on the live navigator workers. Do not SQL-insert that ledger.
 ## Trust-kernel evidence sheet
 
 Score each row separately. Mocked/deterministic, live provider, Telegram, and external-system evidence stay in different classes, and an unavailable installation, provider, bot chat, interaction shape, or host attestation makes a row **incomplete** — never passed.

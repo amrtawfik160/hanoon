@@ -17,6 +17,7 @@ import {
   TASK_AUTHORITY_PUBLISH_MIGRATIONS,
   TASK_AUTHORITY_REVISION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
+  NAVIGATOR_PROMOTION_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   ControllerInteractionRepository,
@@ -505,7 +506,9 @@ async function runInteractionRace(
 }
 
 it("pins the shipped migration bytes and appends the runtime repair migrations", () => {
-  expect(ALL_MIGRATIONS).toHaveLength(80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length);
+  expect(ALL_MIGRATIONS).toHaveLength(
+    80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length + NAVIGATOR_PROMOTION_MIGRATIONS.length,
+  );
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",
   );

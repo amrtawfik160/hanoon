@@ -66,7 +66,7 @@ export type JobExecutorDependencies = {
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
-  /** Deterministic navigator-v1 work only. No live job is routed here yet. */
+  /** Deterministic navigator-v1 work. Recipe-v1 jobs never enter this executor. */
   navigator?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };

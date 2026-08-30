@@ -321,9 +321,13 @@ function proposalReason(
   observation: NavigatorInferenceObservation,
   artifacts: WorkArtifactRepository,
 ): string | null {
-  if (job.workflowEngine !== "navigator-v1") return "workflow_engine_mismatch";
-  if (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") return "workflow_mode_denied";
-  if (job.currentWorkflowStepId !== null) return "workflow_step_active";
+  if (job.workflowEngine === "recipe-v1") {
+    if (job.currentWorkflowStepId !== null) return "workflow_step_active";
+  } else {
+    if (job.workflowEngine !== "navigator-v1") return "workflow_engine_mismatch";
+    if (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") return "workflow_mode_denied";
+    if (job.currentWorkflowStepId !== null) return "workflow_step_active";
+  }
   if (job.version !== snapshot.identity.jobVersion || proposal.basedOn.jobVersion !== job.version) {
     return "stale_job_version";
   }
@@ -521,40 +525,49 @@ export class NavigatorRepository {
     return this.db.transaction((): NavigatorSnapshot => {
       let job = readJobById(this.db, input.jobId);
       if (!job) throw new Error(`Job ${input.jobId} was not found`);
-      if (job.workflowEngine !== "navigator-v1" || (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic")) {
+      const recipeShadow = job.workflowEngine === "recipe-v1";
+      if (
+        !recipeShadow &&
+        (job.workflowEngine !== "navigator-v1" || (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic"))
+      ) {
         throw new TypeError("job is not an executable navigator-v1 job");
       }
       if (job.currentWorkflowStepId !== null) throw new TypeError("job already has an active workflow step");
-      const refreshedBindings: NavigatorArtifactBinding[] = [];
-      for (const binding of job.artifactBindings) {
-        const snapshot = this.artifacts.getCurrentSnapshot(binding.artifactId);
-        const artifact = this.artifacts.getArtifact(binding.artifactId);
-        if (snapshot && (this.artifacts.isSnapshotValid(snapshot.id) || artifact?.kind === "specification")) {
-          refreshedBindings.push({
-            artifactId: binding.artifactId,
-            snapshotId: snapshot.id,
-            snapshotDigest: snapshot.snapshotDigest,
-          });
+      if (!recipeShadow) {
+        const refreshedBindings: NavigatorArtifactBinding[] = [];
+        for (const binding of job.artifactBindings) {
+          const snapshot = this.artifacts.getCurrentSnapshot(binding.artifactId);
+          const artifact = this.artifacts.getArtifact(binding.artifactId);
+          if (snapshot && (this.artifacts.isSnapshotValid(snapshot.id) || artifact?.kind === "specification")) {
+            refreshedBindings.push({
+              artifactId: binding.artifactId,
+              snapshotId: snapshot.id,
+              snapshotDigest: snapshot.snapshotDigest,
+            });
+          }
+        }
+        if (JSON.stringify(refreshedBindings) !== JSON.stringify(job.artifactBindings)) {
+          const refreshed = this.db.prepare(
+            `UPDATE jobs SET artifact_bindings_json = ?, workflow_revision = workflow_revision + 1,
+                 version = version + 1, updated_at = ?
+              WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
+          ).run(JSON.stringify(refreshedBindings), input.now, job.id, job.version);
+          if (refreshed.changes !== 1) throw new VersionConflictError(job.id, job.version);
+          job = readJobById(this.db, input.jobId);
+          if (!job) throw new Error("navigator job disappeared during artifact reconsideration");
+          this.updateTaskAuthorityGraph(job.id, refreshedBindings, input.now);
+        }
+        if (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") {
+          throw new TypeError("navigator workflow mode changed during artifact reconsideration");
         }
       }
-      if (JSON.stringify(refreshedBindings) !== JSON.stringify(job.artifactBindings)) {
-        const refreshed = this.db.prepare(
-          `UPDATE jobs SET artifact_bindings_json = ?, workflow_revision = workflow_revision + 1,
-               version = version + 1, updated_at = ?
-            WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
-        ).run(JSON.stringify(refreshedBindings), input.now, job.id, job.version);
-        if (refreshed.changes !== 1) throw new VersionConflictError(job.id, job.version);
-        job = readJobById(this.db, input.jobId);
-        if (!job) throw new Error("navigator job disappeared during artifact reconsideration");
-        this.updateTaskAuthorityGraph(job.id, refreshedBindings, input.now);
-      }
-      if (job.workflowMode !== "shadow" && job.workflowMode !== "deterministic") {
-        throw new TypeError("navigator workflow mode changed during artifact reconsideration");
-      }
+      const snapshotMode: "shadow" | "deterministic" = recipeShadow
+        ? "shadow"
+        : job.workflowMode === "deterministic" ? "deterministic" : "shadow";
       const payload = {
         engine: "navigator-v1" as const,
         engineRevision: NAVIGATOR_ENGINE_REVISION as 1,
-        mode: job.workflowMode,
+        mode: snapshotMode,
         ownerRequest: job.requestText,
         artifactBindings: [...job.artifactBindings],
         skillCatalog: [...NAVIGATOR_SKILL_CATALOG],
@@ -650,6 +663,10 @@ export class NavigatorRepository {
       );
       if (rejection !== null) {
         this.insertDecision(proposalId, job.id, input.snapshotId, "rejected", rejection, input.now);
+        return this.requireDecision(proposalId);
+      }
+      if (job.workflowEngine === "recipe-v1") {
+        this.insertDecision(proposalId, job.id, input.snapshotId, "shadowed", "recipe_job_shadow", input.now);
         return this.requireDecision(proposalId);
       }
       if (job.workflowMode === "shadow") {

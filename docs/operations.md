@@ -185,27 +185,30 @@ To finish work that already has a pull request, tell the controller which enable
 
 New jobs use one of six recipes: `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, or `architectural`. With the default adaptive job graph, an unpromoted recipe stays in `shadow`: the plugin records its candidate classification and profile, but the candidate graph cannot control delivery or create production success evidence.
 
-Inspect all recipe decisions or one recipe:
+Inspect all recipe decisions, one recipe, or the navigator-v1 engine gate:
 
 ```bash
 bb telegram-agent capability status
 bb telegram-agent capability status direct --json
+bb telegram-agent capability status navigator-v1 --json
 ```
 
 `incomplete` means at least one required proof is absent or cannot be resolved. `failed` means a durable result exists and violates a gate, such as an imperfect safety classifier, a non-zero safety counter, or candidate model results below the baseline. Neither state can write a promotion decision.
 
-Promotion evidence is not accepted as command-line values. The production reader uses the newest append-only manifest for that recipe and resolves every reference against stored records. It requires all eight deterministic categories, a perfect fixed-corpus classifier result, at least one active post-merge run, distinct induced-failure and recovery receipts backed by terminal model trials for that job, at least five candidate and five baseline trials under the same harness and budget, and all five zero-tolerance safety snapshots. Missing, malformed, duplicate, cross-recipe, non-causal, or mismatched references make the manifest incomplete; the reader never falls back to an older valid manifest. A future trusted collector must additionally establish that the live acceptance job is disposable before writing the ledger.
+Promotion evidence is not accepted as command-line values. The recipe reader uses the newest append-only manifest for that recipe and resolves every reference against stored records. It requires all eight deterministic categories, a perfect fixed-corpus classifier result, at least one active post-merge run, distinct induced-failure and recovery receipts backed by terminal model trials for that job, at least five candidate and five baseline trials under the same harness and budget, and all five zero-tolerance safety snapshots. Missing, malformed, duplicate, cross-recipe, non-causal, or mismatched references make the manifest incomplete; the reader never falls back to an older valid manifest. Recipe promotion still has no trusted collector that can prove a disposable live job and write that ledger.
 
-This release does not expose a production collector or evidence-ingestion command. Ordinary operator commands can inspect or consume a future trusted ledger but cannot manufacture one from typed pass/fail or safety assertions. The remaining collector seam is explicitly incomplete, so a fresh installation has no completed live bundle and every adaptive recipe starts in `shadow`.
+Navigator-v1 uses a separate append-only ledger. `DualEngineCoordinator.persistEvaluationEvidence` is the trusted collector: it writes deterministic categories from the measured corpus, including restart and safety only when those were actually measured, and it records the required disposable live scenarios only when each job is an executed run rather than a SQL-stamped terminal state. `promote()` then fails closed if restart or safety was not measured. Ordinary operator commands inspect or consume that ledger. They cannot manufacture it from typed pass/fail assertions.
 
-After a later trusted collector derives and stores that evidence, promotion follows the fixed order shown by `capability status`:
+Recipe promotion stays incomplete on a fresh install, so every adaptive recipe starts in `shadow`. After the navigator collector has written a reviewed manifest, engine promotion follows `capability status`:
 
 ```bash
 bb telegram-agent capability promote direct --json
 bb telegram-agent capability rollback direct --json
+bb telegram-agent capability promote navigator-v1 --json
+bb telegram-agent capability rollback navigator-v1 --json
 ```
 
-Promotion affects only newly created matching jobs. Rollback returns only later matching jobs to `shadow`; it does not mutate the routing mode, model tuple, profile, or receipts of a job already in flight. The independent **Capability job graph** setting can force later jobs onto `legacy` without deleting capability data.
+Promotion affects only newly created matching jobs. Recipe rollback returns only later matching jobs to `shadow`. Navigator rollback returns only later admissions to recipe-v1. Neither mutates the routing mode, model tuple, profile, receipts, or engine of a job already in flight. The independent **Capability job graph** setting can force later jobs onto `legacy` without deleting capability data. The independent **Workflow engine graph** setting can keep later jobs on recipe-v1 even after navigator-v1 is promoted. After a reviewed navigator promotion with that setting left at `adaptive`, the leased executor runs the live navigator, implementation, and release workers.
 
 For a known profile id, inspect its bounded selection and outcome receipts:
 

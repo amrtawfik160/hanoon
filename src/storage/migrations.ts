@@ -4177,6 +4177,161 @@ WHEN NOT (
 BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
 `] as const;
 
+export const NAVIGATOR_PROMOTION_MIGRATIONS = [String.raw`
+CREATE TRIGGER jobs_workflow_engine_immutable
+BEFORE UPDATE ON jobs
+WHEN OLD.workflow_engine IS NOT NEW.workflow_engine
+BEGIN SELECT RAISE(ABORT, 'workflow engine identity is immutable'); END;
+
+CREATE TABLE workflow_engine_promotions (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  engine TEXT NOT NULL CHECK (engine = 'navigator-v1'),
+  action TEXT NOT NULL CHECK (action IN ('promote', 'rollback')),
+  reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 128),
+  evidence_digest TEXT CHECK (evidence_digest IS NULL OR length(evidence_digest) = 64),
+  subject_id TEXT NOT NULL UNIQUE CHECK (length(subject_id) BETWEEN 1 AND 256),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  CHECK (
+    (action = 'promote' AND evidence_digest IS NOT NULL AND reason_code = 'promotion_gates_passed')
+    OR (action = 'rollback' AND evidence_digest IS NULL)
+  )
+);
+CREATE TRIGGER workflow_engine_promotions_append_only_update
+BEFORE UPDATE ON workflow_engine_promotions
+BEGIN SELECT RAISE(ABORT, 'workflow_engine_promotions are append-only'); END;
+CREATE TRIGGER workflow_engine_promotions_append_only_delete
+BEFORE DELETE ON workflow_engine_promotions
+BEGIN SELECT RAISE(ABORT, 'workflow_engine_promotions are append-only'); END;
+
+CREATE TABLE navigator_deterministic_evidence (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  category TEXT NOT NULL UNIQUE CHECK (category IN (
+    'proposal_validity', 'skill_invocation', 'capability_denials', 'ask_matt',
+    'owner_boundaries', 'artifact_frontier', 'task_outcomes', 'release_entry', 'restart'
+  )),
+  suite_id TEXT NOT NULL CHECK (length(suite_id) BETWEEN 1 AND 256),
+  run_id TEXT NOT NULL CHECK (length(run_id) BETWEEN 1 AND 256),
+  artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 64),
+  outcome TEXT NOT NULL CHECK (outcome IN ('passed', 'failed')),
+  record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE TRIGGER navigator_deterministic_evidence_append_only_update
+BEFORE UPDATE ON navigator_deterministic_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_deterministic_evidence is append-only'); END;
+CREATE TRIGGER navigator_deterministic_evidence_append_only_delete
+BEFORE DELETE ON navigator_deterministic_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_deterministic_evidence is append-only'); END;
+
+CREATE TABLE navigator_corpus_evidence (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  corpus_digest TEXT NOT NULL CHECK (length(corpus_digest) = 64),
+  run_id TEXT NOT NULL UNIQUE CHECK (length(run_id) BETWEEN 1 AND 256),
+  result_digest TEXT NOT NULL CHECK (length(result_digest) = 64),
+  total INTEGER NOT NULL CHECK (total BETWEEN 1 AND 100000),
+  correct INTEGER NOT NULL CHECK (correct >= 0 AND correct <= total),
+  unauthorized_effects INTEGER NOT NULL CHECK (unauthorized_effects >= 0),
+  record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE TRIGGER navigator_corpus_evidence_append_only_update
+BEFORE UPDATE ON navigator_corpus_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_corpus_evidence is append-only'); END;
+CREATE TRIGGER navigator_corpus_evidence_append_only_delete
+BEFORE DELETE ON navigator_corpus_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_corpus_evidence is append-only'); END;
+
+CREATE TABLE navigator_live_evidence (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  run_id TEXT NOT NULL UNIQUE CHECK (length(run_id) BETWEEN 1 AND 256),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  scenario TEXT NOT NULL UNIQUE CHECK (scenario IN (
+    'happy_path', 'interrupted_tracker_create', 'stale_head', 'ambiguous_merge',
+    'canary_failure', 'successful_rollback', 'repair', 're_release'
+  )),
+  terminal_state TEXT NOT NULL CHECK (terminal_state IN ('complete', 'merged', 'cancelled')),
+  evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+  record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE TRIGGER navigator_live_evidence_append_only_update
+BEFORE UPDATE ON navigator_live_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_live_evidence is append-only'); END;
+CREATE TRIGGER navigator_live_evidence_append_only_delete
+BEFORE DELETE ON navigator_live_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_live_evidence is append-only'); END;
+
+CREATE TABLE navigator_model_trial_evidence (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  cohort TEXT NOT NULL CHECK (cohort IN ('candidate', 'baseline')),
+  model_trial_id TEXT NOT NULL REFERENCES model_route_trials(id),
+  harness_digest TEXT NOT NULL CHECK (length(harness_digest) = 64),
+  budget_digest TEXT NOT NULL CHECK (length(budget_digest) = 64),
+  record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE(cohort, model_trial_id)
+);
+CREATE TRIGGER navigator_model_trial_evidence_append_only_update
+BEFORE UPDATE ON navigator_model_trial_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_model_trial_evidence is append-only'); END;
+CREATE TRIGGER navigator_model_trial_evidence_append_only_delete
+BEFORE DELETE ON navigator_model_trial_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_model_trial_evidence is append-only'); END;
+
+CREATE TABLE navigator_safety_evidence (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  counter TEXT NOT NULL UNIQUE CHECK (counter IN (
+    'unauthorized_effects', 'owner_boundary_violations', 'duplicate_mutations',
+    'outcome_regressions', 'evidence_binding_failures'
+  )),
+  counter_count INTEGER NOT NULL CHECK (counter_count >= 0),
+  snapshot_id TEXT NOT NULL CHECK (length(snapshot_id) BETWEEN 1 AND 256),
+  evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+  record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE TRIGGER navigator_safety_evidence_append_only_update
+BEFORE UPDATE ON navigator_safety_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_safety_evidence is append-only'); END;
+CREATE TRIGGER navigator_safety_evidence_append_only_delete
+BEFORE DELETE ON navigator_safety_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator_safety_evidence is append-only'); END;
+
+CREATE TABLE navigator_promotion_evidence_manifests (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE CHECK (length(id) BETWEEN 1 AND 256),
+  deterministic_ids_json TEXT NOT NULL CHECK (length(deterministic_ids_json) BETWEEN 2 AND 16384),
+  corpus_id TEXT CHECK (corpus_id IS NULL OR length(corpus_id) BETWEEN 1 AND 256),
+  live_run_ids_json TEXT NOT NULL CHECK (length(live_run_ids_json) BETWEEN 2 AND 16384),
+  candidate_model_ref_ids_json TEXT NOT NULL CHECK (length(candidate_model_ref_ids_json) BETWEEN 2 AND 32768),
+  baseline_model_ref_ids_json TEXT NOT NULL CHECK (length(baseline_model_ref_ids_json) BETWEEN 2 AND 32768),
+  safety_ids_json TEXT NOT NULL CHECK (length(safety_ids_json) BETWEEN 2 AND 16384),
+  reviewed INTEGER NOT NULL CHECK (reviewed IN (0, 1)),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE INDEX navigator_promotion_evidence_manifest_sequence
+  ON navigator_promotion_evidence_manifests(sequence DESC);
+CREATE TRIGGER navigator_promotion_evidence_manifests_append_only_update
+BEFORE UPDATE ON navigator_promotion_evidence_manifests
+BEGIN SELECT RAISE(ABORT, 'navigator_promotion_evidence_manifests are append-only'); END;
+CREATE TRIGGER navigator_promotion_evidence_manifests_append_only_delete
+BEFORE DELETE ON navigator_promotion_evidence_manifests
+BEGIN SELECT RAISE(ABORT, 'navigator_promotion_evidence_manifests are append-only'); END;
+
+CREATE TABLE workflow_engine_contractions (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  engine TEXT NOT NULL CHECK (engine = 'recipe-v1'),
+  remaining_job_ids_json TEXT NOT NULL CHECK (remaining_job_ids_json = '[]'),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE TRIGGER workflow_engine_contractions_append_only_update
+BEFORE UPDATE ON workflow_engine_contractions
+BEGIN SELECT RAISE(ABORT, 'workflow_engine_contractions are append-only'); END;
+CREATE TRIGGER workflow_engine_contractions_append_only_delete
+BEFORE DELETE ON workflow_engine_contractions
+BEGIN SELECT RAISE(ABORT, 'workflow_engine_contractions are append-only'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -4267,4 +4422,5 @@ export const ALL_MIGRATIONS = [
   ...OWNER_BOUNDARY_SOURCE_MIGRATIONS,
   ...POLICY_APPROVAL_INTENT_MIGRATIONS,
   ...NAVIGATOR_RELEASE_MIGRATIONS,
+  ...NAVIGATOR_PROMOTION_MIGRATIONS,
 ] as const;
