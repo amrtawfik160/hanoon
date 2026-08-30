@@ -9,7 +9,7 @@ import type { SendMessagePayload } from "../src/telegram/types";
 
 let fixtureNumber = 0;
 
-function fixture() {
+function fixture(options?: { threadStatus?: "active" | "error"; omitRateLimitRecovery?: boolean }) {
   const { bb } = createFakePluginHost({ pluginId: `telegram-controller-operations-${fixtureNumber++}` });
   const store = openStore(bb.storage, bb.storage.kv, () => 1_000);
   store.createPairingCode(hashSecret("pair-operation"), 1_000, 10_000);
@@ -51,23 +51,23 @@ function fixture() {
   };
   const send = vi.fn(async () => ({ ok: true as const }));
   const stop = vi.fn(async () => ({ ok: true as const }));
-  const sdk = {
-    threads: {
-      get: vi.fn(async () => makeThreadResponse({
-        id: "thr_target",
-        projectId: "proj_1",
-        title: "Fix billing",
-        visibility: "visible",
-        status: "active",
-        archivedAt: null,
-        deletedAt: null,
-      })),
-      send,
-      stop,
-      rateLimitRecovery: vi.fn(),
-      continueAfterRateLimit: vi.fn(),
-    },
-  } as unknown as BbPluginApi["sdk"];
+  const rateLimitRecovery = vi.fn(async () => ({ reason: "eligible", candidate: { failedRequestId: "req-1" } }));
+  const continueAfterRateLimit = vi.fn(async () => ({ ok: true as const }));
+  const threads = {
+    get: vi.fn(async () => makeThreadResponse({
+      id: "thr_target",
+      projectId: "proj_1",
+      title: "Fix billing",
+      visibility: "visible",
+      status: options?.threadStatus ?? "active",
+      archivedAt: null,
+      deletedAt: null,
+    })),
+    send,
+    stop,
+    ...(options?.omitRateLimitRecovery ? {} : { rateLimitRecovery, continueAfterRateLimit }),
+  };
+  const sdk = { threads } as unknown as BbPluginApi["sdk"];
   const telegram = {
     sendMessage: vi.fn(async (_chatId: string, _payload: SendMessagePayload) => ({ message_id: 601 })),
   };
@@ -81,7 +81,7 @@ function fixture() {
   });
   const request = (input: OperationRequest) =>
     service.request({ ...input, controllerFence });
-  return { bb, store, sdk, telegram, service, request, send, stop, controllerFence };
+  return { bb, store, sdk, telegram, service, request, send, stop, rateLimitRecovery, continueAfterRateLimit, controllerFence };
 }
 
 it("binds one steer confirmation to the paired owner, message, target, and nonce hash", async () => {
@@ -216,5 +216,70 @@ it("invalidates an outstanding confirmation when the owner is revoked", async ()
   expect(store.getThreadOperation(requested.id)).toMatchObject({
     state: "failed",
     lastError: "Controller owner was revoked",
+  });
+});
+
+it("runs a confirmed rate-limit retry through recovery and continuation", async () => {
+  const { store, service, request, controllerFence, rateLimitRecovery, continueAfterRateLimit } =
+    fixture({ threadStatus: "error" });
+  const requested = await request({
+    kind: "retry_thread",
+    threadId: "thr_target",
+    signal: AbortSignal.timeout(1_000),
+  });
+  const operation = store.getThreadOperation(requested.id);
+  if (!operation) throw new Error("operation was not stored");
+  expect(store.confirmThreadOperation({
+    nonceHash: operation.nonceHash,
+    userId: "7",
+    chatId: "7",
+    messageId: 601,
+    now: 1_100,
+  }).ok).toBe(true);
+  const fence = {
+    ownerId: controllerFence.ownerId,
+    generation: controllerFence.generation,
+    signal: AbortSignal.timeout(1_000),
+  };
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(rateLimitRecovery).toHaveBeenCalledWith({ threadId: "thr_target" });
+  expect(continueAfterRateLimit).toHaveBeenCalledWith({
+    threadId: "thr_target",
+    failedRequestId: "req-1",
+    mode: "manual",
+  });
+  expect(store.getThreadOperation(requested.id)).toMatchObject({ state: "completed", result: "Retry requested" });
+});
+
+it("reports the retry as unsupported when the host SDK omits rate-limit recovery", async () => {
+  const { store, service, request, controllerFence } =
+    fixture({ threadStatus: "error", omitRateLimitRecovery: true });
+  const requested = await request({
+    kind: "retry_thread",
+    threadId: "thr_target",
+    signal: AbortSignal.timeout(1_000),
+  });
+  const operation = store.getThreadOperation(requested.id);
+  if (!operation) throw new Error("operation was not stored");
+  expect(store.confirmThreadOperation({
+    nonceHash: operation.nonceHash,
+    userId: "7",
+    chatId: "7",
+    messageId: 601,
+    now: 1_100,
+  }).ok).toBe(true);
+  const fence = {
+    ownerId: controllerFence.ownerId,
+    generation: controllerFence.generation,
+    signal: AbortSignal.timeout(1_000),
+  };
+
+  await expect(service.processOne(fence, fence.signal)).resolves.toBe(true);
+
+  expect(store.getThreadOperation(requested.id)).toMatchObject({
+    state: "completed",
+    result: "Safe provider retry is not supported by this BB version",
   });
 });
