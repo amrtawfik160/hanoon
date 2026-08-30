@@ -547,6 +547,22 @@ it("pairs only a valid unconsumed code in a private chat", async () => {
   expect(groupFixture.store.getOwner()).toBeNull();
 });
 
+it("tells the private-chat sender when a pairing code is expired or invalid instead of going silent", async () => {
+  // The code is valid 1_000..11_000; deliver it after it expired.
+  const expiredFixture = ingressFixture({ pairingCode: "pair-code" });
+  await expiredFixture.ingress.handleClaimed(messageUpdate(1, 7, 70, "/start pair-code"), 12_000);
+  expect(expiredFixture.store.getOwner()).toBeNull();
+  expect(expiredFixture.telegram.sent).toHaveLength(1);
+  expect(expiredFixture.telegram.sent[0]?.payload.text ?? "").toMatch(/expired|invalid|new pairing link/i);
+
+  // An unknown code (typo, or a link that was never issued here).
+  const unknownFixture = ingressFixture({ pairingCode: "pair-code" });
+  await unknownFixture.ingress.handleClaimed(messageUpdate(2, 8, 80, "/start wrong-code"), 2_000);
+  expect(unknownFixture.store.getOwner()).toBeNull();
+  expect(unknownFixture.telegram.sent).toHaveLength(1);
+  expect(unknownFixture.telegram.sent[0]?.payload.text ?? "").toMatch(/expired|invalid|new pairing link/i);
+});
+
 it("keeps /projects deterministic and out of the Luna controller queue", async () => {
   const fixture = ingressFixture({ owner: { userId: "7", chatId: "70" } });
 
