@@ -450,7 +450,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned when clock schedules moved to BB Automations with UTC semantics.
   // Re-pinned when BB replaced experimental status labels with the stable
   // presentation contract in plugin SDK 0.4.21.
-  expect(digest).toBe("853902c2eb6e276cedd5885798022c43fa491a87fd9f4324c6b2ccea427188df");
+  // Re-pinned when watch gained the governed update_schedule variant.
+  expect(digest).toBe("3fd7a98dcc64b9c33ee62cbbd0b3154e651ae8da4c14ac48b762a9cf26551808");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -1534,6 +1535,63 @@ it("rejects repeating schedules that poll live work", async () => {
     controllerToolContext,
   )).resolves.toContain('"kind":"schedule"');
   expect(automations.create).toHaveBeenCalledOnce();
+});
+
+it("updates an owned BB schedule through the governed controller seam without widening its execution", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )) as { watching: { id: string } };
+
+  const result = await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    {
+      kind: "update_schedule",
+      id: created.watching.id,
+      cron: "30 9 * * 1-5",
+      instruction: "Send the revised weekday digest.",
+    },
+    controllerToolContext,
+  );
+
+  expect(parseToolJson(result)).toMatchObject({
+    watching: {
+      id: created.watching.id,
+      cron: "30 9 * * 1-5",
+      instruction: "Send the revised weekday digest.",
+    },
+  });
+  expect(automations.update).toHaveBeenCalledWith(expect.objectContaining({
+    id: created.watching.id,
+    definition: expect.objectContaining({
+      mode: "agent",
+      providerId: "codex",
+      model: "gpt-5.6-sol",
+      permissionMode: "auto",
+      target: { kind: "project-default" },
+      trigger: { kind: "cron", cron: "30 9 * * 1-5", timezone: "Etc/UTC" },
+      prompt: "Send the revised weekday digest.",
+    }),
+  }));
 });
 
 it("retires an already-armed live-work poller without touching clock-time schedules", () => {

@@ -150,6 +150,18 @@ export type BbScriptAutomationDefinition = Readonly<{
 
 export type BbAutomationDefinition = BbAgentAutomationDefinition | BbScriptAutomationDefinition;
 
+export type BbAgentAutomationCapabilities = Readonly<{
+  executionTimeout: boolean;
+  resultContract: boolean;
+  preRunAuthority: boolean;
+}>;
+
+export const INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES: BbAgentAutomationCapabilities = Object.freeze({
+  executionTimeout: false,
+  resultContract: false,
+  preRunAuthority: false,
+});
+
 export type AutomationCommandRunner = Readonly<{
   run(input: {
     scope: TerminalScope;
@@ -278,7 +290,16 @@ function commandFailure(title: string, result: CommandResult): Error {
   return new Error(`${title}: BB automation command exited ${result.exitCode}`);
 }
 
+export class BbAutomationNotFoundError extends Error {
+  public constructor() {
+    super("BB automation is already absent");
+    this.name = "BbAutomationNotFoundError";
+  }
+}
+
 export class TerminalBbAutomationAdapter {
+  public readonly agentAutomationCapabilities = INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES;
+
   public constructor(private readonly runner: AutomationCommandRunner) {}
 
   private async execute<T>(input: {
@@ -286,6 +307,7 @@ export class TerminalBbAutomationAdapter {
     title: string;
     command: string;
     schema: z.ZodType<T>;
+    classifyNotFound?: boolean;
     signal?: AbortSignal;
   }): Promise<T> {
     const result = await this.runner.run({
@@ -296,7 +318,13 @@ export class TerminalBbAutomationAdapter {
       maxOutputBytes: 1_048_576,
       signal: input.signal,
     });
-    if (result.outcome !== "exited" || result.exitCode !== 0) throw commandFailure(input.title, result);
+    if (result.outcome !== "exited" || result.exitCode !== 0) {
+      if (input.classifyNotFound === true && result.outcome === "exited" &&
+        result.output.trim() === "Automation not found") {
+        throw new BbAutomationNotFoundError();
+      }
+      throw commandFailure(input.title, result);
+    }
     return input.schema.parse(parseCommandJson<unknown>(result.output, input.title));
   }
 
@@ -436,6 +464,7 @@ export class TerminalBbAutomationAdapter {
       title: "Delete BB automation",
       command: buildAutomationActionCommand("delete", input.projectId, input.automationId),
       schema: z.object({ ok: z.literal(true), id: z.literal(input.automationId) }).passthrough(),
+      classifyNotFound: true,
     });
   }
 }

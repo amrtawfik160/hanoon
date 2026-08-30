@@ -1,6 +1,9 @@
 import { vi } from "vitest";
 import type { BbAutomation, BbAutomationDefinition } from "../../src/bb/automation";
-import type { CreateManagedAutomationInput } from "../../src/services/managed-automation-service";
+import type {
+  CreateManagedAutomationInput,
+  ManagedAutomationService,
+} from "../../src/services/managed-automation-service";
 import type { ManagedAutomationBinding } from "../../src/storage/managed-automation-repository";
 
 function observed(definition: BbAutomationDefinition, id: string, now: number): BbAutomation {
@@ -79,6 +82,24 @@ export function createTestManagedAutomations() {
   const list = vi.fn((controllerKey: string, includeRetired = false) =>
     [...bindings.values()].filter((binding) =>
       binding.controllerKey === controllerKey && (includeRetired || binding.state !== "retired")));
+  const update = vi.fn(async (
+    input: Parameters<ManagedAutomationService["update"]>[0],
+  ): Promise<ManagedAutomationBinding> => {
+    const binding = bindings.get(input.id);
+    if (!binding) throw new Error("missing test automation");
+    const automation = observed(input.definition, binding.bbAutomationId!, input.now);
+    const updated: ManagedAutomationBinding = {
+      ...binding,
+      name: input.definition.name,
+      mode: input.definition.mode,
+      definition: input.definition,
+      observed: automation,
+      lastReconciledAt: input.now,
+      updatedAt: input.now,
+    };
+    bindings.set(input.id, updated);
+    return updated;
+  });
   const retire = vi.fn(async (input: { id: string; now: number }) => {
     const binding = bindings.get(input.id);
     if (!binding) throw new Error("missing test automation");
@@ -86,5 +107,5 @@ export function createTestManagedAutomations() {
     bindings.set(input.id, retired);
     return retired;
   });
-  return { bindings, create, get, list, retire };
+  return { bindings, create, get, list, update, retire };
 }

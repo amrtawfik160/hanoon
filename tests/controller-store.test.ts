@@ -18,9 +18,12 @@ import {
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
+  NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
+  MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
+import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
 
 let fixtureNumber = 0;
 
@@ -222,7 +225,9 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS).toHaveLength(
     80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length +
       NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
-      MANAGED_AUTOMATION_MIGRATIONS.length,
+      MANAGED_AUTOMATION_MIGRATIONS.length +
+      NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length +
+      MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length,
   );
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");
@@ -320,6 +325,103 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[54]).toContain("delivery_reconcile_attempts");
   expect(ALL_MIGRATIONS[54]).toContain("busy_wait_notified_at");
   expect(ALL_MIGRATIONS[54]).not.toMatch(/\b(?:DROP|RENAME)\b/u);
+});
+
+it("upgrades the shipped native SDLC schema without rewriting migration history or losing automation evidence", () => {
+  expect(sha256(NAVIGATOR_RELEASE_MIGRATIONS.join(""))).toBe(
+    "d04a08df34b87f662e7209b499ced6657276c9057cc780454a99f94f0cd0fe69",
+  );
+  expect(sha256(MANAGED_AUTOMATION_MIGRATIONS.join(""))).toBe(
+    "c36ce56104daa850b84ed43d2c6d97365ccbb2371b8c29c6e813a0cc028b9dfd",
+  );
+  expect(NAVIGATOR_RELEASE_MIGRATIONS.join("\n")).not.toContain(
+    "navigator_release_review_finding_events",
+  );
+  expect(MANAGED_AUTOMATION_MIGRATIONS.join("\n")).toContain(
+    "state IN ('pending', 'active', 'paused', 'retired', 'failed')",
+  );
+
+  const { bb } = createFakePluginHost({ pluginId: `native-sdlc-upgrade-${fixtureNumber++}` });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  const shippedMigrationCount = ALL_MIGRATIONS.length -
+    NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length -
+    MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, shippedMigrationCount));
+  db.prepare(
+    `INSERT INTO managed_automations (
+       id, controller_key, source_key, project_id, bb_automation_id, name, mode,
+       definition_json, definition_sha256, authority_json, notification_policy,
+       state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "managed-legacy",
+    "owner-7-controller",
+    "legacy:daily",
+    "proj_owner",
+    "auto_legacy",
+    "Legacy daily check",
+    "agent",
+    "{}",
+    "d".repeat(64),
+    "{}",
+    "material",
+    "active",
+    1_000,
+    1_000,
+  );
+  db.prepare(
+    `INSERT INTO managed_automation_run_evidence (
+       binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+       scheduled_for, started_at, observed_at, evidence_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "managed-legacy",
+    "run_legacy",
+    "auto_legacy",
+    "succeeded",
+    "agent",
+    "schedule",
+    1_000,
+    1_001,
+    1_002,
+    "{}",
+  );
+  db.prepare(
+    `INSERT INTO managed_automation_notifications (
+       bb_run_id, binding_id, controller_key, input_text, state, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "run_legacy",
+    "managed-legacy",
+    "owner-7-controller",
+    "A legacy managed automation finished.",
+    "pending",
+    1_003,
+  );
+
+  openStore(bb.storage, bb.storage.kv, () => 2_000);
+
+  expect(db.prepare(
+    "SELECT state FROM managed_automations WHERE id = 'managed-legacy'",
+  ).get()).toEqual({ state: "active" });
+  expect(db.prepare(
+    "SELECT sequence, status FROM managed_automation_run_evidence WHERE bb_run_id = 'run_legacy'",
+  ).get()).toEqual({ sequence: 1, status: "succeeded" });
+  expect(db.prepare(
+    "SELECT sequence, state FROM managed_automation_notifications WHERE bb_run_id = 'run_legacy'",
+  ).get()).toEqual({ sequence: 1, state: "pending" });
+  expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(() => db.prepare(
+    "UPDATE managed_automations SET state = 'updating' WHERE id = 'managed-legacy'",
+  ).run()).not.toThrow();
+  expect(db.prepare(
+    `SELECT name FROM sqlite_master
+       WHERE type = 'table' AND name = 'navigator_release_review_finding_events'`,
+  ).get()).toEqual({ name: "navigator_release_review_finding_events" });
+  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: ALL_MIGRATIONS.length,
+  });
 });
 
 it("rolls back an interrupted additive delivery-state migration and starts cleanly on retry", () => {

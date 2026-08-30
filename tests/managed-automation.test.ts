@@ -5,8 +5,10 @@ import type {
   BbAutomationDefinition,
   BbAutomationRun,
 } from "../src/bb/automation";
+import { BbAutomationNotFoundError, TerminalBbAutomationAdapter } from "../src/bb/automation";
 import {
   ManagedAutomationReconciler,
+  ManagedAgentExecutionContractUnsupportedError,
   ManagedAutomationService,
   migrateLegacyClockMonitor,
   type ManagedAutomationAdapter,
@@ -114,6 +116,11 @@ function fakeAdapter() {
     return created;
   });
   const adapter: ManagedAutomationAdapter = {
+    agentAutomationCapabilities: {
+      executionTimeout: true,
+      resultContract: true,
+      preRunAuthority: true,
+    },
     create,
     update: vi.fn(async ({ automationId, definition: value }) => {
       const found = automations.get(automationId);
@@ -141,7 +148,9 @@ function fakeAdapter() {
     }),
     runNow: vi.fn(async ({ automationId }) => runEvidence({ automationId, trigger: "manual" })),
     runs: vi.fn(async ({ automationId }) => runs.get(automationId) ?? []),
-    delete: vi.fn(async ({ automationId }) => { automations.delete(automationId); }),
+    delete: vi.fn(async ({ automationId }) => {
+      if (!automations.delete(automationId)) throw new BbAutomationNotFoundError();
+    }),
   };
   return { adapter, automations, runs, create };
 }
@@ -165,6 +174,23 @@ function createInput() {
 }
 
 describe("managed BB automations", () => {
+  it("refuses an agent schedule before invoking BB when the installed contract cannot enforce its boundaries", async () => {
+    const { repository } = fixture();
+    const run = vi.fn();
+    const service = new ManagedAutomationService(
+      repository,
+      new TerminalBbAutomationAdapter({ run }),
+      () => true,
+    );
+
+    await expect(service.create(createInput())).rejects.toMatchObject({
+      code: "BB_AGENT_EXECUTION_CONTRACT_UNSUPPORTED",
+    });
+
+    expect(run).not.toHaveBeenCalled();
+    expect(service.list("owner-7-controller")).toEqual([]);
+  });
+
   it("restarts by reconciling the same durable BB id without creating a duplicate", async () => {
     const { repository } = fixture();
     const fake = fakeAdapter();
@@ -395,6 +421,69 @@ describe("managed BB automations", () => {
       state: "paused",
       lastError: "managed_automation_authority_stale",
     });
+  });
+
+  it("pauses an existing agent schedule before reading runs when BB cannot enforce its execution contract", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const supportedService = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await supportedService.create(createInput());
+    fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
+    const service = new ManagedAutomationService(repository, {
+      ...fake.adapter,
+      agentAutomationCapabilities: {
+        executionTimeout: false,
+        resultContract: false,
+        preRunAuthority: false,
+      },
+    }, () => true);
+
+    await service.reconcile({ binding, scope: SCOPE, now: NOW + 1 });
+
+    expect(fake.adapter.setEnabled).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
+    expect(fake.adapter.runs).not.toHaveBeenCalled();
+    expect(service.get(binding.id)).toMatchObject({
+      state: "paused",
+      lastError: "bb_agent_execution_contract_unsupported",
+    });
+  });
+
+  it("refuses resume, update, and manual execution when an agent contract is unsupported", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const supportedService = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await supportedService.create(createInput());
+    const adapter: ManagedAutomationAdapter = {
+      ...fake.adapter,
+      agentAutomationCapabilities: {
+        executionTimeout: false,
+        resultContract: false,
+        preRunAuthority: false,
+      },
+    };
+    const service = new ManagedAutomationService(repository, adapter, () => true);
+    vi.mocked(fake.adapter.setEnabled).mockClear();
+    vi.mocked(fake.adapter.update).mockClear();
+    vi.mocked(fake.adapter.runNow).mockClear();
+
+    await expect(service.setEnabled({ id: binding.id, scope: SCOPE, enabled: true, now: NOW + 1 }))
+      .rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
+    await expect(service.update({
+      id: binding.id,
+      scope: SCOPE,
+      definition: { ...definition, prompt: "Updated prompt" },
+      now: NOW + 1,
+    })).rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
+    await expect(service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "manual-unsupported",
+      now: NOW + 1,
+    })).rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
+
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+    expect(fake.adapter.update).not.toHaveBeenCalled();
+    expect(fake.adapter.runNow).not.toHaveBeenCalled();
   });
 
   it("does not create a scheduled agent when its current authority preflight fails", async () => {

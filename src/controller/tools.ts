@@ -161,7 +161,7 @@ type ToolDependencies = {
   /** Absent exactly when credential mode is disabled; the three access tools fail closed. */
   credentialAccess?: CredentialAccessService;
   /** BB's scheduler. Absent means clock-based work fails closed. */
-  automations?: Pick<ManagedAutomationService, "create" | "get" | "list" | "retire">;
+  automations?: Pick<ManagedAutomationService, "create" | "get" | "list" | "update" | "retire">;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
   /** Current controller execution tuple, used when this turn opens a child thread. */
@@ -1061,6 +1061,21 @@ async function resolveTrustedScope(
       if (params.kind === "thread_idle") {
         return visibleThreadResolution(dependencies, String(params.threadId), context);
       }
+      if (params.kind === "update_schedule") {
+        const id = String(params.id);
+        const binding = dependencies.automations?.get(id) ?? null;
+        const ownsAutomation = binding !== null &&
+          binding.controllerKey === authorized.controller.controllerKey &&
+          binding.projectId === context.projectId &&
+          binding.definition.mode === "agent" && binding.definition.trigger.kind === "cron" &&
+          ["active", "paused", "failed"].includes(binding.state);
+        const cron = String(params.cron);
+        return exactScope(
+          [`monitor:${id}`, `project:${context.projectId}`],
+          ownsAutomation && nextCronOccurrence(cron, dependencies.now()) !== null,
+          ownsAutomation ? { automationBindingId: id } : {},
+        );
+      }
       const cron = String(params.cron);
       const valid = nextCronOccurrence(cron, dependencies.now()) !== null;
       return exactScope(
@@ -1659,7 +1674,8 @@ async function projectTrustedEvidence(
         monitor.threadId === (params.kind === "thread_idle" ? params.threadId : null) &&
         monitor.cron === (params.kind === "schedule" ? params.cron : null) &&
         (capturedId === undefined || capturedId === monitor.id);
-      const automated = params.kind === "schedule" && automation?.state === "active" &&
+      const automated = (params.kind === "schedule" || params.kind === "update_schedule") &&
+        automation?.state === "active" &&
         automation.controllerKey === authorized.controller.controllerKey &&
         automation.projectId === context.projectId && automation.definition.mode === "agent" &&
         automation.definition.prompt === params.instruction && automation.definition.trigger.kind === "cron" &&
@@ -2287,7 +2303,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[14],
-    description: "Set a durable monitor that wakes you later so you can act without the owner asking again. Use thread_idle to watch any visible BB thread until it finishes or fails, whether or not you started it — the plugin already hears BB events in real time. Threads started or messaged through the controller thread tools are watched automatically. CLI-created work is followed automatically only when controller evidence records its exact thread:<id> reference; set thread_idle yourself when that evidence may be absent. Clock schedules are owned by BB Automations, survive plugin restarts, and run as fresh agent work. Use a schedule only for clock time, never to poll a running thread or job. Write the instruction to your future self in full.",
+    description: "Set or update a durable monitor that wakes you later so you can act without the owner asking again. Use thread_idle to watch any visible BB thread until it finishes or fails, whether or not you started it — the plugin already hears BB events in real time. Threads started or messaged through the controller thread tools are watched automatically. CLI-created work is followed automatically only when controller evidence records its exact thread:<id> reference; set thread_idle yourself when that evidence may be absent. Clock schedules are owned by BB Automations, survive plugin restarts, and run as fresh agent work. Use update_schedule with the managed schedule id to change its UTC cron or instruction without widening its execution settings. Use a schedule only for clock time, never to poll a running thread or job. Write the instruction to your future self in full.",
     presentation: { label: { pending: "Setting a monitor", completed: "Monitor set" } },
     parameters: z.discriminatedUnion("kind", [
       z.object({
@@ -2297,6 +2313,12 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       }).strict(),
       z.object({
         kind: z.literal("schedule"),
+        cron: z.string().trim().min(1).max(120).describe("5-field cron in UTC"),
+        instruction: z.string().trim().min(1).max(1_000),
+      }).strict(),
+      z.object({
+        kind: z.literal("update_schedule"),
+        id: z.string().min(1).max(256),
         cron: z.string().trim().min(1).max(120).describe("5-field cron in UTC"),
         instruction: z.string().trim().min(1).max(1_000),
       }).strict(),
@@ -2328,6 +2350,34 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       }
 
       const automations = dependencies.automations;
+      if (params.kind === "update_schedule") {
+        if (!automations) throw new Error("BB Automations is not configured for this controller");
+        if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
+        const binding = automations.get(params.id);
+        if (!binding || binding.controllerKey !== controller.controllerKey ||
+          binding.projectId !== context.projectId || binding.definition.mode !== "agent" ||
+          binding.definition.trigger.kind !== "cron") {
+          throw new Error("That managed BB schedule is unavailable");
+        }
+        requireCronOccurrence(params.cron, dependencies.now());
+        const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
+          runControllerMutation(dependencies, authorized, context, () => mutation());
+        const updated = await automations.update({
+          id: binding.id,
+          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          definition: {
+            ...binding.definition,
+            trigger: { kind: "cron", cron: params.cron, timezone: "Etc/UTC" },
+            prompt: params.instruction,
+          },
+          now: dependencies.now(),
+          mutate,
+          signal: context.signal,
+        });
+        trustedState(resolution).automationBindingId = updated.id;
+        dependencies.notify();
+        return { watching: automationProjection(updated) };
+      }
       const execution = dependencies.controllerExecution?.();
       const providerId = dependencies.controllerProviderId?.();
       if (!automations || !execution || !providerId) {

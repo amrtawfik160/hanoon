@@ -4,6 +4,7 @@ import {
   buildAutomationRunsCommand,
   buildCreateAutomationCommand,
   buildUpdateAutomationCommand,
+  BbAutomationNotFoundError,
   TerminalBbAutomationAdapter,
   type BbAgentAutomationDefinition,
   type BbAutomation,
@@ -66,9 +67,16 @@ describe("BB automation adapter", () => {
     expect(command).toContain("--name 'Owner'\"'\"'s morning check'");
     expect(command).toContain("--prompt 'Check deploys; don'\"'\"'t guess. $(touch /tmp/nope)'");
     expect(command).toContain("--environment 'env_owner'");
+    expect(command).not.toContain("--timeout");
+    expect(command).not.toContain("result-contract");
     expect(command.endsWith("--json")).toBe(true);
     expect(buildAutomationRunsCommand("proj_owner", "auto_1", 20))
       .toBe("bb automation runs 'auto_1' --project 'proj_owner' --limit '20' --json");
+    expect(new TerminalBbAutomationAdapter({ run: vi.fn() }).agentAutomationCapabilities).toEqual({
+      executionTimeout: false,
+      resultContract: false,
+      preRunAuthority: false,
+    });
   });
 
   it("builds a complete project-bound definition update", () => {
@@ -178,5 +186,21 @@ describe("BB automation adapter", () => {
       ...definition,
       resultContract: { kind: "bounded-text", maximumBytes: 1_048_577 },
     })).toThrow("agent automation result contract");
+  });
+
+  it("classifies BB's exact already-absent delete response without hiding other command failures", async () => {
+    const results: CommandResult[] = [
+      { outcome: "exited", exitCode: 1, output: "Automation not found\n" },
+      { outcome: "exited", exitCode: 1, output: "Permission denied\n" },
+    ];
+    const adapter = new TerminalBbAutomationAdapter({ run: async () => results.shift()! });
+    const input = {
+      scope: { kind: "environment" as const, environmentId: "env_owner" },
+      projectId: "proj_owner",
+      automationId: "auto_absent",
+    };
+
+    await expect(adapter.delete(input)).rejects.toBeInstanceOf(BbAutomationNotFoundError);
+    await expect(adapter.delete(input)).rejects.toThrow("command exited 1");
   });
 });

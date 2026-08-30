@@ -272,6 +272,17 @@ export class ManagedAutomationRepository {
     return this.get(id)!;
   }
 
+  public markExecutionContractBlocked(id: string, now: number): ManagedAutomationBinding {
+    const result = this.db.prepare(
+      `UPDATE managed_automations
+          SET state = 'paused', last_error = 'bb_agent_execution_contract_unsupported',
+              last_reconciled_at = ?, updated_at = ?
+        WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
+    ).run(now, now, id);
+    if (result.changes !== 1) throw new Error("managed automation execution contract block fence was lost");
+    return this.get(id)!;
+  }
+
   public beginRetirement(id: string, now: number): ManagedAutomationBinding {
     const result = this.db.prepare(
       `UPDATE managed_automations SET state = 'retiring', last_error = NULL, updated_at = ?
