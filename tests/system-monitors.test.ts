@@ -3,7 +3,11 @@ import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
-import { SYSTEM_MONITORS, installSystemMonitors } from "../src/services/system-monitors";
+import {
+  SYSTEM_MONITORS,
+  installSystemMonitors,
+  systemAutomationInstallationComplete,
+} from "../src/services/system-monitors";
 import { admitConfirmedJob, policyFixture } from "./helpers";
 import { MonitorService } from "../src/services/monitor-service";
 
@@ -51,6 +55,11 @@ it("installs every system monitor once and stays idempotent across restarts", ()
   const second = store.listSystemMonitors();
   expect(second).toHaveLength(SYSTEM_MONITORS.length);
   expect(second.map((monitor) => monitor.id).sort()).toEqual(first.map((monitor) => monitor.id).sort());
+});
+
+it("keeps the system-automation install latch open after any sibling fails", () => {
+  expect(systemAutomationInstallationComplete(SYSTEM_MONITORS.length - 1)).toBe(false);
+  expect(systemAutomationInstallationComplete(SYSTEM_MONITORS.length)).toBe(true);
 });
 
 it("installs nothing until an owner is paired", () => {

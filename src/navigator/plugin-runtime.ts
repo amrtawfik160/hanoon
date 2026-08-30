@@ -351,15 +351,15 @@ export class PluginNavigatorGitObserver implements NavigatorGitObserver {
   public async observe(request: NavigatorGitObservationRequest): Promise<unknown> {
     const runner = new TerminalCommandRunner(this.sdk);
     const status = await this.sdk.environments.status({ environmentId: request.worktreeId });
-    let headSha = request.expectedHeadSha;
-    let clean = false;
-    if (status.outcome === "available") {
-      const checkout = status.workspace.checkout;
-      if ((checkout.kind === "branch" || checkout.kind === "detached") && checkout.headSha) {
-        headSha = checkout.headSha;
-      }
-      clean = status.workspace.workingTree.state === "clean";
+    if (status.outcome !== "available" || status.workspace.checkout.kind !== "branch" ||
+      status.workspace.checkout.branchName !== request.integrationBranch ||
+      typeof status.workspace.checkout.headSha !== "string" ||
+      !GIT_SHA.test(status.workspace.checkout.headSha)) {
+      throw new Error("navigator worktree is not on the requested integration branch");
     }
+    const checkout = status.workspace.checkout;
+    const headSha = checkout.headSha;
+    const clean = status.workspace.workingTree.state === "clean";
     const ancestry = async (commit: string): Promise<boolean> => {
       if (!GIT_SHA.test(commit)) return false;
       const result = await runner.run({
@@ -382,7 +382,7 @@ export class PluginNavigatorGitObserver implements NavigatorGitObserver {
     return {
       kind: "navigator_git_observation",
       worktreeId: request.worktreeId,
-      branch: request.integrationBranch,
+      branch: checkout.branchName,
       headSha,
       baseHeadSha: request.baseHeadSha,
       baseHeadIsAncestor: await ancestry(request.baseHeadSha),

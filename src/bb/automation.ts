@@ -121,7 +121,18 @@ export type BbAgentAutomationDefinition = Readonly<{
   serviceTier?: "default" | "fast";
   permissionMode: "accept-edits" | "auto" | "full";
   target: BbAutomationTarget;
+  timeoutMs: number;
+  resultContract: Readonly<{
+    kind: "bounded-text";
+    maximumBytes: number;
+  }>;
 }>;
+
+export const DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS = 900_000;
+export const DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT = Object.freeze({
+  kind: "bounded-text" as const,
+  maximumBytes: 32_768,
+});
 
 export type BbScriptAutomationDefinition = Readonly<{
   mode: "script";
@@ -176,6 +187,14 @@ function definitionArgs(definition: BbAutomationDefinition): string[] {
     ...triggerArgs(definition.trigger),
   ];
   if (definition.mode === "agent") {
+    if (!Number.isSafeInteger(definition.timeoutMs) || definition.timeoutMs < 1 || definition.timeoutMs > 14_400_000) {
+      throw new TypeError("agent automation timeout must be 1-14400000 milliseconds");
+    }
+    if (definition.resultContract.kind !== "bounded-text" ||
+      !Number.isSafeInteger(definition.resultContract.maximumBytes) ||
+      definition.resultContract.maximumBytes < 1 || definition.resultContract.maximumBytes > 1_048_576) {
+      throw new TypeError("agent automation result contract must bound text to 1-1048576 bytes");
+    }
     return [
       ...common,
       ...flag("prompt", definition.prompt),
@@ -207,6 +226,13 @@ function command(subcommand: string, args: readonly string[]): string {
 
 export function buildCreateAutomationCommand(definition: BbAutomationDefinition): string {
   return command("create", definitionArgs(definition));
+}
+
+export function buildUpdateAutomationCommand(
+  automationId: string,
+  definition: BbAutomationDefinition,
+): string {
+  return command("update", [shellSingleQuote(automationId), ...definitionArgs(definition)]);
 }
 
 export function buildShowAutomationCommand(projectId: string, automationId: string): string {
@@ -310,6 +336,29 @@ export class TerminalBbAutomationAdapter {
       }
       throw error;
     }
+  }
+
+  public async update(input: {
+    scope: TerminalScope;
+    definition: BbAutomationDefinition;
+    automationId: string;
+    expectedEnabled: boolean;
+    signal?: AbortSignal;
+  }): Promise<BbAutomation> {
+    await this.execute({
+      ...input,
+      title: "Update BB automation",
+      command: buildUpdateAutomationCommand(input.automationId, input.definition),
+      schema: bbAutomationSchema,
+    });
+    const observed = await this.show({
+      scope: input.scope,
+      projectId: input.definition.projectId,
+      automationId: input.automationId,
+      signal: input.signal,
+    });
+    assertAutomationMatches(input.definition, observed, input.expectedEnabled);
+    return observed;
   }
 
   public show(input: {

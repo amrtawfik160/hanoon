@@ -62,8 +62,9 @@ function environmentStatus(input: Readonly<{
   headSha: string;
   clean: boolean;
   branch?: string;
+  detached?: boolean;
 }>) {
-  const branch = input.branch ?? "hanoon/job";
+  const branch = input.branch ?? "hanoon/job-43";
   return {
     outcome: "available" as const,
     workspace: {
@@ -75,7 +76,9 @@ function environmentStatus(input: Readonly<{
         hasUncommittedChanges: !input.clean,
         state: input.clean ? "clean" as const : "dirty_uncommitted" as const,
       },
-      checkout: { kind: "branch" as const, branchName: branch, headSha: input.headSha },
+      checkout: input.detached
+        ? { kind: "detached" as const, headSha: input.headSha }
+        : { kind: "branch" as const, branchName: branch, headSha: input.headSha },
       branch: { currentBranch: branch, defaultBranch: "main" },
       mergeBase: null,
     },
@@ -150,6 +153,22 @@ describe("plugin navigator git observer", () => {
       comparisonBaseHeadIsAncestor: true,
       changedPaths: ["lib/other.ts", "README.md"],
     });
+  });
+
+  it.each([
+    ["a mismatched branch", environmentStatus({ headSha: WORKTREE_HEAD, clean: true, branch: "hanoon/other" })],
+    ["a detached checkout", environmentStatus({ headSha: WORKTREE_HEAD, clean: true, detached: true })],
+  ])("rejects %s instead of echoing the requested integration branch", async (_label, status) => {
+    const { bb } = createFakePluginHost({
+      pluginId: `navigator-plugin-git-branch-${++fixtureSequence}`,
+      sdk: {
+        environments: { status: async () => status },
+        terminals: stubGitTerminals([]),
+      },
+    });
+    const observer = new PluginNavigatorGitObserver(bb.sdk);
+
+    await expect(observer.observe(observationRequest())).rejects.toThrow("integration branch");
   });
 });
 

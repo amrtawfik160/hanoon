@@ -23,7 +23,7 @@ npm run check
 bb plugin types --check .
 ```
 
-The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the vendored plugin declarations still match the installed BB contract.
+The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the exact pinned `@get-bb/plugin-sdk` development dependency still matches the installed BB host contract.
 
 ## Answer-quality evaluation
 
@@ -35,12 +35,13 @@ It is deliberately outside `npm run check`: each case has six independent clause
 
 - Telegram ingress is I/O only: accept, authenticate, persist, and nudge. It must not spawn BB sessions or touch worktrees.
 - The leased executor is the only execution engine. New paths that start work must go through its generation fence and durable effects.
+- External-resource retirement must persist its durable intent before deletion and reconcile interruptions; a deleted resource must never retain an active binding.
 - Project policy is immutable for an active job. Do not let mutable controller settings rewrite worker execution.
 - Reviews use newly spawned BB threads with fresh provider conversations. Do not fork or resume the implementation conversation for review.
 - BB threads do not replace worktrees. Threads own conversation/history/status/permissions; the worktree owns branch, checkout, files, and artifacts.
 - Merge evidence uses the full head from `git ls-remote origin refs/pull/<number>/head`. Do not substitute cached API metadata.
 - Merge, deploy, and canary require distinct durable receipts. Never infer completion from an HTTP success or prose response.
-- Secrets, pairing links, callback nonces, raw private messages, and credential-like output must not enter fixtures, logs, documentation, or persisted evidence.
+- Secrets, pairing links, callback nonces, raw private messages, and raw automation/provider output must not enter fixtures, logs, documentation, persisted evidence, or controller prompts. Persist only an allowlisted, redacted projection.
 
 ## Tests
 

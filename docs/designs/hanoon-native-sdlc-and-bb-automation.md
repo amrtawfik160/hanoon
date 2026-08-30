@@ -108,4 +108,3 @@ This integration is complete only when automated and live tests prove:
 - a BB script automation and BB agent automation can be created, reconciled after restart, run under bounded authority, and reported without a second Hanoon cron;
 - an authenticated provider operation and browser journey succeed without any model-readable secret and produce redacted authoritative evidence;
 - merge, deploy, canary, rollback, and owner boundaries remain correct after all additions.
-

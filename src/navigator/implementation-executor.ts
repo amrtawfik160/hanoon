@@ -350,10 +350,32 @@ function stableId(prefix: string, ...parts: readonly string[]): string {
   return `${prefix}_${createHash("sha256").update(parts.join("\0"), "utf8").digest("base64url").slice(0, 24)}`;
 }
 
-function findingDisposition(finding: NavigatorReviewFinding): "must_fix" | "advisory" {
-  return finding.severity === "critical" || finding.severity === "high" || finding.requirementId !== null
+const NAVIGATOR_FINDING_POLICY = Object.freeze({
+  "code-review": Object.freeze({ defaultDisposition: "must_fix" as const, mustFixRuleIds: Object.freeze([]) }),
+  "clean-code-guard": Object.freeze({
+    defaultDisposition: "advisory" as const,
+    mustFixRuleIds: Object.freeze(["clean.rule-1"]),
+  }),
+  "docs-guard": Object.freeze({
+    defaultDisposition: "advisory" as const,
+    mustFixRuleIds: Object.freeze(["docs.rule-1"]),
+  }),
+  "test-guard": Object.freeze({
+    defaultDisposition: "advisory" as const,
+    mustFixRuleIds: Object.freeze(["tests.rule-1"]),
+  }),
+});
+
+export function navigatorFindingDisposition(
+  finding: NavigatorReviewFinding,
+): "must_fix" | "advisory" | null {
+  const policy = NAVIGATOR_FINDING_POLICY[
+    finding.capabilityId as keyof typeof NAVIGATOR_FINDING_POLICY
+  ];
+  if (!policy) return null;
+  return policy.mustFixRuleIds.some((ruleId) => ruleId === finding.ruleId)
     ? "must_fix"
-    : "advisory";
+    : policy.defaultDisposition;
 }
 
 function findingState(event: FindingEventRow["event"]): NavigatorFindingLedgerEntry["state"] {
@@ -1193,6 +1215,15 @@ export class NavigatorImplementationExecutor {
     const verification = attempt.workOrder.verificationOf;
     if (verification === undefined) return { blockingBurden: 0, policyFailureReason: "finding_verification_source_missing" };
     const source = new Map(verification.findings.map((finding) => [finding.rootCauseId, finding]));
+    const selectedCapabilities = new Set(attempt.profile.assignments.map(({ capabilityId }) => capabilityId));
+    const dispositions = new Map<string, "must_fix" | "advisory">();
+    for (const finding of verification.findings) {
+      const disposition = navigatorFindingDisposition(finding);
+      if (disposition === null || !selectedCapabilities.has(finding.capabilityId)) {
+        return { blockingBurden: 0, policyFailureReason: "finding_policy_unregistered" };
+      }
+      dispositions.set(finding.rootCauseId, disposition);
+    }
     const confirmed = new Map<string, NavigatorReviewFinding>();
     for (const finding of result.findings) {
       const reported = source.get(finding.rootCauseId);
@@ -1210,7 +1241,7 @@ export class NavigatorImplementationExecutor {
     }]));
     for (const finding of verification.findings) {
       const prior = current.get(finding.rootCauseId);
-      const disposition = findingDisposition(finding);
+      const disposition = dispositions.get(finding.rootCauseId)!;
       const isConfirmed = confirmed.has(finding.rootCauseId);
       next.set(finding.rootCauseId, {
         disposition,
@@ -1241,7 +1272,7 @@ export class NavigatorImplementationExecutor {
         attempt,
         sourceReviewAttemptId: verification.attemptId,
         finding: isConfirmed ? confirmed.get(finding.rootCauseId)! : finding,
-        disposition: findingDisposition(finding),
+        disposition: dispositions.get(finding.rootCauseId)!,
         event: isConfirmed ? (prior && findingState(prior.event) === "open" ? "reobserved" : "opened") : "disputed",
         occurrence: next.get(finding.rootCauseId)!.occurrence,
         blockingBurden,
@@ -1701,6 +1732,7 @@ export class NavigatorImplementationExecutor {
         const ticketSnapshot = this.dependencies.store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId);
         if (
           parsed.data.baseHeadSha !== attempt.workOrder.baseHeadSha ||
+          parsed.data.headSha === attempt.workOrder.baseHeadSha ||
           integration.current_head_sha !== attempt.workOrder.baseHeadSha ||
           ticketSnapshot === null ||
           !navigatorAcceptanceCriteriaAreSatisfied(ticketSnapshot, parsed.data.acceptanceCriteria) ||
@@ -1708,9 +1740,11 @@ export class NavigatorImplementationExecutor {
           parsed.data.fullVerification.some((receipt) => receipt.outcome !== "passed")
         ) {
           outcome = "policy_failure";
-          reasonCode = integration.current_head_sha !== attempt.workOrder.baseHeadSha
-            ? "integration_head_drift"
-            : "implementation_evidence_rejected";
+          reasonCode = parsed.data.headSha === attempt.workOrder.baseHeadSha
+            ? "implementation_head_not_advanced"
+            : integration.current_head_sha !== attempt.workOrder.baseHeadSha
+              ? "integration_head_drift"
+              : "implementation_evidence_rejected";
         }
       } else if (parsed.data.reviewedHeadSha !== attempt.workOrder.baseHeadSha) {
         outcome = "policy_failure";

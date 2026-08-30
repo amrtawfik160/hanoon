@@ -3999,6 +3999,33 @@ CREATE TRIGGER navigator_release_findings_append_only_delete
 BEFORE DELETE ON navigator_release_findings
 BEGIN SELECT RAISE(ABORT, 'navigator release findings are append-only'); END;
 
+CREATE TABLE navigator_release_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT REFERENCES workflow_steps(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL CHECK (json_valid(finding_json)),
+  evidence_refs_json TEXT NOT NULL CHECK (json_valid(evidence_refs_json)),
+  occurrence INTEGER NOT NULL CHECK (occurrence BETWEEN 0 AND 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  recorded_at INTEGER NOT NULL,
+  UNIQUE(source_review_attempt_id, fingerprint, event)
+);
+CREATE INDEX navigator_release_review_finding_events_job
+  ON navigator_release_review_finding_events(job_id, sequence);
+CREATE TRIGGER navigator_release_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_release_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
+CREATE TRIGGER navigator_release_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_release_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
+
 CREATE TABLE navigator_release_incidents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id TEXT NOT NULL REFERENCES jobs(id),
@@ -4384,7 +4411,7 @@ CREATE TABLE managed_automations (
   definition_sha256 TEXT NOT NULL CHECK (length(definition_sha256) = 64),
   authority_json TEXT NOT NULL,
   notification_policy TEXT NOT NULL CHECK (notification_policy IN ('material', 'always', 'silent')),
-  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'paused', 'retired', 'failed')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'paused', 'updating', 'retiring', 'retired', 'failed')),
   legacy_monitor_id TEXT UNIQUE,
   observed_json TEXT,
   observed_sha256 TEXT CHECK (observed_sha256 IS NULL OR length(observed_sha256) = 64),

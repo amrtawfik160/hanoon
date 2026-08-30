@@ -1,6 +1,10 @@
 import type { BbPluginApi, PluginAgentConfigurationContext, PluginAgentToolContext } from "@get-bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import {
+  DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
+  DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+} from "../bb/automation";
 import { redactError } from "../errors";
 import {
   isResumablePermanentFailure,
@@ -2356,6 +2360,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           serviceTier: execution.serviceTier,
           permissionMode: execution.permissionMode,
           target: { kind: "project-default" },
+          timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+          resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
         },
         authority: {
           source: "owner",

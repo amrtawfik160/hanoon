@@ -14,6 +14,7 @@ import {
 import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
 import { openStore, type MonitorRecord } from "../src/storage/store";
 import { hashSecret } from "../src/crypto";
+import { policyFixture } from "./helpers";
 
 const NOW = 1_800_000_000_000;
 const SCOPE = { kind: "environment", environmentId: "env_owner" } as const;
@@ -29,6 +30,8 @@ const definition: BbAutomationDefinition = {
   model: "gpt-5.6-sol",
   permissionMode: "full",
   target: { kind: "project-default" },
+  timeoutMs: 900_000,
+  resultContract: { kind: "bounded-text", maximumBytes: 32_768 },
 };
 
 function automation(
@@ -112,6 +115,18 @@ function fakeAdapter() {
   });
   const adapter: ManagedAutomationAdapter = {
     create,
+    update: vi.fn(async ({ automationId, definition: value }) => {
+      const found = automations.get(automationId);
+      if (!found) throw new Error("missing automation");
+      const updated = automation(value, {
+        id: automationId,
+        enabled: found.enabled,
+        createdAt: found.createdAt,
+        updatedAt: NOW + 1,
+      });
+      automations.set(automationId, updated);
+      return updated;
+    }),
     show: vi.fn(async ({ automationId }) => {
       const found = automations.get(automationId);
       if (!found) throw new Error("missing automation");
@@ -137,7 +152,13 @@ function createInput() {
     controllerKey: "owner-7-controller",
     sourceKey: "owner-schedule:daily-health",
     definition,
-    authority: { source: "owner", hostId: "host_owner", mayWidenAutomation: false },
+    authority: {
+      source: "owner",
+      controllerKey: "owner-7-controller",
+      projectId: "proj_owner",
+      hostId: "host_owner",
+      mayWidenAutomation: false,
+    },
     notificationPolicy: "material" as const,
     now: NOW,
   };
@@ -147,11 +168,11 @@ describe("managed BB automations", () => {
   it("restarts by reconciling the same durable BB id without creating a duplicate", async () => {
     const { repository } = fixture();
     const fake = fakeAdapter();
-    const firstService = new ManagedAutomationService(repository, fake.adapter);
+    const firstService = new ManagedAutomationService(repository, fake.adapter, () => true);
     const created = await firstService.create(createInput());
     fake.runs.set(created.bbAutomationId!, [runEvidence({ automationId: created.bbAutomationId! })]);
 
-    const restartedService = new ManagedAutomationService(repository, fake.adapter);
+    const restartedService = new ManagedAutomationService(repository, fake.adapter, () => true);
     const reconciled = await restartedService.create({ ...createInput(), now: NOW + 100 });
 
     expect(reconciled.id).toBe(created.id);
@@ -163,7 +184,7 @@ describe("managed BB automations", () => {
   it("keeps run evidence append-only and de-duplicates a repeated observation", async () => {
     const { bb, repository } = fixture();
     const fake = fakeAdapter();
-    const service = new ManagedAutomationService(repository, fake.adapter);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     const run = runEvidence({ automationId: binding.bbAutomationId! });
 
@@ -172,6 +193,114 @@ describe("managed BB automations", () => {
     expect(() => bb.storage.database().prepare(
       "UPDATE managed_automation_run_evidence SET status = 'failed' WHERE bb_run_id = 'run_1'",
     ).run()).toThrow("append-only");
+  });
+
+  it("screens worker output and errors before durable evidence or controller handoff", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    const privateOutput = "deployment token: telegram-worker-output-secret";
+    const privateError = "provider rejected telegram-worker-error-secret";
+
+    expect(repository.recordRun(binding.id, runEvidence({
+      automationId: binding.bbAutomationId!,
+      status: "failed",
+      output: privateOutput,
+      error: privateError,
+    }), NOW + 1)).toBe(true);
+
+    const persisted = JSON.stringify(bb.storage.database().prepare(
+      `SELECT evidence_json FROM managed_automation_run_evidence WHERE bb_run_id = 'run_1'`,
+    ).get());
+    const handoff = JSON.stringify(bb.storage.database().prepare(
+      `SELECT input_text FROM managed_automation_notifications WHERE bb_run_id = 'run_1'`,
+    ).get());
+    expect(persisted).not.toContain(privateOutput);
+    expect(persisted).not.toContain(privateError);
+    expect(handoff).not.toContain(privateOutput);
+    expect(handoff).not.toContain(privateError);
+    expect(`${persisted}\n${handoff}`).toContain("bb_automation_run_failed");
+  });
+
+  it("fails closed when an agent result exceeds its declared result contract", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    repository.recordRun(binding.id, runEvidence({
+      automationId: binding.bbAutomationId!,
+      output: "x".repeat(definition.resultContract.maximumBytes + 1),
+    }), NOW + 1);
+
+    expect(bb.storage.database().prepare(
+      `SELECT error_class, evidence_json FROM managed_automation_run_evidence WHERE bb_run_id = 'run_1'`,
+    ).get()).toMatchObject({
+      error_class: "bb_automation_result_contract_violated",
+      evidence_json: expect.stringContaining('"contractOutcome":"violated"'),
+    });
+    expect(bb.storage.database().prepare(
+      `SELECT input_text FROM managed_automation_notifications WHERE bb_run_id = 'run_1'`,
+    ).get()).toMatchObject({
+      input_text: expect.stringContaining("Result contract: violated"),
+    });
+  });
+
+  it("persists retirement intent before deleting and reconciles an interrupted retirement", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    let mutationCount = 0;
+
+    await expect(service.retire({
+      id: binding.id,
+      scope: SCOPE,
+      now: NOW + 1,
+      mutate: (mutation) => {
+        mutationCount += 1;
+        if (mutationCount === 2) throw new Error("controller fence was lost");
+        return mutation();
+      },
+    })).rejects.toThrow("controller fence was lost");
+
+    const interrupted = service.get(binding.id)!;
+    expect(interrupted.state).toBe("retiring");
+    await service.reconcile({ binding: interrupted, scope: SCOPE, now: NOW + 2 });
+    expect(service.get(binding.id)?.state).toBe("retired");
+    expect(fake.adapter.delete).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles an interrupted governed definition update from durable intent", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    const updatedDefinition: BbAutomationDefinition = {
+      ...definition,
+      name: "Twice-daily release health",
+      trigger: { kind: "cron", cron: "0 8,20 * * *", timezone: "Etc/UTC" },
+    };
+    let mutationCount = 0;
+
+    await expect(service.update({
+      id: binding.id,
+      scope: SCOPE,
+      definition: updatedDefinition,
+      now: NOW + 1,
+      mutate: (mutation) => {
+        mutationCount += 1;
+        if (mutationCount === 2) throw new Error("controller fence was lost");
+        return mutation();
+      },
+    })).rejects.toThrow("controller fence was lost");
+
+    const interrupted = service.get(binding.id)!;
+    expect(interrupted).toMatchObject({ state: "updating", name: updatedDefinition.name });
+    await service.reconcile({ binding: interrupted, scope: SCOPE, now: NOW + 2 });
+    expect(service.get(binding.id)).toMatchObject({ state: "active", name: updatedDefinition.name });
+    expect(fake.adapter.update).toHaveBeenCalledTimes(2);
   });
 
   it("records running and terminal states once, then hands the terminal result to the controller exactly once", async () => {
@@ -191,8 +320,9 @@ describe("managed BB automations", () => {
       inputText: "Create the controller fixture.",
       now: NOW - 400,
     });
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW - 300);
     const fake = fakeAdapter();
-    const service = new ManagedAutomationService(repository, fake.adapter);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     fake.runs.set(binding.bbAutomationId!, [
       runEvidence({ automationId: binding.bbAutomationId!, status: "running", finishedAt: null, output: null }),
@@ -224,6 +354,63 @@ describe("managed BB automations", () => {
     ).all()).toEqual([{ state: "enqueued" }]);
   });
 
+  it("pauses a scheduled agent before reading runs when its stored authority is no longer current", async () => {
+    const { store, repository } = fixture();
+    store.createPairingCode(hashSecret("pair-policy-gate"), NOW - 1_000, NOW + 10_000);
+    expect(store.pairOwnerWithPrivateChatCode(
+      hashSecret("pair-policy-gate"),
+      "7",
+      "70",
+      NOW - 500,
+    )).toEqual({ ok: true });
+    store.enqueueControllerTurn({
+      controllerKey: "owner-7-controller",
+      telegramUserId: "7",
+      telegramChatId: "70",
+      updateId: 1,
+      inputText: "Create the controller fixture.",
+      now: NOW - 400,
+    });
+    store.upsertProjectPolicy(policyFixture({
+      projectId: "proj_owner",
+      alias: "owner",
+      enabled: false,
+    }), NOW - 300);
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+
+    await reconciler.processDue(NOW + 60_001);
+
+    expect(fake.adapter.setEnabled).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
+    expect(fake.adapter.runs).not.toHaveBeenCalled();
+    expect(service.get(binding.id)).toMatchObject({
+      state: "paused",
+      lastError: "managed_automation_authority_stale",
+    });
+  });
+
+  it("does not create a scheduled agent when its current authority preflight fails", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => false);
+
+    await expect(service.create(createInput())).rejects.toThrow("authority is not current");
+
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(service.list("owner-7-controller")).toMatchObject([{
+      state: "failed",
+      lastError: "managed_automation_authority_stale",
+    }]);
+  });
+
   it("turns on BB first, reads it back, and only then disables the legacy clock", async () => {
     const { store, repository } = fixture();
     const monitor = store.createMonitor({
@@ -235,7 +422,7 @@ describe("managed BB automations", () => {
       now: NOW,
     });
     const fake = fakeAdapter();
-    const service = new ManagedAutomationService(repository, fake.adapter);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
 
     const binding = await migrateLegacyClockMonitor({
       monitor,
@@ -269,7 +456,7 @@ describe("managed BB automations", () => {
     const service = new ManagedAutomationService(repository, {
       ...fake.adapter,
       create: vi.fn(async () => { throw new Error("BB read-back mismatch"); }),
-    });
+    }, () => true);
 
     await expect(migrateLegacyClockMonitor({
       monitor,
@@ -290,7 +477,7 @@ describe("managed BB automations", () => {
   it("pauses BB if the local disable fence is lost, so two schedulers cannot stay active", async () => {
     const { repository } = fixture();
     const fake = fakeAdapter();
-    const service = new ManagedAutomationService(repository, fake.adapter);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const monitor: MonitorRecord = {
       id: "mon_legacy",
       controllerKey: "owner-7-controller",

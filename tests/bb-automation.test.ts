@@ -3,6 +3,7 @@ import {
   assertAutomationMatches,
   buildAutomationRunsCommand,
   buildCreateAutomationCommand,
+  buildUpdateAutomationCommand,
   TerminalBbAutomationAdapter,
   type BbAgentAutomationDefinition,
   type BbAutomation,
@@ -21,6 +22,8 @@ const definition: BbAgentAutomationDefinition = {
   serviceTier: "fast",
   permissionMode: "full",
   target: { kind: "environment", environmentId: "env_owner" },
+  timeoutMs: 900_000,
+  resultContract: { kind: "bounded-text", maximumBytes: 32_768 },
 };
 
 function observed(overrides: Partial<BbAutomation> = {}): BbAutomation {
@@ -66,6 +69,20 @@ describe("BB automation adapter", () => {
     expect(command.endsWith("--json")).toBe(true);
     expect(buildAutomationRunsCommand("proj_owner", "auto_1", 20))
       .toBe("bb automation runs 'auto_1' --project 'proj_owner' --limit '20' --json");
+  });
+
+  it("builds a complete project-bound definition update", () => {
+    const command = buildUpdateAutomationCommand("auto_1", {
+      ...definition,
+      name: "Updated morning check",
+      trigger: { kind: "cron", cron: "30 9 * * *", timezone: "Etc/UTC" },
+    });
+
+    expect(command).toContain("bb automation update 'auto_1'");
+    expect(command).toContain("--project 'proj_owner'");
+    expect(command).toContain("--name 'Updated morning check'");
+    expect(command).toContain("--cron '30 9 * * *'");
+    expect(command.endsWith("--json")).toBe(true);
   });
 
   it("does not accept create success until an exact show read-back passes", async () => {
@@ -152,5 +169,14 @@ describe("BB automation adapter", () => {
   it("rejects unbounded run history requests", () => {
     expect(() => buildAutomationRunsCommand("proj_owner", "auto_1", 0)).toThrow("1-200");
     expect(() => buildAutomationRunsCommand("proj_owner", "auto_1", 201)).toThrow("1-200");
+  });
+
+  it("rejects agent definitions without a bounded execution and result contract", () => {
+    expect(() => buildCreateAutomationCommand({ ...definition, timeoutMs: 0 }))
+      .toThrow("agent automation timeout");
+    expect(() => buildCreateAutomationCommand({
+      ...definition,
+      resultContract: { kind: "bounded-text", maximumBytes: 1_048_577 },
+    })).toThrow("agent automation result contract");
   });
 });

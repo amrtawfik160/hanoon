@@ -1,6 +1,10 @@
 import { nextCronOccurrence } from "./monitor-service";
 import type { TelegramAgentStore } from "../storage/store";
 import {
+  DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
+  DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+} from "../bb/automation";
+import {
   ManagedAutomationService,
   migrateLegacyClockMonitor,
 } from "./managed-automation-service";
@@ -41,6 +45,10 @@ export const SYSTEM_MONITORS: readonly SystemMonitorDefinition[] = Object.freeze
       "Write the weekly scorecard. Read it from durable state and report: work completed, blocked, and cancelled; decisions you needed from the owner; remediation cycles; delivery retries and anything undeliverable. Give the numbers you have and the window they cover, never a rate you cannot support. Keep it to a short message; end with the one thing most worth their attention this week.",
   }),
 ]);
+
+export function systemAutomationInstallationComplete(installed: number): boolean {
+  return installed === SYSTEM_MONITORS.length;
+}
 
 export type SystemMonitorInstaller = {
   store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "ensureSystemMonitor">;
@@ -156,6 +164,8 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
               : {}),
             permissionMode: dependencies.execution.permissionMode,
             target: { kind: "project-default" },
+            timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+            resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
           },
           authority: {
             source: "system",

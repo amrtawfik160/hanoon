@@ -5,7 +5,7 @@ import type { BbAutomation, BbAutomationDefinition, BbAutomationRun } from "../b
 
 type SqliteDatabase = Database.Database;
 
-export type ManagedAutomationState = "pending" | "active" | "paused" | "retired" | "failed";
+export type ManagedAutomationState = "pending" | "active" | "paused" | "updating" | "retiring" | "retired" | "failed";
 export type ManagedAutomationBinding = Readonly<{
   id: string;
   controllerKey: string;
@@ -98,7 +98,7 @@ function parseRow(row: ManagedAutomationRow): ManagedAutomationBinding {
   if (!(["agent", "script"] as const).includes(row.mode as "agent" | "script")) {
     throw new Error(`Unknown managed automation mode ${row.mode}`);
   }
-  if (!(["pending", "active", "paused", "retired", "failed"] as const).includes(row.state as ManagedAutomationState)) {
+  if (!(["pending", "active", "paused", "updating", "retiring", "retired", "failed"] as const).includes(row.state as ManagedAutomationState)) {
     throw new Error(`Unknown managed automation state ${row.state}`);
   }
   if (!(["material", "always", "silent"] as const).includes(row.notification_policy as "material" | "always" | "silent")) {
@@ -159,7 +159,7 @@ export class ManagedAutomationRepository {
     }
     const rows = this.db.prepare(
       `SELECT * FROM managed_automations
-        WHERE state IN ('active', 'paused', 'failed') AND bb_automation_id IS NOT NULL
+        WHERE state IN ('active', 'paused', 'updating', 'retiring', 'failed') AND bb_automation_id IS NOT NULL
           AND (last_reconciled_at IS NULL OR last_reconciled_at <= ?)
         ORDER BY COALESCE(last_reconciled_at, 0), created_at LIMIT ?`,
     ).all(before, limit) as ManagedAutomationRow[];
@@ -220,7 +220,7 @@ export class ManagedAutomationRepository {
           SET bb_automation_id = ?, observed_json = ?, observed_sha256 = ?,
               state = CASE WHEN ? THEN 'active' ELSE 'paused' END,
               last_reconciled_at = ?, last_error = NULL, updated_at = ?
-        WHERE id = ? AND state IN ('pending', 'active', 'paused', 'failed')`,
+        WHERE id = ? AND state IN ('pending', 'active', 'paused', 'updating', 'failed')`,
     ).run(input.automation.id, observedJson, observedSha256, input.automation.enabled ? 1 : 0, input.now, input.now, input.id);
     if (result.changes !== 1) throw new Error("managed automation activation fence was lost");
     return this.get(input.id)!;
@@ -229,16 +229,64 @@ export class ManagedAutomationRepository {
   public fail(id: string, errorClass: string, now: number): ManagedAutomationBinding {
     const result = this.db.prepare(
       `UPDATE managed_automations SET state = 'failed', last_error = ?, updated_at = ?
-        WHERE id = ? AND state <> 'retired'`,
+        WHERE id = ? AND state NOT IN ('updating', 'retiring', 'retired')`,
     ).run(errorClass.slice(0, 256), now, id);
     if (result.changes !== 1) throw new Error("managed automation failure fence was lost");
     return this.get(id)!;
   }
 
+  public beginUpdate(input: {
+    id: string;
+    definition: BbAutomationDefinition;
+    now: number;
+  }): ManagedAutomationBinding {
+    const existing = this.get(input.id);
+    if (!existing || existing.bbAutomationId === null || existing.projectId !== input.definition.projectId) {
+      throw new Error("managed automation update identity is invalid");
+    }
+    const result = this.db.prepare(
+      `UPDATE managed_automations
+          SET name = ?, mode = ?, definition_json = ?, definition_sha256 = ?,
+              state = 'updating', last_error = NULL, updated_at = ?
+        WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
+    ).run(
+      input.definition.name,
+      input.definition.mode,
+      canonical(input.definition),
+      managedAutomationDigest(input.definition),
+      input.now,
+      input.id,
+    );
+    if (result.changes !== 1) throw new Error("managed automation update intent fence was lost");
+    return this.get(input.id)!;
+  }
+
+  public markPolicyBlocked(id: string, now: number): ManagedAutomationBinding {
+    const result = this.db.prepare(
+      `UPDATE managed_automations
+          SET state = 'paused', last_error = 'managed_automation_authority_stale',
+              last_reconciled_at = ?, updated_at = ?
+        WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
+    ).run(now, now, id);
+    if (result.changes !== 1) throw new Error("managed automation policy block fence was lost");
+    return this.get(id)!;
+  }
+
+  public beginRetirement(id: string, now: number): ManagedAutomationBinding {
+    const result = this.db.prepare(
+      `UPDATE managed_automations SET state = 'retiring', last_error = NULL, updated_at = ?
+        WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
+    ).run(now, id);
+    if (result.changes !== 1) throw new Error("managed automation retirement intent fence was lost");
+    return this.get(id)!;
+  }
+
   public retire(id: string, now: number): ManagedAutomationBinding {
+    const existing = this.get(id);
+    if (existing?.state === "retired") return existing;
     const result = this.db.prepare(
       `UPDATE managed_automations SET state = 'retired', updated_at = ?
-        WHERE id = ? AND state <> 'retired'`,
+        WHERE id = ? AND state = 'retiring'`,
     ).run(now, id);
     if (result.changes !== 1) throw new Error("managed automation retirement fence was lost");
     return this.get(id)!;
@@ -247,10 +295,28 @@ export class ManagedAutomationRepository {
   public recordRun(bindingId: string, run: BbAutomationRun, now: number): boolean {
     return this.db.transaction(() => {
       const binding = this.get(bindingId);
-      if (!binding || binding.bbAutomationId !== run.automationId || binding.state === "retired") {
+      if (!binding || binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
         throw new Error("managed automation run does not match its active binding");
       }
-      const evidenceJson = canonical(run);
+      const outputSha256 = run.output === null ? null : managedAutomationDigest(run.output);
+      const contract = managedAutomationRunContract(binding, run);
+      const errorClass = contract.errorClass ?? (run.error === null ? null : "bb_automation_run_failed");
+      const evidenceJson = canonical({
+        automationId: run.automationId,
+        contractOutcome: contract.outcome,
+        errorClass,
+        exitCode: run.exitCode,
+        finishedAt: run.finishedAt,
+        id: run.id,
+        output: outputSha256 === null ? null : { screened: true, sha256: outputSha256 },
+        runMode: run.runMode,
+        scheduledFor: run.scheduledFor,
+        skipReason: run.skipReason,
+        startedAt: run.startedAt,
+        status: run.status,
+        threadId: run.threadId,
+        trigger: run.trigger,
+      });
       const inserted = this.db.prepare(
         `INSERT OR IGNORE INTO managed_automation_run_evidence (
            binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
@@ -265,8 +331,8 @@ export class ManagedAutomationRepository {
         run.runMode,
         run.trigger,
         run.threadId,
-        run.output === null ? null : managedAutomationDigest(run.output),
-        run.error === null ? null : "bb_automation_run_failed",
+        outputSha256,
+        errorClass,
         run.scheduledFor,
         run.startedAt,
         run.finishedAt,
@@ -351,16 +417,39 @@ function managedAutomationNotificationText(
   const instruction = binding.definition.mode === "agent"
     ? binding.definition.prompt
     : `Run the script automation named ${binding.name}.`;
+  const contract = managedAutomationRunContract(binding, run);
   return [
     "A BB Automation run finished. Treat this as a scheduled system handoff, not a new owner request.",
     `Schedule: ${binding.name}`,
     `Result: ${run.status}`,
     `Original instruction: ${clip(instruction, 1_000)}`,
-    `Worker output: ${clip(run.output, 1_800)}`,
-    `Error: ${clip(run.error, 500)}`,
+    run.output === null
+      ? "Worker output: (none)"
+      : `Worker output: screened (sha256 ${managedAutomationDigest(run.output)})`,
+    `Result contract: ${contract.outcome}`,
+    `Error class: ${contract.errorClass ?? (run.error === null ? "(none)" : "bb_automation_run_failed")}`,
     ...(run.threadId ? [`BB worker thread: ${run.threadId}`] : []),
     binding.notificationPolicy === "always"
       ? "Give the owner a short result in simple language."
       : "Continue any safe follow-up that is clearly required. Tell the owner only when the result is material, needs a decision, or needs help. Otherwise stay silent.",
   ].join("\n");
+}
+
+function managedAutomationRunContract(
+  binding: ManagedAutomationBinding,
+  run: BbAutomationRun,
+): Readonly<{
+  outcome: "not_applicable" | "pending" | "satisfied" | "violated";
+  errorClass: string | null;
+}> {
+  if (binding.definition.mode !== "agent") return { outcome: "not_applicable", errorClass: null };
+  if (run.status === "running") return { outcome: "pending", errorClass: null };
+  if (run.finishedAt !== null && run.finishedAt - run.startedAt > binding.definition.timeoutMs) {
+    return { outcome: "violated", errorClass: "bb_automation_timeout_contract_violated" };
+  }
+  if (run.output !== null &&
+    Buffer.byteLength(run.output, "utf8") > binding.definition.resultContract.maximumBytes) {
+    return { outcome: "violated", errorClass: "bb_automation_result_contract_violated" };
+  }
+  return { outcome: "satisfied", errorClass: null };
 }

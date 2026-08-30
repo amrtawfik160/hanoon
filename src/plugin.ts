@@ -123,10 +123,14 @@ import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
 import { MemoryCurationService } from "./services/memory-curation-service";
 import { MemoryEmbeddingService } from "./services/memory-embedding-service";
-import { installSystemAutomations } from "./services/system-monitors";
+import {
+  installSystemAutomations,
+  systemAutomationInstallationComplete,
+} from "./services/system-monitors";
 import {
   ManagedAutomationReconciler,
   ManagedAutomationService,
+  managedAutomationAuthorityIsCurrent,
 } from "./services/managed-automation-service";
 import { ManagedAutomationRepository } from "./storage/managed-automation-repository";
 import { ProductionHealthService } from "./services/production-health-service";
@@ -648,6 +652,15 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   const managedAutomations = new ManagedAutomationService(
     managedAutomationRepository,
     new TerminalBbAutomationAdapter(terminal),
+    (binding) => {
+      const owner = store.getOwner();
+      const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
+      return managedAutomationAuthorityIsCurrent(
+        binding,
+        controller?.controllerKey ?? null,
+        store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
+      );
+    },
   );
   const managedAutomationReconciler = new ManagedAutomationReconciler({
     repository: managedAutomationRepository,
@@ -1447,7 +1460,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         clock: { now: clock },
         warn: (message) => bb.log.warn(message),
       });
-      if (installed > 0) systemMonitorsInstalled = true;
+      if (systemAutomationInstallationComplete(installed)) systemMonitorsInstalled = true;
     },
   };
   const threadNotices = new ThreadNoticeService({
