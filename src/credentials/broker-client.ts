@@ -9,10 +9,17 @@ import https from "node:https";
 import type { IncomingMessage } from "node:http";
 import {
   BROKER_MAX_RESPONSE_BYTES,
-  parseBrokerResponse,
   type BrokerRequestEnvelope,
   type BrokerResponseEnvelope,
 } from "./protocol";
+import {
+  parseCredentialProtocolRequest,
+  parseCredentialProtocolResponse,
+  type CredentialProtocolRequestEnvelope,
+  type CredentialProtocolResponseEnvelope,
+  type ProtectedConnectorRequestEnvelope,
+  type ProtectedConnectorResponseEnvelope,
+} from "./connector-protocol";
 import type { IsolatedCredentialBrokerConfig } from "./config";
 
 const OPERATIONS_PATH = "/v1/operations";
@@ -25,10 +32,16 @@ export type CredentialBrokerClientFailureReason =
   | "unexpected_status"
   | "redirect_rejected"
   | "invalid_response"
+  | "invalid_request"
   | "aborted";
 
 export type CredentialBrokerCallOutcome =
   | { outcome: "succeeded"; response: BrokerResponseEnvelope }
+  | { outcome: "ambiguous" }
+  | { outcome: "failed"; reason: CredentialBrokerClientFailureReason };
+
+export type ProtectedConnectorCallOutcome =
+  | { outcome: "succeeded"; response: ProtectedConnectorResponseEnvelope }
   | { outcome: "ambiguous" }
   | { outcome: "failed"; reason: CredentialBrokerClientFailureReason };
 
@@ -68,8 +81,19 @@ export class CredentialBrokerClient {
 
   public call(
     envelope: BrokerRequestEnvelope,
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<CredentialBrokerCallOutcome>;
+  public call(
+    envelope: ProtectedConnectorRequestEnvelope,
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<ProtectedConnectorCallOutcome>;
+  public call(
+    envelope: CredentialProtocolRequestEnvelope,
     options: Readonly<{ signal?: AbortSignal }> = {},
-  ): Promise<CredentialBrokerCallOutcome> {
+  ): Promise<CredentialBrokerCallOutcome | ProtectedConnectorCallOutcome> {
+    const parsedRequest = parseCredentialProtocolRequest(envelope);
+    if (!parsedRequest.ok) return Promise.resolve({ outcome: "failed", reason: "invalid_request" });
+    const protectedRequest = parsedRequest.value.schemaVersion === 2;
     return new Promise((resolve) => {
       const body = Buffer.from(JSON.stringify(envelope), "utf8");
       const origin = new URL(this.config.endpointOrigin);
@@ -78,7 +102,7 @@ export class CredentialBrokerClient {
       let settled = false;
       let dispatched = false;
       let deadlineTimer: ReturnType<typeof setTimeout>;
-      const finish = (outcome: CredentialBrokerCallOutcome) => {
+      const finish = (outcome: CredentialBrokerCallOutcome | ProtectedConnectorCallOutcome) => {
         if (settled) return;
         settled = true;
         clearTimeout(deadlineTimer);
@@ -98,7 +122,7 @@ export class CredentialBrokerClient {
           "Content-Length": body.byteLength,
         },
       }, (response) => {
-        handleResponse(response, finish);
+        handleResponse(response, finish, protectedRequest);
       });
 
       // A completed TLS handshake is the real "the broker may have seen this
@@ -163,7 +187,8 @@ function classifyPreDispatchError(error: NodeJS.ErrnoException): CredentialBroke
 
 function handleResponse(
   response: IncomingMessage,
-  finish: (outcome: CredentialBrokerCallOutcome) => void,
+  finish: (outcome: CredentialBrokerCallOutcome | ProtectedConnectorCallOutcome) => void,
+  protectedRequest: boolean,
 ): void {
   const status = response.statusCode ?? 0;
   if (status >= 300 && status < 400) {
@@ -207,12 +232,16 @@ function handleResponse(
       finish({ outcome: "failed", reason: "invalid_response" });
       return;
     }
-    const parsed = parseBrokerResponse(parsedJson);
+    const parsed = parseCredentialProtocolResponse(parsedJson);
     if (!parsed.ok) {
       finish({ outcome: "failed", reason: "invalid_response" });
       return;
     }
-    finish({ outcome: "succeeded", response: parsed.value });
+    if (protectedRequest !== (parsed.value.schemaVersion === 2)) {
+      finish({ outcome: "failed", reason: "invalid_response" });
+      return;
+    }
+    finish({ outcome: "succeeded", response: parsed.value } as CredentialBrokerCallOutcome | ProtectedConnectorCallOutcome);
   });
   response.on("error", () => {
     if (settledLocally) return;

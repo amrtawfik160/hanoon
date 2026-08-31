@@ -30,6 +30,9 @@ import {
 import { parseCredentialBrokerConfig, type CredentialBrokerConfigResult } from "./credentials/config";
 import { CredentialBrokerClient } from "./credentials/broker-client";
 import { CredentialAccessService } from "./credentials/service";
+import { ProtectedConnectorAccessService } from "./credentials/protected-connector-service";
+import { evaluateCredentialStaticReadiness } from "./credentials/topology";
+import { PROTECTED_CONNECTOR_POLICY_DIGEST } from "./credentials/connector-policy";
 import {
   RecipePromotionService,
 } from "./capabilities/promotion";
@@ -582,6 +585,26 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     now: clock,
   });
   let credentialAccessService = buildCredentialAccessService();
+  const protectedConnectorAccessService = new ProtectedConnectorAccessService({
+    store,
+    client: () => credentialClient,
+    config: () => credentialConfig,
+    trustKernelReady: () => true,
+    topologyReady: () => evaluateCredentialStaticReadiness({
+      trustKernelReady: true,
+      controllerPermissionMode: config.ok
+        ? config.value.controllerPermissionMode
+        : DEFAULT_CONTROLLER_EXECUTION_PROFILE.permissionMode,
+      config: credentialConfig,
+      now: clock(),
+    }).state === "ready",
+    browserAdministrationIsolated: () => false,
+    auditWritable: () => true,
+    projectPolicyDigest: (projectId) => store.getProjectPolicy(projectId)?.policy.enabled
+      ? PROTECTED_CONNECTOR_POLICY_DIGEST
+      : null,
+    now: clock,
+  });
   bb.onDispose(() => {
     // CredentialBrokerClient exposes rotate(config) but no bare close, so
     // this can only drop the reference rather than force-close its
@@ -659,6 +682,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     notify: () => executorNudge.notify(),
     now: clock,
     credentialAccess: credentialAccessService,
+    protectedConnectorAccess: protectedConnectorAccessService,
     controllerProviderId: () => config.ok
       ? controllerProviderFor(controllerExecutionProfile(config.value).model)
       : undefined,

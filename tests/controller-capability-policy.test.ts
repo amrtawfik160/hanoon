@@ -595,6 +595,23 @@ const EXPECTED_CAPABILITIES = {
     receipt_kind: "observation",
     result_limit: 8_000,
   },
+  telegram_agent_connector_inspect: {
+    capability_id: "telegram_agent_connector_inspect",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["credential_metadata"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "exact_entity",
+    credential_scope: { credential: "credential_broker", audience: "hanoon-credential-broker:v2" },
+    egress: ["credential_broker"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 4_000,
+  },
 } as const satisfies Readonly<Record<ControllerToolName, ControllerCapabilityDescriptor>>;
 
 const SAFE_AUTHORITY: ControllerCapabilityAuthority = {
@@ -719,6 +736,7 @@ describe("controller capability manifest", () => {
       "telegram_agent_resume_project",
       "telegram_agent_add_reference",
       "telegram_agent_search_reference",
+      "telegram_agent_connector_inspect",
     ]);
     expect(CONTROLLER_DATA_CLASSES).toEqual([
       "project_metadata",

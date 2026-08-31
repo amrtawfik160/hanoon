@@ -72,7 +72,7 @@ export type ProtectedConnectorExecutor = Readonly<{
     credentialReference: string;
     signal?: AbortSignal;
   }>): Promise<ProtectedConnectorExecutionSuccess<VercelProjectIdentity> | ProtectedConnectorExecutionFailure>;
-  inspectBrowserVercel(input: Readonly<{
+  inspectBrowserVercel?(input: Readonly<{
     target: BrowserVercelProjectTarget;
     signal?: AbortSignal;
   }>): Promise<ProtectedConnectorExecutionSuccess<BrowserVercelProjectIdentity> | ProtectedConnectorExecutionFailure>;
@@ -476,7 +476,9 @@ export class ProtectedConnectorAuthorityService {
       return this.executor.inspectVercel({ target, credentialReference, signal });
     }
     if (credentialReference !== null) return this.missingCredentialFailure();
-    return this.executor.inspectBrowserVercel({ target, signal });
+    return this.executor.inspectBrowserVercel
+      ? this.executor.inspectBrowserVercel({ target, signal })
+      : Promise.resolve(this.missingCredentialFailure());
   }
 
   private missingCredentialFailure(): ProtectedConnectorExecutionFailure {

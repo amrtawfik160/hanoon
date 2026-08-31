@@ -6,18 +6,20 @@ import type { TLSSocket } from "node:tls";
 import {
   BROKER_MAX_REQUEST_BYTES,
   BROKER_MAX_RESPONSE_BYTES,
-  parseBrokerRequest,
-  parseBrokerResponse,
-  type BrokerRequestEnvelope,
-  type BrokerResponseEnvelope,
 } from "../../src/credentials/protocol.js";
+import {
+  parseCredentialProtocolRequest,
+  parseCredentialProtocolResponse,
+  type CredentialProtocolRequestEnvelope,
+  type CredentialProtocolResponseEnvelope,
+} from "../../src/credentials/connector-protocol.js";
 
 export type BrokerRequestService = Readonly<{
   execute(input: {
     certificateFingerprint: string;
     now: number;
-    request: BrokerRequestEnvelope;
-  }): Promise<BrokerResponseEnvelope>;
+    request: CredentialProtocolRequestEnvelope;
+  }): Promise<CredentialProtocolResponseEnvelope>;
 }>;
 
 export type BrokerServerDependencies = Readonly<{
@@ -103,10 +105,10 @@ function readRequestBody(request: IncomingMessage, limit: number): Promise<BodyR
 
 function sendBrokerResponse(
   response: ServerResponse,
-  brokerResponse: BrokerResponseEnvelope,
+  brokerResponse: CredentialProtocolResponseEnvelope,
   responseLimit: number,
 ): void {
-  const parsed = parseBrokerResponse(brokerResponse);
+  const parsed = parseCredentialProtocolResponse(brokerResponse);
   if (!parsed.ok) {
     sendHttpError(response, 500, "invalid_request");
     return;
@@ -140,10 +142,10 @@ function rejectUnsupportedHttpRequest(request: IncomingMessage, response: Server
   return false;
 }
 
-function parseRequestEnvelope(body: Buffer): BrokerRequestEnvelope | null {
+function parseRequestEnvelope(body: Buffer): CredentialProtocolRequestEnvelope | null {
   try {
     const parsedJson: unknown = JSON.parse(body.toString("utf8"));
-    const parsedRequest = parseBrokerRequest(parsedJson);
+    const parsedRequest = parseCredentialProtocolRequest(parsedJson);
     return parsedRequest.ok ? parsedRequest.value : null;
   } catch {
     return null;
@@ -154,7 +156,7 @@ async function executeBrokerRequest(
   request: IncomingMessage,
   response: ServerResponse,
   dependencies: BrokerServerDependencies,
-  parsedRequest: BrokerRequestEnvelope,
+  parsedRequest: CredentialProtocolRequestEnvelope,
   responseLimit: number,
 ): Promise<void> {
   const fingerprint = certificateFingerprint(request);

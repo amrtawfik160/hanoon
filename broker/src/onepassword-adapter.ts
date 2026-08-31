@@ -9,7 +9,7 @@ type ResolvedSecret = Readonly<{
   itemId: string;
 }>;
 
-type OnePasswordPort = Readonly<{
+export type OnePasswordPort = Readonly<{
   listVaults(): Promise<readonly { id: string }[]>;
   resolveOne(reference: string): Promise<ResolvedSecret | { outcome: "invalid" }>;
 }>;
@@ -43,6 +43,20 @@ export interface VaultAdapter {
   health(expectedVaultId: string): Promise<{ outcome: "ready" } | AdapterFailure>;
   verify(input: { reference: string; expectedVaultId: string; auditHmacKey: Uint8Array }): Promise<VaultVerification>;
 }
+
+export type ProviderCredentialResolution = Readonly<{
+  outcome: "resolved";
+  token: string;
+}> | Readonly<{
+  outcome: "failed";
+  failureClass: "credential_invalid" | "credential_expired" | "provider_rate_limited" | "provider_unavailable";
+  retryable: boolean;
+  retryAfterMs: number | null;
+}>;
+
+export type ProviderCredentialResolver = Readonly<{
+  resolve(reference: string): Promise<ProviderCredentialResolution>;
+}>;
 
 export type OnePasswordAdapterOptions = Readonly<{
   serviceToken: string;
@@ -162,7 +176,36 @@ async function verifyReference(
   }
 }
 
-export async function createOnePasswordAdapter(options: OnePasswordAdapterOptions): Promise<VaultAdapter> {
+async function resolveProviderCredential(
+  port: OnePasswordPort,
+  reference: string,
+): Promise<ProviderCredentialResolution> {
+  try {
+    const resolved = await port.resolveOne(reference);
+    if (resolved.outcome !== "resolved" || resolved.secret.length === 0) {
+      return { outcome: "failed", failureClass: "credential_invalid", retryable: false, retryAfterMs: null };
+    }
+    return { outcome: "resolved", token: resolved.secret };
+  } catch (error) {
+    const mapped = mapProviderError(error);
+    if (mapped.failureClass === "vault_auth_failed") {
+      return { outcome: "failed", failureClass: "credential_invalid", retryable: false, retryAfterMs: null };
+    }
+    if (mapped.failureClass === "provider_rate_limited" || mapped.failureClass === "provider_unavailable") {
+      return {
+        outcome: "failed",
+        failureClass: mapped.failureClass,
+        retryable: mapped.retryable,
+        retryAfterMs: mapped.retryAfterMs,
+      };
+    }
+    return { outcome: "failed", failureClass: "credential_invalid", retryable: false, retryAfterMs: null };
+  }
+}
+
+export async function createOnePasswordAdapter(
+  options: OnePasswordAdapterOptions,
+): Promise<VaultAdapter & { resolveCredential: ProviderCredentialResolver["resolve"] }> {
   let port = options.port;
   let initializationFailure: AdapterFailure | null = null;
   if (!port) {
@@ -177,5 +220,15 @@ export async function createOnePasswordAdapter(options: OnePasswordAdapterOption
     health: async (expectedVaultId) => initializationFailure ?? checkHealth(port!, expectedVaultId),
     verify: async ({ reference, expectedVaultId, auditHmacKey }) =>
       initializationFailure ?? verifyReference(port!, reference, expectedVaultId, auditHmacKey),
+    resolveCredential: async (reference) => initializationFailure
+      ? {
+          outcome: "failed",
+          failureClass: initializationFailure.failureClass === "vault_auth_failed"
+            ? "credential_invalid"
+            : initializationFailure.failureClass,
+          retryable: initializationFailure.retryable,
+          retryAfterMs: initializationFailure.retryAfterMs,
+        }
+      : resolveProviderCredential(port!, reference),
   };
 }

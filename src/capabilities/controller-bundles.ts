@@ -14,6 +14,7 @@ import {
 } from "./catalog";
 import type { CapabilityDescriptor } from "./contracts";
 import { modelRouteSchema } from "./models";
+import type { ControllerToolName } from "../controller/capability-policy";
 
 export const DEFAULT_CONTROLLER_CAPABILITY_MODEL: CapabilityModelSelection = Object.freeze({
   pool: "standard",
@@ -151,21 +152,23 @@ export function controllerToolsForBundles(
   rawBundleIds: readonly string[],
 ): Array<
   | (typeof CONTROLLER_TOOL_BUNDLES)[ControllerToolBundleId][number]
+  | "telegram_agent_connector_inspect"
   | (typeof CONTROLLER_METADATA_TOOL_IDS)[number]
   | (typeof CONTROLLER_PROTOCOL_TOOL_IDS)[number]
 > {
   assertBundleIds(rawBundleIds);
   const selected = new Set(rawBundleIds);
-  const selectedTools = new Set(
+  const selectedTools = new Set<string>(
     CONTROLLER_BUNDLE_IDS.flatMap((bundleId) =>
       selected.has(bundleId) ? [...CONTROLLER_TOOL_BUNDLES[bundleId]] : []
     ),
   );
   return [
     ...CONTROLLER_DOMAIN_TOOL_IDS.filter((toolId) => selectedTools.has(toolId)),
+    ...(selected.has("core-observation") ? ["telegram_agent_connector_inspect" as const] : []),
     ...CONTROLLER_METADATA_TOOL_IDS,
     ...CONTROLLER_PROTOCOL_TOOL_IDS,
-  ];
+  ] as Array<ControllerToolName | (typeof CONTROLLER_METADATA_TOOL_IDS)[number] | (typeof CONTROLLER_PROTOCOL_TOOL_IDS)[number]>;
 }
 
 export type ControllerCapabilityCompatibility =
