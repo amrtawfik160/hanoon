@@ -288,7 +288,7 @@ export class ProtectedConnectorRepository {
         return { outcome: "binding_inactive" };
       }
       const digest = protectedConnectorRequestDigest(request);
-      if (input.capabilityProfileId !== undefined && !this.hasConnectorAssignment(input.capabilityProfileId, request)) {
+      if (input.capabilityProfileId === undefined || !this.hasCurrentConnectorEvidence(input.capabilityProfileId, request)) {
         return { outcome: "binding_inactive" };
       }
       const existing = this.operationByIdempotency(request.installationId, request.idempotencyKey);
@@ -326,7 +326,7 @@ export class ProtectedConnectorRepository {
           digest,
           input.now,
           input.now,
-          input.capabilityProfileId ?? null,
+          input.capabilityProfileId,
         );
       } catch (error) {
         if (error instanceof Error && "code" in error && String(error.code).startsWith("SQLITE_CONSTRAINT")) {
@@ -361,6 +361,7 @@ export class ProtectedConnectorRepository {
       if (response.outcome === "succeeded" && response.completedAt > row.deadline_at) {
         return { outcome: "evidence_incomplete" };
       }
+      const request = requestFromOperationRow(row);
       if (row.state === "completed") {
         return {
           outcome: "replay",
@@ -368,8 +369,11 @@ export class ProtectedConnectorRepository {
           receipt: row.response_receipt_id ? this.getReceipt(input.installationId, row.response_receipt_id) : null,
         };
       }
+      if (!row.capability_profile_id || !this.hasCurrentConnectorEvidence(row.capability_profile_id, request)) {
+        return { outcome: "evidence_incomplete" };
+      }
 
-      if (response.receiptId && !protectedConnectorAuthorityMatchesRequest(input.currentAuthority, requestFromOperationRow(row))) {
+      if (response.receiptId && !protectedConnectorAuthorityMatchesRequest(input.currentAuthority, request)) {
         return { outcome: "evidence_incomplete" };
       }
       if (!response.receiptId) {
@@ -477,19 +481,37 @@ export class ProtectedConnectorRepository {
     );
   }
 
-  private hasConnectorAssignment(
+  private hasCurrentConnectorEvidence(
     profileId: string,
     request: ProtectedConnectorRequestEnvelope,
   ): boolean {
     const row = this.db.prepare(`
-      SELECT assignment.descriptor_digest, profile.mode
+      SELECT assignment.descriptor_digest, profile.mode,
+             selection.descriptor_digest AS selection_descriptor_digest
         FROM capability_profile_assignments AS assignment
         JOIN capability_profiles AS profile ON profile.id = assignment.profile_id
+        JOIN capability_receipts AS selection
+          ON selection.profile_id = profile.id
+         AND selection.profile_revision = profile.revision
+         AND selection.capability_id = assignment.capability_id
+         AND selection.event_type = 'selected'
        WHERE assignment.profile_id = ? AND assignment.capability_id = ?
          AND assignment.capability_kind = 'connector' AND profile.mode = 'active'
-    `).get(profileId, request.capabilityId) as { descriptor_digest: string; mode: string } | undefined;
+         AND profile.revision = (
+           SELECT max(current_profile.revision)
+             FROM capability_profiles AS current_profile
+            WHERE current_profile.subject_kind = profile.subject_kind
+              AND current_profile.subject_id = profile.subject_id
+              AND current_profile.mode = 'active'
+         )
+    `).get(profileId, request.capabilityId) as {
+      descriptor_digest: string;
+      selection_descriptor_digest: string;
+      mode: string;
+    } | undefined;
     const descriptor = capabilityDescriptorById(request.capabilityId);
-    return row !== undefined && descriptor?.kind === "connector" && row.descriptor_digest === descriptor.digest;
+    return row !== undefined && descriptor?.kind === "connector" &&
+      row.descriptor_digest === descriptor.digest && row.selection_descriptor_digest === descriptor.digest;
   }
 
   private appendUniversalConnectorOutcome(

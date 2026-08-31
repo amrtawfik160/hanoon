@@ -348,6 +348,92 @@ describe("binding projections and broker-private targets", () => {
       result: { ...success("browser.vercel_project.inspect.v1").result!, teamSlug: "https://evil.example" },
     })).toEqual({ ok: false, code: "invalid_field" });
   });
+
+  it.each([
+    "https:/evil.example",
+    "HTTPS://evil.example",
+    "https:\\evil.example",
+    "\\\\evil.example",
+    "/evil.example",
+    "https:evil.example",
+    "prefix:https://evil.example",
+  ])("rejects URL normalization variant %s in every caller-controlled target field", (value) => {
+    const targets: readonly ProtectedConnectorTarget[] = [
+      { operation: "convex.project.inspect.v1", teamIdOrSlug: "team-1", projectSlug: "hanoon" },
+      { operation: "vercel.project.inspect.v1", teamId: "team-1", projectIdOrName: "hanoon" },
+      {
+        operation: "browser.vercel_project.inspect.v1",
+        hostId: "host-1",
+        profileId: "profile-1",
+        origin: VERCEL_BROWSER_ORIGIN,
+        journeyId: VERCEL_PROJECT_IDENTITY_JOURNEY_ID,
+        journeyVersion: 1,
+        teamSlug: "team-1",
+        projectName: "hanoon",
+      },
+    ];
+    expect(parseProtectedConnectorTarget({ ...targets[0], teamIdOrSlug: value })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorTarget({ ...targets[0], projectSlug: value })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorTarget({ ...targets[1], teamId: value })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorTarget({ ...targets[1], projectIdOrName: value })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorTarget({ ...targets[2], teamSlug: value })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorTarget({ ...targets[2], projectName: value })).toMatchObject({ ok: false });
+  });
+
+  it.each([
+    "https:/evil.example",
+    "HTTPS://evil.example",
+    "https:\\evil.example",
+    "\\\\evil.example",
+    "/evil.example",
+    "https:evil.example",
+    "prefix:https://evil.example",
+  ])("rejects URL normalization variant %s in every public identity field", (value) => {
+    expect(parseProtectedConnectorResponse({
+      ...success("convex.project.inspect.v1"),
+      result: { ...success("convex.project.inspect.v1").result!, projectId: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("convex.project.inspect.v1"),
+      result: { ...success("convex.project.inspect.v1").result!, projectSlug: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("convex.project.inspect.v1"),
+      result: { ...success("convex.project.inspect.v1").result!, teamId: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("convex.project.inspect.v1"),
+      result: { ...success("convex.project.inspect.v1").result!, teamSlug: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("vercel.project.inspect.v1"),
+      result: { ...success("vercel.project.inspect.v1").result!, projectId: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("vercel.project.inspect.v1"),
+      result: { ...success("vercel.project.inspect.v1").result!, projectName: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("vercel.project.inspect.v1"),
+      result: { ...success("vercel.project.inspect.v1").result!, teamId: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("vercel.project.inspect.v1"),
+      result: { ...success("vercel.project.inspect.v1").result!, teamSlug: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("browser.vercel_project.inspect.v1"),
+      result: { ...success("browser.vercel_project.inspect.v1").result!, profileId: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("browser.vercel_project.inspect.v1"),
+      result: { ...success("browser.vercel_project.inspect.v1").result!, teamSlug: value },
+    })).toMatchObject({ ok: false });
+    expect(parseProtectedConnectorResponse({
+      ...success("browser.vercel_project.inspect.v1"),
+      result: { ...success("browser.vercel_project.inspect.v1").result!, projectName: value },
+    })).toMatchObject({ ok: false });
+  });
 });
 
 describe("protocol generation compatibility", () => {

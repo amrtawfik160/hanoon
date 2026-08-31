@@ -102,6 +102,19 @@ function response(overrides: Partial<ProtectedConnectorResponseEnvelope> = {}): 
 }
 
 describe("Hanoon protected connector persistence", () => {
+  it("denies preparation without a current universal connector profile and leaves no operation", () => {
+    const { bb } = createFakePluginHost({ pluginId: "protected-connector-admission" });
+    const store = openStore(bb.storage, bb.storage.kv, () => NOW);
+    expect(store.reconcileProtectedConnectorBinding({ projection: projection(), now: NOW }))
+      .toMatchObject({ outcome: "reconciled" });
+
+    expect(store.prepareProtectedConnectorOperation({ request: request(), now: NOW }))
+      .toEqual({ outcome: "binding_inactive" });
+    expect(bb.storage.database().prepare(
+      "SELECT count(*) AS count FROM credential_connector_operations",
+    ).get()).toEqual({ count: 0 });
+  });
+
   it("stores only the secret-free projection, preserves history, and restores receipts after restart", () => {
     const { bb } = createFakePluginHost({ pluginId: "protected-connector-persistence" });
     const store = openStore(bb.storage, bb.storage.kv, () => NOW);
@@ -148,6 +161,12 @@ describe("Hanoon protected connector persistence", () => {
       },
       now: NOW + 2_000,
     })).toMatchObject({ outcome: "completed", receipt: { receiptId: "receipt-1" } });
+    expect(bb.storage.database().prepare(`
+      SELECT capability_profile_id FROM credential_connector_operations WHERE request_id = 'request-1'
+    `).get()).toEqual({ capability_profile_id: profile.id });
+    expect(bb.storage.database().prepare(`
+      SELECT capability_profile_id FROM credential_connector_receipts WHERE receipt_id = 'receipt-1'
+    `).get()).toEqual({ capability_profile_id: profile.id });
     expect(store.listCapabilityReceipts(profile.id, 10)).toEqual(expect.arrayContaining([
       expect.objectContaining({
         capabilityId: "telegram_agent_convex_project_inspect",
@@ -185,11 +204,22 @@ describe("Hanoon protected connector persistence", () => {
     })).toEqual({ outcome: "identity_mismatch" });
     const current = projection({ generation: 2 });
     store.reconcileProtectedConnectorBinding({ projection: current, now: NOW + 2 });
+    const capability = CAPABILITY_BY_ID.get("telegram_agent_convex_project_inspect");
+    if (!capability) throw new Error("connector capability missing");
+    const profile = store.createCapabilityProfile({
+      subjectKind: "worker_attempt", subjectId: "attempt:generation", threadId: null,
+      recipeId: "direct", recipeVersion: 1, registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST, mode: "active",
+      model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+      assignments: [{ capabilityId: capability.id, descriptorDigest: capability.digest, capabilityKind: "connector", mandatory: true }],
+      reasonCodes: [], traits: [], now: NOW,
+    });
     const original = request({ bindingGeneration: 2 });
-    expect(store.prepareProtectedConnectorOperation({ request: original, now: NOW + 2 }))
+    expect(store.prepareProtectedConnectorOperation({ request: original, capabilityProfileId: profile.id, now: NOW + 2 }))
       .toMatchObject({ outcome: "prepared" });
     expect(store.prepareProtectedConnectorOperation({
       request: request({ bindingGeneration: 2, requestId: "changed-request" }),
+      capabilityProfileId: profile.id,
       now: NOW + 3,
     })).toEqual({ outcome: "digest_mismatch" });
   });
@@ -249,6 +279,51 @@ describe("Hanoon protected connector persistence", () => {
       },
       now: NOW + 4_000,
     })).toMatchObject({ outcome: "replay", receipt: { receiptId: "receipt-1" } });
+  });
+
+  it("does not persist a connector receipt when current universal evidence disappears", () => {
+    const { bb } = createFakePluginHost({ pluginId: "protected-connector-atomic-completion" });
+    const store = openStore(bb.storage, bb.storage.kv, () => NOW);
+    const capability = CAPABILITY_BY_ID.get("telegram_agent_convex_project_inspect");
+    if (!capability) throw new Error("connector capability missing");
+    const profile = store.createCapabilityProfile({
+      subjectKind: "worker_attempt", subjectId: "attempt:atomic", threadId: null,
+      recipeId: "direct", recipeVersion: 1, registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST, mode: "active",
+      model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+      assignments: [{ capabilityId: capability.id, descriptorDigest: capability.digest, capabilityKind: "connector", mandatory: true }],
+      reasonCodes: [], traits: [], now: NOW,
+    });
+    store.reconcileProtectedConnectorBinding({ projection: projection(), now: NOW });
+    expect(store.prepareProtectedConnectorOperation({ request: request(), capabilityProfileId: profile.id, now: NOW }))
+      .toMatchObject({ outcome: "prepared" });
+    store.createCapabilityProfile({
+      subjectKind: "worker_attempt", subjectId: "attempt:atomic", threadId: null,
+      recipeId: "direct", recipeVersion: 1, registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST, mode: "active",
+      model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+      assignments: [{ capabilityId: capability.id, descriptorDigest: capability.digest, capabilityKind: "connector", mandatory: true }],
+      reasonCodes: ["profile_revision"], traits: [], now: NOW + 1,
+    });
+
+    expect(store.completeProtectedConnectorOperation({
+      installationId: "installation-1",
+      requestId: "request-1",
+      response: response(),
+      currentAuthority: {
+        installationId: "installation-1", taskId: "task-1", projectId: "project-1",
+        capabilityId: "telegram_agent_convex_project_inspect", bindingId: "binding-convex",
+        bindingGeneration: 1, policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        fenceOwner: "executor-1", fenceGeneration: 1,
+      },
+      now: NOW + 2_000,
+    })).toEqual({ outcome: "evidence_incomplete" });
+    expect(bb.storage.database().prepare(
+      "SELECT state, response_receipt_id FROM credential_connector_operations WHERE request_id = 'request-1'",
+    ).get()).toEqual({ state: "prepared", response_receipt_id: null });
+    expect(bb.storage.database().prepare(
+      "SELECT count(*) AS count FROM credential_connector_receipts",
+    ).get()).toEqual({ count: 0 });
   });
 
   it("makes historical projections append-only", () => {

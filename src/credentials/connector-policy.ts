@@ -213,7 +213,8 @@ const BROWSER_TARGET_KEYS = [
 ] as const;
 
 const TARGET_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
-const URL_SHAPED_TARGET_PATTERN = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|\/\/)/u;
+const SCHEME_BEARING_TARGET_PATTERN = /[A-Za-z][A-Za-z0-9+.-]*:/u;
+const URL_PATH_TARGET_PATTERN = /^[\\/]/u;
 const METADATA_VALUE_PATTERN = /^[\x20-\x7e]{1,128}$/;
 const MAX_METADATA_VALUES = 8;
 
@@ -236,6 +237,11 @@ function isOpaqueId(value: unknown): value is string {
   return typeof value === "string" && OPAQUE_ID_PATTERN.test(value);
 }
 
+function isSafeOpaqueId(value: unknown): value is string {
+  return isOpaqueId(value) && !SCHEME_BEARING_TARGET_PATTERN.test(value) &&
+    !URL_PATH_TARGET_PATTERN.test(value);
+}
+
 function isEpochMs(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -250,7 +256,7 @@ function isGeneration(value: unknown): value is number {
 
 function isTargetValue(value: unknown): value is string {
   return typeof value === "string" && TARGET_VALUE_PATTERN.test(value) &&
-    !URL_SHAPED_TARGET_PATTERN.test(value);
+    !SCHEME_BEARING_TARGET_PATTERN.test(value) && !URL_PATH_TARGET_PATTERN.test(value);
 }
 
 function parseMetadataValues(value: unknown): readonly string[] | null {
@@ -370,8 +376,8 @@ export function parseProtectedConnectorTarget(value: unknown): ProtocolParseResu
   if (value.operation !== "browser.vercel_project.inspect.v1") return invalid("invalid_field");
   if (!hasExactKeys(value, BROWSER_TARGET_KEYS)) return invalid("unknown_field");
   if (
-    !isOpaqueId(value.hostId) ||
-    !isOpaqueId(value.profileId) ||
+    !isSafeOpaqueId(value.hostId) ||
+    !isSafeOpaqueId(value.profileId) ||
     value.origin !== VERCEL_BROWSER_ORIGIN ||
     value.journeyId !== VERCEL_PROJECT_IDENTITY_JOURNEY_ID ||
     value.journeyVersion !== VERCEL_PROJECT_IDENTITY_JOURNEY_VERSION ||

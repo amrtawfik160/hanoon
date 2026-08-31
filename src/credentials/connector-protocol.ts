@@ -278,7 +278,8 @@ const RETRYABLE_FAILURES = new Set<ProtectedConnectorFailureClass>([
 ]);
 
 const BOUNDED_IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
-const URL_SHAPED_IDENTITY_PATTERN = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|\/\/)/u;
+const SCHEME_BEARING_IDENTITY_PATTERN = /[A-Za-z][A-Za-z0-9+.-]*:/u;
+const URL_PATH_IDENTITY_PATTERN = /^[\\/]/u;
 const VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/;
 
 type ParseCode = Exclude<ProtocolParseResult<never>, { ok: true }>["code"];
@@ -300,9 +301,14 @@ function isOpaqueId(value: unknown): value is string {
   return typeof value === "string" && OPAQUE_ID_PATTERN.test(value);
 }
 
+function isSafeOpaqueIdentity(value: unknown): value is string {
+  return isOpaqueId(value) && !SCHEME_BEARING_IDENTITY_PATTERN.test(value) &&
+    !URL_PATH_IDENTITY_PATTERN.test(value);
+}
+
 function isBoundedIdentity(value: unknown): value is string {
   return typeof value === "string" && BOUNDED_IDENTITY_PATTERN.test(value) &&
-    !URL_SHAPED_IDENTITY_PATTERN.test(value);
+    !SCHEME_BEARING_IDENTITY_PATTERN.test(value) && !URL_PATH_IDENTITY_PATTERN.test(value);
 }
 
 function isEpochMs(value: unknown): value is number {
@@ -483,8 +489,8 @@ function parseIdentity(
   }
   if (!hasExactKeys(value, BROWSER_RESULT_KEYS)) return invalid("unknown_field");
   if (
-    !isOpaqueId(value.profileId) ||
-    !isOpaqueId(value.journeyId) ||
+    !isSafeOpaqueIdentity(value.profileId) ||
+    !isSafeOpaqueIdentity(value.journeyId) ||
     !isGeneration(value.journeyVersion) ||
     value.origin !== "https://vercel.com" ||
     !isBoundedIdentity(value.teamSlug) ||
