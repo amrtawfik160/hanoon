@@ -555,7 +555,7 @@ describe("navigator ticket integration executor", () => {
 
   it("does not call a worker when the persisted ticket attempt context is stale", async () => {
     const value = fixture();
-    const worker = vi.fn(async () => ({ outcome: "completed" as const }));
+    const worker = vi.fn(async () => ({ outcome: "permanent" as const, reason: "not called" }));
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
       database: value.database,

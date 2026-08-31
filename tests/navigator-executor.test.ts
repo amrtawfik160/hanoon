@@ -19,9 +19,9 @@ import {
   selectNavigatorPlanningRoute,
 } from "../src/navigator/planning-contracts";
 import {
-  createNavigatorCompatibilityAdapter,
   NavigatorEffectProtocol,
   type NavigatorEffectAdapter,
+  type NavigatorEffectContext,
   type NavigatorEffectOutcome,
 } from "../src/navigator/effect-protocol";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -218,7 +218,7 @@ function executor(
 
 function protocolFor(
   value: Fixture,
-  skillExecute: NavigatorEffectAdapter["execute"] = async () => ({ outcome: "completed" }),
+  skillExecute: NavigatorEffectAdapter["execute"] = async (context) => skillCompletion(context),
   leaseMs = 30_000,
   skillReconcile?: NavigatorEffectAdapter["reconcile"],
   now: () => number = () => 1_100,
@@ -244,6 +244,32 @@ function protocolFor(
       },
     ],
   });
+}
+
+function skillCompletion(context: NavigatorEffectContext): NavigatorEffectOutcome {
+  if (context.kind !== "run_navigator_skill") {
+    return { outcome: "permanent", reason: "skill completion received another effect kind" };
+  }
+  const resource = context.attempt.resource ?? { kind: "bb_thread" as const, id: "thr_research_38" };
+  return {
+    outcome: "completed",
+    receipt: {
+      kind: "run_navigator_skill",
+      effectIdempotencyKey: context.effect.idempotencyKey,
+      attemptId: context.attempt.id,
+      resource,
+      observedExternalStateDigest: "e".repeat(64),
+      result: {
+        kind: "research_result",
+        summary: "The executor must persist acceptance before dispatch.",
+        artifactEvidence: context.artifactBindings.map((binding) => ({
+          ...binding,
+          finding: "Proposal acceptance and effect creation share one transaction.",
+          evidenceRefs: ["source:ticket-38"],
+        })),
+      },
+    },
+  };
 }
 
 function executorLeaseWithProjectClaim(
@@ -1031,10 +1057,7 @@ describe("navigator-v1 durable executor slice", () => {
       store: value.store,
       clock: { now: () => 1_100 },
       adapters: [
-        createNavigatorCompatibilityAdapter(
-          "run_navigator_skill",
-          (effect, fence, signal) => workflow.processLeased(effect, fence, signal),
-        ),
+        { kind: "run_navigator_skill", execute: async (context) => skillCompletion(context) },
         {
           kind: "run_navigator_ticket_worker",
           execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
@@ -1066,6 +1089,32 @@ describe("navigator-v1 durable executor slice", () => {
     });
   });
 
+  it("does not complete a skill effect when the adapter omits its receipt", async () => {
+    const value = fixture();
+    const workflow = executor(value);
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({
+      outcome: "completed",
+      receipt: undefined as never,
+    }));
+    const protocol = protocolFor(value, execute);
+    const lease = executorLeaseWithProjectClaim(value, "navigator-receiptless-skill");
+
+    await expect(protocol.processOne({
+      ownerId: "navigator-receiptless-skill",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal)).resolves.toBe(true);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).not.toMatchObject({ status: "done" });
+    expect(value.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toBeNull();
+  });
+
   it("does not call an adapter when the persisted capability receipt is denied", async () => {
     const value = fixture();
     const workflow = executor(value);
@@ -1089,7 +1138,7 @@ describe("navigator-v1 durable executor slice", () => {
       evidenceRefs: ["test:denied"],
       now: 1_100,
     });
-    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({ outcome: "completed" }));
+    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({ outcome: "permanent", reason: "not called" }));
     const protocol = protocolFor(value, execute);
     const lease = executorLeaseWithProjectClaim(value, "navigator-capability-denied");
 
@@ -1111,7 +1160,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({ outcome: "completed" }));
+    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({ outcome: "permanent", reason: "not called" }));
     const protocol = protocolFor(value, execute);
     const lease = value.store.acquireExecutorLease("navigator-claim-missing", 1_100, 30_000);
     if (!lease.acquired) throw new Error("navigator claim test executor lease was unavailable");
@@ -1271,7 +1320,7 @@ describe("navigator-v1 durable executor slice", () => {
     const startedPromise = new Promise<void>((resolve) => { started = resolve; });
     let finish!: () => void;
     const finishPromise = new Promise<void>((resolve) => { finish = resolve; });
-    const execute = vi.fn(async () => {
+    const execute = vi.fn(async (context: NavigatorEffectContext) => {
       started();
       await finishPromise;
       return { outcome: "lease_cancelled" as const, reason: "job cancellation reached the protocol" };
@@ -1343,7 +1392,7 @@ describe("navigator-v1 durable executor slice", () => {
       expect(Object.isFrozen(context.effect.payload)).toBe(true);
       return { outcome: "ambiguous" as const, reason: "provider receipt was lost" };
     });
-    const reconcile = vi.fn(async () => ({ outcome: "completed" as const }));
+    const reconcile = vi.fn(async (context: NavigatorEffectContext) => skillCompletion(context));
     const protocol = protocolFor(value, execute, 30_000, reconcile);
     const lease = executorLeaseWithProjectClaim(value, "navigator-ambiguous");
     await expect(protocol.processOne({
@@ -1393,7 +1442,7 @@ describe("navigator-v1 durable executor slice", () => {
       value.job.id,
       "project:proj_1:pipeline",
     );
-    const secondExecute = vi.fn(async () => ({ outcome: "completed" as const }));
+    const secondExecute = vi.fn(async (context: NavigatorEffectContext) => skillCompletion(context));
     const secondProtocol = protocolFor(value, secondExecute, 30_000, undefined, () => 2_000);
     await secondProtocol.processOne({
       ownerId: "navigator-after-restart",
@@ -1417,11 +1466,11 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const execute = vi.fn(async () => {
+    const execute = vi.fn(async (context: NavigatorEffectContext) => {
       value.db.prepare(
         "UPDATE effects SET lease_owner = ?, lease_generation = ?, lease_expires_at = ? WHERE idempotency_key = ?",
       ).run("new-owner", 99, 9_999, accepted.effectIdempotencyKey);
-      return { outcome: "completed" as const };
+      return skillCompletion(context);
     });
     const protocol = protocolFor(value, execute);
     const lease = executorLeaseWithProjectClaim(value, "navigator-stale");

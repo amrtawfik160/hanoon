@@ -53,7 +53,7 @@ const NAVIGATOR_REQUIRED_RESOURCE_CLAIMS: Readonly<
 };
 
 export type NavigatorEffectOutcome =
-  | Readonly<{ outcome: "completed"; receipt?: NavigatorEffectReceipt }>
+  | Readonly<{ outcome: "completed"; receipt: NavigatorEffectReceipt }>
   | Readonly<{ outcome: "transient"; reason: string }>
   | Readonly<{ outcome: "permanent"; reason: string }>
   | Readonly<{ outcome: "lease_cancelled"; reason: string }>
@@ -140,7 +140,7 @@ export function createNavigatorCompatibilityAdapter(
         context.signal,
       );
       return processed
-        ? { outcome: "completed" }
+        ? { outcome: "transient", reason: "navigator compatibility adapter settled directly" }
         : { outcome: "transient", reason: "navigator compatibility adapter did not settle" };
     },
   };
@@ -689,8 +689,8 @@ export class NavigatorEffectProtocol {
     if (!current || !this.leaseIsCurrent(current, context.fence, now)) return true;
     if (outcome.outcome === "completed") {
       const receipt = this.completedReceipt(effect, context, outcome.receipt);
-      if (receipt !== null && "reason" in receipt) return this.deadLetterCurrent(effect, context, receipt.reason, now);
-      if (receipt?.kind === "run_navigator_skill") {
+      if ("reason" in receipt) return this.deadLetterCurrent(effect, context, receipt.reason, now);
+      if (receipt.kind === "run_navigator_skill") {
         if (context.kind !== "run_navigator_skill") {
           return this.deadLetterCurrent(effect, context, "Navigator receipt kind does not match its context", now);
         }
@@ -718,13 +718,13 @@ export class NavigatorEffectProtocol {
           );
         }
       }
-      if (receipt?.kind === "run_navigator_ticket_worker") {
+      if (receipt.kind === "run_navigator_ticket_worker") {
         return this.settleTicketReceipt({ effect, context, receipt, current, now });
       }
-      if (receipt?.kind === "run_navigator_release") {
+      if (receipt.kind === "run_navigator_release") {
         return this.settleReleaseReceipt({ effect, context, receipt, current, now });
       }
-      return this.completeCurrent(effect, context, now);
+      return this.deadLetterCurrent(effect, context, "Navigator completion receipt kind is not admitted", now);
     }
     if (outcome.outcome === "permanent") return this.deadLetterCurrent(effect, context, outcome.reason, now);
     const currentJob = this.dependencies.store.getJob(effect.jobId);
@@ -732,11 +732,6 @@ export class NavigatorEffectProtocol {
       currentJob.cancelRequestedAt !== null || currentJob.state === "cancelled"
     )) return this.deadLetterCurrent(effect, context, outcome.reason, now);
     return this.retryCurrent(effect, context, outcome.reason, current.attempts, now);
-  }
-
-  private completeCurrent(effect: StoredEffect, context: NavigatorEffectContext, now: number): boolean {
-    this.dependencies.store.completeEffect(effect.idempotencyKey, context.fence.ownerId, context.fence.generation, now);
-    return true;
   }
 
   private settleTicketReceipt(input: NavigatorReceiptSettlementRequest<NavigatorTicketReceipt>): boolean {
@@ -799,8 +794,8 @@ export class NavigatorEffectProtocol {
     effect: StoredEffect,
     context: NavigatorEffectContext,
     rawReceipt: unknown,
-  ): NavigatorEffectReceipt | null | { reason: string } {
-    if (rawReceipt === undefined) return null;
+  ): NavigatorEffectReceipt | { reason: string } {
+    if (rawReceipt === undefined) return { reason: "Navigator completion receipt is required" };
     const parsed = navigatorEffectReceiptSchema.safeParse(rawReceipt);
     if (!parsed.success) return { reason: "Navigator completion receipt is invalid" };
     if (parsed.data.kind !== effect.kind || parsed.data.effectIdempotencyKey !== effect.idempotencyKey) {
