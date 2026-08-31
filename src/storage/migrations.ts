@@ -1872,6 +1872,15 @@ CREATE TABLE credential_connector_receipts (
 
 CREATE INDEX credential_connector_receipts_task
   ON credential_connector_receipts (installation_id, task_id, completed_at);
+`, String.raw`
+ALTER TABLE credential_connector_operations ADD COLUMN capability_profile_id TEXT
+  REFERENCES capability_profiles(id);
+ALTER TABLE credential_connector_receipts ADD COLUMN capability_profile_id TEXT
+  REFERENCES capability_profiles(id);
+CREATE INDEX credential_connector_operations_profile
+  ON credential_connector_operations (capability_profile_id);
+CREATE INDEX credential_connector_receipts_profile
+  ON credential_connector_receipts (capability_profile_id);
 `] as const;
 
 export const CONTROLLER_STEER_RESERVATION_MIGRATIONS = [String.raw`

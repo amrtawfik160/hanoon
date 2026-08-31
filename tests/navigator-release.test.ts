@@ -497,10 +497,11 @@ describe("navigator exact-head release", () => {
   it("appends the navigator release migration after the ticket 41 policy intent migrations", () => {
     const releaseMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_RELEASE_MIGRATIONS.at(-1)!);
     const promotionMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1)!);
-    const connectorMigrationId = ALL_MIGRATIONS.indexOf(PROTECTED_CONNECTOR_MIGRATIONS.at(-1)!);
+    const firstConnectorMigrationId = ALL_MIGRATIONS.indexOf(PROTECTED_CONNECTOR_MIGRATIONS[0]);
+    const lastConnectorMigrationId = ALL_MIGRATIONS.indexOf(PROTECTED_CONNECTOR_MIGRATIONS.at(-1)!);
     expect(promotionMigrationId).toBe(releaseMigrationId + 1);
-    expect(connectorMigrationId).toBe(promotionMigrationId + 1);
-    expect(connectorMigrationId).toBe(ALL_MIGRATIONS.length - 1);
+    expect(firstConnectorMigrationId).toBe(promotionMigrationId + 1);
+    expect(lastConnectorMigrationId).toBe(ALL_MIGRATIONS.length - 1);
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");

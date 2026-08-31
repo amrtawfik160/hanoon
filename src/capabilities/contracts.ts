@@ -89,7 +89,7 @@ const evidenceSchema = z.object({
   requirement: z.enum(["mandatory", "optional"]),
   outcomes: z.array(z.enum(CAPABILITY_TERMINAL_OUTCOMES)).min(1).max(4),
   proofSchema: boundedTextSchema,
-  receiptType: z.enum(["selection", "worker", "guard", "tool", "native", "model", "recipe"]),
+  receiptType: z.enum(["selection", "worker", "guard", "tool", "native", "model", "recipe", "connector"]),
   strength: z.enum(["low", "standard", "high", "critical"]),
 }).strict();
 

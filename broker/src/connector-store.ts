@@ -249,6 +249,9 @@ export class BrokerProtectedConnectorStore {
     credentialReference?: string | null;
     now?: number;
   }>): BrokerConnectorBinding {
+    if (input.projection.state === "active") {
+      throw stableError("connector_binding_active_requires_receipt");
+    }
     const projection = parseProtectedConnectorBindingProjection(input.projection);
     const target = parseProtectedConnectorTarget(input.target);
     if (!projection.ok || !target.ok || projection.value.operation !== target.value.operation) {

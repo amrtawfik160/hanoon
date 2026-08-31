@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { capabilityDescriptorById } from "../capabilities/catalog";
 import {
   parseProtectedConnectorRequest,
   parseProtectedConnectorResponse,
@@ -13,7 +14,10 @@ import {
 } from "../credentials/connector-protocol";
 import {
   parseProtectedConnectorBindingProjection,
+  protectedConnectorBindingCanRun,
+  protectedConnectorAuthorityMatchesRequest,
   type ConnectorBindingState,
+  type ProtectedConnectorAuthoritySnapshot,
   type ProtectedConnectorBindingProjection,
 } from "../credentials/connector-policy";
 import { canonicalBrokerJson } from "../credentials/protocol";
@@ -61,6 +65,7 @@ type OperationRow = {
   deadline_at: number;
   request_digest: string;
   state: "prepared" | "completed" | "ambiguous";
+  capability_profile_id: string | null;
   response_receipt_id: string | null;
   created_at: number;
   updated_at: number;
@@ -88,6 +93,7 @@ type ReceiptRow = {
   response_sha256: string;
   completed_at: number;
   created_at: number;
+  capability_profile_id: string | null;
 };
 
 export type ProtectedConnectorBindingHistoryRecord = Readonly<{
@@ -156,12 +162,6 @@ function parseProjectionJson(value: string): ProtectedConnectorBindingProjection
   const parsed = parseProtectedConnectorBindingProjection(parsedJson);
   if (!parsed.ok) throw new Error("credential_connector_projection_corrupt");
   return parsed.value;
-}
-
-function bindingCanRun(binding: ProtectedConnectorBindingProjection, now: number): boolean {
-  if (binding.expiresAt !== null && now >= binding.expiresAt) return false;
-  if (binding.operation === "browser.vercel_project.inspect.v1") return binding.state === "active";
-  return binding.state === "vault_verified" || binding.state === "active";
 }
 
 function bindingPolicyIdentity(binding: ProtectedConnectorBindingProjection): string {
@@ -274,6 +274,7 @@ export class ProtectedConnectorRepository {
 
   public prepareOperation(input: Readonly<{
     request: ProtectedConnectorRequestEnvelope;
+    capabilityProfileId?: string;
     now: number;
   }>): ProtectedConnectorPrepareResult {
     const parsed = parseProtectedConnectorRequest(input.request);
@@ -283,10 +284,13 @@ export class ProtectedConnectorRepository {
       const binding = this.getBinding(request.installationId, request.bindingId);
       if (!binding) return { outcome: "binding_missing" };
       if (binding.generation !== request.bindingGeneration) return { outcome: "binding_generation_stale" };
-      if (binding.operation !== request.operation || !bindingCanRun(binding, input.now)) {
+      if (binding.operation !== request.operation || !protectedConnectorBindingCanRun(binding, input.now)) {
         return { outcome: "binding_inactive" };
       }
       const digest = protectedConnectorRequestDigest(request);
+      if (input.capabilityProfileId !== undefined && !this.hasConnectorAssignment(input.capabilityProfileId, request)) {
+        return { outcome: "binding_inactive" };
+      }
       const existing = this.operationByIdempotency(request.installationId, request.idempotencyKey);
       if (existing) {
         if (existing.request_digest !== digest) return { outcome: "digest_mismatch" };
@@ -301,8 +305,8 @@ export class ProtectedConnectorRepository {
             installation_id, request_id, idempotency_key, nonce, operation,
             binding_id, binding_generation, task_id, project_id, capability_id,
             policy_digest, fence_owner, fence_generation, issued_at, deadline_at,
-            request_digest, state, response_receipt_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?)
+            request_digest, state, response_receipt_id, created_at, updated_at, capability_profile_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?, ?)
         `).run(
           request.installationId,
           request.requestId,
@@ -322,6 +326,7 @@ export class ProtectedConnectorRepository {
           digest,
           input.now,
           input.now,
+          input.capabilityProfileId ?? null,
         );
       } catch (error) {
         if (error instanceof Error && "code" in error && String(error.code).startsWith("SQLITE_CONSTRAINT")) {
@@ -339,6 +344,7 @@ export class ProtectedConnectorRepository {
     installationId: string;
     requestId: string;
     response: ProtectedConnectorResponseEnvelope;
+    currentAuthority: ProtectedConnectorAuthoritySnapshot | null;
     now: number;
   }>): ProtectedConnectorCompleteResult {
     const parsed = parseProtectedConnectorResponse(input.response);
@@ -363,11 +369,25 @@ export class ProtectedConnectorRepository {
         };
       }
 
+      if (response.receiptId && !protectedConnectorAuthorityMatchesRequest(input.currentAuthority, requestFromOperationRow(row))) {
+        return { outcome: "evidence_incomplete" };
+      }
+      if (!response.receiptId) {
+        this.db.prepare(`
+          UPDATE credential_connector_operations
+             SET state = 'ambiguous', response_receipt_id = NULL, updated_at = ?
+           WHERE installation_id = ? AND request_id = ?
+        `).run(input.now, input.installationId, input.requestId);
+        const updated = this.operationByRequestId(input.installationId, input.requestId)!;
+        return { outcome: "completed", operation: operationFromRow(updated), receipt: null };
+      }
+
       let receipt: ProtectedConnectorReceiptRecord | null = null;
       if (response.receiptId) {
         this.insertReceipt(row, response, input.now);
         receipt = this.getReceipt(input.installationId, response.receiptId);
         if (!receipt) throw new Error("credential connector receipt disappeared after insert");
+        this.appendUniversalConnectorOutcome(row, response, response.receiptId, input.now);
       }
       this.db.prepare(`
         UPDATE credential_connector_operations
@@ -428,8 +448,9 @@ export class ProtectedConnectorRepository {
         receipt_id, installation_id, request_id, idempotency_key, operation,
         binding_id, binding_generation, task_id, project_id, capability_id,
         policy_digest, fence_owner, fence_generation, outcome, failure_class,
-        retryable, retry_after_ms, identity_json, response_sha256, completed_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        retryable, retry_after_ms, identity_json, response_sha256, completed_at, created_at,
+        capability_profile_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       response.receiptId,
       row.installation_id,
@@ -451,6 +472,88 @@ export class ProtectedConnectorRepository {
       response.result === null ? null : canonicalBrokerJson(response.result),
       protectedConnectorResponseDigest(response),
       response.completedAt,
+      now,
+      row.capability_profile_id,
+    );
+  }
+
+  private hasConnectorAssignment(
+    profileId: string,
+    request: ProtectedConnectorRequestEnvelope,
+  ): boolean {
+    const row = this.db.prepare(`
+      SELECT assignment.descriptor_digest, profile.mode
+        FROM capability_profile_assignments AS assignment
+        JOIN capability_profiles AS profile ON profile.id = assignment.profile_id
+       WHERE assignment.profile_id = ? AND assignment.capability_id = ?
+         AND assignment.capability_kind = 'connector' AND profile.mode = 'active'
+    `).get(profileId, request.capabilityId) as { descriptor_digest: string; mode: string } | undefined;
+    const descriptor = capabilityDescriptorById(request.capabilityId);
+    return row !== undefined && descriptor?.kind === "connector" && row.descriptor_digest === descriptor.digest;
+  }
+
+  private appendUniversalConnectorOutcome(
+    row: OperationRow,
+    response: ProtectedConnectorResponseEnvelope,
+    receiptId: string,
+    now: number,
+  ): void {
+    if (!row.capability_profile_id) throw new Error("credential connector capability profile missing");
+    const descriptor = capabilityDescriptorById(row.capability_id);
+    const assignment = this.db.prepare(`
+      SELECT assignment.capability_id, assignment.capability_kind, assignment.descriptor_digest,
+             assignment.mandatory, profile.revision, profile.subject_kind, profile.subject_id
+        FROM capability_profile_assignments AS assignment
+        JOIN capability_profiles AS profile ON profile.id = assignment.profile_id
+       WHERE assignment.profile_id = ? AND assignment.capability_id = ? AND assignment.capability_kind = 'connector'
+         AND profile.mode = 'active'
+    `).get(row.capability_profile_id, row.capability_id) as {
+      capability_id: string;
+      capability_kind: "connector";
+      descriptor_digest: string;
+      mandatory: number;
+      revision: number;
+      subject_kind: "controller_turn" | "worker_attempt";
+      subject_id: string;
+    } | undefined;
+    if (!assignment || descriptor?.kind !== "connector" || assignment.descriptor_digest !== descriptor.digest) {
+      throw new Error("credential connector capability assignment missing");
+    }
+    const existing = this.db.prepare(`
+      SELECT outcome, evidence_refs_json, descriptor_digest
+        FROM capability_receipts
+       WHERE profile_id = ? AND capability_id = ? AND event_type = 'outcome'
+    `).get(row.capability_profile_id, row.capability_id) as {
+      outcome: string;
+      evidence_refs_json: string;
+      descriptor_digest: string;
+    } | undefined;
+    const evidenceRefs = JSON.stringify([`credential_connector_receipt:${receiptId}`]);
+    const outcome = response.outcome === "succeeded" ? "passed" : "failed";
+    if (existing) {
+      if (existing.outcome !== outcome || existing.descriptor_digest !== assignment.descriptor_digest ||
+        existing.evidence_refs_json !== evidenceRefs) throw new Error("credential connector evidence replay mismatch");
+      return;
+    }
+    this.db.prepare(`
+      INSERT INTO capability_receipts (
+        id, profile_id, profile_revision, subject_kind, subject_id, capability_id,
+        capability_kind, descriptor_digest, event_type, reason_code, mandatory,
+        outcome, evidence_refs_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'outcome', ?, ?, ?, ?, ?)
+    `).run(
+      `cap_receipt:connector:${receiptId}`,
+      row.capability_profile_id,
+      assignment.revision,
+      assignment.subject_kind,
+      assignment.subject_id,
+      assignment.capability_id,
+      assignment.capability_kind,
+      assignment.descriptor_digest,
+      `connector_${outcome}`,
+      assignment.mandatory,
+      outcome,
+      evidenceRefs,
       now,
     );
   }

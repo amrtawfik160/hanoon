@@ -17,6 +17,7 @@ import {
 } from "../../src/credentials/connector-protocol.js";
 import {
   protectedConnectorIdentityMatchesTarget,
+  protectedConnectorBindingCanRun,
   type BrowserVercelProjectTarget,
   type ConvexProjectTarget,
   type ProtectedConnectorTarget,
@@ -277,7 +278,7 @@ export class ProtectedConnectorAuthorityService {
       outcome: "denied",
       response: this.completeFailure({ request, binding, failureClass: "destination_denied", completedAt: now }),
     };
-    if (!this.bindingCanRun(binding)) {
+    if (!protectedConnectorBindingCanRun(binding.projection, now)) {
       return {
         outcome: "denied",
         response: this.completeFailure({ request, binding, failureClass: "binding_inactive", completedAt: now }),
@@ -375,7 +376,7 @@ export class ProtectedConnectorAuthorityService {
       this.policyStillCurrent(request) &&
       this.authority.topologyReady(request.operation) &&
       this.fenceCurrent(request) &&
-      this.bindingStillCurrent(request, binding);
+      this.bindingStillCurrent(request, binding, completedAt);
   }
 
   private completeExecutionFailure(
@@ -450,6 +451,7 @@ export class ProtectedConnectorAuthorityService {
   private bindingStillCurrent(
     request: ProtectedConnectorRequestEnvelope,
     claimed: BrokerConnectorBinding,
+    now: number,
   ): boolean {
     const current = this.connectorStore.getBinding(request.installationId, request.bindingId);
     return current !== null &&
@@ -457,15 +459,7 @@ export class ProtectedConnectorAuthorityService {
       current.projection.operation === request.operation &&
       current.projection.capabilityIds.includes(request.capabilityId) &&
       current.targetDigest === claimed.targetDigest &&
-      this.bindingCanRun(current);
-  }
-
-  private bindingCanRun(binding: BrokerConnectorBinding): boolean {
-    if (binding.projection.expiresAt !== null && this.clock() >= binding.projection.expiresAt) return false;
-    if (binding.projection.operation === "browser.vercel_project.inspect.v1") {
-      return binding.projection.state === "active";
-    }
-    return binding.projection.state === "vault_verified" || binding.projection.state === "active";
+      protectedConnectorBindingCanRun(current.projection, now);
   }
 
   private async dispatch(

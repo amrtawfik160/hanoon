@@ -48,7 +48,7 @@ function projection(
     riskClass: "low",
     mfaMode: browser ? "human_presence" : "workload_identity",
     approvalMode: "standing_policy",
-    state: browser ? "active" : "vault_verified",
+    state: browser ? "pending" : "vault_verified",
     generation: 1,
     verifiedAt: null,
     expiresAt: null,
@@ -222,6 +222,15 @@ function totalCalls(harness: Harness): number {
 }
 
 describe("protected connector success and exact targets", () => {
+  it("does not enroll an active binding before an identity receipt exists", () => {
+    const harness = createHarness();
+    expect(() => harness.connectorStore.enrollBinding({
+      projection: projection("convex.project.inspect.v1", { state: "active" }),
+      target: target("convex.project.inspect.v1"),
+      credentialReference: "provider-token",
+    })).toThrow(/active.*receipt|receipt.*active|enroll/i);
+    harness.close();
+  });
   it.each([
     "convex.project.inspect.v1",
     "vercel.project.inspect.v1",

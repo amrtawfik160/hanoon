@@ -277,7 +277,7 @@ describe("binding projections and broker-private targets", () => {
       riskClass: "low",
       mfaMode: browser ? "human_presence" : "workload_identity",
       approvalMode: "standing_policy",
-      state: browser ? "active" : "vault_verified",
+      state: browser ? "pending" : "vault_verified",
       generation: 1,
       verifiedAt: null,
       expiresAt: null,
@@ -326,6 +326,27 @@ describe("binding projections and broker-private targets", () => {
     expect(parseProtectedConnectorTarget({ ...targets[2], journeyId: "model-supplied" })).toMatchObject({ ok: false });
     expect(parseProtectedConnectorTarget({ ...targets[0], url: "https://api.convex.dev" }))
       .toEqual({ ok: false, code: "unknown_field" });
+    expect(parseProtectedConnectorTarget({ ...targets[0], teamIdOrSlug: "https://evil.example" }))
+      .toEqual({ ok: false, code: "invalid_field" });
+    expect(parseProtectedConnectorTarget({ ...targets[1], projectIdOrName: "https://evil.example" }))
+      .toEqual({ ok: false, code: "invalid_field" });
+    expect(parseProtectedConnectorTarget({ ...targets[2], projectName: "https://evil.example" }))
+      .toEqual({ ok: false, code: "invalid_field" });
+  });
+
+  it("rejects URL-shaped public identity values in every operation result", () => {
+    expect(parseProtectedConnectorResponse({
+      ...success("convex.project.inspect.v1"),
+      result: { ...success("convex.project.inspect.v1").result!, teamSlug: "https://evil.example" },
+    })).toEqual({ ok: false, code: "invalid_field" });
+    expect(parseProtectedConnectorResponse({
+      ...success("vercel.project.inspect.v1"),
+      result: { ...success("vercel.project.inspect.v1").result!, projectName: "https://evil.example" },
+    })).toEqual({ ok: false, code: "invalid_field" });
+    expect(parseProtectedConnectorResponse({
+      ...success("browser.vercel_project.inspect.v1"),
+      result: { ...success("browser.vercel_project.inspect.v1").result!, teamSlug: "https://evil.example" },
+    })).toEqual({ ok: false, code: "invalid_field" });
   });
 });
 

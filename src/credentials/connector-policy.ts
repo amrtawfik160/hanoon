@@ -1,5 +1,7 @@
 /** Exact, secret-free binding policy for the protected connector slice. */
 import { createHash } from "node:crypto";
+import { capabilityDescriptorById } from "../capabilities/catalog";
+import type { CapabilityDescriptor } from "../capabilities/contracts";
 import {
   OPAQUE_ID_PATTERN,
   SHA256_PATTERN,
@@ -211,6 +213,7 @@ const BROWSER_TARGET_KEYS = [
 ] as const;
 
 const TARGET_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const URL_SHAPED_TARGET_PATTERN = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|\/\/)/u;
 const METADATA_VALUE_PATTERN = /^[\x20-\x7e]{1,128}$/;
 const MAX_METADATA_VALUES = 8;
 
@@ -246,7 +249,8 @@ function isGeneration(value: unknown): value is number {
 }
 
 function isTargetValue(value: unknown): value is string {
-  return typeof value === "string" && TARGET_VALUE_PATTERN.test(value);
+  return typeof value === "string" && TARGET_VALUE_PATTERN.test(value) &&
+    !URL_SHAPED_TARGET_PATTERN.test(value);
 }
 
 function parseMetadataValues(value: unknown): readonly string[] | null {
@@ -315,6 +319,7 @@ export function parseProtectedConnectorBindingProjection(
   if (!isGeneration(value.generation) || !isNullableEpochMs(value.verifiedAt) || !isNullableEpochMs(value.expiresAt)) {
     return invalid("invalid_field");
   }
+  if (value.state === "active" && value.verifiedAt === null) return invalid("invalid_combination");
   const capabilityIds = parseMetadataValues(value.capabilityIds);
   const audiences = parseMetadataValues(value.audiences);
   const origins = parseMetadataValues(value.origins);
@@ -426,7 +431,7 @@ export type ProtectedConnectorRegistryDenial =
 export type ProtectedConnectorRegistration =
   | Readonly<{
       outcome: "registered";
-      descriptor: ProtectedConnectorDescriptor;
+      descriptor: CapabilityDescriptor;
       binding: ProtectedConnectorBindingProjection;
     }>
   | Readonly<{ outcome: "denied"; reason: ProtectedConnectorRegistryDenial }>;
@@ -465,11 +470,15 @@ export function resolveProtectedConnectorRegistration(
     binding.operation === connectorOperation &&
     binding.capabilityIds.includes(protectedConnectorCapabilityFor(connectorOperation)) &&
     binding.generation >= 1 &&
-    bindingCanRunForRegistry(binding, context.now));
+    protectedConnectorBindingCanRun(binding, context.now));
   if (bindings.length !== 1) return { outcome: "denied", reason: "binding_not_ready" };
+  const capabilityDescriptor = capabilityDescriptorById(protectedConnectorCapabilityFor(connectorOperation));
+  if (!capabilityDescriptor || capabilityDescriptor.kind !== "connector") {
+    return { outcome: "denied", reason: "policy_not_ready" };
+  }
   return {
     outcome: "registered",
-    descriptor: PROTECTED_CONNECTOR_DESCRIPTORS[connectorOperation],
+    descriptor: capabilityDescriptor,
     binding: bindings[0]!,
   };
 }
@@ -512,6 +521,34 @@ export type ProtectedConnectorDurableReceipt = Readonly<{
   responseSha256: string;
 }>;
 
+export type ProtectedConnectorAuthoritySnapshot = Readonly<{
+  installationId: string;
+  taskId: string;
+  projectId: string;
+  capabilityId: ProtectedConnectorCapabilityId;
+  bindingId: string;
+  bindingGeneration: number;
+  policyDigest: string;
+  fenceOwner: string;
+  fenceGeneration: number;
+}>;
+
+export function protectedConnectorAuthorityMatchesRequest(
+  authority: ProtectedConnectorAuthoritySnapshot | null | undefined,
+  request: ProtectedConnectorRequestEnvelope,
+): boolean {
+  return authority !== null && authority !== undefined &&
+    authority.installationId === request.installationId &&
+    authority.taskId === request.taskId &&
+    authority.projectId === request.projectId &&
+    authority.capabilityId === request.capabilityId &&
+    authority.bindingId === request.bindingId &&
+    authority.bindingGeneration === request.bindingGeneration &&
+    authority.policyDigest === request.policyDigest &&
+    authority.fenceOwner === request.fenceOwner &&
+    authority.fenceGeneration === request.fenceGeneration;
+}
+
 /** Only a current, receipted schema-v2 identity proof may support success. */
 export function finalizeProtectedConnectorEvidence(input: Readonly<{
   request: ProtectedConnectorRequestEnvelope;
@@ -519,6 +556,7 @@ export function finalizeProtectedConnectorEvidence(input: Readonly<{
   receipt: ProtectedConnectorDurableReceipt | null;
   binding: ProtectedConnectorBindingProjection;
   currentPolicyDigest: string;
+  currentAuthority: ProtectedConnectorAuthoritySnapshot | null;
   now: number;
 }>): ProtectedConnectorFinalization {
   const parsedBinding = parseProtectedConnectorBindingProjection(input.binding);
@@ -539,16 +577,11 @@ export function finalizeProtectedConnectorEvidence(input: Readonly<{
     binding.generation !== input.request.bindingGeneration ||
     binding.operation !== input.request.operation
   ) return { outcome: "incomplete", reason: "identity_mismatch" };
-  if (
-    input.currentPolicyDigest !== input.request.policyDigest ||
-    !bindingCanRunForRegistry(binding, input.now)
-  ) {
-    return { outcome: "incomplete", reason: "authority_changed" };
-  }
   if (response.completedAt > input.request.deadlineAt) {
     return { outcome: "incomplete", reason: "deadline_expired" };
   }
   if (response.outcome !== "succeeded") return { outcome: "incomplete", reason: "operation_failed" };
+  if (!input.receipt) return { outcome: "incomplete", reason: "invalid_evidence" };
   const receipt = input.receipt;
   if (
     !receipt ||
@@ -568,6 +601,13 @@ export function finalizeProtectedConnectorEvidence(input: Readonly<{
     receipt.outcome !== "succeeded" ||
     receipt.responseSha256 !== protectedConnectorResponseDigest(response)
   ) return { outcome: "incomplete", reason: "invalid_evidence" };
+  if (
+    input.currentPolicyDigest !== input.request.policyDigest ||
+    !protectedConnectorAuthorityMatchesRequest(input.currentAuthority, input.request) ||
+    !protectedConnectorBindingCanRun(binding, input.now)
+  ) {
+    return { outcome: "incomplete", reason: "authority_changed" };
+  }
   return {
     outcome: "succeeded",
     operation: response.operation,
@@ -577,9 +617,9 @@ export function finalizeProtectedConnectorEvidence(input: Readonly<{
   };
 }
 
-function bindingCanRunForRegistry(binding: ProtectedConnectorBindingProjection, now: number): boolean {
+export function protectedConnectorBindingCanRun(binding: ProtectedConnectorBindingProjection, now: number): boolean {
   if (binding.expiresAt !== null && now >= binding.expiresAt) return false;
   return binding.operation === "browser.vercel_project.inspect.v1"
-    ? binding.state === "active"
+    ? binding.state === "pending" || binding.state === "active"
     : binding.state === "vault_verified" || binding.state === "active";
 }

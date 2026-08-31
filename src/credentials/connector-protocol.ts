@@ -278,6 +278,7 @@ const RETRYABLE_FAILURES = new Set<ProtectedConnectorFailureClass>([
 ]);
 
 const BOUNDED_IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const URL_SHAPED_IDENTITY_PATTERN = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|\/\/)/u;
 const VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/;
 
 type ParseCode = Exclude<ProtocolParseResult<never>, { ok: true }>["code"];
@@ -300,7 +301,8 @@ function isOpaqueId(value: unknown): value is string {
 }
 
 function isBoundedIdentity(value: unknown): value is string {
-  return typeof value === "string" && BOUNDED_IDENTITY_PATTERN.test(value);
+  return typeof value === "string" && BOUNDED_IDENTITY_PATTERN.test(value) &&
+    !URL_SHAPED_IDENTITY_PATTERN.test(value);
 }
 
 function isEpochMs(value: unknown): value is number {

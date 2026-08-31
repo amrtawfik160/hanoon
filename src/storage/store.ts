@@ -321,6 +321,7 @@ import type {
   ProtectedConnectorResponseEnvelope,
 } from "../credentials/connector-protocol";
 import type { ProtectedConnectorBindingProjection } from "../credentials/connector-policy";
+import type { ProtectedConnectorAuthoritySnapshot } from "../credentials/connector-policy";
 import { NavigatorRepository } from "../navigator/repository";
 import type {
   NavigatorArtifactBinding,
@@ -4412,12 +4413,14 @@ export interface TelegramAgentStore {
   ): readonly ProtectedConnectorBindingHistoryRecord[];
   prepareProtectedConnectorOperation(input: Readonly<{
     request: ProtectedConnectorRequestEnvelope;
+    capabilityProfileId?: string;
     now: number;
   }>): ProtectedConnectorPrepareResult;
   completeProtectedConnectorOperation(input: Readonly<{
     installationId: string;
     requestId: string;
     response: ProtectedConnectorResponseEnvelope;
+    currentAuthority: ProtectedConnectorAuthoritySnapshot | null;
     now: number;
   }>): ProtectedConnectorCompleteResult;
   markProtectedConnectorOperationAmbiguous(input: Readonly<{
@@ -5928,6 +5931,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public prepareProtectedConnectorOperation(input: Readonly<{
     request: ProtectedConnectorRequestEnvelope;
+    capabilityProfileId?: string;
     now: number;
   }>): ProtectedConnectorPrepareResult {
     return this.protectedConnectorRepository.prepareOperation(input);
@@ -5937,6 +5941,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     installationId: string;
     requestId: string;
     response: ProtectedConnectorResponseEnvelope;
+    currentAuthority: ProtectedConnectorAuthoritySnapshot | null;
     now: number;
   }>): ProtectedConnectorCompleteResult {
     return this.protectedConnectorRepository.completeOperation(input);

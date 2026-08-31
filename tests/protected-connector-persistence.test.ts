@@ -2,6 +2,11 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
+  CAPABILITY_BY_ID,
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+} from "../src/capabilities/catalog";
+import {
   PROTECTED_CONNECTOR_POLICY_DIGEST,
   type ProtectedConnectorBindingProjection,
 } from "../src/credentials/connector-policy";
@@ -100,16 +105,58 @@ describe("Hanoon protected connector persistence", () => {
   it("stores only the secret-free projection, preserves history, and restores receipts after restart", () => {
     const { bb } = createFakePluginHost({ pluginId: "protected-connector-persistence" });
     const store = openStore(bb.storage, bb.storage.kv, () => NOW);
+    const capability = CAPABILITY_BY_ID.get("telegram_agent_convex_project_inspect");
+    if (!capability) throw new Error("connector capability missing");
+    const profile = store.createCapabilityProfile({
+      subjectKind: "worker_attempt",
+      subjectId: "attempt:connector",
+      threadId: null,
+      recipeId: "direct",
+      recipeVersion: 1,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST,
+      mode: "active",
+      model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+      assignments: [{
+        capabilityId: capability.id,
+        descriptorDigest: capability.digest,
+        capabilityKind: "connector",
+        mandatory: true,
+      }],
+      reasonCodes: [],
+      traits: [],
+      now: NOW,
+    });
     expect(store.reconcileProtectedConnectorBinding({ projection: projection(), now: NOW }))
       .toMatchObject({ outcome: "reconciled" });
-    expect(store.prepareProtectedConnectorOperation({ request: request(), now: NOW }))
+    expect(store.prepareProtectedConnectorOperation({ request: request(), capabilityProfileId: profile.id, now: NOW }))
       .toMatchObject({ outcome: "prepared" });
     expect(store.completeProtectedConnectorOperation({
       installationId: "installation-1",
       requestId: "request-1",
       response: response(),
+      currentAuthority: {
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        capabilityId: "telegram_agent_convex_project_inspect",
+        bindingId: "binding-convex",
+        bindingGeneration: 1,
+        policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+      },
       now: NOW + 2_000,
     })).toMatchObject({ outcome: "completed", receipt: { receiptId: "receipt-1" } });
+    expect(store.listCapabilityReceipts(profile.id, 10)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        capabilityId: "telegram_agent_convex_project_inspect",
+        capabilityKind: "connector",
+        eventType: "outcome",
+        outcome: "passed",
+        evidenceRefs: ["credential_connector_receipt:receipt-1"],
+      }),
+    ]));
 
     expect(store.getProtectedConnectorBinding("installation-1", "binding-convex"))
       .toMatchObject({ state: "active", verifiedAt: NOW + 2_000 });
@@ -145,6 +192,63 @@ describe("Hanoon protected connector persistence", () => {
       request: request({ bindingGeneration: 2, requestId: "changed-request" }),
       now: NOW + 3,
     })).toEqual({ outcome: "digest_mismatch" });
+  });
+
+  it("keeps an unreceipted ambiguity open and settles it with the later exact receipt", () => {
+    const { bb } = createFakePluginHost({ pluginId: "protected-connector-ambiguity" });
+    const store = openStore(bb.storage, bb.storage.kv, () => NOW);
+    const capability = CAPABILITY_BY_ID.get("telegram_agent_convex_project_inspect");
+    if (!capability) throw new Error("connector capability missing");
+    const profile = store.createCapabilityProfile({
+      subjectKind: "worker_attempt", subjectId: "attempt:ambiguity", threadId: null,
+      recipeId: "direct", recipeVersion: 1, registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST, mode: "active",
+      model: { pool: "standard", providerId: "codex", modelId: "model", reasoning: "high", serviceTier: "fast" },
+      assignments: [{ capabilityId: capability.id, descriptorDigest: capability.digest, capabilityKind: "connector", mandatory: true }],
+      reasonCodes: [], traits: [], now: NOW,
+    });
+    expect(store.reconcileProtectedConnectorBinding({ projection: projection(), now: NOW }))
+      .toMatchObject({ outcome: "reconciled" });
+    expect(store.prepareProtectedConnectorOperation({ request: request(), capabilityProfileId: profile.id, now: NOW }))
+      .toMatchObject({ outcome: "prepared" });
+    expect(store.completeProtectedConnectorOperation({
+      installationId: "installation-1",
+      requestId: "request-1",
+      response: response({
+        outcome: "failed",
+        result: null,
+        failureClass: "result_ambiguous",
+        retryable: false,
+        retryAfterMs: null,
+        receiptId: null,
+      }),
+      currentAuthority: null,
+      now: NOW + 2_000,
+    })).toMatchObject({ outcome: "completed", operation: { state: "ambiguous" }, receipt: null });
+    expect(store.completeProtectedConnectorOperation({
+      installationId: "installation-1",
+      requestId: "request-1",
+      response: response(),
+      currentAuthority: {
+        installationId: "installation-1", taskId: "task-1", projectId: "project-1",
+        capabilityId: "telegram_agent_convex_project_inspect", bindingId: "binding-convex",
+        bindingGeneration: 1, policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        fenceOwner: "executor-1", fenceGeneration: 1,
+      },
+      now: NOW + 3_000,
+    })).toMatchObject({ outcome: "completed", operation: { state: "completed" }, receipt: { receiptId: "receipt-1" } });
+    expect(store.completeProtectedConnectorOperation({
+      installationId: "installation-1",
+      requestId: "request-1",
+      response: response(),
+      currentAuthority: {
+        installationId: "installation-1", taskId: "task-1", projectId: "project-1",
+        capabilityId: "telegram_agent_convex_project_inspect", bindingId: "binding-convex",
+        bindingGeneration: 1, policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        fenceOwner: "executor-1", fenceGeneration: 1,
+      },
+      now: NOW + 4_000,
+    })).toMatchObject({ outcome: "replay", receipt: { receiptId: "receipt-1" } });
   });
 
   it("makes historical projections append-only", () => {
