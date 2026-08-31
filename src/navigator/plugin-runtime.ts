@@ -20,13 +20,21 @@ import {
   type NavigatorPullRequestPublisher,
   type NavigatorTicketWorkerAttempt,
   type NavigatorTicketWorkerRunner,
+  type NavigatorTicketWorkerExecution,
 } from "./implementation-executor";
-import { NavigatorReleaseExecutor } from "./release-executor";
+import { navigatorReleaseTitle, NavigatorReleaseExecutor } from "./release-executor";
 import {
-  createNavigatorCompatibilityAdapter,
   NavigatorEffectProtocol,
   type NavigatorEffectAdapter,
+  type NavigatorEffectOutcome,
 } from "./effect-protocol";
+import type {
+  NavigatorEffectContext,
+  NavigatorReleaseEffectContext,
+  NavigatorReleaseReceipt,
+  NavigatorTicketEffectContext,
+  NavigatorTicketReceipt,
+} from "./effect-contracts";
 import { DeterministicWorkflowNavigator } from "./deterministic-navigator";
 import type { NavigatorInferenceObservation, NavigatorSkillAttempt, NavigatorSnapshot } from "./models";
 import {
@@ -52,6 +60,76 @@ export type NavigatorPluginRuntime = Readonly<{
   implementation: NavigatorImplementationExecutor;
   release: NavigatorReleaseExecutor;
 }>;
+
+function ticketReceipt(
+  context: NavigatorTicketEffectContext,
+  execution: NavigatorTicketWorkerExecution,
+): NavigatorTicketReceipt {
+  return {
+    kind: "run_navigator_ticket_worker",
+    effectIdempotencyKey: context.effect.idempotencyKey,
+    attemptId: context.ticket.attempt.id,
+    resource: execution.resource,
+    exactHeadSha: execution.exactHeadSha,
+    result: execution.result,
+    gitObservation: execution.gitObservation,
+  };
+}
+
+async function executeTicketAdapter(
+  operation: Pick<NavigatorImplementationExecutor, "executeAttempt">,
+  context: NavigatorEffectContext,
+): Promise<NavigatorEffectOutcome> {
+  if (context.kind !== "run_navigator_ticket_worker") {
+    return { outcome: "permanent", reason: "Navigator ticket adapter received another effect kind" };
+  }
+  const execution = await operation.executeAttempt(context.ticket.attempt, context.signal);
+  return { outcome: "completed", receipt: ticketReceipt(context, execution) };
+}
+
+function releaseReceipt(
+  context: NavigatorReleaseEffectContext,
+  published: NavigatorPullRequestRecord,
+  environmentId: string,
+): NavigatorReleaseReceipt {
+  return {
+    kind: "run_navigator_release",
+    effectIdempotencyKey: context.effect.idempotencyKey,
+    attemptId: context.attempt.id,
+    resource: { kind: "environment", id: environmentId },
+    number: published.number,
+    url: published.url,
+    environmentId,
+  };
+}
+
+async function executeReleaseAdapter(
+  operation: Pick<NavigatorReleaseExecutor, "executeEntry" | "integrationEnvironmentId">,
+  context: NavigatorEffectContext,
+): Promise<NavigatorEffectOutcome> {
+  if (context.kind !== "run_navigator_release") {
+    return { outcome: "permanent", reason: "Navigator release adapter received another effect kind" };
+  }
+  const published = await operation.executeEntry({
+    jobId: context.effect.jobId,
+    title: navigatorReleaseTitle(context.job.requestText),
+    body: "Exact-head release of the accepted implementation tickets.",
+  }, context.signal);
+  const environmentId = operation.integrationEnvironmentId(context.effect.jobId);
+  return { outcome: "completed", receipt: releaseReceipt(context, published, environmentId) };
+}
+
+export function createNavigatorTicketEffectAdapter(
+  operation: Pick<NavigatorImplementationExecutor, "executeAttempt">,
+): NavigatorEffectAdapter {
+  return { kind: "run_navigator_ticket_worker", execute: (context) => executeTicketAdapter(operation, context) };
+}
+
+export function createNavigatorReleaseEffectAdapter(
+  operation: Pick<NavigatorReleaseExecutor, "executeEntry" | "integrationEnvironmentId">,
+): NavigatorEffectAdapter {
+  return { kind: "run_navigator_release", execute: (context) => executeReleaseAdapter(operation, context) };
+}
 
 function parseThreadJson(raw: unknown): unknown {
   if (typeof raw !== "object" || raw === null) return {};
@@ -571,11 +649,12 @@ export function createNavigatorRuntime(input: Readonly<{
   clock: { now(): number };
   navigator?: WorkflowNavigator;
 }>): NavigatorPluginRuntime {
+  const skillRunner = new PluginNavigatorSkillRunner(input.sdk);
   const navigator = new NavigatorWorkflowExecutor({
       store: input.store,
       navigator: input.navigator ?? new DeterministicWorkflowNavigator(),
       observeInference: (snapshot) => observePluginNavigatorInference(input.store, input.sdk, snapshot),
-      skillRunner: new PluginNavigatorSkillRunner(input.sdk),
+      skillRunner,
       modelRoute: input.modelRoute,
       clock: input.clock,
     });
@@ -597,14 +676,21 @@ export function createNavigatorRuntime(input: Readonly<{
   const skillAdapter: NavigatorEffectAdapter = {
     kind: "run_navigator_skill",
     execute: async (context) => {
-      const processed = await navigator.processLeased(
-        context.effect,
-        { ...context.fence, signal: context.signal },
-        context.signal,
-      );
-      return processed
-        ? { outcome: "completed" }
-        : { outcome: "transient", reason: "navigator skill adapter did not settle" };
+      if (context.kind !== "run_navigator_skill") {
+        return { outcome: "permanent", reason: "Navigator skill adapter received another effect kind" };
+      }
+      const run = await skillRunner.run(context.attempt, { bindResource: async () => undefined }, context.signal);
+      return {
+        outcome: "completed",
+        receipt: {
+          kind: "run_navigator_skill" as const,
+          effectIdempotencyKey: context.effect.idempotencyKey,
+          attemptId: context.attempt.id,
+          resource: run.resource,
+          observedExternalStateDigest: run.observedExternalStateDigest,
+          result: run.result,
+        },
+      };
     },
   };
   return {
@@ -613,14 +699,8 @@ export function createNavigatorRuntime(input: Readonly<{
       clock: input.clock,
       adapters: [
         skillAdapter,
-        createNavigatorCompatibilityAdapter(
-          "run_navigator_ticket_worker",
-          (effect, fence, signal) => implementation.processLeased(effect, fence, signal),
-        ),
-        createNavigatorCompatibilityAdapter(
-          "run_navigator_release",
-          (effect, fence, signal) => release.processLeased(effect, fence, signal),
-        ),
+        createNavigatorTicketEffectAdapter(implementation),
+        createNavigatorReleaseEffectAdapter(release),
       ],
     }),
     navigator,

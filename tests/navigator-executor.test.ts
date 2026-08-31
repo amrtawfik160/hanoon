@@ -24,7 +24,6 @@ import {
   type NavigatorEffectAdapter,
   type NavigatorEffectOutcome,
 } from "../src/navigator/effect-protocol";
-import { runJobExecutorService } from "../src/services/job-executor-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
@@ -245,6 +244,70 @@ function protocolFor(
       },
     ],
   });
+}
+
+function executorLeaseWithProjectClaim(
+  value: Fixture,
+  ownerId: string,
+  now = 1_100,
+  leaseMs = 30_000,
+): { generation: number } {
+  const lease = value.store.acquireExecutorLease(ownerId, now, leaseMs);
+  if (!lease.acquired) throw new Error("navigator test executor lease was unavailable");
+  value.db.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+     ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+  ).run(
+    value.job.id,
+    "project:proj_1:pipeline",
+    ownerId,
+    lease.generation,
+    now + leaseMs,
+    now,
+    now,
+  );
+  return { generation: lease.generation };
+}
+
+const REQUIRED_CLAIMS_BY_EFFECT_KIND = {
+  run_navigator_skill: [{ resourceKind: "project", resourceKey: "project:proj_1:pipeline" }],
+  run_navigator_ticket_worker: [{ resourceKind: "project", resourceKey: "project:proj_1:pipeline" }],
+  run_navigator_release: [{ resourceKind: "project", resourceKey: "project:proj_1:pipeline" }],
+} as const;
+
+type ClaimCase = "empty" | "unrelated" | "wrong key" | "wrong kind" | "wrong owner" | "wrong generation" | "expired" | "valid exact";
+const CLAIM_CASES: readonly ClaimCase[] = [
+  "empty", "unrelated", "wrong key", "wrong kind", "wrong owner", "wrong generation", "expired", "valid exact",
+];
+const CLAIM_MATRIX = (Object.keys(REQUIRED_CLAIMS_BY_EFFECT_KIND) as Array<keyof typeof REQUIRED_CLAIMS_BY_EFFECT_KIND>)
+  .flatMap((effectKind) => CLAIM_CASES.map((claimCase) => [effectKind, claimCase] as const));
+
+function insertClaimMatrixCase(
+  value: Fixture,
+  effectKind: keyof typeof REQUIRED_CLAIMS_BY_EFFECT_KIND,
+  claimCase: ClaimCase,
+  ownerId: string,
+  generation: number,
+  now: number,
+): void {
+  if (claimCase === "empty") return;
+  for (const required of REQUIRED_CLAIMS_BY_EFFECT_KIND[effectKind]) {
+    const resourceKind = claimCase === "wrong kind" ? "repository_merge" : required.resourceKind;
+    const resourceKey = claimCase === "unrelated"
+      ? "project:unrelated:pipeline"
+      : claimCase === "wrong key" ? "project:proj_1:other" : required.resourceKey;
+    const claimOwner = claimCase === "wrong owner" ? `${ownerId}-other` : ownerId;
+    const claimGeneration = claimCase === "wrong generation" ? generation + 1 : generation;
+    const expiresAt = claimCase === "expired" ? now : now + 30_000;
+    value.db.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+       ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).run(value.job.id, resourceKey, resourceKind, claimOwner, claimGeneration, expiresAt, now, now);
+  }
 }
 
 describe("navigator-v1 durable executor slice", () => {
@@ -982,14 +1045,12 @@ describe("navigator-v1 durable executor slice", () => {
         },
       ],
     });
-    const abort = new AbortController();
-    await runJobExecutorService({
-      store: value.store,
-      clock: { now: () => 1_100 },
-      navigatorEffects: protocol,
-      sleep: vi.fn(async () => abort.abort()),
-      releaseOnShutdown: true,
-    }, abort.signal);
+    const lease = executorLeaseWithProjectClaim(value, "navigator-highest");
+    await protocol.processOne({
+      ownerId: "navigator-highest",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal);
 
     expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({ status: "done" });
     expect(value.store.getNavigatorSkillAttempt(accepted.attemptId!)).toMatchObject({
@@ -1003,6 +1064,150 @@ describe("navigator-v1 durable executor slice", () => {
       currentWorkflowStepId: null,
       workflowRevision: value.job.workflowRevision + 1,
     });
+  });
+
+  it("does not call an adapter when the persisted capability receipt is denied", async () => {
+    const value = fixture();
+    const workflow = executor(value);
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const attempt = value.store.getNavigatorSkillAttempt(accepted.attemptId!);
+    if (!attempt) throw new Error("navigator capability test attempt was not stored");
+    const profile = value.store.getLatestCapabilityProfile("worker_attempt", attempt.id);
+    if (!profile) throw new Error("navigator capability profile was not stored");
+    value.store.appendCapabilityReceipt({
+      profileId: profile.id,
+      capabilityId: attempt.skillId,
+      capabilityKind: "skill",
+      descriptorDigest: attempt.descriptorDigest,
+      eventType: "denied",
+      reasonCode: "test_denied",
+      mandatory: true,
+      evidenceRefs: ["test:denied"],
+      now: 1_100,
+    });
+    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({ outcome: "completed" }));
+    const protocol = protocolFor(value, execute);
+    const lease = executorLeaseWithProjectClaim(value, "navigator-capability-denied");
+
+    await expect(protocol.processOne({
+      ownerId: "navigator-capability-denied",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal)).resolves.toBe(true);
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({ status: "dead" });
+  });
+
+  it("does not call an adapter when the exact project claim is missing", async () => {
+    const value = fixture();
+    const workflow = executor(value);
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const execute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({ outcome: "completed" }));
+    const protocol = protocolFor(value, execute);
+    const lease = value.store.acquireExecutorLease("navigator-claim-missing", 1_100, 30_000);
+    if (!lease.acquired) throw new Error("navigator claim test executor lease was unavailable");
+
+    await expect(protocol.processOne({
+      ownerId: "navigator-claim-missing",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal)).resolves.toBe(true);
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({ status: "dead" });
+  });
+
+  it.each(CLAIM_MATRIX)("requires the exact %s claim set (%s)", async (effectKind, claimCase) => {
+    const value = fixture();
+    const workflow = executor(value);
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const ownerId = `navigator-claim-matrix-${effectKind}-${claimCase}`;
+    const lease = value.store.acquireExecutorLease(ownerId, 1_100, 30_000);
+    if (!lease.acquired) throw new Error("navigator claim matrix executor lease was unavailable");
+    value.db.prepare(
+      `UPDATE effects SET kind = ?, status = 'leased', lease_owner = ?, lease_generation = ?, lease_expires_at = ?
+        WHERE idempotency_key = ?`,
+    ).run(effectKind, ownerId, lease.generation, 31_100, accepted.effectIdempotencyKey);
+    insertClaimMatrixCase(value, effectKind, claimCase, ownerId, lease.generation, 1_100);
+    const admit = vi.spyOn(value.store, "admitNavigatorCapabilityEvidence").mockReturnValue(true);
+    const leased = value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!);
+    if (!leased) throw new Error("navigator claim matrix effect was not leased");
+    vi.spyOn(value.store, "leaseNavigatorEffect").mockReturnValue(leased);
+    const protocol = protocolFor(value);
+
+    await expect(protocol.processOne({
+      ownerId,
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal)).resolves.toBe(true);
+
+    expect(admit).toHaveBeenCalledTimes(claimCase === "valid exact" ? 1 : 0);
+  });
+
+  it("does not leave a typed completion receipt or workflow state after settlement rollback", async () => {
+    const value = fixture();
+    const workflow = executor(value);
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    const attemptId = accepted.attemptId;
+    if (!attemptId) throw new Error("navigator receipt test attempt was not stored");
+    const execute = vi.fn(async (context): Promise<NavigatorEffectOutcome> => ({
+      outcome: "completed",
+      receipt: {
+        kind: "run_navigator_skill",
+        effectIdempotencyKey: context.effect.idempotencyKey,
+        attemptId,
+        observedExternalStateDigest: "e".repeat(64),
+        resource: { kind: "bb_thread", id: "thr_typed_receipt" },
+        result: {
+          kind: "research_result",
+          summary: "typed receipt",
+          artifactEvidence: [{
+            artifactId: value.artifactId,
+            snapshotId: value.snapshotId,
+            snapshotDigest: value.snapshotDigest,
+            finding: "typed receipt",
+            evidenceRefs: ["receipt:typed"],
+          }],
+        },
+      },
+    }));
+    const protocol = protocolFor(value, execute);
+    const lease = executorLeaseWithProjectClaim(value, "navigator-settlement-rollback");
+    value.db.exec(
+      `CREATE TRIGGER navigator_test_fail_workflow_settlement
+       BEFORE INSERT ON workflow_step_outcomes
+       BEGIN SELECT RAISE(ABORT, 'navigator settlement fault'); END`,
+    );
+
+    await expect(protocol.processOne({
+      ownerId: "navigator-settlement-rollback",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    }, new AbortController().signal)).resolves.toBe(true);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(value.store.getNavigatorWorkflowStepOutcome(accepted.workflowStepId!)).toBeNull();
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).not.toMatchObject({ status: "done" });
+    expect(value.db.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
   });
 
   it("leases one navigator effect at a time and transfers an expired lease to the next generation", async () => {
@@ -1072,8 +1277,7 @@ describe("navigator-v1 durable executor slice", () => {
       return { outcome: "lease_cancelled" as const, reason: "job cancellation reached the protocol" };
     });
     const protocol = protocolFor(value, execute);
-    const lease = value.store.acquireExecutorLease("navigator-cancel", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("cancellation executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "navigator-cancel");
     const processing = protocol.processOne({
       ownerId: "navigator-cancel",
       generation: lease.generation,
@@ -1111,8 +1315,7 @@ describe("navigator-v1 durable executor slice", () => {
       return { outcome: "lease_cancelled" as const, reason: "executor fence was cancelled" };
     });
     const protocol = protocolFor(value, execute);
-    const lease = value.store.acquireExecutorLease("navigator-fence-cancel", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("fence-cancellation executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "navigator-fence-cancel");
     const processing = protocol.processOne({
       ownerId: "navigator-fence-cancel",
       generation: lease.generation,
@@ -1140,10 +1343,9 @@ describe("navigator-v1 durable executor slice", () => {
       expect(Object.isFrozen(context.effect.payload)).toBe(true);
       return { outcome: "ambiguous" as const, reason: "provider receipt was lost" };
     });
-    const reconcile = vi.fn(async () => ({ outcome: "completed" as const, receipt: { reconciled: true } }));
+    const reconcile = vi.fn(async () => ({ outcome: "completed" as const }));
     const protocol = protocolFor(value, execute, 30_000, reconcile);
-    const lease = value.store.acquireExecutorLease("navigator-ambiguous", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("ambiguous executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "navigator-ambiguous");
     await expect(protocol.processOne({
       ownerId: "navigator-ambiguous",
       generation: lease.generation,
@@ -1165,8 +1367,7 @@ describe("navigator-v1 durable executor slice", () => {
     });
     const firstExecute = vi.fn(async () => ({ outcome: "transient" as const, reason: "worker restarted" }));
     const firstProtocol = protocolFor(value, firstExecute);
-    const firstLease = value.store.acquireExecutorLease("navigator-before-restart", 1_100, 30_000);
-    if (!firstLease.acquired) throw new Error("pre-restart executor lease was unavailable");
+    const firstLease = executorLeaseWithProjectClaim(value, "navigator-before-restart");
     await firstProtocol.processOne({
       ownerId: "navigator-before-restart",
       generation: firstLease.generation,
@@ -1180,7 +1381,19 @@ describe("navigator-v1 durable executor slice", () => {
 
     const secondLease = value.store.acquireExecutorLease("navigator-after-restart", 2_000, 30_000);
     if (!secondLease.acquired) throw new Error("post-restart executor lease was unavailable");
-    const secondExecute = vi.fn(async () => ({ outcome: "completed" as const, receipt: { restarted: true } }));
+    value.db.prepare(
+      `UPDATE job_resource_claims
+          SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
+        WHERE job_id = ? AND resource_key = ? AND resource_kind = 'project' AND state = 'held'`,
+    ).run(
+      "navigator-after-restart",
+      secondLease.generation,
+      32_000,
+      2_000,
+      value.job.id,
+      "project:proj_1:pipeline",
+    );
+    const secondExecute = vi.fn(async () => ({ outcome: "completed" as const }));
     const secondProtocol = protocolFor(value, secondExecute, 30_000, undefined, () => 2_000);
     await secondProtocol.processOne({
       ownerId: "navigator-after-restart",
@@ -1211,8 +1424,7 @@ describe("navigator-v1 durable executor slice", () => {
       return { outcome: "completed" as const };
     });
     const protocol = protocolFor(value, execute);
-    const lease = value.store.acquireExecutorLease("navigator-stale", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("stale-settlement executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "navigator-stale");
     const before = value.store.getJob(value.job.id);
     await expect(protocol.processOne({
       ownerId: "navigator-stale",

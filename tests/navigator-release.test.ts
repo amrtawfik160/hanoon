@@ -24,6 +24,7 @@ import {
   ALL_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
@@ -510,15 +511,16 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
+    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.at(-1));
     [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
+      expect(ALL_MIGRATIONS.at(-(index + 2))).toBe(migration);
     });
     const stateUpgradeOffset = MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 6))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");
@@ -581,6 +583,21 @@ describe("navigator exact-head release", () => {
     });
     expect(fixture.store.listEffectsForJob(fixture.job.id).filter((effect) => effect.kind === "run_navigator_release"))
       .toHaveLength(1);
+
+    fixture.database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?)`,
+    ).run(
+      fixture.job.id,
+      projectResourceKey("proj_1"),
+      "executor",
+      fixture.leaseGeneration,
+      130_000,
+      fixture.now(),
+      fixture.now(),
+    );
 
     const { executor, publish } = releaseExecutor(fixture);
     const protocol = new NavigatorEffectProtocol({

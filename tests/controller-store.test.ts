@@ -20,6 +20,7 @@ import {
   MANAGED_AUTOMATION_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -227,7 +228,8 @@ it("keeps every shipped migration at its original position and appends new ones"
       NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
       MANAGED_AUTOMATION_MIGRATIONS.length +
       NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length +
-      MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length,
+      MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length +
+      NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length,
   );
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");
@@ -346,7 +348,8 @@ it("upgrades the shipped native SDLC schema without rewriting migration history 
   registerWorkArtifactRelationshipValidation(db);
   const shippedMigrationCount = ALL_MIGRATIONS.length -
     NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length -
-    MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+    MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length -
+    NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, shippedMigrationCount));
   db.prepare(
     `INSERT INTO managed_automations (

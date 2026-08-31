@@ -4177,6 +4177,63 @@ WHEN NOT (
 BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
 `] as const;
 
+export const NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS = [String.raw`
+ALTER TABLE navigator_skill_attempts ADD COLUMN capability_profile_id TEXT REFERENCES capability_profiles(id);
+ALTER TABLE navigator_skill_attempts ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+ALTER TABLE navigator_ticket_worker_attempts ADD COLUMN capability_profile_id TEXT REFERENCES capability_profiles(id);
+ALTER TABLE navigator_ticket_worker_attempts ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+ALTER TABLE navigator_release_attempts ADD COLUMN capability_profile_id TEXT REFERENCES capability_profiles(id);
+ALTER TABLE navigator_release_attempts ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+
+CREATE TABLE navigator_effect_capability_evidence (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 256),
+  operation TEXT NOT NULL CHECK (operation IN ('artifact_write', 'prototype_write', 'worktree_write', 'release_entry')),
+  profile_id TEXT NOT NULL REFERENCES capability_profiles(id),
+  profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 128),
+  capability_kind TEXT NOT NULL CHECK (capability_kind IN (
+    'skill', 'tool', 'bundle', 'native-adapter', 'model', 'connector', 'recipe'
+  )),
+  descriptor_digest TEXT NOT NULL CHECK (length(descriptor_digest) = 64),
+  receipt_id TEXT NOT NULL REFERENCES capability_receipts(id),
+  owner_id TEXT,
+  generation INTEGER CHECK (generation IS NULL OR generation >= 1),
+  admitted_at INTEGER,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (effect_idempotency_key, operation, capability_id)
+);
+CREATE INDEX navigator_effect_capability_evidence_profile
+  ON navigator_effect_capability_evidence(profile_id, profile_revision);
+CREATE TRIGGER navigator_effect_capability_evidence_append_only_delete
+BEFORE DELETE ON navigator_effect_capability_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator capability evidence cannot be deleted'); END;
+
+CREATE TABLE navigator_effect_receipts (
+  effect_idempotency_key TEXT PRIMARY KEY REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('run_navigator_skill', 'run_navigator_ticket_worker', 'run_navigator_release')),
+  receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
+  receipt_digest TEXT NOT NULL CHECK (length(receipt_digest) = 64),
+  owner_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0)
+);
+CREATE TRIGGER navigator_effect_receipts_append_only_update
+BEFORE UPDATE ON navigator_effect_receipts
+BEGIN SELECT RAISE(ABORT, 'navigator effect receipts are append-only'); END;
+CREATE TRIGGER navigator_effect_receipts_append_only_delete
+BEFORE DELETE ON navigator_effect_receipts
+BEGIN SELECT RAISE(ABORT, 'navigator effect receipts are append-only'); END;
+`] as const;
+
 export const NAVIGATOR_PROMOTION_MIGRATIONS = [String.raw`
 CREATE TRIGGER jobs_workflow_engine_immutable
 BEFORE UPDATE ON jobs
@@ -4728,4 +4785,5 @@ export const ALL_MIGRATIONS = [
   ...MANAGED_AUTOMATION_MIGRATIONS,
   ...NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   ...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  ...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
 ] as const;

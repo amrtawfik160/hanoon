@@ -308,6 +308,7 @@ import {
 } from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
 import { NavigatorRepository } from "../navigator/repository";
+import type { NavigatorTicketWorkerOutcome } from "../navigator/implementation-executor";
 import type {
   NavigatorArtifactBinding,
   NavigatorInferenceObservation,
@@ -327,6 +328,16 @@ import {
   type NavigatorReleaseIncidentPhase,
   type NavigatorReleaseRollbackOutcome,
 } from "../navigator/release-contracts";
+import type {
+  NavigatorCapabilityAssignment,
+  NavigatorCapabilityEvidence,
+  NavigatorCapabilityOperation,
+  NavigatorReleaseReceipt,
+  NavigatorTicketAttemptContext,
+  NavigatorTicketSettlementInput,
+  NavigatorSkillReceipt,
+} from "../navigator/effect-contracts";
+import { navigatorReleaseReceiptSchema } from "../navigator/effect-contracts";
 
 /**
  * A tapped controller button. `replayed` is a Telegram redelivery of a callback
@@ -863,7 +874,10 @@ export type NavigatorReleaseEffectSettlementInput = ExecutorFence & Readonly<{
   number: number;
   url: string;
   environmentId: string;
+  receipt?: NavigatorReleaseReceipt;
 }>;
+
+type NavigatorTicketSettlementHandler = (input: NavigatorTicketSettlementInput) => NavigatorTicketWorkerOutcome | null;
 
 function navigatorReleaseStartedEvent(
   input: NavigatorReleaseEffectSettlementInput,
@@ -4025,6 +4039,34 @@ export interface TelegramAgentStore {
   getNavigatorProposalDecision(id: string): NavigatorProposalDecision | null;
   getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null;
   getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
+  recordNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    operation: NavigatorCapabilityOperation;
+    profileId: string;
+    profileRevision: number;
+    assignments: readonly NavigatorCapabilityAssignment[];
+    now: number;
+  }): void;
+  getNavigatorCapabilityEvidence(effectIdempotencyKey: string): readonly NavigatorCapabilityEvidence[];
+  admitNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): boolean;
+  getNavigatorTicketAttemptContext(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorTicketAttemptContext | null;
+  registerNavigatorTicketSettlement(handler: NavigatorTicketSettlementHandler): void;
+  settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
     attemptId: string;
@@ -4085,6 +4127,7 @@ export interface TelegramAgentStore {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    receipt?: NavigatorSkillReceipt;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
     reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
@@ -5595,6 +5638,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
   private readonly navigatorRepository: NavigatorRepository;
+  private navigatorTicketSettlementHandler: NavigatorTicketSettlementHandler | null = null;
   private readonly taskAuthorityRepository: TaskAuthorityRepository;
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
@@ -12649,6 +12693,52 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.getAttempt(id);
   }
 
+  public recordNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    operation: NavigatorCapabilityOperation;
+    profileId: string;
+    profileRevision: number;
+    assignments: readonly NavigatorCapabilityAssignment[];
+    now: number;
+  }): void {
+    this.navigatorRepository.recordNavigatorCapabilityEvidence(input);
+  }
+
+  public getNavigatorCapabilityEvidence(effectIdempotencyKey: string): readonly NavigatorCapabilityEvidence[] {
+    return this.navigatorRepository.getNavigatorCapabilityEvidence(effectIdempotencyKey);
+  }
+
+  public admitNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): boolean {
+    return this.navigatorRepository.admitNavigatorCapabilityEvidence(input);
+  }
+
+  public getNavigatorTicketAttemptContext(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorTicketAttemptContext | null {
+    return this.navigatorRepository.getNavigatorTicketAttemptContext(input);
+  }
+
+  public registerNavigatorTicketSettlement(handler: NavigatorTicketSettlementHandler): void {
+    this.navigatorTicketSettlementHandler = handler;
+  }
+
+  public settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null {
+    return this.navigatorTicketSettlementHandler?.(input) ?? null;
+  }
+
   public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {
     return this.navigatorRepository.getOutcome(workflowStepId);
   }
@@ -12688,16 +12778,60 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!Number.isSafeInteger(input.number) || input.number < 1) throw new TypeError("release pull request number is invalid");
     const url = assertSafeExternalHttpsUrl(input.url, "navigator release pull request URL");
     if (!input.environmentId) throw new TypeError("navigator release environment identity is required");
+    const parsedReceipt = input.receipt === undefined
+      ? undefined
+      : navigatorReleaseReceiptSchema.safeParse(input.receipt);
+    if (parsedReceipt !== undefined && !parsedReceipt.success) return false;
+    const receipt = parsedReceipt?.data;
     const settle = this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const effectRow = this.effectByKey(input.effectIdempotencyKey);
       if (!effectRow || !this.navigatorReleaseEffectIsCurrent(effectRow, input)) return false;
+      if (receipt !== undefined && !this.releaseReceiptMatches(receipt, effectRow, input, url)) return false;
       const current = this.readJobById(effectRow.job_id);
       if (!current || current.cancelRequestedAt !== null || current.state === "cancelled") return false;
       if (current.state === "implementing" && !this.applyNavigatorReleaseStart(current, input, url)) return false;
-      return this.completeNavigatorReleaseEffect(effectRow, input);
+      if (receipt !== undefined) this.recordNavigatorReleaseReceipt(receipt, effectRow.job_id, input);
+      const completed = this.completeNavigatorReleaseEffect(effectRow, input);
+      if (!completed && receipt !== undefined) throw new Error("navigator release effect lease changed before receipt settlement");
+      return completed;
     });
     return settle.immediate();
+  }
+
+  private releaseReceiptMatches(
+    receipt: NavigatorReleaseReceipt,
+    effectRow: EffectRow,
+    input: NavigatorReleaseEffectSettlementInput,
+    url: string,
+  ): boolean {
+    const effect = parseEffect(effectRow);
+    const attemptId = typeof effect.payload.attemptId === "string" ? effect.payload.attemptId : null;
+    return receipt.effectIdempotencyKey === input.effectIdempotencyKey && receipt.attemptId === attemptId &&
+      receipt.number === input.number && receipt.url === url && receipt.environmentId === input.environmentId &&
+      receipt.resource.id === input.environmentId;
+  }
+
+  private recordNavigatorReleaseReceipt(
+    receipt: NavigatorReleaseReceipt,
+    jobId: string,
+    input: NavigatorReleaseEffectSettlementInput,
+  ): void {
+    const receiptJson = JSON.stringify(receipt);
+    this.db.prepare(
+      `INSERT INTO navigator_effect_receipts (
+         effect_idempotency_key, job_id, kind, receipt_json, receipt_digest,
+         owner_id, generation, recorded_at
+       ) VALUES (?, ?, 'run_navigator_release', ?, ?, ?, ?, ?)`,
+    ).run(
+      receipt.effectIdempotencyKey,
+      jobId,
+      receiptJson,
+      createHash("sha256").update(receiptJson, "utf8").digest("hex"),
+      input.ownerId,
+      input.generation,
+      input.now,
+    );
   }
 
   private navigatorReleaseEffectIsCurrent(
@@ -12856,6 +12990,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    receipt?: NavigatorSkillReceipt;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
     reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;

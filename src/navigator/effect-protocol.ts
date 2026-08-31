@@ -1,5 +1,6 @@
 import type { Job, StoredEffect } from "../domain/models";
 import type { TaskAuthorityOperation } from "../domain/task-authority";
+import { projectResourceKey } from "../autonomy/models";
 import type { JobResourceClaim } from "../autonomy/models";
 import type { EffectFence } from "../services/effect-runner";
 import type { TelegramAgentStore } from "../storage/store";
@@ -10,6 +11,27 @@ import type {
   NavigatorWorkflowStep,
 } from "./models";
 import type { NavigatorReleaseAttempt } from "./release-contracts";
+import type {
+  NavigatorCapabilityEvidence,
+  NavigatorEffectContext,
+  NavigatorEffectReceipt,
+  NavigatorReleaseReceipt,
+  NavigatorReleaseEffectContext,
+  NavigatorSkillEffectContext,
+  NavigatorTicketReceipt,
+  NavigatorTicketEffectContext,
+  NavigatorTicketAttemptContext,
+} from "./effect-contracts";
+import { navigatorEffectReceiptSchema } from "./effect-contracts";
+
+export type {
+  NavigatorCapabilityEvidence,
+  NavigatorEffectContext,
+  NavigatorEffectReceipt,
+  NavigatorReleaseEffectContext,
+  NavigatorSkillEffectContext,
+  NavigatorTicketEffectContext,
+} from "./effect-contracts";
 
 export const NAVIGATOR_EFFECT_KINDS = [
   "run_navigator_skill",
@@ -20,21 +42,18 @@ export const NAVIGATOR_EFFECT_KINDS = [
 export type NavigatorEffectKind = (typeof NAVIGATOR_EFFECT_KINDS)[number];
 type NavigatorJob = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
 
-export type NavigatorEffectContext = Readonly<{
-  effect: Readonly<StoredEffect>;
-  job: Readonly<NavigatorJob>;
-  fence: Readonly<Pick<EffectFence, "ownerId" | "generation">>;
-  signal: AbortSignal;
-  workflowStep: Readonly<NavigatorWorkflowStep> | null;
-  acceptedProposal: Readonly<NavigatorProposalRecord> | null;
-  artifactBindings: readonly NavigatorArtifactBinding[];
-  resourceClaims: readonly JobResourceClaim[];
-  authorityOperations: readonly TaskAuthorityOperation[];
-  capabilityEvidence: readonly string[];
-}>;
+type NavigatorRequiredResourceClaim = Readonly<Pick<JobResourceClaim, "resourceKind" | "resourceKey">>;
+
+const NAVIGATOR_REQUIRED_RESOURCE_CLAIMS: Readonly<
+  Record<NavigatorEffectKind, (job: NavigatorJob) => readonly NavigatorRequiredResourceClaim[]>
+> = {
+  run_navigator_skill: (job) => [{ resourceKind: "project", resourceKey: projectResourceKey(job.projectId ?? "") }],
+  run_navigator_ticket_worker: (job) => [{ resourceKind: "project", resourceKey: projectResourceKey(job.projectId ?? "") }],
+  run_navigator_release: (job) => [{ resourceKind: "project", resourceKey: projectResourceKey(job.projectId ?? "") }],
+};
 
 export type NavigatorEffectOutcome =
-  | Readonly<{ outcome: "completed"; receipt?: unknown }>
+  | Readonly<{ outcome: "completed"; receipt?: NavigatorEffectReceipt }>
   | Readonly<{ outcome: "transient"; reason: string }>
   | Readonly<{ outcome: "permanent"; reason: string }>
   | Readonly<{ outcome: "lease_cancelled"; reason: string }>
@@ -57,6 +76,12 @@ type NavigatorEffectStore = Pick<
   | "getNavigatorProposalDecision"
   | "getNavigatorSkillAttempt"
   | "getNavigatorReleaseAttempt"
+  | "getNavigatorCapabilityEvidence"
+  | "admitNavigatorCapabilityEvidence"
+  | "settleNavigatorSkillAttempt"
+  | "settleNavigatorTicketWorkerAttempt"
+  | "settleNavigatorReleaseEffect"
+  | "getNavigatorTicketAttemptContext"
   | "getCurrentWorkArtifactSnapshot"
   | "isWorkArtifactSnapshotValid"
   | "listCurrentHeldResourceClaims"
@@ -186,16 +211,26 @@ function effectIsLeasedBy(
 type NavigatorAttemptEvidence = Readonly<{
   skillAttempt: NavigatorSkillAttempt | null;
   releaseAttempt: NavigatorReleaseAttempt | null;
+  ticketContext: NavigatorTicketAttemptContext | null;
 }>;
 
 type NavigatorAdmissionEvidence = Readonly<{
   job: NavigatorJob;
   resourceClaims: readonly JobResourceClaim[];
+  capabilityEvidence: readonly NavigatorCapabilityEvidence[];
 }>;
 
 type NavigatorWorkflowContext = Readonly<{
   workflowStep: NavigatorWorkflowStep | null;
   acceptedProposal: NavigatorProposalRecord | null;
+}>;
+
+type NavigatorReceiptSettlementRequest<TReceipt> = Readonly<{
+  effect: StoredEffect;
+  context: NavigatorEffectContext;
+  receipt: TReceipt;
+  current: StoredEffect;
+  now: number;
 }>;
 
 function frozenExecutionContext(input: Readonly<{
@@ -205,35 +240,52 @@ function frozenExecutionContext(input: Readonly<{
   signal: AbortSignal;
   workflowStep: NavigatorWorkflowStep | null;
   acceptedProposal: NavigatorProposalRecord | null;
+  skillAttempt: NavigatorSkillAttempt | null;
+  releaseAttempt: NavigatorReleaseAttempt | null;
+  ticketContext: NavigatorTicketAttemptContext | null;
   artifactBindings: readonly NavigatorArtifactBinding[];
   resourceClaims: readonly JobResourceClaim[];
   authorityOperations: readonly TaskAuthorityOperation[];
-  capabilityEvidence: readonly string[];
+  capabilityEvidence: readonly import("./effect-contracts").NavigatorCapabilityEvidence[];
 }>): NavigatorEffectContext {
-  return Object.freeze({
+  const base = {
     effect: cloneAndFreezeNavigatorValue({ ...input.effect, payload: { ...input.effect.payload } }),
     job: cloneAndFreezeNavigatorValue(input.job),
     fence: Object.freeze({ ...input.fence }),
     signal: input.signal,
-    workflowStep: cloneAndFreezeNavigatorValue(input.workflowStep),
-    acceptedProposal: cloneAndFreezeNavigatorValue(input.acceptedProposal),
     artifactBindings: cloneAndFreezeNavigatorValue(input.artifactBindings),
     resourceClaims: cloneAndFreezeNavigatorValue(input.resourceClaims),
     authorityOperations: Object.freeze([...input.authorityOperations]),
-    capabilityEvidence: Object.freeze([...input.capabilityEvidence]),
-  });
-}
-
-function capabilityEvidenceFor(
-  skillAttempt: NavigatorSkillAttempt | null,
-  releaseAttempt: NavigatorReleaseAttempt | null,
-  operations: readonly TaskAuthorityOperation[],
-): readonly string[] {
-  return [
-    `authority:${operations.join(",")}`,
-    ...(skillAttempt === null ? [] : [`skill:${skillAttempt.skillId}`, `descriptor:${skillAttempt.descriptorDigest}`]),
-    ...(releaseAttempt === null ? [] : [`release-tickets:${releaseAttempt.implementationTicketIds.length}`]),
-  ];
+    capabilityEvidence: cloneAndFreezeNavigatorValue(input.capabilityEvidence),
+  } as const;
+  if (input.effect.kind === "run_navigator_skill" && input.workflowStep && input.acceptedProposal && input.skillAttempt) {
+    return Object.freeze({
+      ...base,
+      kind: "run_navigator_skill" as const,
+      workflowStep: cloneAndFreezeNavigatorValue(input.workflowStep),
+      acceptedProposal: cloneAndFreezeNavigatorValue(input.acceptedProposal),
+      attempt: cloneAndFreezeNavigatorValue(input.skillAttempt),
+    });
+  }
+  if (input.effect.kind === "run_navigator_ticket_worker" && input.ticketContext) {
+    return Object.freeze({
+      ...base,
+      kind: "run_navigator_ticket_worker" as const,
+      workflowStep: null,
+      acceptedProposal: null,
+      ticket: cloneAndFreezeNavigatorValue(input.ticketContext),
+    });
+  }
+  if (input.effect.kind === "run_navigator_release" && input.workflowStep && input.acceptedProposal && input.releaseAttempt) {
+    return Object.freeze({
+      ...base,
+      kind: "run_navigator_release" as const,
+      workflowStep: cloneAndFreezeNavigatorValue(input.workflowStep),
+      acceptedProposal: cloneAndFreezeNavigatorValue(input.acceptedProposal),
+      attempt: cloneAndFreezeNavigatorValue(input.releaseAttempt),
+    });
+  }
+  throw new TypeError("Navigator effect context is missing its operation-specific evidence");
 }
 
 export class NavigatorEffectProtocol {
@@ -280,9 +332,9 @@ export class NavigatorEffectProtocol {
     if ("reason" in admission) return admission;
     const stepValidation = this.prepareWorkflowContext(effect, admission.job);
     if ("reason" in stepValidation) return stepValidation;
-    const attempts = this.attemptEvidence(effect, admission.job, stepValidation.workflowStep);
+    const attempts = this.attemptEvidence(effect, admission.job, stepValidation.workflowStep, fence, now);
     if ("reason" in attempts) return attempts;
-    const { skillAttempt, releaseAttempt } = attempts;
+    const { skillAttempt, releaseAttempt, ticketContext } = attempts;
     const artifactValidation = this.validateArtifactBindings(admission.job.artifactBindings);
     if (artifactValidation !== null) return { reason: artifactValidation };
     const operations = authorityOperations(effect, skillAttempt);
@@ -308,7 +360,7 @@ export class NavigatorEffectProtocol {
     attempts: NavigatorAttemptEvidence;
     operations: readonly TaskAuthorityOperation[];
   }>): NavigatorEffectContext {
-    const { skillAttempt, releaseAttempt } = input.attempts;
+    const { skillAttempt, releaseAttempt, ticketContext } = input.attempts;
     return frozenExecutionContext({
       effect: input.effect,
       job: input.admission.job,
@@ -319,7 +371,10 @@ export class NavigatorEffectProtocol {
       artifactBindings: input.admission.job.artifactBindings,
       resourceClaims: input.admission.resourceClaims,
       authorityOperations: input.operations,
-      capabilityEvidence: capabilityEvidenceFor(skillAttempt, releaseAttempt, input.operations),
+      skillAttempt,
+      releaseAttempt,
+      ticketContext,
+      capabilityEvidence: input.admission.capabilityEvidence,
     });
   }
 
@@ -334,9 +389,19 @@ export class NavigatorEffectProtocol {
     const jobReason = this.jobValidation(job);
     if (jobReason !== null || job === null) return { reason: jobReason ?? "Navigator effect job is unavailable" };
     const resourceClaims = this.dependencies.store.listCurrentHeldResourceClaims(job.id, 128);
-    return this.claimsAreCurrent(resourceClaims, fence, now)
-      ? { job, resourceClaims }
-      : { reason: "Navigator effect resource claim is stale" };
+    if (!this.claimsAreCurrent(effect, job, resourceClaims, fence, now)) {
+      return { reason: "Navigator effect resource claim is absent, unrelated, or stale" };
+    }
+    if (job.projectId === null || !this.dependencies.store.admitNavigatorCapabilityEvidence({
+      effectIdempotencyKey: effect.idempotencyKey,
+      jobId: job.id,
+      projectId: job.projectId,
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now,
+    })) return { reason: "Navigator capability evidence is absent, stale, denied, or not exact" };
+    const capabilityEvidence = this.dependencies.store.getNavigatorCapabilityEvidence(effect.idempotencyKey);
+    return { job, resourceClaims, capabilityEvidence };
   }
 
   private leaseValidation(effect: StoredEffect, fence: EffectFence, now: number): string | null {
@@ -364,8 +429,20 @@ export class NavigatorEffectProtocol {
       : null;
   }
 
-  private claimsAreCurrent(claims: readonly JobResourceClaim[], fence: EffectFence, now: number): boolean {
-    return claims.every((claim) => this.claimIsCurrent(claim, fence, now));
+  private claimsAreCurrent(
+    effect: StoredEffect,
+    job: NavigatorJob,
+    claims: readonly JobResourceClaim[],
+    fence: EffectFence,
+    now: number,
+  ): boolean {
+    if (!isNavigatorEffectKind(effect.kind) || job.projectId === null) return false;
+    const required = NAVIGATOR_REQUIRED_RESOURCE_CLAIMS[effect.kind](job);
+    return claims.length === required.length && claims.every((claim) =>
+      this.claimIsCurrent(claim, fence, now) && required.some((requirement) =>
+        requirement.resourceKind === claim.resourceKind && requirement.resourceKey === claim.resourceKey)) &&
+      required.every((requirement) => claims.some((claim) =>
+        requirement.resourceKind === claim.resourceKind && requirement.resourceKey === claim.resourceKey));
   }
 
   private prepareWorkflowContext(
@@ -415,10 +492,12 @@ export class NavigatorEffectProtocol {
     effect: StoredEffect,
     job: NavigatorJob,
     workflowStep: NavigatorWorkflowStep | null,
+    fence: EffectFence,
+    now: number,
   ): NavigatorAttemptEvidence | { reason: string } {
     if (effect.kind === "run_navigator_skill") return this.skillAttemptEvidence(effect, job, workflowStep);
     if (effect.kind === "run_navigator_release") return this.releaseAttemptEvidence(effect, job, workflowStep);
-    return { skillAttempt: null, releaseAttempt: null };
+    return this.ticketAttemptEvidence(effect, job, fence, now);
   }
 
   private skillAttemptEvidence(
@@ -429,7 +508,7 @@ export class NavigatorEffectProtocol {
     const attempt = this.dependencies.store.getNavigatorSkillAttempt(payloadIdentifier(effect, "attemptId") ?? "");
     return attempt && workflowStep && attempt.effectIdempotencyKey === effect.idempotencyKey &&
       attempt.jobId === job.id && attempt.workflowStepId === workflowStep.id
-      ? { skillAttempt: attempt, releaseAttempt: null }
+      ? { skillAttempt: attempt, releaseAttempt: null, ticketContext: null }
       : { reason: "Navigator skill attempt identity is unavailable" };
   }
 
@@ -441,8 +520,27 @@ export class NavigatorEffectProtocol {
     const attempt = this.dependencies.store.getNavigatorReleaseAttempt(payloadIdentifier(effect, "attemptId") ?? "");
     return attempt && workflowStep && attempt.effectIdempotencyKey === effect.idempotencyKey &&
       attempt.jobId === job.id && attempt.workflowStepId === workflowStep.id
-      ? { skillAttempt: null, releaseAttempt: attempt }
+      ? { skillAttempt: null, releaseAttempt: attempt, ticketContext: null }
       : { reason: "Navigator release attempt identity is unavailable" };
+  }
+
+  private ticketAttemptEvidence(
+    effect: StoredEffect,
+    job: NavigatorJob,
+    fence: EffectFence,
+    now: number,
+  ): NavigatorAttemptEvidence | { reason: string } {
+    const attemptId = payloadIdentifier(effect, "attemptId");
+    const ticketContext = attemptId === null ? null : this.dependencies.store.getNavigatorTicketAttemptContext({
+      attemptId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now,
+    });
+    return ticketContext?.attempt.jobId === job.id
+      ? { skillAttempt: null, releaseAttempt: null, ticketContext }
+      : { reason: "Navigator ticket attempt context is stale or unavailable" };
   }
 
   private authorityIsCurrent(effect: StoredEffect, operations: readonly TaskAuthorityOperation[]): boolean {
@@ -589,7 +687,45 @@ export class NavigatorEffectProtocol {
     const now = this.dependencies.clock.now();
     const current = this.dependencies.store.getEffect(effect.jobId, effect.idempotencyKey);
     if (!current || !this.leaseIsCurrent(current, context.fence, now)) return true;
-    if (outcome.outcome === "completed") return this.completeCurrent(effect, context, now);
+    if (outcome.outcome === "completed") {
+      const receipt = this.completedReceipt(effect, context, outcome.receipt);
+      if (receipt !== null && "reason" in receipt) return this.deadLetterCurrent(effect, context, receipt.reason, now);
+      if (receipt?.kind === "run_navigator_skill") {
+        if (context.kind !== "run_navigator_skill") {
+          return this.deadLetterCurrent(effect, context, "Navigator receipt kind does not match its context", now);
+        }
+        try {
+          const settled = this.dependencies.store.settleNavigatorSkillAttempt({
+            attemptId: context.attempt.id,
+            effectIdempotencyKey: effect.idempotencyKey,
+            observedExternalStateDigest: receipt.observedExternalStateDigest,
+            result: receipt.result,
+            receipt,
+            ownerId: context.fence.ownerId,
+            generation: context.fence.generation,
+            now,
+          });
+          return settled !== null
+            ? true
+            : this.retryCurrent(effect, context, "Navigator skill settlement fence was lost", current.attempts, now);
+        } catch (error) {
+          return this.retryCurrent(
+            effect,
+            context,
+            `Navigator skill settlement failed: ${safeReason(error, "persistence error")}`,
+            current.attempts,
+            now,
+          );
+        }
+      }
+      if (receipt?.kind === "run_navigator_ticket_worker") {
+        return this.settleTicketReceipt({ effect, context, receipt, current, now });
+      }
+      if (receipt?.kind === "run_navigator_release") {
+        return this.settleReleaseReceipt({ effect, context, receipt, current, now });
+      }
+      return this.completeCurrent(effect, context, now);
+    }
     if (outcome.outcome === "permanent") return this.deadLetterCurrent(effect, context, outcome.reason, now);
     const currentJob = this.dependencies.store.getJob(effect.jobId);
     if (outcome.outcome === "lease_cancelled" && currentJob !== null && (
@@ -601,6 +737,81 @@ export class NavigatorEffectProtocol {
   private completeCurrent(effect: StoredEffect, context: NavigatorEffectContext, now: number): boolean {
     this.dependencies.store.completeEffect(effect.idempotencyKey, context.fence.ownerId, context.fence.generation, now);
     return true;
+  }
+
+  private settleTicketReceipt(input: NavigatorReceiptSettlementRequest<NavigatorTicketReceipt>): boolean {
+    if (input.context.kind !== "run_navigator_ticket_worker") {
+      return this.deadLetterCurrent(input.effect, input.context, "Navigator receipt kind does not match its context", input.now);
+    }
+    try {
+      const settled = this.dependencies.store.settleNavigatorTicketWorkerAttempt({
+        attemptId: input.context.ticket.attempt.id,
+        effectIdempotencyKey: input.effect.idempotencyKey,
+        receipt: input.receipt,
+        ownerId: input.context.fence.ownerId,
+        generation: input.context.fence.generation,
+        now: input.now,
+      });
+      return settled !== null
+        ? true
+        : this.retryCurrent(input.effect, input.context, "Navigator ticket settlement fence was lost", input.current.attempts, input.now);
+    } catch (error) {
+      return this.retryCurrent(
+        input.effect,
+        input.context,
+        `Navigator ticket settlement failed: ${safeReason(error, "persistence error")}`,
+        input.current.attempts,
+        input.now,
+      );
+    }
+  }
+
+  private settleReleaseReceipt(input: NavigatorReceiptSettlementRequest<NavigatorReleaseReceipt>): boolean {
+    if (input.context.kind !== "run_navigator_release") {
+      return this.deadLetterCurrent(input.effect, input.context, "Navigator receipt kind does not match its context", input.now);
+    }
+    try {
+      const settled = this.dependencies.store.settleNavigatorReleaseEffect({
+        effectIdempotencyKey: input.effect.idempotencyKey,
+        number: input.receipt.number,
+        url: input.receipt.url,
+        environmentId: input.receipt.environmentId,
+        receipt: input.receipt,
+        ownerId: input.context.fence.ownerId,
+        generation: input.context.fence.generation,
+        now: input.now,
+      });
+      return settled
+        ? true
+        : this.retryCurrent(input.effect, input.context, "Navigator release settlement fence was lost", input.current.attempts, input.now);
+    } catch (error) {
+      return this.retryCurrent(
+        input.effect,
+        input.context,
+        `Navigator release settlement failed: ${safeReason(error, "persistence error")}`,
+        input.current.attempts,
+        input.now,
+      );
+    }
+  }
+
+  private completedReceipt(
+    effect: StoredEffect,
+    context: NavigatorEffectContext,
+    rawReceipt: unknown,
+  ): NavigatorEffectReceipt | null | { reason: string } {
+    if (rawReceipt === undefined) return null;
+    const parsed = navigatorEffectReceiptSchema.safeParse(rawReceipt);
+    if (!parsed.success) return { reason: "Navigator completion receipt is invalid" };
+    if (parsed.data.kind !== effect.kind || parsed.data.effectIdempotencyKey !== effect.idempotencyKey) {
+      return { reason: "Navigator completion receipt is bound to another effect" };
+    }
+    const attemptId = context.kind === "run_navigator_ticket_worker"
+      ? context.ticket.attempt.id
+      : context.attempt.id;
+    return parsed.data.attemptId === attemptId
+      ? parsed.data
+      : { reason: "Navigator completion receipt is bound to another attempt" };
   }
 
   private deadLetterCurrent(

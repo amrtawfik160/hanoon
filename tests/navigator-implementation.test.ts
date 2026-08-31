@@ -516,6 +516,12 @@ describe("navigator ticket integration executor", () => {
       ownerId: "executor-40",
       generation: 1,
     });
+    value.database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+       ) VALUES (?, 'project:proj_40:pipeline', 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).run(value.jobId, "executor-40", 1, 101_100, 1_100, 1_100);
     const protocol = new NavigatorEffectProtocol({
       store: value.store,
       clock: { now: value.now },
@@ -545,6 +551,77 @@ describe("navigator ticket integration executor", () => {
         reasonCode: "git_observation_rejected",
       })],
     });
+  });
+
+  it("does not call a worker when the persisted ticket attempt context is stale", async () => {
+    const value = fixture();
+    const worker = vi.fn(async () => ({ outcome: "completed" as const }));
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner: { run: vi.fn(), reconcileUnavailableResource: vi.fn() },
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    const slice = executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    value.database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+       ) VALUES (?, 'project:proj_40:pipeline', 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).run(value.jobId, "executor-40", 1, 101_100, 1_100, 1_100);
+    value.database.prepare("UPDATE navigator_ticket_slices SET state = 'invalidated' WHERE id = ?")
+      .run(slice.id);
+    const effect = value.store.listEffectsForJob(value.jobId).find((candidate) =>
+      candidate.kind === "run_navigator_ticket_worker");
+    if (!effect) throw new Error("navigator ticket worker effect was not stored");
+
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: value.now },
+      adapters: [
+        {
+          kind: "run_navigator_skill",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })),
+        },
+        {
+          kind: "run_navigator_ticket_worker",
+          execute: worker,
+        },
+        {
+          kind: "run_navigator_release",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })),
+        },
+      ],
+    });
+
+    await expect(protocol.processOne(
+      { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },
+      new AbortController().signal,
+    )).resolves.toBe(true);
+
+    expect(worker).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.jobId, effect.idempotencyKey)).toMatchObject({ status: "dead" });
   });
 
   it("rejects a successful implementation that did not advance beyond its base head", async () => {

@@ -29,4 +29,6 @@ export type NavigatorReleaseAttempt = Readonly<{
   snapshotDigest: string;
   jobVersion: number;
   workflowRevision: number;
+  capabilityProfileId: string | null;
+  capabilityProfileRevision: number | null;
 }>;
