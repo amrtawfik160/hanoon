@@ -2,6 +2,7 @@ import type { StoredEffect } from "../domain/models";
 import type { EffectFence } from "../services/effect-runner";
 import type { TelegramAgentStore } from "../storage/store";
 import type { NavigatorPullRequestRecord } from "./implementation-contracts";
+import type { NavigatorReleaseReceipt } from "./effect-contracts";
 
 export type NavigatorReleaseExecutorDependencies = Readonly<{
   store: TelegramAgentStore;
@@ -98,11 +99,22 @@ export class NavigatorReleaseExecutor {
       }),
       abortWhenSignaled(signal),
     ]);
+    const environmentId = this.dependencies.integrationWorktreeId(effect.jobId);
+    const receipt: NavigatorReleaseReceipt = {
+      kind: "run_navigator_release",
+      effectIdempotencyKey: effect.idempotencyKey,
+      attemptId,
+      resource: { kind: "environment", id: environmentId },
+      number: published.number,
+      url: published.url,
+      environmentId,
+    };
     if (!this.dependencies.store.settleNavigatorReleaseEffect({
       effectIdempotencyKey: effect.idempotencyKey,
       number: published.number,
       url: published.url,
-      environmentId: this.dependencies.integrationWorktreeId(effect.jobId),
+      environmentId,
+      receipt,
       ownerId: fence.ownerId,
       generation: fence.generation,
       now: this.dependencies.clock.now(),

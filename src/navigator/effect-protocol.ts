@@ -1,9 +1,9 @@
 import type { Job, StoredEffect } from "../domain/models";
 import type { TaskAuthorityOperation } from "../domain/task-authority";
-import { projectResourceKey } from "../autonomy/models";
 import type { JobResourceClaim } from "../autonomy/models";
 import type { EffectFence } from "../services/effect-runner";
 import type { TelegramAgentStore } from "../storage/store";
+import { navigatorClaimContract } from "./claim-contracts";
 import type {
   NavigatorArtifactBinding,
   NavigatorProposalRecord,
@@ -41,16 +41,6 @@ export const NAVIGATOR_EFFECT_KINDS = [
 
 export type NavigatorEffectKind = (typeof NAVIGATOR_EFFECT_KINDS)[number];
 type NavigatorJob = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
-
-type NavigatorRequiredResourceClaim = Readonly<Pick<JobResourceClaim, "resourceKind" | "resourceKey">>;
-
-const NAVIGATOR_REQUIRED_RESOURCE_CLAIMS: Readonly<
-  Record<NavigatorEffectKind, (job: NavigatorJob) => readonly NavigatorRequiredResourceClaim[]>
-> = {
-  run_navigator_skill: (job) => [{ resourceKind: "project", resourceKey: projectResourceKey(job.projectId ?? "") }],
-  run_navigator_ticket_worker: (job) => [{ resourceKind: "project", resourceKey: projectResourceKey(job.projectId ?? "") }],
-  run_navigator_release: (job) => [{ resourceKind: "project", resourceKey: projectResourceKey(job.projectId ?? "") }],
-};
 
 export type NavigatorEffectOutcome =
   | Readonly<{ outcome: "completed"; receipt: NavigatorEffectReceipt }>
@@ -125,25 +115,6 @@ export class NavigatorEffectLeaseCancellationError extends Error {
     super(message);
     this.name = "NavigatorEffectLeaseCancellationError";
   }
-}
-
-export function createNavigatorCompatibilityAdapter(
-  kind: NavigatorEffectKind,
-  processLeased: (effect: StoredEffect, fence: EffectFence, signal: AbortSignal) => Promise<boolean>,
-): NavigatorEffectAdapter {
-  return {
-    kind,
-    execute: async (context) => {
-      const processed = await processLeased(
-        context.effect,
-        { ...context.fence, signal: context.signal },
-        context.signal,
-      );
-      return processed
-        ? { outcome: "transient", reason: "navigator compatibility adapter settled directly" }
-        : { outcome: "transient", reason: "navigator compatibility adapter did not settle" };
-    },
-  };
 }
 
 const TERMINAL_JOB_STATES = new Set<Job["state"]>([
@@ -388,8 +359,14 @@ export class NavigatorEffectProtocol {
     const job = this.dependencies.store.getJob(effect.jobId);
     const jobReason = this.jobValidation(job);
     if (jobReason !== null || job === null) return { reason: jobReason ?? "Navigator effect job is unavailable" };
+    const ticketContext = effect.kind === "run_navigator_ticket_worker"
+      ? this.ticketContextForAdmission(effect, fence, now)
+      : null;
+    if (effect.kind === "run_navigator_ticket_worker" && ticketContext === null) {
+      return { reason: "Navigator ticket work-artifact claim is stale or unavailable" };
+    }
     const resourceClaims = this.dependencies.store.listCurrentHeldResourceClaims(job.id, 128);
-    if (!this.claimsAreCurrent(effect, job, resourceClaims, fence, now)) {
+    if (!this.claimsAreCurrent(effect, job, resourceClaims, ticketContext, fence, now)) {
       return { reason: "Navigator effect resource claim is absent, unrelated, or stale" };
     }
     if (job.projectId === null || !this.dependencies.store.admitNavigatorCapabilityEvidence({
@@ -402,6 +379,21 @@ export class NavigatorEffectProtocol {
     })) return { reason: "Navigator capability evidence is absent, stale, denied, or not exact" };
     const capabilityEvidence = this.dependencies.store.getNavigatorCapabilityEvidence(effect.idempotencyKey);
     return { job, resourceClaims, capabilityEvidence };
+  }
+
+  private ticketContextForAdmission(
+    effect: StoredEffect,
+    fence: EffectFence,
+    now: number,
+  ): NavigatorTicketAttemptContext | null {
+    const attemptId = payloadIdentifier(effect, "attemptId");
+    return attemptId === null ? null : this.dependencies.store.getNavigatorTicketAttemptContext({
+      attemptId,
+      effectIdempotencyKey: effect.idempotencyKey,
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now,
+    });
   }
 
   private leaseValidation(effect: StoredEffect, fence: EffectFence, now: number): string | null {
@@ -433,16 +425,21 @@ export class NavigatorEffectProtocol {
     effect: StoredEffect,
     job: NavigatorJob,
     claims: readonly JobResourceClaim[],
+    ticketContext: NavigatorTicketAttemptContext | null,
     fence: EffectFence,
     now: number,
   ): boolean {
-    if (!isNavigatorEffectKind(effect.kind) || job.projectId === null) return false;
-    const required = NAVIGATOR_REQUIRED_RESOURCE_CLAIMS[effect.kind](job);
-    return claims.length === required.length && claims.every((claim) =>
-      this.claimIsCurrent(claim, fence, now) && required.some((requirement) =>
+    if (!isNavigatorEffectKind(effect.kind)) return false;
+    const contract = navigatorClaimContract(effect.kind, job);
+    if (contract === null || claims.length !== contract.resourceClaims.length) return false;
+    const resourceClaimsAreCurrent = claims.every((claim) =>
+      this.claimIsCurrent(claim, fence, now) && contract.resourceClaims.some((requirement) =>
         requirement.resourceKind === claim.resourceKind && requirement.resourceKey === claim.resourceKey)) &&
-      required.every((requirement) => claims.some((claim) =>
+      contract.resourceClaims.every((requirement) => claims.some((claim) =>
         requirement.resourceKind === claim.resourceKind && requirement.resourceKey === claim.resourceKey));
+    const ticketClaimIsCurrent = !contract.requiresTicketWorkArtifact ||
+      (ticketContext !== null && this.claimIsCurrent(ticketContext.claim, fence, now));
+    return resourceClaimsAreCurrent && ticketClaimIsCurrent;
   }
 
   private prepareWorkflowContext(
@@ -558,7 +555,11 @@ export class NavigatorEffectProtocol {
     return null;
   }
 
-  private claimIsCurrent(claim: JobResourceClaim, fence: EffectFence, now: number): boolean {
+  private claimIsCurrent(
+    claim: Readonly<{ state: string; ownerId: string; generation: number; leaseExpiresAt: number }>,
+    fence: EffectFence,
+    now: number,
+  ): boolean {
     return claim.state === "held" && claim.ownerId === fence.ownerId && claim.generation === fence.generation &&
       claim.leaseExpiresAt > now;
   }

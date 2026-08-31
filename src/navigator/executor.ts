@@ -8,6 +8,7 @@ import type {
   NavigatorSkillAttempt,
   NavigatorSnapshot,
 } from "./models";
+import type { NavigatorSkillReceipt } from "./effect-contracts";
 import { NAVIGATOR_RESEARCH_STEP_CONTRACT } from "./models";
 import {
   NavigatorPublicationDriftError,
@@ -224,6 +225,16 @@ export class NavigatorWorkflowExecutor {
         effectIdempotencyKey: effect.idempotencyKey,
         observedExternalStateDigest: skillRun.observedExternalStateDigest,
         result: durableResult?.result ?? skillRun.result,
+        ...(policyFailureReason === undefined ? {
+          receipt: {
+            kind: "run_navigator_skill" as const,
+            effectIdempotencyKey: effect.idempotencyKey,
+            attemptId: attempt.id,
+            resource: skillRun.resource,
+            observedExternalStateDigest: skillRun.observedExternalStateDigest,
+            result: durableResult?.result ?? skillRun.result,
+          } satisfies NavigatorSkillReceipt,
+        } : {}),
         ...(publication === null ? {} : { publishedArtifactBindings: publication.artifactBindings }),
         ...(publication === null ? {} : { reconciledArtifactIds: publication.reconciledArtifactIds }),
         ...(policyFailureReason === undefined ? {} : { policyFailureReason }),

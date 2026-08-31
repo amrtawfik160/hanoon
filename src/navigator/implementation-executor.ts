@@ -1020,14 +1020,32 @@ export class NavigatorImplementationExecutor {
         throw new Error("navigator ticket worker returned a different resource");
       }
       const gitObservation = await this.observeAttemptGit(attempt, run.result);
-      this.settleAttempt({
+      const parsedObservation = navigatorGitObservationSchema.safeParse(gitObservation);
+      const parsedResult = navigatorTicketWorkerResultSchema.safeParse(run.result);
+      const exactHeadSha = parsedObservation.success
+        ? parsedObservation.data.headSha
+        : parsedResult.success && parsedResult.data.kind === "implementation_result"
+          ? parsedResult.data.headSha
+          : parsedResult.success && parsedResult.data.kind === "code_review_result"
+            ? parsedResult.data.reviewedHeadSha
+            : attempt.workOrder.baseHeadSha;
+      const settled = this.settleNavigatorTicketWorkerAttempt({
         attemptId: attempt.id,
-        effectKey: effect.idempotencyKey,
-        rawResult: run.result,
-        rawGitObservation: gitObservation,
-        fence,
+        effectIdempotencyKey: effect.idempotencyKey,
+        receipt: {
+          kind: "run_navigator_ticket_worker",
+          effectIdempotencyKey: effect.idempotencyKey,
+          attemptId: attempt.id,
+          resource: run.resource,
+          exactHeadSha,
+          result: run.result,
+          gitObservation: parsedObservation.success ? parsedObservation.data : null,
+        },
+        ownerId: fence.ownerId,
+        generation: fence.generation,
         now: this.dependencies.clock.now(),
       });
+      if (settled === null) throw new Error("navigator ticket settlement fence was lost");
     } catch (error) {
       if (error instanceof NavigatorTicketWorkerUnavailableError) {
         try {

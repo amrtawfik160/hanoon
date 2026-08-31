@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
-import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
+import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../src/autonomy/models";
 import { CAPABILITY_BY_ID, CAPABILITY_GRAPH_DIGEST, CAPABILITY_REGISTRY_DIGEST } from "../src/capabilities/catalog";
 import {
   assessGuardEnvelope,
@@ -17,9 +17,11 @@ import { NavigatorImplementationExecutor } from "../src/navigator/implementation
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import {
-  createNavigatorCompatibilityAdapter,
   NavigatorEffectProtocol,
+  type NavigatorEffectContext,
+  type NavigatorEffectOutcome,
 } from "../src/navigator/effect-protocol";
+import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-runtime";
 import {
   ALL_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
@@ -31,6 +33,7 @@ import {
   NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
 } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
+import { runJobExecutorService } from "../src/services/job-executor-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture, sha } from "./helpers";
@@ -355,6 +358,100 @@ function fence(fixture: OwnedFixture) {
   };
 }
 
+function releaseReceipt(context: NavigatorEffectContext): NavigatorEffectOutcome {
+  if (context.kind !== "run_navigator_release") {
+    return { outcome: "permanent", reason: "release receipt received another effect kind" };
+  }
+  return {
+    outcome: "completed",
+    receipt: {
+      kind: "run_navigator_release",
+      effectIdempotencyKey: context.effect.idempotencyKey,
+      attemptId: context.attempt.id,
+      resource: { kind: "environment", id: "env_job_42" },
+      number: 42,
+      url: "https://github.com/acme/cyndra/pull/42",
+      environmentId: "env_job_42",
+    },
+  };
+}
+
+function insertProjectClaim(fixture: OwnedFixture): void {
+  const now = fixture.now();
+  for (const requirement of releaseClaimRequirements(fixture)) {
+    fixture.database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
+    ).run(
+      fixture.job.id,
+      requirement.resourceKey,
+      requirement.resourceKind,
+      "executor",
+      fixture.leaseGeneration,
+      130_000,
+      now,
+      now,
+    );
+  }
+}
+
+type ClaimCase = "empty" | "unrelated" | "wrong key" | "wrong kind" | "wrong owner" | "wrong generation" | "expired" | "valid exact";
+const CLAIM_CASES: readonly ClaimCase[] = [
+  "empty", "unrelated", "wrong key", "wrong kind", "wrong owner", "wrong generation", "expired", "valid exact",
+];
+
+function releaseClaimRequirements(fixture: OwnedFixture): readonly {
+  resourceKind: "project" | "repository_merge" | "production_target";
+  resourceKey: string;
+}[] {
+  const policy = fixture.store.getJob(fixture.job.id)?.policy;
+  if (!policy) throw new Error("release claim matrix policy is missing");
+  return [
+    { resourceKind: "project", resourceKey: projectResourceKey(policy.projectId) },
+    { resourceKind: "repository_merge", resourceKey: repositoryMergeResourceKey(policy.githubRepository) },
+    ...(policy.production === undefined ? [] : [{
+      resourceKind: "production_target" as const,
+      resourceKey: productionResourceKey(policy),
+    }]),
+  ];
+}
+
+function configureReleaseClaimCase(
+  fixture: OwnedFixture,
+  effectIdempotencyKey: string,
+  claimCase: ClaimCase,
+  now: number,
+): void {
+  const requirements = releaseClaimRequirements(fixture);
+  if (claimCase !== "empty") {
+    for (const [index, requirement] of requirements.entries()) {
+      const resourceKind = claimCase === "wrong kind"
+        ? requirement.resourceKind === "project" ? "repository_merge" : "project"
+        : requirement.resourceKind;
+      const resourceKey = claimCase === "unrelated"
+        ? `unrelated:${String(index)}`
+        : claimCase === "wrong key" && index === 0 ? `${requirement.resourceKey}:other` : requirement.resourceKey;
+      const ownerId = claimCase === "wrong owner" ? "release-matrix-other" : "executor";
+      const generation = claimCase === "wrong generation" ? 2 : 1;
+      const expiresAt = claimCase === "expired" || claimCase === "valid exact" ? now : now + 30_000;
+      fixture.database.prepare(
+        `INSERT INTO job_resource_claims (
+           job_id, resource_key, resource_kind, state, owner_id, generation,
+           lease_expires_at, acquired_at, renewed_at
+         ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
+      ).run(fixture.job.id, resourceKey, resourceKind, ownerId, generation, expiresAt, now, now);
+    }
+  }
+  if (claimCase === "valid exact") {
+    fixture.database.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = 'executor', lease_generation = 1, lease_expires_at = ?
+        WHERE idempotency_key = ?`,
+    ).run(now, effectIdempotencyKey);
+  }
+}
+
 function failedStage(
   phase: "deploy" | "canary",
   rollback: "pass" | "fail" | "missing" | "timed_out",
@@ -512,15 +609,18 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
     expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.at(-1));
+    const protocolOffset = NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
     [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(index + 2))).toBe(migration);
+      expect(ALL_MIGRATIONS.at(-(protocolOffset + index + 1))).toBe(migration);
     });
     const stateUpgradeOffset = MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 6))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 1))).toBe(
+      NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1),
+    );
+    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");
@@ -584,20 +684,7 @@ describe("navigator exact-head release", () => {
     expect(fixture.store.listEffectsForJob(fixture.job.id).filter((effect) => effect.kind === "run_navigator_release"))
       .toHaveLength(1);
 
-    fixture.database.prepare(
-      `INSERT INTO job_resource_claims (
-         job_id, resource_key, resource_kind, state, owner_id, generation,
-         lease_expires_at, acquired_at, renewed_at
-       ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?)`,
-    ).run(
-      fixture.job.id,
-      projectResourceKey("proj_1"),
-      "executor",
-      fixture.leaseGeneration,
-      130_000,
-      fixture.now(),
-      fixture.now(),
-    );
+    insertProjectClaim(fixture);
 
     const { executor, publish } = releaseExecutor(fixture);
     const protocol = new NavigatorEffectProtocol({
@@ -612,10 +699,7 @@ describe("navigator exact-head release", () => {
           kind: "run_navigator_ticket_worker",
           execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
         },
-        createNavigatorCompatibilityAdapter(
-          "run_navigator_release",
-          (effect, releaseFence, signal) => executor.processLeased(effect, releaseFence, signal),
-        ),
+        createNavigatorReleaseEffectAdapter(executor),
       ],
     });
     expect(await protocol.processOne(fence(fixture), new AbortController().signal)).toBe(true);
@@ -635,6 +719,143 @@ describe("navigator exact-head release", () => {
     });
     expect(reopened.listEffectsForJob(fixture.job.id).find((effect) => effect.kind === "run_navigator_release"))
       .toMatchObject({ status: "done" });
+  });
+
+  it("does not complete a release effect when the adapter omits its receipt", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release receipt test effect was not stored");
+    insertProjectClaim(fixture);
+    const adapter = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({
+      outcome: "completed",
+      receipt: undefined as never,
+    }));
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_release", execute: adapter },
+      ],
+    });
+
+    await expect(protocol.processOne(fence(fixture), new AbortController().signal)).resolves.toBe(true);
+
+    expect(adapter).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "dead" });
+  });
+
+  it("rolls back a typed release receipt when receipt persistence fails", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release rollback effect was not stored");
+    insertProjectClaim(fixture);
+    fixture.database.exec(
+      `CREATE TRIGGER navigator_test_fail_release_receipt
+       BEFORE INSERT ON navigator_effect_receipts
+       WHEN NEW.kind = 'run_navigator_release'
+       BEGIN SELECT RAISE(ABORT, 'release receipt fault'); END`,
+    );
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_release", execute: async (context) => releaseReceipt(context) },
+      ],
+    });
+
+    await expect(protocol.processOne(fence(fixture), new AbortController().signal)).resolves.toBe(true);
+
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "failed" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "implementing" });
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
+  });
+
+  it("reconciles an ambiguous release outcome with a typed receipt", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release reconciliation effect was not stored");
+    insertProjectClaim(fixture);
+    const execute = vi.fn(async () => ({ outcome: "ambiguous" as const, reason: "publish receipt was lost" }));
+    const reconcile = vi.fn(async (context: NavigatorEffectContext) => releaseReceipt(context));
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_release", execute, reconcile },
+      ],
+    });
+
+    await expect(protocol.processOne(fence(fixture), new AbortController().signal)).resolves.toBe(true);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(fixture.database.prepare(
+      "SELECT kind FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ kind: "run_navigator_release" });
+  });
+
+  it.each(CLAIM_CASES)("runs the release executor only with the exact claim set (%s)", async (claimCase) => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release claim matrix effect was not stored");
+    const now = fixture.now();
+    configureReleaseClaimCase(fixture, accepted.effectIdempotencyKey, claimCase, now);
+    if (!fixture.store.releaseExecutorLease("executor", fixture.leaseGeneration, now)) {
+      throw new Error("release claim matrix predecessor lease was not released");
+    }
+    const execute = vi.fn(async (context: NavigatorEffectContext) => releaseReceipt(context));
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 30,
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_release", execute },
+      ],
+    });
+    const abort = new AbortController();
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(execute).toHaveBeenCalledTimes(claimCase === "valid exact" ? 1 : 0);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({
+      status: claimCase === "valid exact" ? "done" : "pending",
+    });
+    if (claimCase === "valid exact") {
+      const heldClaims = fixture.store.listCurrentHeldResourceClaims(fixture.job.id, 10);
+      expect(heldClaims.map((claim) => `${claim.resourceKind}:${claim.resourceKey}`).sort()).toEqual(
+        releaseClaimRequirements(fixture).map((claim) => `${claim.resourceKind}:${claim.resourceKey}`).sort(),
+      );
+    }
   });
 
   it("auto-authorizes a shipped navigator merge without a standing grant and re-derives after head drift", async () => {

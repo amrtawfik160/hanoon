@@ -4058,6 +4058,16 @@ export interface TelegramAgentStore {
     generation: number;
     now: number;
   }): boolean;
+  reauthorizeNavigatorCompatibilityEffect(input: {
+    effectIdempotencyKey: string;
+    attemptId: string;
+    profileId: string;
+    profileRevision: number;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): boolean;
   getNavigatorTicketAttemptContext(input: {
     attemptId: string;
     effectIdempotencyKey: string;
@@ -12721,6 +12731,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.admitNavigatorCapabilityEvidence(input);
   }
 
+  public reauthorizeNavigatorCompatibilityEffect(input: {
+    effectIdempotencyKey: string;
+    attemptId: string;
+    profileId: string;
+    profileRevision: number;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): boolean {
+    return this.navigatorRepository.reauthorizeNavigatorCompatibilityEffect(input);
+  }
+
   public getNavigatorTicketAttemptContext(input: {
     attemptId: string;
     effectIdempotencyKey: string;
@@ -12778,22 +12801,20 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (!Number.isSafeInteger(input.number) || input.number < 1) throw new TypeError("release pull request number is invalid");
     const url = assertSafeExternalHttpsUrl(input.url, "navigator release pull request URL");
     if (!input.environmentId) throw new TypeError("navigator release environment identity is required");
-    const parsedReceipt = input.receipt === undefined
-      ? undefined
-      : navigatorReleaseReceiptSchema.safeParse(input.receipt);
-    if (parsedReceipt !== undefined && !parsedReceipt.success) return false;
-    const receipt = parsedReceipt?.data;
+    const parsedReceipt = navigatorReleaseReceiptSchema.safeParse(input.receipt);
+    if (!parsedReceipt.success) return false;
+    const receipt = parsedReceipt.data;
     const settle = this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const effectRow = this.effectByKey(input.effectIdempotencyKey);
       if (!effectRow || !this.navigatorReleaseEffectIsCurrent(effectRow, input)) return false;
-      if (receipt !== undefined && !this.releaseReceiptMatches(receipt, effectRow, input, url)) return false;
+      if (!this.releaseReceiptMatches(receipt, effectRow, input, url)) return false;
       const current = this.readJobById(effectRow.job_id);
       if (!current || current.cancelRequestedAt !== null || current.state === "cancelled") return false;
       if (current.state === "implementing" && !this.applyNavigatorReleaseStart(current, input, url)) return false;
-      if (receipt !== undefined) this.recordNavigatorReleaseReceipt(receipt, effectRow.job_id, input);
+      this.recordNavigatorReleaseReceipt(receipt, effectRow.job_id, input);
       const completed = this.completeNavigatorReleaseEffect(effectRow, input);
-      if (!completed && receipt !== undefined) throw new Error("navigator release effect lease changed before receipt settlement");
+      if (!completed) throw new Error("navigator release effect lease changed before receipt settlement");
       return completed;
     });
     return settle.immediate();
@@ -15073,6 +15094,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         effect.lease_generation !== input.generation || effect.lease_expires_at === null || effect.lease_expires_at <= input.now) {
         return false;
       }
+      const ticketClaim = effect.kind === "run_navigator_ticket_worker"
+        ? this.navigatorTicketClaimForFence(input.jobId, input.effectIdempotencyKey)
+        : null;
+      if (effect.kind === "run_navigator_ticket_worker" && (
+        ticketClaim === null || ticketClaim.state !== "held" || ticketClaim.owner_id !== input.ownerId ||
+        ticketClaim.generation !== input.generation || ticketClaim.lease_expires_at <= input.now
+      )) return false;
       if (effect.kind === "deploy_production" || effect.kind === "verify_production") {
         const job = this.readJobById(input.jobId);
         const admission = this.autonomyRepository.getAdmission(input.jobId);
@@ -15107,27 +15135,70 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           input.now,
         );
       if (updatedEffect.changes !== 1) return false;
-      if (claims.length === 0) return true;
-      const renewedClaims = this.db
-        .prepare(
-          `UPDATE job_resource_claims SET lease_expires_at = ?, renewed_at = ?
-             WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
-               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-        )
-        .run(
-          input.now + input.leaseMs,
-          input.now,
-          input.jobId,
-          input.ownerId,
-          input.generation,
-          input.ownerId,
-          input.generation,
-          input.now,
-        );
-      return renewedClaims.changes === claims.length;
+      if (claims.length > 0) {
+        const renewedClaims = this.db
+          .prepare(
+            `UPDATE job_resource_claims SET lease_expires_at = ?, renewed_at = ?
+               WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+                 AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                   AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+          )
+          .run(
+            input.now + input.leaseMs,
+            input.now,
+            input.jobId,
+            input.ownerId,
+            input.generation,
+            input.ownerId,
+            input.generation,
+            input.now,
+          );
+        if (renewedClaims.changes !== claims.length) {
+          throw new Error("job resource claim changed during operation fence renewal");
+        }
+      }
+      if (ticketClaim !== null && this.db.prepare(
+        `UPDATE work_artifact_claims SET lease_expires_at = ?, renewed_at = ?
+           WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ? AND lease_expires_at > ?`,
+      ).run(
+        input.now + input.leaseMs,
+        input.now,
+        ticketClaim.claim_id,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes !== 1) {
+        throw new Error("ticket work-artifact claim changed during operation fence renewal");
+      }
+      return true;
     });
     return renew.immediate();
+  }
+
+  private navigatorTicketClaimForFence(
+    jobId: string,
+    effectIdempotencyKey: string,
+  ): Readonly<{
+    claim_id: number;
+    state: string;
+    owner_id: string;
+    generation: number;
+    lease_expires_at: number;
+  }> | null {
+    const row = this.db.prepare(
+      `SELECT claim.id AS claim_id, claim.state, claim.owner_id, claim.generation, claim.lease_expires_at
+         FROM navigator_ticket_worker_attempts AS attempt
+         JOIN navigator_ticket_slices AS slice ON slice.id = attempt.slice_id
+         JOIN work_artifact_claims AS claim ON claim.id = slice.claim_id
+        WHERE attempt.job_id = ? AND attempt.effect_idempotency_key = ?`,
+    ).get(jobId, effectIdempotencyKey) as Readonly<{
+      claim_id: number;
+      state: string;
+      owner_id: string;
+      generation: number;
+      lease_expires_at: number;
+    }> | undefined;
+    return row ?? null;
   }
 
   public assertProductionStageFence(input: ProductionStageFenceInput): boolean {

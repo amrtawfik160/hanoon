@@ -3923,7 +3923,6 @@ SELECT observation.observation_id, observation.job_id, observation.authority_id,
    AND boundary.authority_revision = observation.authority_revision
    AND boundary.affected_effect_idempotency_key = observation.affected_effect_idempotency_key
  WHERE boundary.status <> 'revoked';
-`, String.raw`
 CREATE TRIGGER policy_boundary_observations_require_live_executor_fence
 BEFORE INSERT ON policy_boundary_observations
 WHEN EXISTS (
@@ -4232,6 +4231,86 @@ BEGIN SELECT RAISE(ABORT, 'navigator effect receipts are append-only'); END;
 CREATE TRIGGER navigator_effect_receipts_append_only_delete
 BEFORE DELETE ON navigator_effect_receipts
 BEGIN SELECT RAISE(ABORT, 'navigator effect receipts are append-only'); END;
+`, String.raw`
+CREATE TABLE navigator_effect_compatibility (
+  effect_idempotency_key TEXT PRIMARY KEY REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('run_navigator_skill', 'run_navigator_ticket_worker', 'run_navigator_release')),
+  attempt_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state = 'pending'),
+  reason_code TEXT NOT NULL CHECK (reason_code = 'preceding_schema_capability_evidence_missing'),
+  decoder_revision INTEGER NOT NULL CHECK (decoder_revision = 1),
+  created_at INTEGER NOT NULL,
+  UNIQUE (job_id, attempt_id)
+);
+CREATE TRIGGER navigator_effect_compatibility_append_only_update
+BEFORE UPDATE ON navigator_effect_compatibility
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility records are append-only'); END;
+CREATE TRIGGER navigator_effect_compatibility_append_only_delete
+BEFORE DELETE ON navigator_effect_compatibility
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility records are append-only'); END;
+
+INSERT OR IGNORE INTO navigator_effect_compatibility (
+  effect_idempotency_key, job_id, kind, attempt_id, state, reason_code,
+  decoder_revision, created_at
+)
+SELECT effect.idempotency_key, effect.job_id, effect.kind, attempt.id,
+       'pending', 'preceding_schema_capability_evidence_missing', 1, effect.created_at
+  FROM effects AS effect
+  JOIN navigator_skill_attempts AS attempt
+    ON attempt.effect_idempotency_key = effect.idempotency_key
+ WHERE effect.kind = 'run_navigator_skill'
+   AND effect.status IN ('pending', 'leased', 'failed')
+   AND attempt.capability_profile_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM navigator_effect_capability_evidence AS evidence
+      WHERE evidence.effect_idempotency_key = effect.idempotency_key
+   )
+UNION ALL
+SELECT effect.idempotency_key, effect.job_id, effect.kind, attempt.id,
+       'pending', 'preceding_schema_capability_evidence_missing', 1, effect.created_at
+  FROM effects AS effect
+  JOIN navigator_ticket_worker_attempts AS attempt
+    ON attempt.effect_idempotency_key = effect.idempotency_key
+ WHERE effect.kind = 'run_navigator_ticket_worker'
+   AND effect.status IN ('pending', 'leased', 'failed')
+   AND attempt.capability_profile_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM navigator_effect_capability_evidence AS evidence
+      WHERE evidence.effect_idempotency_key = effect.idempotency_key
+   )
+UNION ALL
+SELECT effect.idempotency_key, effect.job_id, effect.kind, attempt.id,
+       'pending', 'preceding_schema_capability_evidence_missing', 1, effect.created_at
+  FROM effects AS effect
+  JOIN navigator_release_attempts AS attempt
+    ON attempt.effect_idempotency_key = effect.idempotency_key
+ WHERE effect.kind = 'run_navigator_release'
+   AND effect.status IN ('pending', 'leased', 'failed')
+   AND attempt.capability_profile_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM navigator_effect_capability_evidence AS evidence
+      WHERE evidence.effect_idempotency_key = effect.idempotency_key
+   );
+`, String.raw`
+CREATE TABLE navigator_effect_compatibility_resolutions (
+  effect_idempotency_key TEXT PRIMARY KEY REFERENCES navigator_effect_compatibility(effect_idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('run_navigator_skill', 'run_navigator_ticket_worker', 'run_navigator_release')),
+  attempt_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL REFERENCES capability_profiles(id),
+  profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),
+  owner_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
+  UNIQUE (job_id, attempt_id)
+);
+CREATE TRIGGER navigator_effect_compatibility_resolutions_append_only_update
+BEFORE UPDATE ON navigator_effect_compatibility_resolutions
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility resolutions are append-only'); END;
+CREATE TRIGGER navigator_effect_compatibility_resolutions_append_only_delete
+BEFORE DELETE ON navigator_effect_compatibility_resolutions
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility resolutions are append-only'); END;
 `] as const;
 
 export const NAVIGATOR_PROMOTION_MIGRATIONS = [String.raw`

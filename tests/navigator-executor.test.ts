@@ -25,6 +25,7 @@ import {
   type NavigatorEffectOutcome,
 } from "../src/navigator/effect-protocol";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { runJobExecutorService } from "../src/services/job-executor-service";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
 
@@ -297,43 +298,135 @@ function executorLeaseWithProjectClaim(
   return { generation: lease.generation };
 }
 
-const REQUIRED_CLAIMS_BY_EFFECT_KIND = {
-  run_navigator_skill: [{ resourceKind: "project", resourceKey: "project:proj_1:pipeline" }],
-  run_navigator_ticket_worker: [{ resourceKind: "project", resourceKey: "project:proj_1:pipeline" }],
-  run_navigator_release: [{ resourceKind: "project", resourceKey: "project:proj_1:pipeline" }],
-} as const;
+type CapabilityEvidenceCase =
+  | "valid"
+  | "missing"
+  | "denied"
+  | "stale"
+  | "wrong descriptor"
+  | "wrong profile revision"
+  | "wrong project"
+  | "wrong operation";
+
+const CAPABILITY_EVIDENCE_CASES: readonly CapabilityEvidenceCase[] = [
+  "valid",
+  "missing",
+  "denied",
+  "stale",
+  "wrong descriptor",
+  "wrong profile revision",
+  "wrong project",
+  "wrong operation",
+];
+
+function prepareCapabilityExecutor(value: Fixture, now: number): void {
+  const predecessor = executorLeaseWithProjectClaim(value, "navigator-capability-predecessor", now, 1_000);
+  value.db.prepare(
+    `UPDATE job_resource_claims SET lease_expires_at = ?
+      WHERE job_id = ? AND resource_kind = 'project' AND resource_key = 'project:proj_1:pipeline'`,
+  ).run(now, value.job.id);
+  value.db.prepare(
+    `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?, lease_expires_at = ?
+      WHERE job_id = ? AND kind = 'run_navigator_skill'`,
+  ).run("navigator-capability-predecessor", predecessor.generation, now, value.job.id);
+  if (!value.store.releaseExecutorLease("navigator-capability-predecessor", predecessor.generation, now)) {
+    throw new Error("navigator capability predecessor lease was not released");
+  }
+}
+
+function corruptCapabilityEvidence(
+  value: Fixture,
+  accepted: Readonly<{ effectIdempotencyKey: string; attemptId: string }>,
+  testCase: Exclude<CapabilityEvidenceCase, "valid">,
+): void {
+  const attempt = value.store.getNavigatorSkillAttempt(accepted.attemptId);
+  if (!attempt) throw new Error("navigator capability matrix attempt was not stored");
+  const profile = value.store.getLatestCapabilityProfile("worker_attempt", attempt.id);
+  if (!profile) throw new Error("navigator capability matrix profile was not stored");
+  const evidence = value.store.getNavigatorCapabilityEvidence(accepted.effectIdempotencyKey)[0];
+  if (!evidence && testCase !== "missing") throw new Error("navigator capability matrix evidence was not stored");
+  if (testCase === "missing") {
+    value.db.exec("DROP TRIGGER navigator_effect_capability_evidence_append_only_delete");
+    value.db.prepare("DELETE FROM navigator_effect_capability_evidence WHERE effect_idempotency_key = ?")
+      .run(accepted.effectIdempotencyKey);
+  } else if (testCase === "denied") {
+    value.store.appendCapabilityReceipt({
+      profileId: profile.id,
+      capabilityId: attempt.skillId,
+      capabilityKind: "skill",
+      descriptorDigest: attempt.descriptorDigest,
+      eventType: "denied",
+      reasonCode: "matrix_denied",
+      mandatory: true,
+      evidenceRefs: ["test:capability-matrix"],
+      now: 1_100,
+    });
+  } else if (testCase === "stale") {
+    value.db.prepare(
+      "UPDATE navigator_skill_attempts SET capability_profile_revision = ? WHERE id = ?",
+    ).run(profile.revision + 1, attempt.id);
+  } else if (testCase === "wrong descriptor") {
+    value.db.prepare(
+      "UPDATE navigator_effect_capability_evidence SET descriptor_digest = ? WHERE effect_idempotency_key = ?",
+    ).run("d".repeat(64), accepted.effectIdempotencyKey);
+  } else if (testCase === "wrong profile revision") {
+    value.db.prepare(
+      "UPDATE navigator_effect_capability_evidence SET profile_revision = ? WHERE effect_idempotency_key = ?",
+    ).run(profile.revision + 1, accepted.effectIdempotencyKey);
+  } else if (testCase === "wrong project") {
+    value.db.prepare(
+      "UPDATE navigator_effect_capability_evidence SET project_id = ? WHERE effect_idempotency_key = ?",
+    ).run("proj_other", accepted.effectIdempotencyKey);
+  } else {
+    value.db.prepare(
+      "UPDATE navigator_effect_capability_evidence SET operation = 'prototype_write' WHERE effect_idempotency_key = ?",
+    ).run(accepted.effectIdempotencyKey);
+  }
+}
+
+async function runCapabilityExecutor(
+  value: Fixture,
+  protocol: NavigatorEffectProtocol,
+  now: number,
+): Promise<void> {
+  const abort = new AbortController();
+  await runJobExecutorService({
+    store: value.store,
+    clock: { now: () => now },
+    leaseMs: 1_000,
+    navigatorEffects: protocol,
+    effectRunnerFactory: () => ({ run: async () => undefined }),
+    waitForWork: async () => abort.abort(),
+    releaseOnShutdown: true,
+  }, abort.signal);
+}
 
 type ClaimCase = "empty" | "unrelated" | "wrong key" | "wrong kind" | "wrong owner" | "wrong generation" | "expired" | "valid exact";
 const CLAIM_CASES: readonly ClaimCase[] = [
   "empty", "unrelated", "wrong key", "wrong kind", "wrong owner", "wrong generation", "expired", "valid exact",
 ];
-const CLAIM_MATRIX = (Object.keys(REQUIRED_CLAIMS_BY_EFFECT_KIND) as Array<keyof typeof REQUIRED_CLAIMS_BY_EFFECT_KIND>)
-  .flatMap((effectKind) => CLAIM_CASES.map((claimCase) => [effectKind, claimCase] as const));
 
 function insertClaimMatrixCase(
   value: Fixture,
-  effectKind: keyof typeof REQUIRED_CLAIMS_BY_EFFECT_KIND,
   claimCase: ClaimCase,
   ownerId: string,
   generation: number,
   now: number,
 ): void {
   if (claimCase === "empty") return;
-  for (const required of REQUIRED_CLAIMS_BY_EFFECT_KIND[effectKind]) {
-    const resourceKind = claimCase === "wrong kind" ? "repository_merge" : required.resourceKind;
-    const resourceKey = claimCase === "unrelated"
-      ? "project:unrelated:pipeline"
-      : claimCase === "wrong key" ? "project:proj_1:other" : required.resourceKey;
-    const claimOwner = claimCase === "wrong owner" ? `${ownerId}-other` : ownerId;
-    const claimGeneration = claimCase === "wrong generation" ? generation + 1 : generation;
-    const expiresAt = claimCase === "expired" ? now : now + 30_000;
-    value.db.prepare(
-      `INSERT INTO job_resource_claims (
-         job_id, resource_key, resource_kind, state, owner_id, generation,
-         lease_expires_at, acquired_at, renewed_at, released_at, release_reason
-       ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
-    ).run(value.job.id, resourceKey, resourceKind, claimOwner, claimGeneration, expiresAt, now, now);
-  }
+  const resourceKind = claimCase === "wrong kind" ? "repository_merge" : "project";
+  const resourceKey = claimCase === "unrelated"
+    ? "project:unrelated:pipeline"
+    : claimCase === "wrong key" ? "project:proj_1:other" : "project:proj_1:pipeline";
+  const claimOwner = claimCase === "wrong owner" ? `${ownerId}-other` : ownerId;
+  const claimGeneration = claimCase === "wrong generation" ? generation + 1 : generation;
+  const expiresAt = claimCase === "expired" ? now : now + 30_000;
+  value.db.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+     ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+  ).run(value.job.id, resourceKey, resourceKind, claimOwner, claimGeneration, expiresAt, now, now);
 }
 
 describe("navigator-v1 durable executor slice", () => {
@@ -1169,13 +1262,53 @@ describe("navigator-v1 durable executor slice", () => {
       ownerId: "navigator-claim-missing",
       generation: lease.generation,
       signal: new AbortController().signal,
-    }, new AbortController().signal)).resolves.toBe(true);
+    }, new AbortController().signal)).resolves.toBe(false);
 
     expect(execute).not.toHaveBeenCalled();
-    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({ status: "dead" });
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({ status: "pending" });
   });
 
-  it.each(CLAIM_MATRIX)("requires the exact %s claim set (%s)", async (effectKind, claimCase) => {
+  it.each(CAPABILITY_EVIDENCE_CASES)(
+    "admits only exact persisted capability evidence (%s)",
+    async (testCase) => {
+      const value = fixture();
+      const accepted = await executor(value).proposeNext({
+        jobId: value.job.id,
+        externalStateDigest: "e".repeat(64),
+        evidenceRefs: [],
+      });
+      if (!accepted.attemptId || !accepted.effectIdempotencyKey) {
+        throw new Error("navigator capability matrix admission was incomplete");
+      }
+      if (testCase !== "valid") corruptCapabilityEvidence(value, {
+        effectIdempotencyKey: accepted.effectIdempotencyKey,
+        attemptId: accepted.attemptId,
+      }, testCase);
+      prepareCapabilityExecutor(value, 1_100);
+      const contexts: NavigatorEffectContext[] = [];
+      const execute = vi.fn(async (context: NavigatorEffectContext) => {
+        contexts.push(context);
+        return skillCompletion(context);
+      });
+      const protocol = protocolFor(value, execute, 30_000, undefined, () => 1_100);
+
+      await runCapabilityExecutor(value, protocol, 1_100);
+
+      expect(execute).toHaveBeenCalledTimes(testCase === "valid" ? 1 : 0);
+      if (testCase === "valid") {
+        const context = contexts[0];
+        expect(context).toBeDefined();
+        expect(Object.isFrozen(context)).toBe(true);
+        expect(Object.isFrozen(context.effect)).toBe(true);
+        expect(Object.isFrozen(context.capabilityEvidence)).toBe(true);
+        expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+      } else {
+        expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "dead" });
+      }
+    },
+  );
+
+  it("quarantines legacy work until explicit reauthorization, then resumes the same effect once", async () => {
     const value = fixture();
     const workflow = executor(value);
     const accepted = await workflow.proposeNext({
@@ -1183,27 +1316,116 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const ownerId = `navigator-claim-matrix-${effectKind}-${claimCase}`;
-    const lease = value.store.acquireExecutorLease(ownerId, 1_100, 30_000);
-    if (!lease.acquired) throw new Error("navigator claim matrix executor lease was unavailable");
+    if (!accepted.attemptId || !accepted.effectIdempotencyKey) {
+      throw new Error("navigator compatibility continuation identity was not stored");
+    }
+    const attempt = value.store.getNavigatorSkillAttempt(accepted.attemptId);
+    const profile = attempt ? value.store.getLatestCapabilityProfile("worker_attempt", attempt.id) : null;
+    if (!attempt || !profile) throw new Error("navigator compatibility profile was not stored");
+    value.db.exec("DROP TRIGGER navigator_effect_capability_evidence_append_only_delete");
+    value.db.prepare("DELETE FROM navigator_effect_capability_evidence WHERE effect_idempotency_key = ?")
+      .run(accepted.effectIdempotencyKey);
     value.db.prepare(
-      `UPDATE effects SET kind = ?, status = 'leased', lease_owner = ?, lease_generation = ?, lease_expires_at = ?
-        WHERE idempotency_key = ?`,
-    ).run(effectKind, ownerId, lease.generation, 31_100, accepted.effectIdempotencyKey);
-    insertClaimMatrixCase(value, effectKind, claimCase, ownerId, lease.generation, 1_100);
-    const admit = vi.spyOn(value.store, "admitNavigatorCapabilityEvidence").mockReturnValue(true);
-    const leased = value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!);
-    if (!leased) throw new Error("navigator claim matrix effect was not leased");
-    vi.spyOn(value.store, "leaseNavigatorEffect").mockReturnValue(leased);
-    const protocol = protocolFor(value);
+      "UPDATE navigator_skill_attempts SET capability_profile_id = NULL, capability_profile_revision = NULL WHERE id = ?",
+    ).run(attempt.id);
+    value.db.prepare(
+      `INSERT INTO navigator_effect_compatibility (
+         effect_idempotency_key, job_id, kind, attempt_id, state, reason_code, decoder_revision, created_at
+       ) VALUES (?, ?, 'run_navigator_skill', ?, 'pending', 'preceding_schema_capability_evidence_missing', 1, ?)`,
+    ).run(accepted.effectIdempotencyKey, value.job.id, attempt.id, 1_100);
+    const predecessor = executorLeaseWithProjectClaim(value, "navigator-compatibility-predecessor", 1_100, 1_000);
+    value.db.prepare(
+      "UPDATE job_resource_claims SET lease_expires_at = ? WHERE job_id = ? AND resource_kind = 'project'",
+    ).run(1_100, value.job.id);
+    if (!value.store.releaseExecutorLease("navigator-compatibility-predecessor", predecessor.generation, 1_100)) {
+      throw new Error("navigator compatibility predecessor lease was not released");
+    }
 
-    await expect(protocol.processOne({
-      ownerId,
-      generation: lease.generation,
-      signal: new AbortController().signal,
-    }, new AbortController().signal)).resolves.toBe(true);
+    const execute = vi.fn(async (context: NavigatorEffectContext) => skillCompletion(context));
+    const protocol = protocolFor(value, execute, 1_000, undefined, () => 1_100);
+    await runCapabilityExecutor(value, protocol, 1_100);
+    expect(execute).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "pending" });
 
-    expect(admit).toHaveBeenCalledTimes(claimCase === "valid exact" ? 1 : 0);
+    let reauthorized = false;
+    const currentNow = (): number => {
+      const lease = value.db.prepare("SELECT owner_id, generation FROM executor_lease WHERE singleton = 1")
+        .get() as { owner_id: string | null; generation: number };
+      if (!reauthorized && lease.owner_id !== null) {
+        if (!value.store.reauthorizeNavigatorCompatibilityEffect({
+          effectIdempotencyKey: accepted.effectIdempotencyKey!,
+          attemptId: attempt.id,
+          profileId: profile.id,
+          profileRevision: profile.revision,
+          ownerId: lease.owner_id,
+          generation: lease.generation,
+          now: 1_100,
+          leaseMs: 1_000,
+        })) throw new Error("navigator compatibility reauthorization was rejected");
+        reauthorized = true;
+      }
+      return 1_100;
+    };
+    const continuationAbort = new AbortController();
+    await runJobExecutorService({
+      store: value.store,
+      clock: { now: currentNow },
+      leaseMs: 1_000,
+      navigatorEffects: new NavigatorEffectProtocol({
+        store: value.store,
+        clock: { now: currentNow },
+        leaseMs: 1_000,
+        adapters: [
+          { kind: "run_navigator_skill", execute },
+          { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          { kind: "run_navigator_release", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+        ],
+      }),
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => continuationAbort.abort(),
+      releaseOnShutdown: true,
+    }, continuationAbort.signal);
+
+    expect(reauthorized).toBe(true);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(value.db.prepare(
+      "SELECT profile_id, profile_revision, owner_id, generation FROM navigator_effect_compatibility_resolutions WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toMatchObject({
+      profile_id: profile.id,
+      profile_revision: profile.revision,
+      owner_id: expect.any(String),
+      generation: expect.any(Number),
+    });
+
+    await runCapabilityExecutor(value, protocol, 1_100);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(value.db.prepare("SELECT COUNT(*) AS count FROM navigator_effect_compatibility_resolutions").get())
+      .toEqual({ count: 1 });
+  });
+
+  it.each(CLAIM_CASES)("requires the exact skill claim set (%s)", async (claimCase) => {
+    const value = fixture();
+    const workflow = executor(value);
+    const accepted = await workflow.proposeNext({
+      jobId: value.job.id,
+      externalStateDigest: "e".repeat(64),
+      evidenceRefs: [],
+    });
+    if (claimCase === "valid exact") {
+      prepareCapabilityExecutor(value, 1_100);
+    } else {
+      insertClaimMatrixCase(value, claimCase, "navigator-claim-matrix-invalid", 1, 1_100);
+    }
+    const execute = vi.fn(async (context: NavigatorEffectContext) => skillCompletion(context));
+    const protocol = protocolFor(value, execute);
+    await runCapabilityExecutor(value, protocol, 1_100);
+
+    expect(execute).toHaveBeenCalledTimes(claimCase === "valid exact" ? 1 : 0);
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey!)).toMatchObject({
+      status: claimCase === "valid exact" ? "done" : "pending",
+    });
   });
 
   it("does not leave a typed completion receipt or workflow state after settlement rollback", async () => {
@@ -1269,6 +1491,12 @@ describe("navigator-v1 durable executor slice", () => {
     });
     const firstLease = value.store.acquireExecutorLease("navigator-first", 1_100, 1_000);
     if (!firstLease.acquired) throw new Error("first navigator executor lease was unavailable");
+    value.db.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, 'project:proj_1:pipeline', 'project', 'held', ?, ?, ?, ?, ?)`,
+    ).run(value.job.id, "navigator-first", firstLease.generation, 2_100, 1_100, 1_100);
     const first = value.store.leaseNavigatorEffect({
       ownerId: "navigator-first",
       generation: firstLease.generation,
