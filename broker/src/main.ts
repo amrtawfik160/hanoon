@@ -52,14 +52,14 @@ export type BrokerStartupOptions = Readonly<{
 
 export function createDurableProtectedConnectorAuthority(
   foundationStore: BrokerStore,
-  connectorStore: BrokerProtectedConnectorStore,
+  _connectorStore: BrokerProtectedConnectorStore,
   clock: () => number,
 ): ProtectedConnectorAuthorityPort {
   return {
     topologyReady: (operation, context) => {
       if (!context) return false;
       const installation = foundationStore.getInstallation(context.installationId);
-      const policy = connectorStore.getPolicy(context.installationId, context.projectId);
+      const policy = _connectorStore.getPolicy(context.installationId, context.projectId);
       const now = clock();
       return installation?.state === "active" &&
         installation.topologyReceiptExpiresAt > now &&
@@ -67,7 +67,7 @@ export function createDurableProtectedConnectorAuthority(
         policy?.enabledOperations.includes(operation) === true;
     },
     auditWritable: () => foundationStore.auditWritable(),
-    fenceCurrent: (input) => connectorStore.fenceCurrent(input),
+    fenceCurrent: (input) => foundationStore.isExecutorFenceCurrent({ ...input, now: clock() }),
   };
 }
 

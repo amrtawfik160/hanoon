@@ -7,6 +7,7 @@
  */
 import https from "node:https";
 import type { IncomingMessage } from "node:http";
+import type { LookupFunction } from "node:net";
 import {
   BROKER_MAX_RESPONSE_BYTES,
   type BrokerRequestEnvelope,
@@ -62,13 +63,15 @@ export class CredentialBrokerClient {
   private agent: https.Agent;
   private config: IsolatedCredentialBrokerConfig;
   private readonly clock: () => number;
+  private readonly lookup?: LookupFunction;
 
   public constructor(
     config: IsolatedCredentialBrokerConfig,
-    options: Readonly<{ clock?: () => number }> = {},
+    options: Readonly<{ clock?: () => number; lookup?: LookupFunction }> = {},
   ) {
     this.config = config;
     this.clock = options.clock ?? (() => Date.now());
+    this.lookup = options.lookup;
     this.agent = buildAgent(config);
   }
 
@@ -77,6 +80,11 @@ export class CredentialBrokerClient {
     this.agent.destroy();
     this.config = config;
     this.agent = buildAgent(config);
+  }
+
+  /** Closes idle keep-alive sockets when the owning composition is disposed. */
+  public close(): void {
+    this.agent.destroy();
   }
 
   public call(
@@ -102,15 +110,19 @@ export class CredentialBrokerClient {
       let settled = false;
       let dispatched = false;
       let deadlineTimer: ReturnType<typeof setTimeout>;
+      let abortListener: (() => void) | undefined;
       const finish = (outcome: CredentialBrokerCallOutcome | ProtectedConnectorCallOutcome) => {
         if (settled) return;
         settled = true;
         clearTimeout(deadlineTimer);
+        if (abortListener && options.signal) options.signal.removeEventListener("abort", abortListener);
         resolve(outcome);
       };
 
       const request = https.request({
         agent: this.agent,
+        lookup: this.lookup,
+        servername: origin.hostname,
         method: "POST",
         hostname: origin.hostname,
         port: origin.port ? Number(origin.port) : 443,
@@ -154,12 +166,12 @@ export class CredentialBrokerClient {
       });
 
       if (options.signal) {
-        const onAbort = () => {
+        abortListener = () => {
           request.destroy();
           finish(dispatched ? { outcome: "ambiguous" } : { outcome: "failed", reason: "aborted" });
         };
-        if (options.signal.aborted) onAbort();
-        else options.signal.addEventListener("abort", onAbort, { once: true });
+        if (options.signal.aborted) abortListener();
+        else options.signal.addEventListener("abort", abortListener, { once: true });
       }
 
       request.end(body);

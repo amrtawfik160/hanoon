@@ -88,6 +88,52 @@ describe("protected provider identity adapters", () => {
     }
   });
 
+  it("uses the fixed local TLS transport for Vercel and rejects a bad SNI", async () => {
+    const tls = createMtlsFixture();
+    let server: https.Server | null = null;
+    try {
+      server = https.createServer({ key: tls.serverPrivateKeyPem, cert: tls.serverCertificatePem }, (request, response) => {
+        if (request.url !== "/v9/projects/hanoon?teamId=team-id") {
+          response.writeHead(404).end();
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+          id: "vercel-project-id",
+          name: "hanoon",
+          accountId: "team-id",
+          framework: "nextjs",
+          latestDeployments: [{ readyState: "READY" }],
+        }));
+      });
+      await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("provider_test_address_missing");
+      const options = {
+        port: address.port,
+        caCertificatePem: tls.caCertificatePem,
+        servername: "broker.test",
+        lookup: (_hostname: string, _options: object, callback: (error: null, addresses: { address: string; family: number }[]) => void) =>
+          callback(null, [{ address: "127.0.0.1", family: 4 }]),
+      };
+      const executor = createProtectedConnectorExecutor({
+        http: createProtectedConnectorProviderHttpPort(options),
+        credentials: resolver(),
+      });
+      await expect(executor.inspectVercel({ target: vercelTarget, credentialReference: "broker-ref" }))
+        .resolves.toMatchObject({ outcome: "succeeded", identity: { projectId: "vercel-project-id", teamId: "team-id" } });
+
+      const badSniExecutor = createProtectedConnectorExecutor({
+        http: createProtectedConnectorProviderHttpPort({ ...options, servername: "wrong.test" }),
+        credentials: resolver(),
+      });
+      await expect(badSniExecutor.inspectVercel({ target: vercelTarget, credentialReference: "broker-ref" }))
+        .resolves.toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+    } finally {
+      if (server?.listening) await new Promise<void>((resolve) => server!.close(() => resolve()));
+      tls.cleanup();
+    }
+  });
+
   it("calls the fixed Convex operation and returns only the bounded identity", async () => {
     const calls: unknown[] = [];
     const http: ProtectedConnectorProviderHttpPort = {
@@ -225,5 +271,30 @@ describe("protected provider identity adapters", () => {
 
     expect(result).toMatchObject({ outcome: "failed", failureClass: "credential_expired" });
     expect(calls).toBe(0);
+  });
+
+  it("bounds credential resolution with the same cancellation as transport", async () => {
+    let providerCalls = 0;
+    const http: ProtectedConnectorProviderHttpPort = {
+      getConvexProject: async () => { providerCalls += 1; throw new Error("must not call"); },
+      getVercelProject: async () => { throw new Error("unused"); },
+    };
+    const credentials: ProtectedConnectorCredentialResolver = {
+      resolve: () => new Promise(() => undefined),
+    };
+    const executor = createProtectedConnectorExecutor({ http, credentials });
+    const controller = new AbortController();
+    const pending = executor.inspectConvex({
+      target: convexTarget,
+      credentialReference: "broker-ref",
+      signal: controller.signal,
+    });
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({
+      outcome: "failed",
+      failureClass: "provider_unavailable",
+    });
+    expect(providerCalls).toBe(0);
   });
 });

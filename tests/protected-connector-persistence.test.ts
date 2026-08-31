@@ -25,6 +25,7 @@ import {
   BROKER_FOUNDATION_SCHEMA,
   applyBrokerMigrations,
 } from "../broker/src/migrations";
+import { BrokerProtectedConnectorStore } from "../broker/src/connector-store";
 import { temporaryBrokerDatabase } from "./support/credential-broker-fixtures";
 
 const NOW = 1_800_000_000_000;
@@ -53,6 +54,12 @@ function projection(overrides: Partial<ProtectedConnectorBindingProjection> = {}
     ...overrides,
   } as ProtectedConnectorBindingProjection;
 }
+
+const convexTarget = {
+  operation: "convex.project.inspect.v1" as const,
+  teamIdOrSlug: "convex-team",
+  projectSlug: "hanoon",
+};
 
 function request(overrides: Partial<ProtectedConnectorRequestEnvelope> = {}): ProtectedConnectorRequestEnvelope {
   return {
@@ -388,6 +395,10 @@ describe("append-only schema compatibility", () => {
     try {
       fixture.db.exec(BROKER_FOUNDATION_SCHEMA);
       fixture.db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (1, ?)").run(NOW);
+      expect(() => fixture.db.prepare(`
+        INSERT INTO broker_admin_events (event_id, operation, installation_id, outcome, occurred_at)
+        VALUES ('pre-fix-rejected', 'connector.binding.enroll', 'installation-v1', 'succeeded', ?)
+      `).run(NOW)).toThrow(/CHECK constraint failed/);
       fixture.db.prepare(`
         INSERT INTO broker_installations (
           installation_id, client_certificate_fingerprint, policy_digest,
@@ -437,11 +448,32 @@ describe("append-only schema compatibility", () => {
       expect(fixture.db.prepare("SELECT result, protocol_version FROM broker_receipts WHERE receipt_id = 'receipt-v1'").get())
         .toEqual({ result: "valid", protocol_version: 1 });
       expect(fixture.db.prepare("SELECT version FROM broker_schema_migrations ORDER BY version").all())
-        .toEqual([{ version: 1 }, { version: 2 }]);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+
+      const connectors = new BrokerProtectedConnectorStore(fixture.db, {
+        dataKey: new Uint8Array(32).fill(0x11),
+        clock: () => NOW,
+      });
+      const enrolled = connectors.enrollProtectedBinding({
+        projectId: "project-v1",
+        policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        enabledOperations: ["convex.project.inspect.v1"],
+        projection: projection({ installationId: "installation-v1", bindingId: "binding-v1-connector" }),
+        target: convexTarget,
+        credentialReference: "op://vault/item/token",
+        now: NOW,
+      });
+      expect(enrolled.projection.bindingId).toBe("binding-v1-connector");
 
       const reopened = new Database(fixture.databasePath);
       applyBrokerMigrations(reopened);
       expect(reopened.prepare("SELECT count(*) AS count FROM broker_receipts").get()).toEqual({ count: 1 });
+      expect(reopened.prepare("SELECT operation, installation_id FROM broker_connector_admin_events ORDER BY occurred_at").all())
+        .toEqual([
+          { operation: "policy.set", installation_id: "installation-v1" },
+          { operation: "binding.enroll", installation_id: "installation-v1" },
+        ]);
+      expect(reopened.prepare("SELECT count(*) AS count FROM broker_admin_events").get()).toEqual({ count: 0 });
       reopened.close();
     } finally {
       fixture.close();

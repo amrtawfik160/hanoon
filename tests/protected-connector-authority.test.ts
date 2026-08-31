@@ -239,6 +239,23 @@ describe("protected connector success and exact targets", () => {
         fenceGeneration: 1,
       })).toBe(false);
       harness.connectorStore.claimRequest({ request: request("convex.project.inspect.v1"), certificateFingerprint: CERTIFICATE, now: NOW });
+      // A request claim records intent only. It must not mint executor authority.
+      expect(authority.fenceCurrent({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+      })).toBe(false);
+      expect(harness.foundationStore.attestExecutorFence({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+        expiresAt: NOW + 10_000,
+        now: NOW,
+      })).toBe(true);
       expect(authority.fenceCurrent({
         installationId: "installation-1",
         taskId: "task-1",

@@ -233,6 +233,29 @@ export class CredentialAccessRepository {
     }).immediate();
   }
 
+  /**
+   * A failed current health observation invalidates the prior readiness
+   * snapshot. The last successful attempt remains useful history, but it can
+   * never make the installation ready after this write.
+   */
+  public markCredentialHealthUnavailable(input: Readonly<{
+    installationId: string;
+    failureClass: BrokerFailureClass;
+    now: number;
+  }>): CredentialHealthRecord | null {
+    const row = this.healthRow(input.installationId);
+    if (!row) return null;
+    this.db.prepare(`
+      UPDATE credential_health
+         SET adapter_state = 'unavailable', audit_writable = 0,
+             last_attempt_at = ?, last_failure_at = ?, last_failure_class = ?,
+             updated_at = ?
+       WHERE installation_id = ?
+    `).run(input.now, input.now, input.failureClass, input.now, input.installationId);
+    const updated = this.healthRow(input.installationId);
+    return updated ? toHealthRecord(updated) : null;
+  }
+
   public listCredentialBindings(input: Readonly<{
     installationId: string;
     state?: BrokerBindingState;

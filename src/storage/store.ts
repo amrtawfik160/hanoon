@@ -314,7 +314,12 @@ import {
   type SettleStageExecutionInput,
   type StageExecutionRecord,
 } from "./stage-execution-repository";
-import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
+import type {
+  BrokerBindingState,
+  BrokerFailureClass,
+  BrokerRequestEnvelope,
+  CredentialBindingMetadata,
+} from "../credentials/protocol";
 import type {
   ProtectedConnectorOperation,
   ProtectedConnectorRequestEnvelope,
@@ -4397,6 +4402,11 @@ export interface TelegramAgentStore {
   ): CredentialVerificationCompleteResult;
   getCredentialReceipt(installationId: string, receiptId: string): CredentialReceiptRecord | null;
   getCredentialHealth(installationId: string): CredentialHealthRecord | null;
+  markCredentialHealthUnavailable(input: Readonly<{
+    installationId: string;
+    failureClass: BrokerFailureClass;
+    now: number;
+  }>): CredentialHealthRecord | null;
   reconcileProtectedConnectorBinding(input: Readonly<{
     projection: ProtectedConnectorBindingProjection;
     now: number;
@@ -5908,6 +5918,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getCredentialHealth(installationId: string): CredentialHealthRecord | null {
     return this.credentialAccessRepository.getCredentialHealth(installationId);
+  }
+
+  public markCredentialHealthUnavailable(input: Readonly<{
+    installationId: string;
+    failureClass: BrokerFailureClass;
+    now: number;
+  }>): CredentialHealthRecord | null {
+    return this.credentialAccessRepository.markCredentialHealthUnavailable(input);
   }
 
   public reconcileProtectedConnectorBinding(input: Readonly<{

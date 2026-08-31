@@ -143,6 +143,16 @@ export type BrokerRequestCompletion = Readonly<BrokerRequestClaimInput & {
   adapterVersion?: string;
 }>;
 
+export type BrokerExecutorFenceAttestation = Readonly<{
+  installationId: string;
+  taskId: string;
+  projectId: string;
+  fenceOwner: string;
+  fenceGeneration: number;
+  expiresAt: number;
+  now?: number;
+}>;
+
 type DbInstallationRow = {
   installation_id: string;
   client_certificate_fingerprint: string;
@@ -289,6 +299,78 @@ export class BrokerStore {
 
   public auditWritable(): boolean {
     return this.auditKey !== undefined;
+  }
+
+  /**
+   * Records authority established by the executor/administration boundary.
+   * Request claims never call this method, so a claim cannot mint its own
+   * fence authority.
+   */
+  public attestExecutorFence(input: BrokerExecutorFenceAttestation): boolean {
+    const now = input.now ?? this.clock();
+    if (
+      input.fenceGeneration < 1 ||
+      input.expiresAt <= now ||
+      input.taskId.trim().length === 0 ||
+      input.projectId.trim().length === 0 ||
+      input.fenceOwner.trim().length === 0
+    ) return false;
+    const current = this.db.prepare(`
+      SELECT fence_owner, fence_generation, expires_at
+        FROM broker_connector_executor_fences
+       WHERE installation_id = ? AND task_id = ? AND project_id = ?
+    `).get(input.installationId, input.taskId, input.projectId) as {
+      fence_owner: string;
+      fence_generation: number;
+      expires_at: number;
+    } | undefined;
+    if (
+      current &&
+      (input.fenceGeneration < current.fence_generation ||
+        (input.fenceGeneration === current.fence_generation && current.fence_owner !== input.fenceOwner))
+    ) return false;
+    this.db.prepare(`
+      INSERT INTO broker_connector_executor_fences (
+        installation_id, task_id, project_id, fence_owner,
+        fence_generation, expires_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (installation_id, task_id, project_id) DO UPDATE SET
+        fence_owner = excluded.fence_owner,
+        fence_generation = excluded.fence_generation,
+        expires_at = excluded.expires_at,
+        updated_at = excluded.updated_at
+    `).run(
+      input.installationId,
+      input.taskId,
+      input.projectId,
+      input.fenceOwner,
+      input.fenceGeneration,
+      input.expiresAt,
+      now,
+    );
+    return true;
+  }
+
+  public isExecutorFenceCurrent(input: Readonly<{
+    installationId: string;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+    now?: number;
+  }>): boolean {
+    const row = this.db.prepare(`
+      SELECT fence_owner, fence_generation, expires_at
+        FROM broker_connector_executor_fences
+       WHERE installation_id = ? AND task_id = ? AND project_id = ?
+    `).get(input.installationId, input.taskId, input.projectId) as {
+      fence_owner: string;
+      fence_generation: number;
+      expires_at: number;
+    } | undefined;
+    return row?.fence_owner === input.fenceOwner &&
+      row.fence_generation === input.fenceGeneration &&
+      row.expires_at > (input.now ?? this.clock());
   }
 
   getInstallationCount(): number {

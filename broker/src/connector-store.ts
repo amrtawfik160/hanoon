@@ -496,15 +496,17 @@ export class BrokerProtectedConnectorStore {
     fenceGeneration: number;
   }>): boolean {
     const row = this.db.prepare(`
-      SELECT fence_owner, fence_generation
-        FROM broker_connector_requests
+      SELECT fence_owner, fence_generation, expires_at
+        FROM broker_connector_executor_fences
        WHERE installation_id = ? AND task_id = ? AND project_id = ?
-       ORDER BY fence_generation DESC, started_at DESC LIMIT 1
     `).get(input.installationId, input.taskId, input.projectId) as {
       fence_owner: string;
       fence_generation: number;
+      expires_at: number;
     } | undefined;
-    return row?.fence_owner === input.fenceOwner && row.fence_generation === input.fenceGeneration;
+    return row?.fence_owner === input.fenceOwner &&
+      row.fence_generation === input.fenceGeneration &&
+      row.expires_at > this.clock();
   }
 
   public completeRequest(input: Readonly<{

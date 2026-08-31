@@ -11,7 +11,7 @@ export const PROTECTED_PROVIDER_TIMEOUT_MS = 10_000;
 export const PROTECTED_PROVIDER_MAX_BODY_BYTES = 64 * 1024;
 
 export type ProtectedConnectorCredentialResolver = Readonly<{
-  resolve(reference: string): Promise<
+  resolve(reference: string, signal?: AbortSignal): Promise<
     | Readonly<{ outcome: "resolved"; token: string }>
     | Readonly<{
         outcome: "failed";
@@ -123,6 +123,25 @@ function mapHttpFailure(response: ProtectedConnectorProviderResponse, connectorV
   return retryableProviderFailure(connectorVersion);
 }
 
+async function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) throw new Error("provider_operation_aborted");
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(new Error("provider_operation_aborted"));
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function convexStatus(value: unknown): ConvexProjectIdentity["status"] {
   if (value === "active" || value === "ready") return "active";
   if (value === "paused") return "paused";
@@ -184,9 +203,10 @@ function vercelIdentity(body: ProviderObject, version: string, observedAt: numbe
 async function resolveToken(
   credentials: ProtectedConnectorCredentialResolver,
   reference: string,
+  signal?: AbortSignal,
 ): Promise<Readonly<{ token: string }> | ConnectorFailure> {
   try {
-    const resolved = await credentials.resolve(reference);
+    const resolved = await abortable(credentials.resolve(reference, signal), signal);
     if (resolved.outcome === "failed") return {
       outcome: "failed",
       failureClass: resolved.failureClass,
@@ -210,7 +230,7 @@ async function inspectWithToken<Identity>(input: Readonly<{
   signal?: AbortSignal;
   clock: () => number;
 }>): Promise<ProviderResult<Identity>> {
-  const resolved = await resolveToken(input.credentials, input.reference);
+  const resolved = await resolveToken(input.credentials, input.reference, input.signal);
   if ("failureClass" in resolved) return { ...resolved, connectorVersion: input.connectorVersion };
   let token: string | undefined = resolved.token;
   try {

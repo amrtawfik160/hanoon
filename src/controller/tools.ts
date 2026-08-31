@@ -1794,7 +1794,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         credential: descriptor.credential_scope.credential === "bb"
           ? { credential: "bb", audience: "bb-plugin-sdk" }
           : descriptor.credential_scope.credential === "credential_broker"
-            ? { credential: "credential_broker", audience: "hanoon-credential-broker:v1" }
+            ? {
+                credential: "credential_broker",
+                audience: descriptor.credential_scope.audience as "hanoon-credential-broker:v1" | "hanoon-credential-broker:v2",
+              }
             : { credential: "none", audience: "none" },
       }, {
         ...registration,

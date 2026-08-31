@@ -38,7 +38,7 @@ export type ProtectedConnectorAccessStore = Pick<
   | "markProtectedConnectorOperationAmbiguous"
   | "getProtectedConnectorReceipt"
   | "runControllerMutation"
-> & Partial<Pick<TelegramAgentStore, "getProtectedConnectorOperation">>;
+> & Partial<Pick<TelegramAgentStore, "getProtectedConnectorOperation" | "reconcileProtectedConnectorBinding">>;
 
 export type ProtectedConnectorCaller = Readonly<{
   call(
@@ -69,6 +69,11 @@ export type ProtectedConnectorInspectionResult =
       receiptId: string;
       completedAt: number;
     }>;
+
+export type ProtectedConnectorProjectionReconciliationResult =
+  | Readonly<{ outcome: "reconciled"; projection: ProtectedConnectorBindingProjection }>
+  | Readonly<{ outcome: "denied"; reason: string }>
+  | Readonly<{ outcome: "rejected"; reason: "generation_downgrade" | "identity_mismatch" }>;
 
 export type ProtectedConnectorAccessDependencies = Readonly<{
   store: ProtectedConnectorAccessStore;
@@ -134,6 +139,34 @@ function failedResponseResult(
 
 export class ProtectedConnectorAccessService {
   public constructor(private readonly deps: ProtectedConnectorAccessDependencies) {}
+
+  /**
+   * Imports the secret-free projection returned by protected broker
+   * enrollment through an authenticated controller mutation. Hanoon never
+   * accepts target or credential material on this channel.
+   */
+  public reconcileEnrollment(input: Readonly<{
+    projectId: string;
+    projection: ProtectedConnectorBindingProjection;
+    authorized: AuthorizedControllerCapability;
+  }>): ProtectedConnectorProjectionReconciliationResult {
+    if (input.authorized.turn.origin !== "owner" && input.authorized.controller.projectId !== input.projectId) {
+      return { outcome: "denied", reason: "project_scope" };
+    }
+    const config = this.deps.config();
+    if (config.state !== "isolated" || input.projection.installationId !== config.value.installationId) {
+      return { outcome: "denied", reason: "installation_scope" };
+    }
+    if (!this.deps.store.reconcileProtectedConnectorBinding) return { outcome: "denied", reason: "unavailable" };
+    const write = this.mutate(input.authorized, (now) => this.deps.store.reconcileProtectedConnectorBinding!({
+      projection: input.projection,
+      now,
+    }));
+    if (write.outcome === "stale") return { outcome: "denied", reason: "stale_fence" };
+    const result = write.mutationValue;
+    if (result.outcome === "reconciled") return { outcome: "reconciled", projection: result.binding };
+    return { outcome: "rejected", reason: result.outcome };
+  }
 
   public readiness(operation: ProtectedConnectorOperation, projectId: string): ProtectedConnectorReadiness {
     const config = this.deps.config();
