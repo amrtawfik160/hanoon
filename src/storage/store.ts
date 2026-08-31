@@ -300,12 +300,27 @@ import {
   type CredentialVerificationPrepareResult,
 } from "./credential-access-repository";
 import {
+  ProtectedConnectorRepository,
+  type ProtectedConnectorBindingHistoryRecord,
+  type ProtectedConnectorCompleteResult,
+  type ProtectedConnectorOperationRecord,
+  type ProtectedConnectorPrepareResult,
+  type ProtectedConnectorProjectionResult,
+  type ProtectedConnectorReceiptRecord,
+} from "./protected-connector-repository";
+import {
   StageExecutionRepository,
   type RecordStageExecutionInput,
   type SettleStageExecutionInput,
   type StageExecutionRecord,
 } from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
+import type {
+  ProtectedConnectorOperation,
+  ProtectedConnectorRequestEnvelope,
+  ProtectedConnectorResponseEnvelope,
+} from "../credentials/connector-protocol";
+import type { ProtectedConnectorBindingProjection } from "../credentials/connector-policy";
 import { NavigatorRepository } from "../navigator/repository";
 import type {
   NavigatorArtifactBinding,
@@ -4381,6 +4396,36 @@ export interface TelegramAgentStore {
   ): CredentialVerificationCompleteResult;
   getCredentialReceipt(installationId: string, receiptId: string): CredentialReceiptRecord | null;
   getCredentialHealth(installationId: string): CredentialHealthRecord | null;
+  reconcileProtectedConnectorBinding(input: Readonly<{
+    projection: ProtectedConnectorBindingProjection;
+    now: number;
+  }>): ProtectedConnectorProjectionResult;
+  getProtectedConnectorBinding(installationId: string, bindingId: string): ProtectedConnectorBindingProjection | null;
+  listProtectedConnectorBindings(input: Readonly<{
+    installationId: string;
+    operation?: ProtectedConnectorOperation;
+    limit: number;
+  }>): readonly ProtectedConnectorBindingProjection[];
+  listProtectedConnectorBindingHistory(
+    installationId: string,
+    bindingId: string,
+  ): readonly ProtectedConnectorBindingHistoryRecord[];
+  prepareProtectedConnectorOperation(input: Readonly<{
+    request: ProtectedConnectorRequestEnvelope;
+    now: number;
+  }>): ProtectedConnectorPrepareResult;
+  completeProtectedConnectorOperation(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    response: ProtectedConnectorResponseEnvelope;
+    now: number;
+  }>): ProtectedConnectorCompleteResult;
+  markProtectedConnectorOperationAmbiguous(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    now: number;
+  }>): ProtectedConnectorOperationRecord | null;
+  getProtectedConnectorReceipt(installationId: string, receiptId: string): ProtectedConnectorReceiptRecord | null;
 }
 
 export type TelegramStatusOutboxStore = TelegramAgentStore & {
@@ -5546,6 +5591,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly controllerEvidenceRepository: ControllerEvidenceRepository;
   private readonly controllerInteractionRepository: ControllerInteractionRepository;
   private readonly credentialAccessRepository: CredentialAccessRepository;
+  private readonly protectedConnectorRepository: ProtectedConnectorRepository;
   private readonly stageExecutionRepository: StageExecutionRepository;
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
@@ -5567,6 +5613,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.controllerInteractionRepository = new ControllerInteractionRepository(db);
     this.controllerEvidenceRepository = new ControllerEvidenceRepository(db, clock);
     this.credentialAccessRepository = new CredentialAccessRepository(db);
+    this.protectedConnectorRepository = new ProtectedConnectorRepository(db);
     this.stageExecutionRepository = new StageExecutionRepository(db);
     this.referenceRepository = new ReferenceRepository(db);
     this.workArtifactRepository = new WorkArtifactRepository(db);
@@ -5848,6 +5895,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getCredentialHealth(installationId: string): CredentialHealthRecord | null {
     return this.credentialAccessRepository.getCredentialHealth(installationId);
+  }
+
+  public reconcileProtectedConnectorBinding(input: Readonly<{
+    projection: ProtectedConnectorBindingProjection;
+    now: number;
+  }>): ProtectedConnectorProjectionResult {
+    return this.protectedConnectorRepository.reconcileBindingProjection(input);
+  }
+
+  public getProtectedConnectorBinding(
+    installationId: string,
+    bindingId: string,
+  ): ProtectedConnectorBindingProjection | null {
+    return this.protectedConnectorRepository.getBinding(installationId, bindingId);
+  }
+
+  public listProtectedConnectorBindings(input: Readonly<{
+    installationId: string;
+    operation?: ProtectedConnectorOperation;
+    limit: number;
+  }>): readonly ProtectedConnectorBindingProjection[] {
+    return this.protectedConnectorRepository.listBindings(input);
+  }
+
+  public listProtectedConnectorBindingHistory(
+    installationId: string,
+    bindingId: string,
+  ): readonly ProtectedConnectorBindingHistoryRecord[] {
+    return this.protectedConnectorRepository.listBindingHistory(installationId, bindingId);
+  }
+
+  public prepareProtectedConnectorOperation(input: Readonly<{
+    request: ProtectedConnectorRequestEnvelope;
+    now: number;
+  }>): ProtectedConnectorPrepareResult {
+    return this.protectedConnectorRepository.prepareOperation(input);
+  }
+
+  public completeProtectedConnectorOperation(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    response: ProtectedConnectorResponseEnvelope;
+    now: number;
+  }>): ProtectedConnectorCompleteResult {
+    return this.protectedConnectorRepository.completeOperation(input);
+  }
+
+  public markProtectedConnectorOperationAmbiguous(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    now: number;
+  }>): ProtectedConnectorOperationRecord | null {
+    return this.protectedConnectorRepository.markOperationAmbiguous(input);
+  }
+
+  public getProtectedConnectorReceipt(
+    installationId: string,
+    receiptId: string,
+  ): ProtectedConnectorReceiptRecord | null {
+    return this.protectedConnectorRepository.getReceipt(installationId, receiptId);
   }
 
   public saveReferenceDocument(input: SaveReferenceDocumentInput): SaveReferenceDocumentResult {

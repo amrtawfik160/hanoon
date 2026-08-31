@@ -8,7 +8,12 @@ import type { Job } from "../src/domain/models";
 import { NavigatorImplementationExecutor } from "../src/navigator/implementation-executor";
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
-import { ALL_MIGRATIONS, NAVIGATOR_PROMOTION_MIGRATIONS, NAVIGATOR_RELEASE_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  NAVIGATOR_PROMOTION_MIGRATIONS,
+  NAVIGATOR_RELEASE_MIGRATIONS,
+  PROTECTED_CONNECTOR_MIGRATIONS,
+} from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
@@ -490,8 +495,12 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("appends the navigator release migration after the ticket 41 policy intent migrations", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-2)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    const releaseMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_RELEASE_MIGRATIONS.at(-1)!);
+    const promotionMigrationId = ALL_MIGRATIONS.indexOf(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1)!);
+    const connectorMigrationId = ALL_MIGRATIONS.indexOf(PROTECTED_CONNECTOR_MIGRATIONS.at(-1)!);
+    expect(promotionMigrationId).toBe(releaseMigrationId + 1);
+    expect(connectorMigrationId).toBe(promotionMigrationId + 1);
+    expect(connectorMigrationId).toBe(ALL_MIGRATIONS.length - 1);
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");

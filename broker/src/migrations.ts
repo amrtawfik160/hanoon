@@ -1,9 +1,9 @@
 import { chmodSync } from "node:fs";
 import type Database from "better-sqlite3";
 
-const MIGRATION_VERSION = 1;
+const MIGRATION_VERSIONS = [1, 2] as const;
 
-const BROKER_SCHEMA = String.raw`
+export const BROKER_FOUNDATION_SCHEMA = String.raw`
 CREATE TABLE IF NOT EXISTS broker_schema_migrations (
   version INTEGER PRIMARY KEY CHECK (version > 0),
   applied_at INTEGER NOT NULL
@@ -123,15 +123,156 @@ CREATE INDEX IF NOT EXISTS broker_receipts_installation_completed
   ON broker_receipts (installation_id, completed_at);
 `;
 
+const PROTECTED_CONNECTOR_SCHEMA = String.raw`
+CREATE TABLE IF NOT EXISTS broker_connector_policies (
+  installation_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  enabled_operations_json TEXT NOT NULL CHECK (length(enabled_operations_json) BETWEEN 2 AND 1024),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (installation_id, project_id),
+  FOREIGN KEY (installation_id) REFERENCES broker_installations (installation_id)
+);
+
+CREATE TABLE IF NOT EXISTS broker_connector_bindings (
+  installation_id TEXT NOT NULL,
+  binding_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  state TEXT NOT NULL CHECK (state IN (
+    'pending', 'vault_verified', 'active', 'degraded', 'expired', 'revoked', 'compromised'
+  )),
+  projection_json TEXT NOT NULL CHECK (length(projection_json) BETWEEN 2 AND 16384),
+  target_ciphertext TEXT NOT NULL CHECK (target_ciphertext LIKE 'v1.%'),
+  target_digest TEXT NOT NULL CHECK (length(target_digest) = 64),
+  credential_reference_ciphertext TEXT CHECK (
+    credential_reference_ciphertext IS NULL OR credential_reference_ciphertext LIKE 'v1.%'
+  ),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (installation_id, binding_id),
+  FOREIGN KEY (installation_id) REFERENCES broker_installations (installation_id)
+);
+
+CREATE INDEX IF NOT EXISTS broker_connector_bindings_operation
+  ON broker_connector_bindings (installation_id, operation, state, generation);
+
+CREATE TABLE IF NOT EXISTS broker_connector_requests (
+  installation_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  binding_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation >= 1),
+  task_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  capability_id TEXT NOT NULL,
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  fence_owner TEXT NOT NULL,
+  fence_generation INTEGER NOT NULL CHECK (fence_generation >= 1),
+  certificate_fingerprint TEXT NOT NULL CHECK (length(certificate_fingerprint) = 64),
+  issued_at INTEGER NOT NULL CHECK (issued_at >= 0),
+  deadline_at INTEGER NOT NULL CHECK (deadline_at >= 0),
+  state TEXT NOT NULL CHECK (state IN ('claimed', 'completed', 'ambiguous')),
+  response_json TEXT,
+  completed_receipt_id TEXT,
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  completed_at INTEGER CHECK (completed_at IS NULL OR completed_at >= 0),
+  PRIMARY KEY (installation_id, idempotency_key),
+  UNIQUE (installation_id, request_id),
+  UNIQUE (installation_id, nonce),
+  FOREIGN KEY (installation_id, binding_id)
+    REFERENCES broker_connector_bindings (installation_id, binding_id)
+);
+
+CREATE INDEX IF NOT EXISTS broker_connector_requests_task
+  ON broker_connector_requests (installation_id, task_id, state);
+
+CREATE TABLE IF NOT EXISTS broker_connector_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  installation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  binding_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation >= 1),
+  task_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  capability_id TEXT NOT NULL,
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  fence_owner TEXT NOT NULL,
+  fence_generation INTEGER NOT NULL CHECK (fence_generation >= 1),
+  request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+  client_certificate_fingerprint TEXT NOT NULL CHECK (length(client_certificate_fingerprint) = 64),
+  target_digest TEXT CHECK (target_digest IS NULL OR length(target_digest) = 64),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed')),
+  failure_class TEXT,
+  retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+  retry_after_ms INTEGER CHECK (retry_after_ms IS NULL OR retry_after_ms >= 0),
+  identity_json TEXT CHECK (identity_json IS NULL OR length(identity_json) BETWEEN 2 AND 16384),
+  response_sha256 TEXT NOT NULL CHECK (length(response_sha256) = 64),
+  connector_version TEXT NOT NULL CHECK (length(connector_version) BETWEEN 1 AND 32),
+  protocol_version INTEGER NOT NULL CHECK (protocol_version = 2),
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  completed_at INTEGER NOT NULL CHECK (completed_at >= 0),
+  UNIQUE (installation_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS broker_connector_receipts_task
+  ON broker_connector_receipts (installation_id, task_id, completed_at);
+
+CREATE TABLE IF NOT EXISTS broker_connector_admin_events (
+  event_id TEXT PRIMARY KEY,
+  operation TEXT NOT NULL CHECK (operation IN ('policy.set', 'binding.enroll', 'binding.project')),
+  installation_id TEXT NOT NULL,
+  project_id TEXT,
+  binding_id TEXT,
+  target_digest TEXT CHECK (target_digest IS NULL OR length(target_digest) = 64),
+  projection_sha256 TEXT CHECK (projection_sha256 IS NULL OR length(projection_sha256) = 64),
+  occurred_at INTEGER NOT NULL CHECK (occurred_at >= 0)
+);
+
+CREATE TRIGGER IF NOT EXISTS broker_connector_receipts_append_only_update
+BEFORE UPDATE ON broker_connector_receipts
+BEGIN SELECT RAISE(ABORT, 'broker connector receipts are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS broker_connector_receipts_append_only_delete
+BEFORE DELETE ON broker_connector_receipts
+BEGIN SELECT RAISE(ABORT, 'broker connector receipts are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS broker_connector_admin_events_append_only_update
+BEFORE UPDATE ON broker_connector_admin_events
+BEGIN SELECT RAISE(ABORT, 'broker connector admin events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS broker_connector_admin_events_append_only_delete
+BEFORE DELETE ON broker_connector_admin_events
+BEGIN SELECT RAISE(ABORT, 'broker connector admin events are append-only'); END;
+`;
+
 export function applyBrokerMigrations(db: Database.Database): void {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
-  db.exec(BROKER_SCHEMA);
-  const applied = db.prepare("SELECT 1 FROM broker_schema_migrations WHERE version = ?").get(MIGRATION_VERSION);
-  if (!applied) {
-    db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (?, ?)")
-      .run(MIGRATION_VERSION, Date.now());
+  db.exec(BROKER_FOUNDATION_SCHEMA);
+  db.exec(PROTECTED_CONNECTOR_SCHEMA);
+  for (const version of MIGRATION_VERSIONS) {
+    const applied = db.prepare("SELECT 1 FROM broker_schema_migrations WHERE version = ?").get(version);
+    if (!applied) {
+      db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (?, ?)")
+        .run(version, Date.now());
+    }
   }
   if (db.name !== ":memory:") {
     try {

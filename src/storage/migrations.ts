@@ -1750,6 +1750,130 @@ CREATE TABLE credential_health (
 );
 `] as const;
 
+/**
+ * Schema-v2 protected connector state is additive. The version-1 credential
+ * tables above keep their original checks and rows unchanged; connector
+ * bindings, requests, receipts, and immutable projection history live beside
+ * them so a restart never has to reinterpret a shipped foundation row.
+ */
+export const PROTECTED_CONNECTOR_MIGRATIONS = [String.raw`
+CREATE TABLE credential_connector_bindings (
+  installation_id TEXT NOT NULL,
+  binding_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  state TEXT NOT NULL CHECK (state IN (
+    'pending', 'vault_verified', 'active', 'degraded', 'expired', 'revoked', 'compromised'
+  )),
+  projection_json TEXT NOT NULL CHECK (length(projection_json) BETWEEN 2 AND 16384),
+  projection_sha256 TEXT NOT NULL CHECK (length(projection_sha256) = 64),
+  verified_at INTEGER,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (installation_id, binding_id)
+);
+
+CREATE INDEX credential_connector_bindings_operation
+  ON credential_connector_bindings (installation_id, operation, state, generation);
+
+CREATE TABLE credential_connector_binding_history (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  installation_id TEXT NOT NULL,
+  binding_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  projection_json TEXT NOT NULL CHECK (length(projection_json) BETWEEN 2 AND 16384),
+  projection_sha256 TEXT NOT NULL CHECK (length(projection_sha256) = 64),
+  observed_at INTEGER NOT NULL,
+  UNIQUE (installation_id, binding_id, generation, projection_sha256)
+);
+
+CREATE TRIGGER credential_connector_binding_history_append_only_update
+BEFORE UPDATE ON credential_connector_binding_history
+BEGIN SELECT RAISE(ABORT, 'credential connector binding history is append-only'); END;
+CREATE TRIGGER credential_connector_binding_history_append_only_delete
+BEFORE DELETE ON credential_connector_binding_history
+BEGIN SELECT RAISE(ABORT, 'credential connector binding history is append-only'); END;
+
+CREATE TABLE credential_connector_operations (
+  installation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  binding_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation >= 1),
+  task_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  capability_id TEXT NOT NULL,
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  fence_owner TEXT NOT NULL,
+  fence_generation INTEGER NOT NULL CHECK (fence_generation >= 1),
+  issued_at INTEGER NOT NULL,
+  deadline_at INTEGER NOT NULL,
+  request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+  state TEXT NOT NULL CHECK (state IN ('prepared', 'completed', 'ambiguous')),
+  response_receipt_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (installation_id, idempotency_key),
+  UNIQUE (installation_id, request_id),
+  UNIQUE (installation_id, nonce),
+  FOREIGN KEY (installation_id, binding_id)
+    REFERENCES credential_connector_bindings (installation_id, binding_id)
+);
+
+CREATE INDEX credential_connector_operations_task
+  ON credential_connector_operations (installation_id, task_id, state);
+
+CREATE TABLE credential_connector_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  installation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN (
+    'convex.project.inspect.v1',
+    'vercel.project.inspect.v1',
+    'browser.vercel_project.inspect.v1'
+  )),
+  binding_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation >= 1),
+  task_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  capability_id TEXT NOT NULL,
+  policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+  fence_owner TEXT NOT NULL,
+  fence_generation INTEGER NOT NULL CHECK (fence_generation >= 1),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed')),
+  failure_class TEXT,
+  retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+  retry_after_ms INTEGER,
+  identity_json TEXT CHECK (identity_json IS NULL OR length(identity_json) BETWEEN 2 AND 16384),
+  response_sha256 TEXT NOT NULL CHECK (length(response_sha256) = 64),
+  completed_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (installation_id, idempotency_key),
+  FOREIGN KEY (installation_id, binding_id)
+    REFERENCES credential_connector_bindings (installation_id, binding_id)
+);
+
+CREATE INDEX credential_connector_receipts_task
+  ON credential_connector_receipts (installation_id, task_id, completed_at);
+`] as const;
+
 export const CONTROLLER_STEER_RESERVATION_MIGRATIONS = [String.raw`
 ALTER TABLE controller_turns ADD COLUMN steer_reservation_turn_id TEXT;
 `] as const;
@@ -4423,4 +4547,5 @@ export const ALL_MIGRATIONS = [
   ...POLICY_APPROVAL_INTENT_MIGRATIONS,
   ...NAVIGATOR_RELEASE_MIGRATIONS,
   ...NAVIGATOR_PROMOTION_MIGRATIONS,
+  ...PROTECTED_CONNECTOR_MIGRATIONS,
 ] as const;
