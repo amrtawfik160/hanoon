@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createSecret } from "./crypto";
 import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
-import { capabilityDescriptorById } from "./capabilities/catalog";
+import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+  capabilityDescriptorById,
+} from "./capabilities/catalog";
+import { isCurrentManagedAutomationAuthority } from "./domain/managed-automation";
 import {
   guardRequirementBindings,
   persistBlockedGuardSettlement,
@@ -655,11 +660,42 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     (binding) => {
       const owner = store.getOwner();
       const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
-      return managedAutomationAuthorityIsCurrent(
+      const current = managedAutomationAuthorityIsCurrent(
         binding,
         controller?.controllerKey ?? null,
         store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
       );
+      if (!current || !controller?.hostId) return false;
+      if (isCurrentManagedAutomationAuthority(binding.authority)) {
+        return binding.authority.hostId === controller.hostId;
+      }
+      // Legacy bindings remain readable and reconcilable for migration. They
+      // cannot submit a new durable operation because the repository requires
+      // current versioned authority for that path.
+      return true;
+    },
+    (binding, operation) => {
+      const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
+      const evidence = binding.capabilityEvidence;
+      if (!authority || authority.origin !== "owner" || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
+        operation.operationClass !== "create" || operation.targetProjectId !== binding.projectId ||
+        authority.taskAuthority.kind !== "controller-turn" || authority.taskAuthority.turnId === "") return false;
+      const profile = store.getCapabilityProfileById(evidence.profileId);
+      if (!profile || profile.mode !== "active" || profile.subjectKind !== "controller_turn" ||
+        profile.subjectId !== authority.taskAuthority.turnId || profile.revision !== evidence.profileRevision ||
+        profile.registryDigest !== CAPABILITY_REGISTRY_DIGEST || profile.graphDigest !== CAPABILITY_GRAPH_DIGEST ||
+        operation.definitionRevision !== binding.definitionRevision) return false;
+      const assignment = profile.assignments.find((candidate) => candidate.capabilityId === evidence.capabilityId);
+      const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
+      if (!descriptor || (assignment && assignment.descriptorDigest !== evidence.descriptorDigest) ||
+        descriptor.version !== evidence.descriptorVersion) return false;
+      const profileRef = `capability-profile:${profile.id}:${profile.revision}`;
+      if (!evidence.evidenceRefs.includes(profileRef)) return false;
+      const receiptRef = evidence.evidenceRefs.find((ref) => ref.startsWith("capability-receipt:"));
+      return receiptRef === undefined || store.listCapabilityReceipts(profile.id, 256).some((receipt) =>
+        receipt.eventType === "selected" && receipt.id === receiptRef.slice("capability-receipt:".length) &&
+        receipt.capabilityId === evidence.capabilityId && receipt.descriptorDigest === evidence.descriptorDigest &&
+        receipt.profileRevision === evidence.profileRevision);
     },
   );
   const managedAutomationReconciler = new ManagedAutomationReconciler({
@@ -668,6 +704,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     store,
     notify: () => executorNudge.notify(),
     warn: (message) => bb.log.warn(message),
+    clock: { now: clock },
   });
   const toolDependencies: Parameters<typeof registerControllerTools>[1] = {
     store,
@@ -1434,11 +1471,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
         if (controller?.hostId) {
           for (const binding of managedAutomations.list(controller.controllerKey, false)) {
-            if (binding.authority.source !== "system") continue;
+            const isSystemBinding = isCurrentManagedAutomationAuthority(binding.authority)
+              ? binding.authority.origin === "system-maintenance"
+              : binding.authority.source === "system";
+            if (!isSystemBinding) continue;
             try {
               await managedAutomations.retire({
                 id: binding.id,
-                scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+                scope: { kind: "host", hostId: controller.hostId, cwd: null },
                 now: clock(),
               });
               systemMonitorsInstalled = false;

@@ -118,7 +118,7 @@ export type JobExecutorDependencies = {
     install(): void | Promise<void>;
   };
   automations?: {
-    processDue(now: number, signal?: AbortSignal): Promise<boolean>;
+    processDue(now: number, signal?: AbortSignal, fence?: EffectFence): Promise<boolean>;
   };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
@@ -996,7 +996,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // can happen long after the executor starts.
         await deps.systemMonitors?.install();
         if (deps.automations) {
-          didWork = await deps.automations.processDue(deps.clock.now(), signal) || didWork;
+          didWork = await deps.automations.processDue(deps.clock.now(), workAbort.signal, effectFence) || didWork;
         }
 
         const configuredCap = validConfiguredCap(deps.maxConcurrentJobs?.());

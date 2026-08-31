@@ -131,7 +131,7 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
           monitor: old,
           store: dependencies.store,
           service: dependencies.service,
-          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          scope: { kind: "host", hostId: controller.hostId, cwd: null },
           projectId: controller.projectId,
           controllerKey: controller.controllerKey,
           providerId: dependencies.providerId,
@@ -145,7 +145,7 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
         });
       } else {
         await dependencies.service.create({
-          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          scope: { kind: "host", hostId: controller.hostId, cwd: null },
           controllerKey: controller.controllerKey,
           sourceKey: definition.systemKey,
           definition: {

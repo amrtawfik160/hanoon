@@ -1,68 +1,85 @@
-import type { TerminalScope } from "../bb/terminal-command";
 import {
-  assertAutomationMatches,
   BbAutomationNotFoundError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
-  type BbAutomation,
-  type BbAgentAutomationCapabilities,
-  type BbAutomationDefinition,
-  type BbAutomationRun,
-  type BbAutomationTarget,
 } from "../bb/automation";
 import type { MonitorRecord, TelegramAgentStore } from "../storage/store";
+import type {
+  ManagedAutomationOperation,
+  ManagedAutomationControllerFence,
+  ManagedAutomationBinding,
+} from "../storage/managed-automation-repository";
 import {
   ManagedAutomationRepository,
-  type ManagedAutomationBinding,
+  managedAutomationDigest,
 } from "../storage/managed-automation-repository";
+import type {
+  ManagedAutomationCapabilities,
+  ManagedAutomationDefinition,
+  ManagedAutomationObservation,
+  ManagedAutomationOperationRequest,
+  ManagedAutomationRun,
+  ManagedAutomationScope,
+  ManagedAutomationTarget,
+  StoredManagedAutomationAuthority,
+} from "../domain/managed-automation";
+import { isCurrentManagedAutomationAuthority } from "../domain/managed-automation";
+import type { EffectFence } from "./effect-runner";
 
 export type ManagedAutomationAdapter = Readonly<{
-  agentAutomationCapabilities: BbAgentAutomationCapabilities;
+  agentAutomationCapabilities: ManagedAutomationCapabilities;
   create(input: {
-    scope: TerminalScope;
-    definition: BbAutomationDefinition;
+    scope: ManagedAutomationScope;
+    definition: ManagedAutomationDefinition;
     signal?: AbortSignal;
-  }): Promise<BbAutomation>;
+  }): Promise<ManagedAutomationObservation>;
   update(input: {
-    scope: TerminalScope;
-    definition: BbAutomationDefinition;
+    scope: ManagedAutomationScope;
+    definition: ManagedAutomationDefinition;
     automationId: string;
     expectedEnabled: boolean;
     signal?: AbortSignal;
-  }): Promise<BbAutomation>;
+  }): Promise<ManagedAutomationObservation>;
   show(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
+    expectedDefinition?: ManagedAutomationDefinition;
+    expectedEnabled?: boolean;
     signal?: AbortSignal;
-  }): Promise<BbAutomation>;
+  }): Promise<ManagedAutomationObservation>;
   setEnabled(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     enabled: boolean;
     signal?: AbortSignal;
-  }): Promise<BbAutomation>;
+  }): Promise<ManagedAutomationObservation>;
   runNow(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     idempotencyKey: string;
     signal?: AbortSignal;
-  }): Promise<BbAutomationRun>;
+  }): Promise<ManagedAutomationRun>;
   runs(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     limit?: number;
     signal?: AbortSignal;
-  }): Promise<readonly BbAutomationRun[]>;
+  }): Promise<readonly ManagedAutomationRun[]>;
   delete(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     signal?: AbortSignal;
   }): Promise<void>;
+  findByDefinition?(input: {
+    scope: ManagedAutomationScope;
+    definition: ManagedAutomationDefinition;
+    signal?: AbortSignal;
+  }): Promise<ManagedAutomationObservation | null>;
 }>;
 
 export class ManagedAgentExecutionContractUnsupportedError extends Error {
@@ -75,22 +92,43 @@ export class ManagedAgentExecutionContractUnsupportedError extends Error {
 }
 
 export type CreateManagedAutomationInput = Readonly<{
-  scope: TerminalScope;
+  scope: ManagedAutomationScope;
   controllerKey: string;
   sourceKey: string;
-  definition: BbAutomationDefinition;
-  authority: Readonly<Record<string, unknown>>;
+  definition: ManagedAutomationDefinition;
+  authority: StoredManagedAutomationAuthority;
   notificationPolicy: "material" | "always" | "silent";
   legacyMonitorId?: string | null;
   now: number;
   mutate?: ManagedAutomationMutation;
   signal?: AbortSignal;
+  deferProvider?: boolean;
+  operation?: ManagedAutomationOperationRequest;
+  controllerFence?: ManagedAutomationControllerFence;
 }>;
 
 export type ManagedAutomationMutation = <T>(mutation: () => T) => T;
 
 function applyMutation<T>(mutate: ManagedAutomationMutation | undefined, mutation: () => T): T {
   return mutate ? mutate(mutation) : mutation();
+}
+
+class ManagedAutomationExecutorFenceLostError extends Error {
+  public constructor() {
+    super("managed automation executor fence was lost");
+    this.name = "ManagedAutomationExecutorFenceLostError";
+  }
+}
+
+function executorMutation(
+  store: Pick<TelegramAgentStore, "runExecutorMutation">,
+  fence: EffectFence,
+): ManagedAutomationMutation {
+  return <T>(mutation: () => T): T => {
+    const result = store.runExecutorMutation({ ownerId: fence.ownerId, generation: fence.generation }, mutation);
+    if (result.outcome === "stale") throw new ManagedAutomationExecutorFenceLostError();
+    return result.mutationValue;
+  };
 }
 
 function agentExecutionContractIsSupported(adapter: ManagedAutomationAdapter): boolean {
@@ -118,6 +156,7 @@ export class ManagedAutomationService {
     private readonly repository: ManagedAutomationRepository,
     private readonly adapter: ManagedAutomationAdapter,
     private readonly authorityIsCurrent: (binding: ManagedAutomationBinding) => boolean,
+    private readonly capabilityIsCurrent: (binding: ManagedAutomationBinding, operation: ManagedAutomationOperation) => boolean = () => true,
   ) {}
 
   public get(id: string): ManagedAutomationBinding | null {
@@ -129,7 +168,11 @@ export class ManagedAutomationService {
   }
 
   public async create(input: CreateManagedAutomationInput): Promise<ManagedAutomationBinding> {
-    if (input.definition.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
+    const deferred = input.deferProvider === true || input.operation !== undefined;
+    if (deferred && (!input.operation || !input.controllerFence || !input.mutate)) {
+      throw new TypeError("deferred managed automation creation requires an operation fence");
+    }
+    if (!deferred && input.definition.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     const reserved = applyMutation(input.mutate, () => this.repository.reserve({
       controllerKey: input.controllerKey,
       sourceKey: input.sourceKey,
@@ -140,7 +183,13 @@ export class ManagedAutomationService {
       notificationPolicy: input.notificationPolicy,
       legacyMonitorId: input.legacyMonitorId ?? null,
       now: input.now,
+      definitionRevision: input.operation?.definitionRevision ?? 1,
+      operation: input.operation,
+      controllerFence: input.controllerFence,
     }));
+    if (deferred) {
+      return reserved;
+    }
     if (reserved.mode === "agent" && !this.authorityIsCurrent(reserved)) {
       if (reserved.bbAutomationId === null) {
         applyMutation(input.mutate, () => this.repository.fail(
@@ -153,6 +202,7 @@ export class ManagedAutomationService {
           binding: reserved,
           scope: input.scope,
           now: input.now,
+          mutate: input.mutate,
           signal: input.signal,
         });
       }
@@ -167,7 +217,7 @@ export class ManagedAutomationService {
         signal: input.signal,
       });
     }
-    let automation: BbAutomation | null = null;
+    let automation: ManagedAutomationObservation | null = null;
     try {
       automation = await this.adapter.create({
         scope: input.scope,
@@ -207,9 +257,71 @@ export class ManagedAutomationService {
     }
   }
 
+  public admitOperation(
+    binding: ManagedAutomationBinding,
+    operation: ManagedAutomationOperation,
+  ): Readonly<{ allowed: true } | { allowed: false; errorClass: string }> {
+    if (operation.operationClass !== "create") return { allowed: false, errorClass: "managed_automation_operation_unsupported" };
+    if (operation.state !== "leased") return { allowed: false, errorClass: "managed_automation_operation_not_leased" };
+    if (operation.bindingId !== binding.id) return { allowed: false, errorClass: "managed_automation_operation_stale" };
+    if (operation.targetProjectId !== binding.projectId || operation.definitionRevision !== binding.definitionRevision) {
+      return { allowed: false, errorClass: "managed_automation_operation_stale" };
+    }
+    if (managedAutomationDigest(operation.authority) !== managedAutomationDigest(binding.authority) ||
+      managedAutomationDigest(operation.capabilityEvidence) !== managedAutomationDigest(binding.capabilityEvidence)) {
+      return { allowed: false, errorClass: "managed_automation_operation_stale" };
+    }
+    if (isCurrentManagedAutomationAuthority(binding.authority) &&
+      (!operation.capabilityEvidence || !binding.capabilityEvidence ||
+        managedAutomationDigest(operation.capabilityEvidence) !== managedAutomationDigest(binding.capabilityEvidence))) {
+      return { allowed: false, errorClass: "managed_automation_capability_evidence_stale" };
+    }
+    if (isCurrentManagedAutomationAuthority(operation.authority) && (!operation.controllerFence ||
+      (operation.authority.origin === "owner" && operation.authority.taskAuthority.turnId !== operation.controllerFence.turnId))) {
+      return { allowed: false, errorClass: "managed_automation_operation_stale" };
+    }
+    if (binding.state === "retired") return { allowed: false, errorClass: "managed_automation_binding_retired" };
+    if (binding.mode === "agent" && !agentExecutionContractIsSupported(this.adapter)) {
+      return { allowed: false, errorClass: "bb_agent_execution_contract_unsupported" };
+    }
+    if (!this.authorityIsCurrent(binding)) {
+      return { allowed: false, errorClass: "managed_automation_authority_stale" };
+    }
+    if (!this.capabilityIsCurrent(binding, operation)) {
+      return { allowed: false, errorClass: "managed_automation_capability_evidence_stale" };
+    }
+    return { allowed: true };
+  }
+
+  public async executeClaimedOperation(input: {
+    binding: ManagedAutomationBinding;
+    operation: ManagedAutomationOperation;
+    scope: ManagedAutomationScope;
+    signal?: AbortSignal;
+  }): Promise<ManagedAutomationObservation> {
+    const admission = this.admitOperation(input.binding, input.operation);
+    if (!admission.allowed) throw new Error(admission.errorClass);
+    if (input.operation.attempts > 1 && !this.adapter.findByDefinition) {
+      throw new Error("managed_automation_reconciliation_unsupported");
+    }
+    const existing = this.adapter.findByDefinition
+      ? await this.adapter.findByDefinition({
+          scope: input.scope,
+          definition: input.binding.definition,
+          signal: input.signal,
+        })
+      : null;
+    if (input.signal?.aborted) throw new Error("managed_automation_operation_aborted");
+    return existing ?? this.adapter.create({
+      scope: input.scope,
+      definition: input.binding.definition,
+      signal: input.signal,
+    });
+  }
+
   public async reconcile(input: {
     binding: ManagedAutomationBinding;
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     now: number;
     mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
@@ -229,6 +341,7 @@ export class ManagedAutomationService {
         binding: input.binding,
         scope: input.scope,
         now: input.now,
+        mutate: input.mutate,
         signal: input.signal,
       });
     }
@@ -237,6 +350,7 @@ export class ManagedAutomationService {
         binding: input.binding,
         scope: input.scope,
         now: input.now,
+        mutate: input.mutate,
         signal: input.signal,
       });
     }
@@ -259,9 +373,10 @@ export class ManagedAutomationService {
         scope: input.scope,
         projectId: input.binding.projectId,
         automationId: input.binding.bbAutomationId,
+        expectedDefinition: input.binding.definition,
+        expectedEnabled: input.binding.state !== "paused",
         signal: input.signal,
       });
-      assertAutomationMatches(input.binding.definition, automation, input.binding.state !== "paused");
       const active = applyMutation(input.mutate, () => this.repository.activate({
         id: input.binding.id,
         automation,
@@ -294,9 +409,10 @@ export class ManagedAutomationService {
 
   public async setEnabled(input: {
     id: string;
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     enabled: boolean;
     now: number;
+    mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
     const binding = requireActiveBinding(this.repository, input.id);
@@ -311,13 +427,13 @@ export class ManagedAutomationService {
       enabled: input.enabled,
       signal: input.signal,
     });
-    return this.repository.activate({ id: binding.id, automation, now: input.now });
+    return applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation, now: input.now }));
   }
 
   public async update(input: {
     id: string;
-    scope: TerminalScope;
-    definition: BbAutomationDefinition;
+    scope: ManagedAutomationScope;
+    definition: ManagedAutomationDefinition;
     now: number;
     mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
@@ -333,6 +449,7 @@ export class ManagedAutomationService {
         binding: updating,
         scope: input.scope,
         now: input.now,
+        mutate: input.mutate,
         signal: input.signal,
       });
       throw new Error("managed automation authority is not current");
@@ -353,8 +470,9 @@ export class ManagedAutomationService {
 
   public async pauseForStaleAuthority(input: {
     binding: ManagedAutomationBinding;
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     now: number;
+    mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
     let binding = input.binding;
@@ -366,7 +484,7 @@ export class ManagedAutomationService {
         expectedEnabled: binding.observed?.enabled ?? true,
         signal: input.signal,
       });
-      binding = this.repository.activate({ id: binding.id, automation: updated, now: input.now });
+      binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: updated, now: input.now }));
     }
     if (binding.observed?.enabled !== false) {
       const paused = await this.adapter.setEnabled({
@@ -376,15 +494,16 @@ export class ManagedAutomationService {
         enabled: false,
         signal: input.signal,
       });
-      binding = this.repository.activate({ id: binding.id, automation: paused, now: input.now });
+      binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: paused, now: input.now }));
     }
-    return this.repository.markPolicyBlocked(binding.id, input.now);
+    return applyMutation(input.mutate, () => this.repository.markPolicyBlocked(binding.id, input.now));
   }
 
   public async pauseForUnsupportedAgentExecution(input: {
     binding: ManagedAutomationBinding;
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     now: number;
+    mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
     let binding = input.binding;
@@ -396,18 +515,18 @@ export class ManagedAutomationService {
         enabled: false,
         signal: input.signal,
       });
-      binding = this.repository.activate({ id: binding.id, automation: paused, now: input.now });
+      binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: paused, now: input.now }));
     }
-    return this.repository.markExecutionContractBlocked(binding.id, input.now);
+    return applyMutation(input.mutate, () => this.repository.markExecutionContractBlocked(binding.id, input.now));
   }
 
   public async runNow(input: {
     id: string;
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     idempotencyKey: string;
     now: number;
     signal?: AbortSignal;
-  }): Promise<BbAutomationRun> {
+  }): Promise<ManagedAutomationRun> {
     const binding = requireActiveBinding(this.repository, input.id);
     if (binding.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     if (binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
@@ -426,7 +545,7 @@ export class ManagedAutomationService {
 
   public async retire(input: {
     id: string;
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     now: number;
     mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
@@ -471,7 +590,7 @@ export async function migrateLegacyClockMonitor(input: {
   monitor: MonitorRecord;
   store: Pick<TelegramAgentStore, "cancelMonitor">;
   service: ManagedAutomationService;
-  scope: TerminalScope;
+  scope: ManagedAutomationScope;
   projectId: string;
   controllerKey: string;
   providerId: string;
@@ -479,7 +598,7 @@ export async function migrateLegacyClockMonitor(input: {
   reasoningLevel?: string;
   serviceTier?: "default" | "fast";
   permissionMode: "accept-edits" | "auto" | "full";
-  target?: BbAutomationTarget;
+  target?: ManagedAutomationTarget;
   hostId?: string;
   now: number;
   signal?: AbortSignal;
@@ -536,6 +655,8 @@ export async function migrateLegacyClockMonitor(input: {
 }
 
 const AUTOMATION_RECONCILIATION_INTERVAL_MS = 60_000;
+const AUTOMATION_OPERATION_LEASE_MS = 120_000;
+const AUTOMATION_OPERATION_RENEWAL_MS = 30_000;
 
 export class ManagedAutomationReconciler {
   private lastSweepAt = Number.NEGATIVE_INFINITY;
@@ -543,14 +664,41 @@ export class ManagedAutomationReconciler {
   public constructor(private readonly dependencies: Readonly<{
     repository: ManagedAutomationRepository;
     service: ManagedAutomationService;
-    store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "getProjectPolicy" | "enqueueControllerTurn">;
+    store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "getProjectPolicy" | "enqueueControllerTurn" | "runExecutorMutation">;
     notify(): void;
     warn?(message: string): void;
+    clock?: { now(): number };
   }>) {}
 
-  public async processDue(now: number, signal?: AbortSignal): Promise<boolean> {
+  public async processDue(now: number, signal?: AbortSignal, fence?: EffectFence): Promise<boolean> {
     if (now - this.lastSweepAt < AUTOMATION_RECONCILIATION_INTERVAL_MS) return false;
     this.lastSweepAt = now;
+    if (fence) {
+      if (fence.signal.aborted || signal?.aborted) return false;
+      let didWork = await this.processDurableOperations(now, fence, signal);
+      if (!fence.signal.aborted && !signal?.aborted) {
+        const operationSignal = AbortSignal.any([fence.signal, ...(signal ? [signal] : [])]);
+        didWork = await this.processExistingBindings(
+          now,
+          operationSignal,
+          executorMutation(this.dependencies.store, fence),
+        ) || didWork;
+      }
+      return this.enqueuePendingNotifications(
+        now,
+        didWork,
+        executorMutation(this.dependencies.store, fence),
+      );
+    }
+    const didWork = await this.processExistingBindings(now, signal);
+    return this.enqueuePendingNotifications(now, didWork);
+  }
+
+  private async processExistingBindings(
+    now: number,
+    signal?: AbortSignal,
+    mutate?: ManagedAutomationMutation,
+  ): Promise<boolean> {
     let didWork = false;
     const owner = this.dependencies.store.getOwner();
     const controller = owner
@@ -561,7 +709,8 @@ export class ManagedAutomationReconciler {
       20,
     );
     for (const binding of candidates) {
-      const hostId = typeof binding.authority.hostId === "string" ? binding.authority.hostId : null;
+      if (signal?.aborted) break;
+      const hostId = managedAutomationHostId(binding);
       if (!hostId) {
         this.dependencies.warn?.(`Managed automation ${binding.id} has no verified BB host`);
         continue;
@@ -574,8 +723,9 @@ export class ManagedAutomationReconciler {
         )) {
           await this.dependencies.service.pauseForStaleAuthority({
             binding,
-            scope: { kind: "host_path", hostId, cwd: null },
+            scope: { kind: "host", hostId, cwd: null },
             now,
+            mutate,
             signal,
           });
           didWork = true;
@@ -585,44 +735,172 @@ export class ManagedAutomationReconciler {
           binding.lastError === "managed_automation_authority_stale"
           ? await this.dependencies.service.setEnabled({
               id: binding.id,
-              scope: { kind: "host_path", hostId, cwd: null },
+              scope: { kind: "host", hostId, cwd: null },
               enabled: true,
               now,
+              mutate,
               signal,
             })
           : binding;
         await this.dependencies.service.reconcile({
           binding: current,
-          scope: { kind: "host_path", hostId, cwd: null },
+          scope: { kind: "host", hostId, cwd: null },
           now,
+          mutate,
           signal,
         });
         didWork = true;
-      } catch {
+      } catch (error) {
+        if (error instanceof ManagedAutomationExecutorFenceLostError) break;
         this.dependencies.warn?.(`Managed automation ${binding.id} could not be reconciled`);
       }
     }
 
-    if (!owner) return didWork;
-    if (!controller) return didWork;
+    return didWork;
+  }
+
+  private async processDurableOperations(
+    now: number,
+    fence: EffectFence,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    let didWork = false;
+    for (const pending of this.dependencies.repository.listDueOperations(now, 20)) {
+      if (fence.signal.aborted || signal?.aborted) break;
+      const operation = this.dependencies.repository.claimOperation({
+        operationId: pending.id,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now,
+        leaseMs: AUTOMATION_OPERATION_LEASE_MS,
+      });
+      if (!operation) continue;
+      didWork = true;
+      const binding = this.dependencies.repository.get(operation.bindingId);
+      if (!binding) continue;
+      const admission = this.dependencies.service.admitOperation(binding, operation);
+      if (!admission.allowed) {
+        this.dependencies.repository.settleOperation({
+          operationId: operation.id,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now,
+          outcome: "failed",
+          errorClass: admission.errorClass,
+        });
+        continue;
+      }
+      const hostId = managedAutomationHostId(binding);
+      if (!hostId) {
+        this.dependencies.repository.settleOperation({
+          operationId: operation.id,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          now,
+          outcome: "failed",
+          errorClass: "managed_automation_host_unverified",
+        });
+        continue;
+      }
+      await this.executeDurableOperation(binding, operation, hostId, now, fence, signal);
+    }
+    return didWork;
+  }
+
+  private async executeDurableOperation(
+    binding: ManagedAutomationBinding,
+    operation: ManagedAutomationOperation,
+    hostId: string,
+    now: number,
+    fence: EffectFence,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const operationAbort = new AbortController();
+    const operationSignal = AbortSignal.any([fence.signal, operationAbort.signal, ...(signal ? [signal] : [])]);
+    const renewal = setInterval(() => {
+      const leaseNow = this.dependencies.clock?.now() ?? now;
+      if (!this.dependencies.repository.renewOperationLease({
+        operationId: operation.id,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: leaseNow,
+        leaseMs: AUTOMATION_OPERATION_LEASE_MS,
+      })) operationAbort.abort();
+    }, AUTOMATION_OPERATION_RENEWAL_MS);
+    try {
+      if (operationSignal.aborted) return;
+      const automation = await this.dependencies.service.executeClaimedOperation({
+        binding,
+        operation,
+        scope: { kind: "host", hostId, cwd: null },
+        signal: operationSignal,
+      });
+      if (operationSignal.aborted) return;
+      this.dependencies.repository.settleOperation({
+        operationId: operation.id,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: this.dependencies.clock?.now() ?? now,
+        outcome: "succeeded",
+        automation,
+      });
+    } catch (error) {
+      if (operationSignal.aborted) return;
+      this.dependencies.repository.settleOperation({
+        operationId: operation.id,
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: this.dependencies.clock?.now() ?? now,
+        outcome: "ambiguous",
+        errorClass: automationErrorClass(error),
+      });
+      this.dependencies.warn?.(`Managed automation ${binding.id} provider outcome is ambiguous`);
+    } finally {
+      clearInterval(renewal);
+    }
+  }
+
+  private enqueuePendingNotifications(
+    now: number,
+    didWork: boolean,
+    mutate?: ManagedAutomationMutation,
+  ): boolean {
+    const owner = this.dependencies.store.getOwner();
+    const controller = owner
+      ? this.dependencies.store.getControllerForOwner(owner.userId, owner.chatId)
+      : null;
+    if (!owner || !controller) return didWork;
     for (const notification of this.dependencies.repository.listPendingNotifications(20)) {
       if (notification.controllerKey !== controller.controllerKey) continue;
-      this.dependencies.store.enqueueControllerTurn({
-        controllerKey: notification.controllerKey,
-        telegramUserId: owner.userId,
-        telegramChatId: owner.chatId,
-        updateId: notification.updateId,
-        inputText: notification.inputText,
-        origin: "system",
-        now,
-      });
-      if (this.dependencies.repository.markNotificationEnqueued(notification.sequence, now)) {
-        didWork = true;
-        this.dependencies.notify();
+      try {
+        const marked = applyMutation(mutate, () => {
+          this.dependencies.store.enqueueControllerTurn({
+            controllerKey: notification.controllerKey,
+            telegramUserId: owner.userId,
+            telegramChatId: owner.chatId,
+            updateId: notification.updateId,
+            inputText: notification.inputText,
+            origin: "system",
+            now,
+          });
+          return this.dependencies.repository.markNotificationEnqueued(notification.sequence, now);
+        });
+        if (marked) {
+          didWork = true;
+          this.dependencies.notify();
+        }
+      } catch (error) {
+        if (!(error instanceof ManagedAutomationExecutorFenceLostError)) throw error;
+        return didWork;
       }
     }
     return didWork;
   }
+}
+
+function managedAutomationHostId(binding: ManagedAutomationBinding): string | null {
+  if (isCurrentManagedAutomationAuthority(binding.authority)) return binding.authority.hostId;
+  return typeof binding.authority.hostId === "string" ? binding.authority.hostId : null;
 }
 
 export function managedAutomationAuthorityIsCurrent(
@@ -630,9 +908,14 @@ export function managedAutomationAuthorityIsCurrent(
   currentControllerKey: string | null,
   projectEnabled: boolean,
 ): boolean {
-  return projectEnabled && currentControllerKey === binding.controllerKey &&
-    binding.authority.controllerKey === binding.controllerKey &&
-    binding.authority.projectId === binding.projectId &&
-    typeof binding.authority.hostId === "string" &&
-    binding.authority.mayWidenAutomation === false;
+  if (!projectEnabled || currentControllerKey !== binding.controllerKey) return false;
+  if (isCurrentManagedAutomationAuthority(binding.authority)) {
+    return binding.authority.controllerKey === binding.controllerKey &&
+      binding.authority.projectId === binding.projectId &&
+      binding.authority.hostId.length > 0 &&
+      binding.authority.mayWidenAutomation === false;
+  }
+  const authority = binding.authority;
+  return authority.controllerKey === binding.controllerKey && authority.projectId === binding.projectId &&
+    typeof authority.hostId === "string" && authority.mayWidenAutomation === false;
 }

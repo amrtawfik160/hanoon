@@ -484,6 +484,32 @@ function authorizedControllerCapabilityContext(
   return { controller, turn, profile };
 }
 
+function ownerAutomationCapabilityEvidence(
+  dependencies: Pick<ToolDependencies, "store">,
+  profile: ReturnType<typeof authorizedControllerCapabilityContext>["profile"],
+) {
+  const descriptor = CAPABILITY_BY_ID.get("telegram_agent_watch");
+  const assignment = profile.assignments.find((candidate) => candidate.capabilityId === "telegram_agent_watch");
+  if (!descriptor || (assignment && assignment.descriptorDigest !== descriptor.digest)) {
+    throw new Error("The controller capability profile does not authorize BB schedule management");
+  }
+  const selected = dependencies.store.listCapabilityReceipts(profile.id, 256).find((receipt) =>
+    receipt.eventType === "selected" && receipt.capabilityId === "telegram_agent_watch" &&
+    receipt.profileRevision === profile.revision && receipt.descriptorDigest === descriptor.digest);
+  return {
+    version: 1 as const,
+    profileId: profile.id,
+    profileRevision: profile.revision,
+    capabilityId: assignment?.capabilityId ?? descriptor.id,
+    descriptorVersion: descriptor.version,
+    descriptorDigest: descriptor.digest,
+    evidenceRefs: [
+      `capability-profile:${profile.id}:${profile.revision}`,
+      ...(selected ? [`capability-receipt:${selected.id}`] : []),
+    ],
+  };
+}
+
 async function ownerTurnImages(
   dependencies: ToolDependencies,
   controllerKey: string,
@@ -754,6 +780,15 @@ function automationProjection(binding: ManagedAutomationBinding) {
     instruction: definition.mode === "agent" ? definition.prompt : definition.name,
     state: binding.state,
     lastError: binding.lastError,
+    observed: binding.observed === null
+      ? null
+      : {
+          id: binding.observed.id,
+          enabled: binding.observed.enabled,
+          nextRunAt: binding.observed.nextRunAt,
+          lastRunAt: binding.observed.lastRunAt,
+          lastRunStatus: binding.observed.lastRunStatus,
+        },
     nextDueAt: binding.observed?.nextRunAt ?? null,
     fireCount: binding.observed?.runCount ?? 0,
   };
@@ -814,7 +849,7 @@ function packWatchList(monitors: MonitorRecord[], automations: ManagedAutomation
       ...row,
       instruction: clipInstruction(
         row.instruction,
-        row.state === "active" || row.state === "armed" || row.state === "failed"
+        row.state === "active" || row.state === "armed" || row.state === "pending" || row.state === "failed"
           ? LIVE_INSTRUCTION_CHARS
           : SETTLED_INSTRUCTION_CHARS,
       ),
@@ -1675,7 +1710,7 @@ async function projectTrustedEvidence(
         monitor.cron === (params.kind === "schedule" ? params.cron : null) &&
         (capturedId === undefined || capturedId === monitor.id);
       const automated = (params.kind === "schedule" || params.kind === "update_schedule") &&
-        automation?.state === "active" &&
+        (automation?.state === "active" || automation?.state === "pending") &&
         automation.controllerKey === authorized.controller.controllerKey &&
         automation.projectId === context.projectId && automation.definition.mode === "agent" &&
         automation.definition.prompt === params.instruction && automation.definition.trigger.kind === "cron" &&
@@ -1683,9 +1718,10 @@ async function projectTrustedEvidence(
         (capturedId === undefined || capturedId === automation.id);
       const armed = localArmed || automated;
       if (!armed) throw new Error("monitor proof is not bound to the exact authorized watch");
+      const providerObserved = automated && automation?.state === "active";
       return {
-        outcome: armed ? "succeeded" : "observed",
-        proofKinds: automated
+        outcome: localArmed || providerObserved ? "succeeded" : "observed",
+        proofKinds: providerObserved
           ? ["monitor_state", "external_mutation", "obligation"]
           : ["monitor_state", "obligation"],
         subjectRefs: monitor
@@ -2364,7 +2400,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           runControllerMutation(dependencies, authorized, context, () => mutation());
         const updated = await automations.update({
           id: binding.id,
-          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          scope: { kind: "host", hostId: controller.hostId, cwd: null },
           definition: {
             ...binding.definition,
             trigger: { kind: "cron", cron: params.cron, timezone: "Etc/UTC" },
@@ -2386,8 +2422,9 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       requireCronOccurrence(params.cron, dependencies.now());
       if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
       const now = dependencies.now();
+      const capabilityContext = authorizedControllerCapabilityContext(dependencies.store, context);
+      const capabilityEvidence = ownerAutomationCapabilityEvidence(dependencies, capabilityContext.profile);
       const identity = sha256ControllerJson({
-        turnId: authorized.turn.id,
         projectId: context.projectId,
         cron: params.cron,
         instruction: params.instruction,
@@ -2395,7 +2432,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
         runControllerMutation(dependencies, authorized, context, () => mutation());
       const binding = await automations.create({
-        scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+        scope: { kind: "host", hostId: controller.hostId, cwd: null },
         controllerKey: controller.controllerKey,
         sourceKey: `owner-schedule:${identity}`,
         definition: {
@@ -2414,17 +2451,37 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
         },
         authority: {
-          source: "owner",
+          version: 1,
+          origin: "owner",
           controllerKey: controller.controllerKey,
-          turnId: authorized.turn.id,
           projectId: context.projectId,
           hostId: controller.hostId,
+          taskAuthority: {
+            version: 1,
+            kind: "controller-turn",
+            turnId: authorized.turn.id,
+            revision: 1,
+          },
+          standingAuthority: null,
+          capabilityEvidence,
           mayWidenAutomation: false,
         },
         notificationPolicy: "material",
         now,
         mutate,
         signal: context.signal,
+        deferProvider: true,
+        operation: {
+          version: 1,
+          operationClass: "create",
+          targetProjectId: context.projectId,
+          definitionRevision: 1,
+        },
+        controllerFence: {
+          ownerId: authorized.fence.ownerId,
+          generation: authorized.fence.generation,
+          turnId: authorized.turn.id,
+        },
       });
       trustedState(resolution).automationBindingId = binding.id;
       dependencies.notify();
@@ -2459,7 +2516,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           runControllerMutation(dependencies, authorized, context, () => mutation());
         await automations.retire({
           id: params.id,
-          scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
+          scope: { kind: "host", hostId: controller.hostId, cwd: null },
           now: dependencies.now(),
           mutate,
           signal: context.signal,

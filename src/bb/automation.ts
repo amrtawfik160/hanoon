@@ -7,6 +7,16 @@ import {
   type CommandResult,
   type TerminalScope,
 } from "./terminal-command";
+import type {
+  ManagedAutomationAgentDefinition,
+  ManagedAutomationCapabilities,
+  ManagedAutomationDefinition,
+  ManagedAutomationObservation,
+  ManagedAutomationRun,
+  ManagedAutomationScope,
+  ManagedAutomationTarget,
+  ManagedAutomationTrigger,
+} from "../domain/managed-automation";
 
 const automationTriggerSchema = z.discriminatedUnion("triggerType", [
   z.object({
@@ -79,7 +89,7 @@ export const bbAutomationSchema = z.object({
   updatedAt: z.number().int().nonnegative(),
 }).passthrough();
 
-export type BbAutomation = z.infer<typeof bbAutomationSchema>;
+export type BbAutomation = ManagedAutomationObservation;
 
 export const bbAutomationRunSchema = z.object({
   id: z.string().min(1),
@@ -97,36 +107,11 @@ export const bbAutomationRunSchema = z.object({
   finishedAt: z.number().int().nonnegative().nullable(),
 }).passthrough();
 
-export type BbAutomationRun = z.infer<typeof bbAutomationRunSchema>;
+export type BbAutomationRun = ManagedAutomationRun;
 
-export type BbAutomationTrigger =
-  | Readonly<{ kind: "cron"; cron: string; timezone: string }>
-  | Readonly<{ kind: "once"; at: string }>;
-
-export type BbAutomationTarget =
-  | Readonly<{ kind: "project-default" }>
-  | Readonly<{ kind: "target-thread"; threadId: string }>
-  | Readonly<{ kind: "environment"; environmentId: string }>
-  | Readonly<{ kind: "new-worktree"; baseBranch: string }>;
-
-export type BbAgentAutomationDefinition = Readonly<{
-  mode: "agent";
-  projectId: string;
-  name: string;
-  trigger: BbAutomationTrigger;
-  prompt: string;
-  providerId: string;
-  model: string;
-  reasoningLevel?: string;
-  serviceTier?: "default" | "fast";
-  permissionMode: "accept-edits" | "auto" | "full";
-  target: BbAutomationTarget;
-  timeoutMs: number;
-  resultContract: Readonly<{
-    kind: "bounded-text";
-    maximumBytes: number;
-  }>;
-}>;
+export type BbAutomationTrigger = ManagedAutomationTrigger;
+export type BbAutomationTarget = ManagedAutomationTarget;
+export type BbAgentAutomationDefinition = ManagedAutomationAgentDefinition;
 
 export const DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS = 900_000;
 export const DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT = Object.freeze({
@@ -134,27 +119,9 @@ export const DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT = Object.freeze({
   maximumBytes: 32_768,
 });
 
-export type BbScriptAutomationDefinition = Readonly<{
-  mode: "script";
-  projectId: string;
-  name: string;
-  trigger: BbAutomationTrigger;
-  source: Readonly<
-    | { kind: "inline"; script: string }
-    | { kind: "file"; path: string; sha256: string; hostId?: string }
-  >;
-  interpreter: "bash" | "sh" | "node" | "python3";
-  timeoutMs: number;
-  env?: Readonly<Record<string, string>>;
-}>;
-
-export type BbAutomationDefinition = BbAgentAutomationDefinition | BbScriptAutomationDefinition;
-
-export type BbAgentAutomationCapabilities = Readonly<{
-  executionTimeout: boolean;
-  resultContract: boolean;
-  preRunAuthority: boolean;
-}>;
+export type BbScriptAutomationDefinition = Extract<ManagedAutomationDefinition, { mode: "script" }>;
+export type BbAutomationDefinition = ManagedAutomationDefinition;
+export type BbAgentAutomationCapabilities = ManagedAutomationCapabilities;
 
 export const INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES: BbAgentAutomationCapabilities = Object.freeze({
   executionTimeout: false,
@@ -172,6 +139,12 @@ export type AutomationCommandRunner = Readonly<{
     signal?: AbortSignal;
   }): Promise<CommandResult>;
 }>;
+
+function terminalScope(scope: ManagedAutomationScope): TerminalScope {
+  return scope.kind === "host"
+    ? { kind: "host_path", hostId: scope.hostId, cwd: scope.cwd }
+    : scope;
+}
 
 function flag(name: string, value: string): string[] {
   return [`--${name}`, shellSingleQuote(value)];
@@ -249,6 +222,10 @@ export function buildUpdateAutomationCommand(
 
 export function buildShowAutomationCommand(projectId: string, automationId: string): string {
   return command("show", [shellSingleQuote(automationId), ...flag("project", projectId)]);
+}
+
+export function buildListAutomationsCommand(projectId: string): string {
+  return command("list", [...flag("project", projectId)]);
 }
 
 export function buildAutomationActionCommand(
@@ -329,15 +306,16 @@ export class TerminalBbAutomationAdapter {
   }
 
   public async create(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     definition: BbAutomationDefinition;
     signal?: AbortSignal;
   }): Promise<BbAutomation> {
     const created = await this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: "Create BB automation",
       command: buildCreateAutomationCommand(input.definition),
       schema: bbAutomationSchema,
+      signal: input.signal,
     });
     try {
       const observed = await this.show({
@@ -366,18 +344,59 @@ export class TerminalBbAutomationAdapter {
     }
   }
 
+  public async list(input: {
+    scope: ManagedAutomationScope;
+    projectId: string;
+    signal?: AbortSignal;
+  }): Promise<readonly BbAutomation[]> {
+    const response = await this.execute({
+      scope: terminalScope(input.scope),
+      title: "List BB automations",
+      command: buildListAutomationsCommand(input.projectId),
+      schema: z.union([
+        z.object({ automations: z.array(bbAutomationSchema) }).passthrough(),
+        z.array(bbAutomationSchema),
+      ]),
+      signal: input.signal,
+    });
+    return Array.isArray(response) ? response : response.automations;
+  }
+
+  public async findByDefinition(input: {
+    scope: ManagedAutomationScope;
+    definition: BbAutomationDefinition;
+    signal?: AbortSignal;
+  }): Promise<BbAutomation | null> {
+    const candidates = await this.list({
+      scope: input.scope,
+      projectId: input.definition.projectId,
+      signal: input.signal,
+    });
+    for (const candidate of candidates) {
+      try {
+        assertAutomationMatches(input.definition, candidate);
+        return candidate;
+      } catch {
+        // The list is an observation set; only an exact definition match closes
+        // an ambiguous create attempt.
+      }
+    }
+    return null;
+  }
+
   public async update(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     definition: BbAutomationDefinition;
     automationId: string;
     expectedEnabled: boolean;
     signal?: AbortSignal;
   }): Promise<BbAutomation> {
     await this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: "Update BB automation",
       command: buildUpdateAutomationCommand(input.automationId, input.definition),
       schema: bbAutomationSchema,
+      signal: input.signal,
     });
     const observed = await this.show({
       scope: input.scope,
@@ -390,31 +409,40 @@ export class TerminalBbAutomationAdapter {
   }
 
   public show(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
+    expectedDefinition?: BbAutomationDefinition;
+    expectedEnabled?: boolean;
     signal?: AbortSignal;
   }): Promise<BbAutomation> {
     return this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: "Read BB automation",
       command: buildShowAutomationCommand(input.projectId, input.automationId),
       schema: bbAutomationSchema,
+      signal: input.signal,
+    }).then((observed) => {
+      if (input.expectedDefinition) {
+        assertAutomationMatches(input.expectedDefinition, observed, input.expectedEnabled ?? true);
+      }
+      return observed;
     });
   }
 
   public async setEnabled(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     enabled: boolean;
     signal?: AbortSignal;
   }): Promise<BbAutomation> {
     await this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: input.enabled ? "Resume BB automation" : "Pause BB automation",
       command: buildAutomationActionCommand(input.enabled ? "resume" : "pause", input.projectId, input.automationId),
       schema: bbAutomationSchema,
+      signal: input.signal,
     });
     const observed = await this.show(input);
     if (observed.enabled !== input.enabled) throw new Error("BB automation enabled state did not reconcile");
@@ -422,49 +450,52 @@ export class TerminalBbAutomationAdapter {
   }
 
   public async runNow(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     idempotencyKey: string;
     signal?: AbortSignal;
   }): Promise<BbAutomationRun> {
     const response = await this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: "Run BB automation",
       command: buildRunAutomationCommand(input.projectId, input.automationId, input.idempotencyKey),
       schema: z.object({ run: bbAutomationRunSchema }).passthrough(),
+      signal: input.signal,
     });
     return response.run;
   }
 
   public async runs(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     limit?: number;
     signal?: AbortSignal;
   }): Promise<readonly BbAutomationRun[]> {
     const response = await this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: "Read BB automation runs",
       command: buildAutomationRunsCommand(input.projectId, input.automationId, input.limit),
       schema: z.object({ runs: z.array(bbAutomationRunSchema), nextCursor: z.string().nullable() }).passthrough(),
+      signal: input.signal,
     });
     return response.runs;
   }
 
   public async delete(input: {
-    scope: TerminalScope;
+    scope: ManagedAutomationScope;
     projectId: string;
     automationId: string;
     signal?: AbortSignal;
   }): Promise<void> {
     await this.execute({
-      ...input,
+      scope: terminalScope(input.scope),
       title: "Delete BB automation",
       command: buildAutomationActionCommand("delete", input.projectId, input.automationId),
       schema: z.object({ ok: z.literal(true), id: z.literal(input.automationId) }).passthrough(),
       classifyNotFound: true,
+      signal: input.signal,
     });
   }
 }

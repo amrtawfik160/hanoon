@@ -5,6 +5,7 @@ import type {
   ManagedAutomationService,
 } from "../../src/services/managed-automation-service";
 import type { ManagedAutomationBinding } from "../../src/storage/managed-automation-repository";
+import { isCurrentManagedAutomationAuthority } from "../../src/domain/managed-automation";
 
 function observed(definition: BbAutomationDefinition, id: string, now: number): BbAutomation {
   return {
@@ -63,6 +64,11 @@ export function createTestManagedAutomations() {
       definition: input.definition,
       definitionSha256: "d".repeat(64),
       authority: input.authority,
+      definitionRevision: input.operation?.definitionRevision ?? 1,
+      authorityVersion: isCurrentManagedAutomationAuthority(input.authority) ? 1 : 0,
+      capabilityEvidence: isCurrentManagedAutomationAuthority(input.authority)
+        ? input.authority.capabilityEvidence
+        : null,
       notificationPolicy: input.notificationPolicy,
       state: "active",
       legacyMonitorId: input.legacyMonitorId ?? null,
@@ -72,6 +78,8 @@ export function createTestManagedAutomations() {
       lastRunId: null,
       lastRunStatus: null,
       lastError: null,
+      lastOperationId: input.deferProvider ? "managed-automation-operation-test" : null,
+      lastOperationOutcome: input.deferProvider ? "pending" : null,
       createdAt: input.now,
       updatedAt: input.now,
     };
