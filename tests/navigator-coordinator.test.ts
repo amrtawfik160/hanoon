@@ -23,9 +23,11 @@ import {
   NAVIGATOR_LIVE_SCENARIOS,
   NavigatorPromotionService,
 } from "../src/navigator/promotion";
+import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
+import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import { EffectRunner } from "../src/services/effect-runner";
-import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
+import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture, productionPolicyFixture, sha } from "./helpers";
@@ -651,8 +653,17 @@ describe("disposable navigator live path", () => {
       now: now(),
     });
     expect(releaseDecision.decision).toBe("accepted");
+    const releaseClaimNow = now();
+    const insertReleaseClaim = database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, ?, 'held', 'executor', ?, ?, ?, ?)`,
+    );
+    insertReleaseClaim.run(draft.id, projectResourceKey("proj_1"), "project", lease.generation, 130_000, releaseClaimNow, releaseClaimNow);
+    insertReleaseClaim.run(draft.id, repositoryMergeResourceKey("acme/cyndra"), "repository_merge", lease.generation, 130_000, releaseClaimNow, releaseClaimNow);
+    insertReleaseClaim.run(draft.id, productionResourceKey(store.getJob(draft.id)!.policy!), "production_target", lease.generation, 130_000, releaseClaimNow, releaseClaimNow);
     const release = new NavigatorReleaseExecutor({
-      store,
       publishPullRequest: async () => ({
         operationId: "pr-43",
         jobId: draft.id,
@@ -661,9 +672,17 @@ describe("disposable navigator live path", () => {
         headSha: HEAD,
       }),
       integrationWorktreeId: () => "env_job_dual",
-      clock: { now },
     });
-    expect(await release.processOne({
+    const releaseProtocol = new NavigatorEffectProtocol({
+      store,
+      clock: { now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+        { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+        createNavigatorReleaseEffectAdapter(release),
+      ],
+    });
+    expect(await releaseProtocol.processOne({
       ownerId: "executor",
       generation: lease.generation,
       signal: new AbortController().signal,
@@ -680,17 +699,6 @@ describe("disposable navigator live path", () => {
     database.prepare(
       `UPDATE job_admissions SET project_id = ?, state = 'admitted', admitted_at = ? WHERE job_id = ?`,
     ).run("proj_1", now(), draft.id);
-    const insertClaim = database.prepare(
-      `INSERT INTO job_resource_claims (
-         job_id, resource_key, resource_kind, state, owner_id, generation,
-         lease_expires_at, acquired_at, renewed_at
-       ) VALUES (?, ?, ?, 'held', 'executor', ?, 130000, 10100, 10100)`,
-    );
-    insertClaim.run(draft.id, projectResourceKey("proj_1"), "project", lease.generation);
-    const policy = store.getJob(draft.id)?.policy;
-    if (policy) {
-      insertClaim.run(draft.id, productionResourceKey(policy), "production_target", lease.generation);
-    }
     const current = store.getJob(draft.id)!;
     const deployKey = `${current.id}:${current.version + 1}:deploy_production`;
     database.prepare(

@@ -17,6 +17,7 @@ import { NavigatorImplementationExecutor } from "../src/navigator/implementation
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import {
+  NavigatorEffectAmbiguousError,
   NavigatorEffectProtocol,
   type NavigatorEffectContext,
   type NavigatorEffectOutcome,
@@ -342,10 +343,8 @@ function releaseExecutor(
   return {
     publish,
     executor: new NavigatorReleaseExecutor({
-      store: fixture.store,
       publishPullRequest: publish,
       integrationWorktreeId: () => "env_job_42",
-      clock: { now: fixture.now },
     }),
   };
 }
@@ -449,6 +448,35 @@ function configureReleaseClaimCase(
       `UPDATE effects SET status = 'leased', lease_owner = 'executor', lease_generation = 1, lease_expires_at = ?
         WHERE idempotency_key = ?`,
     ).run(now, effectIdempotencyKey);
+  }
+}
+
+function expireReleaseLeases(
+  fixture: OwnedFixture,
+  effectIdempotencyKey: string,
+  now: number,
+): void {
+  fixture.database.prepare(
+    `UPDATE effects
+        SET status = 'leased', lease_owner = 'stale-release', lease_generation = ?,
+            lease_expires_at = ?, next_attempt_at = ?
+      WHERE idempotency_key = ?`,
+  ).run(fixture.leaseGeneration, now, now, effectIdempotencyKey);
+  fixture.database.prepare(
+    `UPDATE job_resource_claims
+        SET lease_expires_at = ?, renewed_at = ?
+      WHERE job_id = ? AND state = 'held'`,
+  ).run(now, now, fixture.job.id);
+}
+
+function prepareExpiredReleaseForSuccessor(
+  fixture: OwnedFixture,
+  effectIdempotencyKey: string,
+  now: number,
+): void {
+  expireReleaseLeases(fixture, effectIdempotencyKey, now);
+  if (!fixture.store.releaseExecutorLease("executor", fixture.leaseGeneration, now)) {
+    throw new Error("release predecessor lease was not released");
   }
 }
 
@@ -709,7 +737,7 @@ describe("navigator exact-head release", () => {
       prNumber: 42,
       environmentId: "env_job_42",
     });
-    expect(await executor.processOne(fence(fixture), new AbortController().signal)).toBe(false);
+    expect(await protocol.processOne(fence(fixture), new AbortController().signal)).toBe(false);
     expect(publish).toHaveBeenCalledTimes(1);
     const reopened = openStore(fixture.bb.storage, fixture.bb.storage.kv, fixture.now);
     expect(reopened.getJob(fixture.job.id)).toMatchObject({
@@ -782,6 +810,42 @@ describe("navigator exact-head release", () => {
     ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
   });
 
+  it("does not settle a release after an entry claim is lost before atomic settlement", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release claim fence effect was not stored");
+    insertProjectClaim(fixture);
+    const adapter = vi.fn(async (context: NavigatorEffectContext): Promise<NavigatorEffectOutcome> => {
+      fixture.database.prepare(
+        `UPDATE job_resource_claims
+            SET state = 'released', released_at = ?, release_reason = 'entry claim lost'
+          WHERE job_id = ? AND resource_kind = 'project' AND state = 'held'`,
+      ).run(fixture.now(), fixture.job.id);
+      return releaseReceipt(context);
+    });
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_release", execute: adapter },
+      ],
+    });
+
+    await expect(protocol.processOne(fence(fixture), new AbortController().signal)).resolves.toBe(true);
+
+    expect(adapter).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "failed" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "implementing" });
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
+  });
+
   it("reconciles an ambiguous release outcome with a typed receipt", async () => {
     const fixture = ownedFixture();
     const accepted = propose(fixture, {
@@ -810,6 +874,97 @@ describe("navigator exact-head release", () => {
     expect(fixture.database.prepare(
       "SELECT kind FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
     ).get(accepted.effectIdempotencyKey)).toEqual({ kind: "run_navigator_release" });
+  });
+
+  it("reconciles ambiguous release entry through the shared release adapter", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release adapter reconciliation effect was not stored");
+    insertProjectClaim(fixture);
+    const executeEntry = vi.fn(async () => {
+      throw new NavigatorEffectAmbiguousError("release publication receipt was lost");
+    });
+    const reconcileEntry = vi.fn(async () => ({
+      operationId: "release:job-42",
+      jobId: fixture.job.id,
+      number: 42,
+      url: "https://github.com/acme/cyndra/pull/42",
+      headSha: HEAD,
+    }));
+    const adapter = createNavigatorReleaseEffectAdapter({
+      executeEntry,
+      reconcileEntry,
+      integrationEnvironmentId: () => "env_job_42",
+    });
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        adapter,
+      ],
+    });
+
+    await expect(protocol.processOne(fence(fixture), new AbortController().signal)).resolves.toBe(true);
+
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+    expect(reconcileEntry).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "resolving_pr_head" });
+  });
+
+  it("reconciles an ambiguous release entry through the real executor service", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release service reconciliation effect was not stored");
+    insertProjectClaim(fixture);
+    const now = fixture.now();
+    prepareExpiredReleaseForSuccessor(fixture, accepted.effectIdempotencyKey, now);
+    const executeEntry = vi.fn(async () => {
+      throw new NavigatorEffectAmbiguousError("release publication receipt was lost");
+    });
+    const reconcileEntry = vi.fn(async () => ({
+      operationId: "release:job-42",
+      jobId: fixture.job.id,
+      number: 42,
+      url: "https://github.com/acme/cyndra/pull/42",
+      headSha: HEAD,
+    }));
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        createNavigatorReleaseEffectAdapter({
+          executeEntry,
+          reconcileEntry,
+          integrationEnvironmentId: () => "env_job_42",
+        }),
+      ],
+    });
+    const abort = new AbortController();
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+    expect(reconcileEntry).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "resolving_pr_head" });
   });
 
   it.each(CLAIM_CASES)("runs the release executor only with the exact claim set (%s)", async (claimCase) => {
@@ -856,6 +1011,250 @@ describe("navigator exact-head release", () => {
         releaseClaimRequirements(fixture).map((claim) => `${claim.resourceKind}:${claim.resourceKey}`).sort(),
       );
     }
+  });
+
+  it("keeps release entry restartable when the executor lease is lost in flight", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release lease-loss effect was not stored");
+    insertProjectClaim(fixture);
+    const now = fixture.now();
+    prepareExpiredReleaseForSuccessor(fixture, accepted.effectIdempotencyKey, now);
+    const publish = vi.fn(async () => {
+      const currentLease = fixture.database.prepare(
+        "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+      ).get() as { owner_id: string | null; generation: number } | undefined;
+      if (!currentLease?.owner_id) throw new Error("release lease-loss executor was not acquired");
+      const takeover = fixture.database.prepare(
+        `UPDATE executor_lease SET owner_id = 'stale-release', generation = generation + 1,
+            lease_expires_at = ?
+          WHERE singleton = 1 AND owner_id = ? AND generation = ?`,
+      ).run(now + 10_000, currentLease.owner_id, currentLease.generation);
+      if (takeover.changes !== 1) throw new Error("release lease-loss takeover did not win");
+      await new Promise<void>(() => undefined);
+      return {
+        operationId: "release:job-42",
+        jobId: fixture.job.id,
+        number: 42,
+        url: "https://github.com/acme/cyndra/pull/42",
+        headSha: HEAD,
+      };
+    });
+    const release = new NavigatorReleaseExecutor({
+      publishPullRequest: publish,
+      integrationWorktreeId: () => "env_job_42",
+    });
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 30,
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        createNavigatorReleaseEffectAdapter(release),
+      ],
+    });
+    const abort = new AbortController();
+    const sleep = vi.fn(async (_milliseconds: number, sleepSignal: AbortSignal) => {
+      abort.abort();
+      throw sleepSignal.reason ?? new Error("successor could not acquire the executor lease");
+    });
+    const service = runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      sleep,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => { throw new Error("lease loss must stop before the ordinary wait"); },
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    await service;
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "leased" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "implementing" });
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
+    expect(fixture.database.prepare(
+      "SELECT owner_id FROM executor_lease WHERE singleton = 1",
+    ).get()).toEqual({ owner_id: "stale-release" });
+  });
+
+  it("retries the same release operation after entry completed before a restart", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release restart effect was not stored");
+    insertProjectClaim(fixture);
+    const now = fixture.now();
+    prepareExpiredReleaseForSuccessor(fixture, accepted.effectIdempotencyKey, now);
+    let entryCount = 0;
+    const publish = vi.fn(async () => {
+      entryCount += 1;
+      const currentLease = fixture.database.prepare(
+        "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+      ).get() as { owner_id: string | null; generation: number } | undefined;
+      if (!currentLease?.owner_id) throw new Error("release restart executor was not acquired");
+      if (entryCount === 1) {
+        const takeover = fixture.database.prepare(
+          `UPDATE executor_lease SET owner_id = 'stale-release', generation = generation + 1,
+              lease_expires_at = ?
+            WHERE singleton = 1 AND owner_id = ? AND generation = ?`,
+        ).run(now + 10_000, currentLease.owner_id, currentLease.generation);
+        if (takeover.changes !== 1) throw new Error("release restart takeover did not win");
+      }
+      return {
+        operationId: "release:job-42",
+        jobId: fixture.job.id,
+        number: 42,
+        url: "https://github.com/acme/cyndra/pull/42",
+        headSha: HEAD,
+      };
+    });
+    const release = new NavigatorReleaseExecutor({
+      publishPullRequest: publish,
+      integrationWorktreeId: () => "env_job_42",
+    });
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 30,
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        createNavigatorReleaseEffectAdapter(release),
+      ],
+    });
+    const firstAbort = new AbortController();
+    const firstSleep = vi.fn(async (_milliseconds: number, sleepSignal: AbortSignal) => {
+      firstAbort.abort();
+      throw sleepSignal.reason ?? new Error("successor could not acquire the executor lease");
+    });
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      sleep: firstSleep,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => { throw new Error("first release restart must stop after lease loss"); },
+      releaseOnShutdown: true,
+    }, firstAbort.signal);
+
+    const takeoverLease = fixture.database.prepare(
+      "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+    ).get() as { owner_id: string | null; generation: number } | undefined;
+    if (!takeoverLease?.owner_id) throw new Error("release restart takeover lease is missing");
+    expect(fixture.store.releaseExecutorLease(takeoverLease.owner_id, takeoverLease.generation, now)).toBe(true);
+    expireReleaseLeases(fixture, accepted.effectIdempotencyKey, now);
+
+    const secondAbort = new AbortController();
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => secondAbort.abort(),
+      releaseOnShutdown: true,
+    }, secondAbort.signal);
+
+    expect(firstSleep).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({
+      state: "resolving_pr_head",
+      prNumber: 42,
+      environmentId: "env_job_42",
+    });
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 1 });
+  });
+
+  it("restarts a release that was leased before entry began", async () => {
+    const fixture = ownedFixture();
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release pre-entry restart effect was not stored");
+    insertProjectClaim(fixture);
+    const now = fixture.now();
+    prepareExpiredReleaseForSuccessor(fixture, accepted.effectIdempotencyKey, now);
+    const firstExecute = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({
+      outcome: "lease_cancelled",
+      reason: "executor restarted before release entry",
+    }));
+    const firstProtocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_release", execute: firstExecute },
+      ],
+    });
+    const firstAbort = new AbortController();
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: firstProtocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => firstAbort.abort(),
+      releaseOnShutdown: true,
+    }, firstAbort.signal);
+
+    expect(firstExecute).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "failed" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "implementing" });
+    expireReleaseLeases(fixture, accepted.effectIdempotencyKey, now);
+    const publish = vi.fn(async () => ({
+      operationId: "release:job-42",
+      jobId: fixture.job.id,
+      number: 42,
+      url: "https://github.com/acme/cyndra/pull/42",
+      headSha: HEAD,
+    }));
+    const secondProtocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        createNavigatorReleaseEffectAdapter(new NavigatorReleaseExecutor({
+          publishPullRequest: publish,
+          integrationWorktreeId: () => "env_job_42",
+        })),
+      ],
+    });
+    const secondAbort = new AbortController();
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: secondProtocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => secondAbort.abort(),
+      releaseOnShutdown: true,
+    }, secondAbort.signal);
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "resolving_pr_head" });
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 1 });
   });
 
   it("auto-authorizes a shipped navigator merge without a standing grant and re-derives after head drift", async () => {

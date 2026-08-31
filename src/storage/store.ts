@@ -81,6 +81,11 @@ import {
   type WorkflowEngineRolloutDecision,
 } from "../navigator/promotion";
 import {
+  navigatorClaimContract,
+  type NavigatorClaimContract,
+  type NavigatorClaimedEffectKind,
+} from "../navigator/claim-contracts";
+import {
   WorkflowEngineRepository,
   type WorkflowEngineContraction,
 } from "./workflow-engine-repository";
@@ -377,6 +382,14 @@ type LegacyControllerQuestionRow = Readonly<{
   answers_json: unknown;
   asked_at: unknown;
   answered_at: unknown;
+}>;
+
+type NavigatorResourceClaimRow = Readonly<{
+  resource_key: string;
+  resource_kind: string;
+  owner_id: string;
+  generation: number;
+  lease_expires_at: number;
 }>;
 
 export type CapabilityDispatchSettings = Readonly<{
@@ -874,7 +887,7 @@ export type NavigatorReleaseEffectSettlementInput = ExecutorFence & Readonly<{
   number: number;
   url: string;
   environmentId: string;
-  receipt?: NavigatorReleaseReceipt;
+  receipt: NavigatorReleaseReceipt;
 }>;
 
 type NavigatorTicketSettlementHandler = (input: NavigatorTicketSettlementInput) => NavigatorTicketWorkerOutcome | null;
@@ -4097,12 +4110,6 @@ export interface TelegramAgentStore {
   }): StoredEffect | null;
   settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean;
   leaseNavigatorSkillEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null;
-  leaseNavigatorReleaseEffect(input: {
     ownerId: string;
     generation: number;
     now: number;
@@ -12810,7 +12817,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!effectRow || !this.navigatorReleaseEffectIsCurrent(effectRow, input)) return false;
       if (!this.releaseReceiptMatches(receipt, effectRow, input, url)) return false;
       const current = this.readJobById(effectRow.job_id);
-      if (!current || current.cancelRequestedAt !== null || current.state === "cancelled") return false;
+      if (!current || current.cancelRequestedAt !== null || current.state === "cancelled" ||
+        !this.navigatorResourceClaimsAreCurrent(current, "run_navigator_release", input)) return false;
       if (current.state === "implementing" && !this.applyNavigatorReleaseStart(current, input, url)) return false;
       this.recordNavigatorReleaseReceipt(receipt, effectRow.job_id, input);
       const completed = this.completeNavigatorReleaseEffect(effectRow, input);
@@ -12867,6 +12875,42 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.effectIdempotencyKey,
         authorityEffect,
       ));
+  }
+
+  private navigatorResourceClaimsAreCurrent(
+    job: Job,
+    kind: NavigatorClaimedEffectKind,
+    input: Readonly<{ ownerId: string; generation: number; now: number }>,
+  ): boolean {
+    const contract = navigatorClaimContract(kind, job);
+    if (contract === null) return false;
+    return this.navigatorResourceClaimsMatchContract(
+      contract,
+      this.currentNavigatorResourceClaims(job.id),
+      input,
+    );
+  }
+
+  private currentNavigatorResourceClaims(jobId: string): NavigatorResourceClaimRow[] {
+    return this.db.prepare(
+      `SELECT resource_key, resource_kind, owner_id, generation, lease_expires_at
+         FROM job_resource_claims
+        WHERE job_id = ? AND state = 'held'`,
+    ).all(jobId) as NavigatorResourceClaimRow[];
+  }
+
+  private navigatorResourceClaimsMatchContract(
+    contract: NavigatorClaimContract,
+    claims: readonly NavigatorResourceClaimRow[],
+    input: Readonly<{ ownerId: string; generation: number; now: number }>,
+  ): boolean {
+    if (claims.length !== contract.resourceClaims.length) return false;
+    return claims.every((claim) => claim.owner_id === input.ownerId &&
+      claim.generation === input.generation && claim.lease_expires_at > input.now &&
+      contract.resourceClaims.some((requirement) => requirement.resourceKey === claim.resource_key &&
+        requirement.resourceKind === claim.resource_kind)) &&
+      contract.resourceClaims.every((requirement) => claims.some((claim) =>
+        requirement.resourceKey === claim.resource_key && requirement.resourceKind === claim.resource_kind));
   }
 
   private applyNavigatorReleaseStart(
@@ -12935,14 +12979,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.leaseSkillEffect(input);
   }
 
-  public leaseNavigatorReleaseEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null {
-    return this.navigatorRepository.leaseReleaseEffect(input);
-  }
 
   public getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null {
     return this.navigatorRepository.getReleaseAttempt(id);
@@ -15114,6 +15150,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         )
         .all(input.jobId) as Array<{ claim_id: number; owner_id: string; generation: number }>;
       if (claims.some((claim) => claim.owner_id !== input.ownerId || claim.generation !== input.generation)) return false;
+      if (effect.kind === "run_navigator_skill" || effect.kind === "run_navigator_ticket_worker" ||
+        effect.kind === "run_navigator_release") {
+        const job = this.readJobById(input.jobId);
+        if (!job || !this.navigatorResourceClaimsAreCurrent(job, effect.kind, input)) return false;
+      }
       const updatedEffect = this.db
         .prepare(
           `UPDATE effects SET lease_expires_at = ?, updated_at = ?
@@ -15299,6 +15340,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const result: StoredEffect[] = [];
     for (const row of rows) {
       if (!this.executorLeaseIsCurrent(ownerId, generation, now)) break;
+      if (row.kind === "run_navigator_skill" || row.kind === "run_navigator_ticket_worker" || row.kind === "run_navigator_release") {
+        continue;
+      }
       if (row.kind === "merge_pr" || row.kind === "deploy_production" || row.kind === "verify_production") {
         const claimed = this.leaseNextJobEffect({
           jobId: row.job_id,

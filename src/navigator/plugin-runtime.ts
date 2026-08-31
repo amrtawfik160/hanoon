@@ -35,6 +35,7 @@ import type {
   NavigatorTicketEffectContext,
   NavigatorTicketReceipt,
 } from "./effect-contracts";
+import { navigatorReleaseReceiptSchema } from "./effect-contracts";
 import { DeterministicWorkflowNavigator } from "./deterministic-navigator";
 import type { NavigatorInferenceObservation, NavigatorSkillAttempt, NavigatorSnapshot } from "./models";
 import {
@@ -87,12 +88,29 @@ async function executeTicketAdapter(
   return { outcome: "completed", receipt: ticketReceipt(context, execution) };
 }
 
+type NavigatorReleaseEntryOperation = Pick<
+  NavigatorReleaseExecutor,
+  "executeEntry" | "reconcileEntry" | "integrationEnvironmentId"
+>;
+
+function releaseEntryRequest(context: NavigatorReleaseEffectContext): Readonly<{
+  jobId: string;
+  title: string;
+  body: string;
+}> {
+  return {
+    jobId: context.effect.jobId,
+    title: navigatorReleaseTitle(context.job.requestText),
+    body: "Exact-head release of the accepted implementation tickets.",
+  };
+}
+
 function releaseReceipt(
   context: NavigatorReleaseEffectContext,
   published: NavigatorPullRequestRecord,
   environmentId: string,
-): NavigatorReleaseReceipt {
-  return {
+): NavigatorReleaseReceipt | null {
+  const parsed = navigatorReleaseReceiptSchema.safeParse({
     kind: "run_navigator_release",
     effectIdempotencyKey: context.effect.idempotencyKey,
     attemptId: context.attempt.id,
@@ -100,23 +118,43 @@ function releaseReceipt(
     number: published.number,
     url: published.url,
     environmentId,
-  };
+  });
+  return parsed.success ? parsed.data : null;
+}
+
+function releaseEntryOutcome(
+  context: NavigatorReleaseEffectContext,
+  published: NavigatorPullRequestRecord,
+  environmentId: string,
+): NavigatorEffectOutcome {
+  const receipt = releaseReceipt(context, published, environmentId);
+  return receipt === null
+    ? { outcome: "permanent", reason: "Navigator release entry receipt is invalid" }
+    : { outcome: "completed", receipt };
 }
 
 async function executeReleaseAdapter(
-  operation: Pick<NavigatorReleaseExecutor, "executeEntry" | "integrationEnvironmentId">,
+  operation: NavigatorReleaseEntryOperation,
   context: NavigatorEffectContext,
 ): Promise<NavigatorEffectOutcome> {
   if (context.kind !== "run_navigator_release") {
     return { outcome: "permanent", reason: "Navigator release adapter received another effect kind" };
   }
-  const published = await operation.executeEntry({
-    jobId: context.effect.jobId,
-    title: navigatorReleaseTitle(context.job.requestText),
-    body: "Exact-head release of the accepted implementation tickets.",
-  }, context.signal);
+  const published = await operation.executeEntry(releaseEntryRequest(context), context.signal);
   const environmentId = operation.integrationEnvironmentId(context.effect.jobId);
-  return { outcome: "completed", receipt: releaseReceipt(context, published, environmentId) };
+  return releaseEntryOutcome(context, published, environmentId);
+}
+
+async function reconcileReleaseAdapter(
+  operation: NavigatorReleaseEntryOperation,
+  context: NavigatorEffectContext,
+): Promise<NavigatorEffectOutcome> {
+  if (context.kind !== "run_navigator_release") {
+    return { outcome: "permanent", reason: "Navigator release adapter received another effect kind" };
+  }
+  const published = await operation.reconcileEntry(releaseEntryRequest(context), context.signal);
+  const environmentId = operation.integrationEnvironmentId(context.effect.jobId);
+  return releaseEntryOutcome(context, published, environmentId);
 }
 
 export function createNavigatorTicketEffectAdapter(
@@ -126,9 +164,13 @@ export function createNavigatorTicketEffectAdapter(
 }
 
 export function createNavigatorReleaseEffectAdapter(
-  operation: Pick<NavigatorReleaseExecutor, "executeEntry" | "integrationEnvironmentId">,
+  operation: NavigatorReleaseEntryOperation,
 ): NavigatorEffectAdapter {
-  return { kind: "run_navigator_release", execute: (context) => executeReleaseAdapter(operation, context) };
+  return {
+    kind: "run_navigator_release",
+    execute: (context) => executeReleaseAdapter(operation, context),
+    reconcile: (context) => reconcileReleaseAdapter(operation, context),
+  };
 }
 
 function parseThreadJson(raw: unknown): unknown {
@@ -668,10 +710,8 @@ export function createNavigatorRuntime(input: Readonly<{
       clock: input.clock,
     });
   const release = new NavigatorReleaseExecutor({
-      store: input.store,
       publishPullRequest: (request) => publishPluginNavigatorPullRequest(input.sdk, request),
       integrationWorktreeId: (jobId) => `env_${jobId}`,
-      clock: input.clock,
     });
   const skillAdapter: NavigatorEffectAdapter = {
     kind: "run_navigator_skill",
