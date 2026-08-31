@@ -16,6 +16,7 @@ import { assessReviewGroup } from "../src/domain/review-lenses";
 import { NavigatorImplementationExecutor } from "../src/navigator/implementation-executor";
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
+import { navigatorReleaseOperationId } from "../src/navigator/release-contracts";
 import {
   NavigatorEffectAmbiguousError,
   NavigatorEffectProtocol,
@@ -206,7 +207,7 @@ function startResolvedIntegration(
 
 function ownedFixture(
   task = "Ship the accepted navigator tickets to production",
-  options: Readonly<{ engine?: "recipe-v1" | "navigator-v1" }> = {},
+  options: Readonly<{ engine?: "recipe-v1" | "navigator-v1"; admit?: boolean }> = {},
 ): OwnedFixture {
   fixtureSequence += 1;
   const { bb } = createFakePluginHost({ pluginId: `navigator-release-${fixtureSequence}` });
@@ -293,7 +294,19 @@ function ownedFixture(
     now,
   };
   startResolvedIntegration(fixture);
-  bb.storage.database().prepare("UPDATE jobs SET state = 'implementing' WHERE id = ?").run(bound.id);
+  if (options.admit) {
+    const admission = store.tryAdmit({
+      jobId: bound.id,
+      maxConcurrentJobs: 8,
+      ownerId: "executor",
+      generation: lease.generation,
+      now: now(),
+      leaseMs: 120_000,
+    });
+    if (admission.outcome !== "admitted") throw new Error(`navigator job admission failed: ${admission.reason}`);
+  } else {
+    bb.storage.database().prepare("UPDATE jobs SET state = 'implementing' WHERE id = ?").run(bound.id);
+  }
   const job = store.getJob(bound.id);
   if (!job) throw new Error("implementing navigator job is missing");
   return { ...fixture, job };
@@ -333,7 +346,7 @@ function propose(
 function releaseExecutor(
   fixture: OwnedFixture,
   publish = vi.fn(async () => ({
-    operationId: "pr-42",
+    operationId: navigatorReleaseOperationId(fixture.job.id),
     jobId: fixture.job.id,
     number: 42,
     url: "https://github.com/acme/cyndra/pull/42",
@@ -367,10 +380,28 @@ function releaseReceipt(context: NavigatorEffectContext): NavigatorEffectOutcome
       kind: "run_navigator_release",
       effectIdempotencyKey: context.effect.idempotencyKey,
       attemptId: context.attempt.id,
+      jobId: context.effect.jobId,
+      operationId: navigatorReleaseOperationId(context.effect.jobId),
       resource: { kind: "environment", id: "env_job_42" },
       number: 42,
       url: "https://github.com/acme/cyndra/pull/42",
       environmentId: "env_job_42",
+    },
+  };
+}
+
+function releaseReceiptWithIdentity(
+  context: NavigatorEffectContext,
+  identity: Readonly<{ jobId?: string; operationId?: string }>,
+): NavigatorEffectOutcome {
+  const outcome = releaseReceipt(context);
+  if (outcome.outcome !== "completed" || outcome.receipt.kind !== "run_navigator_release") return outcome;
+  return {
+    ...outcome,
+    receipt: {
+      ...outcome.receipt,
+      jobId: identity.jobId ?? outcome.receipt.jobId,
+      operationId: identity.operationId ?? outcome.receipt.operationId,
     },
   };
 }
@@ -634,6 +665,90 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
   }).run(claimed);
 }
 
+function admitCompetingMerge(fixture: OwnedFixture): string {
+  const policy = {
+    ...productionPolicy(),
+    projectId: "proj_2",
+    alias: "cyndra-competitor",
+  };
+  fixture.store.upsertProjectPolicy(policy, fixture.now());
+  const now = fixture.now();
+  const controllerKey = "owner-7-competitor";
+  const turn = fixture.store.enqueueControllerTurn({
+    controllerKey,
+    telegramUserId: "7",
+    telegramChatId: "7",
+    updateId: 50_000 + fixtureSequence,
+    inputText: "Ship the competing release",
+    now,
+  });
+  const claimed = fixture.store.claimNextControllerTurn({
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now,
+  });
+  if (!claimed || claimed.id !== turn.id) throw new Error("competing controller turn was not claimed");
+  if (!fixture.store.markControllerSpawned({
+    turnId: turn.id,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now,
+    projectId: policy.projectId,
+    hostId: "host_competitor",
+    threadId: "thr_controller_competitor",
+  })) throw new Error("competing controller spawn was not recorded");
+  if (!fixture.store.markControllerTurnSubmitted({
+    turnId: turn.id,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now,
+  })) throw new Error("competing controller submission was not recorded");
+  const created = fixture.store.createConfirmedControllerJob({
+    controllerThreadId: "thr_controller_competitor",
+    projectId: policy.projectId,
+    task: "Ship the competing release",
+    now,
+  });
+  const selected = fixture.store.getJob(created.id);
+  if (!selected) throw new Error("competing navigator job is missing");
+  const admission = fixture.store.tryAdmit({
+    jobId: selected.id,
+    maxConcurrentJobs: 8,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now: fixture.now(),
+    leaseMs: 120_000,
+  });
+  if (admission.outcome !== "admitted") throw new Error(`competing job admission failed: ${admission.reason}`);
+
+  fixture.database.prepare(
+    `UPDATE jobs SET state = 'awaiting_merge_approval', environment_id = 'env_competitor',
+       pr_number = 99, pr_url = 'https://github.com/acme/cyndra/pull/99', pr_head_sha = ?,
+       version = version + 1 WHERE id = ?`,
+  ).run(HEAD, selected.id);
+  const awaitingApproval = fixture.store.getJob(selected.id);
+  if (!awaitingApproval) throw new Error("competing approval job is missing");
+  const accepted = fixture.store.acceptTaskAuthorityAndEnqueueMerge({
+    jobId: selected.id,
+    expectedJobVersion: awaitingApproval.version,
+    headSha: HEAD,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now: fixture.now(),
+  });
+  if (!accepted.ok) throw new Error(`competing merge acceptance failed: ${accepted.reason}`);
+  fixture.database.prepare("UPDATE effects SET status = 'done' WHERE job_id = ? AND kind <> 'merge_pr'").run(selected.id);
+  const leased = fixture.store.leaseNextJobEffect({
+    jobId: selected.id,
+    ownerId: "executor",
+    generation: fixture.leaseGeneration,
+    now: fixture.now(),
+    leaseMs: 120_000,
+  });
+  if (!leased || leased.kind !== "merge_pr") throw new Error("competing merge did not acquire its claims");
+  return selected.id;
+}
+
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
     expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.at(-1));
@@ -747,6 +862,167 @@ describe("navigator exact-head release", () => {
     });
     expect(reopened.listEffectsForJob(fixture.job.id).find((effect) => effect.kind === "run_navigator_release"))
       .toMatchObject({ status: "done" });
+  });
+
+  it("leases and settles release claims acquired after ordinary admission", async () => {
+    const fixture = ownedFixture("Ship normally admitted tickets to production", { admit: true });
+    expect(fixture.store.listCurrentHeldResourceClaims(fixture.job.id, 10).map((claim) => claim.resourceKind))
+      .toEqual(["project"]);
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("ordinary admission release effect was not stored");
+    const now = fixture.now();
+    prepareExpiredReleaseForSuccessor(fixture, accepted.effectIdempotencyKey, now);
+    const { executor, publish } = releaseExecutor(fixture);
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: () => now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        createNavigatorReleaseEffectAdapter(executor),
+      ],
+    });
+    const abort = new AbortController();
+    await runJobExecutorService({
+      store: fixture.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith({
+      operationId: navigatorReleaseOperationId(fixture.job.id),
+      jobId: fixture.job.id,
+      title: "Ship normally admitted tickets to production",
+      body: "Exact-head release of the accepted implementation tickets.",
+    });
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({
+      state: "resolving_pr_head",
+      prNumber: 42,
+      environmentId: "env_job_42",
+    });
+    expect(fixture.store.listCurrentHeldResourceClaims(fixture.job.id, 10)
+      .map((claim) => `${claim.resourceKind}:${claim.resourceKey}`).sort()).toEqual(
+      releaseClaimRequirements(fixture).map((claim) => `${claim.resourceKind}:${claim.resourceKey}`).sort(),
+    );
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 1 });
+    const receiptRow = fixture.database.prepare(
+      "SELECT receipt_json FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey) as { receipt_json: string } | undefined;
+    expect(JSON.parse(receiptRow?.receipt_json ?? "{}")).toMatchObject({
+      jobId: fixture.job.id,
+      operationId: navigatorReleaseOperationId(fixture.job.id),
+    });
+  });
+
+  it.each([
+    ["execution", "jobId"],
+    ["execution", "operationId"],
+    ["reconciliation", "jobId"],
+    ["reconciliation", "operationId"],
+  ] as const)("rejects a mismatched release %s %s without a transition or receipt", async (phase, field) => {
+    const fixture = ownedFixture("Reject mismatched release provider identity", { admit: true });
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("release identity effect was not stored");
+    const identity = field === "jobId"
+      ? { jobId: "job-release-other" }
+      : { operationId: navigatorReleaseOperationId("job-release-other") };
+    const adapter = {
+      kind: "run_navigator_release" as const,
+      execute: vi.fn(async (context: NavigatorEffectContext): Promise<NavigatorEffectOutcome> => phase === "execution"
+        ? releaseReceiptWithIdentity(context, identity)
+        : { outcome: "ambiguous" as const, reason: "release receipt was lost" }),
+      reconcile: vi.fn(async (context: NavigatorEffectContext) => releaseReceiptWithIdentity(context, identity)),
+    };
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        adapter,
+      ],
+    });
+
+    await expect(protocol.processOne(fence(fixture), new AbortController().signal)).resolves.toBe(true);
+
+    expect(adapter.execute).toHaveBeenCalledTimes(1);
+    expect(adapter.reconcile).toHaveBeenCalledTimes(phase === "reconciliation" ? 1 : 0);
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "failed" });
+    expect(fixture.store.getJob(fixture.job.id)).toMatchObject({
+      state: "implementing",
+      currentWorkflowStepId: accepted.workflowStepId,
+    });
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
+  });
+
+  it("refuses a stale release generation before acquiring its missing claims", () => {
+    const fixture = ownedFixture("Reject a stale release generation", { admit: true });
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("stale release effect was not stored");
+    const now = fixture.now();
+    prepareExpiredReleaseForSuccessor(fixture, accepted.effectIdempotencyKey, now);
+    const successor = fixture.store.acquireExecutorLease("successor", now, 1_000);
+    if (!successor.acquired) throw new Error("successor executor lease was not acquired");
+
+    expect(fixture.store.leaseNavigatorEffect({
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now,
+      leaseMs: 1_000,
+    })).toBeNull();
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({
+      status: "leased",
+      leaseOwner: "stale-release",
+      leaseGeneration: fixture.leaseGeneration,
+    });
+    expect(fixture.store.listCurrentHeldResourceClaims(fixture.job.id, 10)).toHaveLength(1);
+    expect(fixture.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(accepted.effectIdempotencyKey)).toEqual({ count: 0 });
+  });
+
+  it("refuses a release claim conflict without partially leasing or acquiring claims", () => {
+    const fixture = ownedFixture("Reject a competing repository release", { admit: true });
+    const competingJobId = admitCompetingMerge(fixture);
+    const accepted = propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    if (!accepted.effectIdempotencyKey) throw new Error("conflicting release effect was not stored");
+    const before = fixture.store.listCurrentHeldResourceClaims(fixture.job.id, 10);
+
+    expect(fixture.store.leaseNavigatorEffect({
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: fixture.now(),
+      leaseMs: 120_000,
+    })).toBeNull();
+    expect(fixture.store.getEffect(fixture.job.id, accepted.effectIdempotencyKey)).toMatchObject({
+      status: "pending",
+      attempts: 0,
+    });
+    expect(fixture.store.listCurrentHeldResourceClaims(fixture.job.id, 10)).toEqual(before);
+    expect(fixture.store.listCurrentHeldResourceClaims(competingJobId, 10)
+      .map((claim) => claim.resourceKind).sort()).toEqual(["production_target", "project", "repository_merge"]);
   });
 
   it("does not complete a release effect when the adapter omits its receipt", async () => {
@@ -888,7 +1164,7 @@ describe("navigator exact-head release", () => {
       throw new NavigatorEffectAmbiguousError("release publication receipt was lost");
     });
     const reconcileEntry = vi.fn(async () => ({
-      operationId: "release:job-42",
+      operationId: navigatorReleaseOperationId(fixture.job.id),
       jobId: fixture.job.id,
       number: 42,
       url: "https://github.com/acme/cyndra/pull/42",
@@ -931,7 +1207,7 @@ describe("navigator exact-head release", () => {
       throw new NavigatorEffectAmbiguousError("release publication receipt was lost");
     });
     const reconcileEntry = vi.fn(async () => ({
-      operationId: "release:job-42",
+      operationId: navigatorReleaseOperationId(fixture.job.id),
       jobId: fixture.job.id,
       number: 42,
       url: "https://github.com/acme/cyndra/pull/42",
@@ -1036,7 +1312,7 @@ describe("navigator exact-head release", () => {
       if (takeover.changes !== 1) throw new Error("release lease-loss takeover did not win");
       await new Promise<void>(() => undefined);
       return {
-        operationId: "release:job-42",
+        operationId: navigatorReleaseOperationId(fixture.job.id),
         jobId: fixture.job.id,
         number: 42,
         url: "https://github.com/acme/cyndra/pull/42",
@@ -1113,7 +1389,7 @@ describe("navigator exact-head release", () => {
         if (takeover.changes !== 1) throw new Error("release restart takeover did not win");
       }
       return {
-        operationId: "release:job-42",
+        operationId: navigatorReleaseOperationId(fixture.job.id),
         jobId: fixture.job.id,
         number: 42,
         url: "https://github.com/acme/cyndra/pull/42",
@@ -1220,7 +1496,7 @@ describe("navigator exact-head release", () => {
     expect(fixture.store.getJob(fixture.job.id)).toMatchObject({ state: "implementing" });
     expireReleaseLeases(fixture, accepted.effectIdempotencyKey, now);
     const publish = vi.fn(async () => ({
-      operationId: "release:job-42",
+      operationId: navigatorReleaseOperationId(fixture.job.id),
       jobId: fixture.job.id,
       number: 42,
       url: "https://github.com/acme/cyndra/pull/42",

@@ -24,6 +24,10 @@ import {
 } from "./implementation-executor";
 import { navigatorReleaseTitle, NavigatorReleaseExecutor } from "./release-executor";
 import {
+  navigatorReleaseOperationId,
+  type NavigatorReleaseEntryRequest,
+} from "./release-contracts";
+import {
   NavigatorEffectProtocol,
   type NavigatorEffectAdapter,
   type NavigatorEffectOutcome,
@@ -93,12 +97,9 @@ type NavigatorReleaseEntryOperation = Pick<
   "executeEntry" | "reconcileEntry" | "integrationEnvironmentId"
 >;
 
-function releaseEntryRequest(context: NavigatorReleaseEffectContext): Readonly<{
-  jobId: string;
-  title: string;
-  body: string;
-}> {
+function releaseEntryRequest(context: NavigatorReleaseEffectContext): NavigatorReleaseEntryRequest {
   return {
+    operationId: navigatorReleaseOperationId(context.effect.jobId),
     jobId: context.effect.jobId,
     title: navigatorReleaseTitle(context.job.requestText),
     body: "Exact-head release of the accepted implementation tickets.",
@@ -114,6 +115,8 @@ function releaseReceipt(
     kind: "run_navigator_release",
     effectIdempotencyKey: context.effect.idempotencyKey,
     attemptId: context.attempt.id,
+    jobId: published.jobId,
+    operationId: published.operationId,
     resource: { kind: "environment", id: environmentId },
     number: published.number,
     url: published.url,
@@ -127,6 +130,10 @@ function releaseEntryOutcome(
   published: NavigatorPullRequestRecord,
   environmentId: string,
 ): NavigatorEffectOutcome {
+  if (
+    published.jobId !== context.effect.jobId ||
+    published.operationId !== navigatorReleaseOperationId(context.effect.jobId)
+  ) return { outcome: "permanent", reason: "Navigator release entry identity is invalid" };
   const receipt = releaseReceipt(context, published, environmentId);
   return receipt === null
     ? { outcome: "permanent", reason: "Navigator release entry receipt is invalid" }
@@ -590,7 +597,7 @@ async function readPullRequestHeadSha(
 
 export async function publishPluginNavigatorPullRequest(
   sdk: BbSdk,
-  request: Readonly<{ jobId: string; title: string; body: string }>,
+  request: NavigatorReleaseEntryRequest,
 ): Promise<NavigatorPullRequestRecord> {
   const snapshot = await sdk.environments.pullRequest({
     environmentId: `env_${request.jobId}`,
@@ -599,7 +606,7 @@ export async function publishPluginNavigatorPullRequest(
     throw new Error("navigator release pull request snapshot is unavailable");
   }
   return {
-    operationId: `release:${request.jobId}`,
+    operationId: request.operationId,
     jobId: request.jobId,
     number: snapshot.pullRequest.number,
     url: snapshot.pullRequest.url,

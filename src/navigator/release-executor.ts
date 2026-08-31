@@ -1,7 +1,8 @@
 import type { NavigatorPullRequestRecord } from "./implementation-contracts";
+import type { NavigatorReleaseEntryRequest } from "./release-contracts";
 
 export type NavigatorReleaseExecutorDependencies = Readonly<{
-  publishPullRequest(input: Readonly<{ jobId: string; title: string; body: string }>): Promise<NavigatorPullRequestRecord>;
+  publishPullRequest(input: NavigatorReleaseEntryRequest): Promise<NavigatorPullRequestRecord>;
   integrationWorktreeId(jobId: string): string;
 }>;
 
@@ -31,7 +32,7 @@ export class NavigatorReleaseExecutor {
   }
 
   public async executeEntry(
-    input: Readonly<{ jobId: string; title: string; body: string }>,
+    input: NavigatorReleaseEntryRequest,
     signal: AbortSignal,
   ): Promise<NavigatorPullRequestRecord> {
     return Promise.race([
@@ -41,7 +42,7 @@ export class NavigatorReleaseExecutor {
   }
 
   public async reconcileEntry(
-    input: Readonly<{ jobId: string; title: string; body: string }>,
+    input: NavigatorReleaseEntryRequest,
     signal: AbortSignal,
   ): Promise<NavigatorPullRequestRecord> {
     return this.executeEntry(input, signal);

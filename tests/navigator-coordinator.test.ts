@@ -26,6 +26,7 @@ import {
 import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
 import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
+import { navigatorReleaseOperationId } from "../src/navigator/release-contracts";
 import { EffectRunner } from "../src/services/effect-runner";
 import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../src/autonomy/models";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -665,7 +666,7 @@ describe("disposable navigator live path", () => {
     insertReleaseClaim.run(draft.id, productionResourceKey(store.getJob(draft.id)!.policy!), "production_target", lease.generation, 130_000, releaseClaimNow, releaseClaimNow);
     const release = new NavigatorReleaseExecutor({
       publishPullRequest: async () => ({
-        operationId: "pr-43",
+        operationId: navigatorReleaseOperationId(draft.id),
         jobId: draft.id,
         number: 43,
         url: "https://github.com/acme/cyndra/pull/43",

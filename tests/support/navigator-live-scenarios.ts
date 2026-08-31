@@ -13,6 +13,7 @@ import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/
 import { NavigatorEffectProtocol } from "../../src/navigator/effect-protocol";
 import { createNavigatorReleaseEffectAdapter } from "../../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../../src/navigator/release-executor";
+import { navigatorReleaseOperationId } from "../../src/navigator/release-contracts";
 import { EffectRunner } from "../../src/services/effect-runner";
 import type { ProductionStageSnapshot } from "../../src/services/production-runner";
 import type { TelegramAgentStore } from "../../src/storage/store";
@@ -879,7 +880,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
       insertReleaseClaim.run(opened.jobId, productionResourceKey(releaseJob.policy), "production_target", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
       const release = new NavigatorReleaseExecutor({
         publishPullRequest: async () => ({
-          operationId: "pr-43",
+          operationId: navigatorReleaseOperationId(opened.jobId),
           jobId: opened.jobId,
           number: 43,
           url: "https://github.com/acme/cyndra/pull/43",

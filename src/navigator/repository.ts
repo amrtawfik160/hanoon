@@ -22,7 +22,11 @@ import {
 } from "./effect-contracts";
 import type { NavigatorTicketAttemptContext } from "./effect-contracts";
 import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
-import { navigatorClaimContract, type NavigatorClaimedEffectKind } from "./claim-contracts";
+import {
+  navigatorClaimContract,
+  type NavigatorClaimedEffectKind,
+  type NavigatorRequiredResourceClaim,
+} from "./claim-contracts";
 import {
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
@@ -102,7 +106,9 @@ type NavigatorTicketClaimRow = Readonly<{
 }>;
 
 type NavigatorLeaseClaimPlan = Readonly<{
+  jobId: string;
   jobClaimIds: readonly number[];
+  missingJobClaims: readonly NavigatorRequiredResourceClaim[];
   ticketClaim: NavigatorTicketClaimRow | null;
 }>;
 
@@ -127,6 +133,15 @@ type NavigatorCompatibilityEvidenceSeed = Readonly<{
 }>;
 
 class NavigatorLeaseConflictError extends Error {}
+
+function sqliteErrorCode(error: unknown): unknown {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return (error as { code?: unknown }).code;
+}
+
+function isNavigatorClaimConstraint(error: unknown): boolean {
+  return sqliteErrorCode(error) === "SQLITE_CONSTRAINT_UNIQUE";
+}
 
 function isNavigatorClaimedEffectKind(kind: StoredEffect["kind"]): kind is NavigatorClaimedEffectKind {
   return kind === "run_navigator_skill" || kind === "run_navigator_ticket_worker" || kind === "run_navigator_release";
@@ -2196,19 +2211,53 @@ export class NavigatorRepository {
       `SELECT claim_id, resource_key, resource_kind, state, owner_id, generation, lease_expires_at
          FROM job_resource_claims WHERE job_id = ? AND state = 'held' ORDER BY claim_id`,
     ).all(effect.jobId) as NavigatorLeaseClaimRow[];
-    if (claims.length !== contract.resourceClaims.length || claims.some((claim) => !contract.resourceClaims.some((requirement) =>
+    if (claims.some((claim) => !contract.resourceClaims.some((requirement) =>
       claim.resource_kind === requirement.resourceKind && claim.resource_key === requirement.resourceKey))) return null;
     const ticketClaim = contract.requiresTicketWorkArtifact
       ? this.navigatorTicketClaimForEffect(effect)
       : null;
     const allowExpiredTransfer = effect.status === "leased" && effect.leaseExpiresAt !== null &&
       effect.leaseExpiresAt <= input.now;
+    if (effect.kind === "run_navigator_release") {
+      return this.navigatorReleaseClaimPlan(effect.jobId, claims, contract.resourceClaims, input, allowExpiredTransfer);
+    }
+    if (claims.length !== contract.resourceClaims.length) return null;
     if (contract.requiresTicketWorkArtifact && !this.claimCanTransfer(ticketClaim, input, allowExpiredTransfer)) return null;
     if (!claims.every((claim) => this.claimCanTransfer(claim, input, allowExpiredTransfer))) return null;
     return {
+      jobId: effect.jobId,
       jobClaimIds: claims.map((claim) => claim.claim_id),
+      missingJobClaims: [],
       ticketClaim,
     };
+  }
+
+  private navigatorReleaseClaimPlan(
+    jobId: string,
+    claims: readonly NavigatorLeaseClaimRow[],
+    requirements: readonly NavigatorRequiredResourceClaim[],
+    input: Readonly<{ ownerId: string; generation: number; now: number; leaseMs: number }>,
+    allowExpiredTransfer: boolean,
+  ): NavigatorLeaseClaimPlan | null {
+    if (claims.length > requirements.length) return null;
+    const projectClaim = claims.find((claim) => claim.resource_kind === "project");
+    if (!this.claimCanTransfer(projectClaim ?? null, input, allowExpiredTransfer)) return null;
+    if (!claims.every((claim) => this.claimCanTransfer(claim, input, allowExpiredTransfer))) return null;
+    const missingJobClaims = requirements.filter((requirement) => !claims.some((claim) =>
+      claim.resource_kind === requirement.resourceKind && claim.resource_key === requirement.resourceKey));
+    if (missingJobClaims.some((requirement) => this.heldResourceClaimExists(requirement.resourceKey))) return null;
+    return {
+      jobId,
+      jobClaimIds: claims.map((claim) => claim.claim_id),
+      missingJobClaims,
+      ticketClaim: null,
+    };
+  }
+
+  private heldResourceClaimExists(resourceKey: string): boolean {
+    return this.db.prepare(
+      "SELECT 1 FROM job_resource_claims WHERE resource_key = ? AND state = 'held' LIMIT 1",
+    ).get(resourceKey) !== undefined;
   }
 
   private claimCanTransfer(
@@ -2260,6 +2309,33 @@ export class NavigatorRepository {
       if (updateJobClaims.run(input.ownerId, input.generation, expiry, input.now, claimId).changes !== 1) {
         throw new NavigatorLeaseConflictError("navigator job resource claim changed during effect lease");
       }
+    }
+    try {
+      const insertJobClaim = this.db.prepare(
+        `INSERT INTO job_resource_claims (
+           job_id, resource_key, resource_kind, state, owner_id, generation,
+           lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+         ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+      );
+      for (const claim of plan.missingJobClaims) {
+        if (insertJobClaim.run(
+          plan.jobId,
+          claim.resourceKey,
+          claim.resourceKind,
+          input.ownerId,
+          input.generation,
+          expiry,
+          input.now,
+          input.now,
+        ).changes !== 1) {
+          throw new NavigatorLeaseConflictError("navigator job resource claim was not acquired");
+        }
+      }
+    } catch (error) {
+      if (isNavigatorClaimConstraint(error)) {
+        throw new NavigatorLeaseConflictError("navigator job resource claim conflicted during effect lease");
+      }
+      throw error;
     }
     if (plan.ticketClaim !== null && this.db.prepare(
       `UPDATE work_artifact_claims SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?

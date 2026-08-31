@@ -329,6 +329,7 @@ import type {
 } from "../navigator/models";
 import {
   NAVIGATOR_RELEASE_STATES,
+  navigatorReleaseOperationId,
   type NavigatorReleaseAttempt,
   type NavigatorReleaseIncidentPhase,
   type NavigatorReleaseRollbackOutcome,
@@ -12837,6 +12838,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const effect = parseEffect(effectRow);
     const attemptId = typeof effect.payload.attemptId === "string" ? effect.payload.attemptId : null;
     return receipt.effectIdempotencyKey === input.effectIdempotencyKey && receipt.attemptId === attemptId &&
+      receipt.jobId === effectRow.job_id && receipt.operationId === navigatorReleaseOperationId(effectRow.job_id) &&
       receipt.number === input.number && receipt.url === url && receipt.environmentId === input.environmentId &&
       receipt.resource.id === input.environmentId;
   }
