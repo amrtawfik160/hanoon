@@ -3,9 +3,12 @@ import { statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { FOUNDATION_BROKER_POLICY_DIGEST } from "../src/credentials/protocol";
+import { PROTECTED_CONNECTOR_POLICY_DIGEST } from "../src/credentials/connector-policy";
+import { protectedConnectorCapabilityFor } from "../src/credentials/connector-protocol";
 import { createAdminServer, type RunningAdminServer } from "../broker/src/admin-server";
 import { runAdminCli } from "../broker/src/admin-cli";
 import { BrokerStore } from "../broker/src/store";
+import { BrokerProtectedConnectorStore } from "../broker/src/connector-store";
 import type { VaultAdapter } from "../broker/src/onepassword-adapter";
 import { temporaryBrokerDatabase } from "./support/credential-broker-fixtures";
 import { certificateFingerprint, createMtlsFixture, type MtlsFixture } from "./support/mtls-fixtures";
@@ -23,6 +26,7 @@ type AdminHarness = Readonly<{
   fixture: MtlsFixture;
   database: ReturnType<typeof temporaryBrokerDatabase>;
   store: BrokerStore;
+  connectorStore: BrokerProtectedConnectorStore;
   socketPath: string;
   server: RunningAdminServer;
   close(): Promise<void>;
@@ -80,6 +84,10 @@ async function createAdminHarness(): Promise<AdminHarness> {
     auditKey: new Uint8Array(32).fill(0x22),
     clock: () => NOW,
   });
+  const connectorStore = new BrokerProtectedConnectorStore(database.db, {
+    dataKey: new Uint8Array(32).fill(0x11),
+    clock: () => NOW,
+  });
   const adapter: VaultAdapter = {
     health: async () => ({ outcome: "ready" }),
     verify: async () => ({ outcome: "valid", versionHmac: "d".repeat(64) }),
@@ -88,6 +96,7 @@ async function createAdminHarness(): Promise<AdminHarness> {
   const server = createAdminServer({
     socketPath,
     store,
+    connectorStore,
     adapter,
     clock: () => NOW,
     brokerVersion: "0.1.0",
@@ -97,6 +106,7 @@ async function createAdminHarness(): Promise<AdminHarness> {
     fixture,
     database,
     store,
+    connectorStore,
     socketPath,
     server,
     close: async () => {
@@ -165,6 +175,55 @@ describe("credential broker local administration", () => {
         { operation: "binding.revoke", outcome: "succeeded" },
         { operation: "installation.revoke", outcome: "succeeded" },
       ]));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("atomically enrolls a typed connector and returns only its projection", async () => {
+    const harness = await createAdminHarness();
+    try {
+      const installationId = await enrollInstallation(harness);
+      const response = await sendAdminRequest(harness.socketPath, {
+        operation: "connector.binding.enroll",
+        installationId,
+        projectId: "project-1",
+        policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        enabledOperations: ["convex.project.inspect.v1"],
+        credentialReference: REFERENCE,
+        projection: {
+          schemaVersion: 2,
+          installationId,
+          bindingId: "connector-binding-1",
+          operation: "convex.project.inspect.v1",
+          bindingKind: "workload_identity",
+          authorityProvider: "convex",
+          secretProvider: "provider_native",
+          principalLabel: "test workload",
+          capabilityIds: [protectedConnectorCapabilityFor("convex.project.inspect.v1")],
+          audiences: ["api.convex.dev"],
+          origins: [],
+          scopes: ["project:read"],
+          riskClass: "low",
+          mfaMode: "workload_identity",
+          approvalMode: "standing_policy",
+          state: "vault_verified",
+          generation: 1,
+          verifiedAt: null,
+          expiresAt: null,
+        },
+        target: {
+          operation: "convex.project.inspect.v1",
+          teamIdOrSlug: "team-1",
+          projectSlug: "project-1",
+        },
+      });
+      expect(response).toMatchObject({ ok: true, operation: "connector.binding.enroll", projectId: "project-1", state: "vault_verified" });
+      expect(JSON.stringify(response)).not.toContain(REFERENCE);
+      expect(harness.connectorStore.getPolicy(installationId, "project-1")).toMatchObject({
+        policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+      });
+      expect(harness.connectorStore.getBinding(installationId, "connector-binding-1")?.hasCredentialReference).toBe(true);
     } finally {
       await harness.close();
     }

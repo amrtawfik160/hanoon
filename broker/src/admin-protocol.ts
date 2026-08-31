@@ -7,6 +7,16 @@ import {
   SHA256_PATTERN,
   type BrokerBindingState,
 } from "../../src/credentials/protocol.js";
+import {
+  PROTECTED_CONNECTOR_OPERATIONS,
+  type ProtectedConnectorOperation,
+} from "../../src/credentials/connector-protocol.js";
+import {
+  parseProtectedConnectorBindingProjection,
+  parseProtectedConnectorTarget,
+  type ProtectedConnectorBindingProjection,
+  type ProtectedConnectorTarget,
+} from "../../src/credentials/connector-policy.js";
 
 export const ADMIN_MAX_LINE_BYTES = 16_384;
 export const ADMIN_OPERATIONS = [
@@ -15,6 +25,7 @@ export const ADMIN_OPERATIONS = [
   "installation.revoke",
   "binding.add",
   "binding.revoke",
+  "connector.binding.enroll",
   "installation.doctor",
   "broker.status",
 ] as const;
@@ -48,6 +59,16 @@ export type AdminRequest =
       approvalMode: (typeof BROKER_APPROVAL_MODES)[number];
     }>
   | Readonly<{ operation: "binding.revoke"; installationId: string; bindingId: string }>
+  | Readonly<{
+      operation: "connector.binding.enroll";
+      installationId: string;
+      projectId: string;
+      policyDigest: string;
+      enabledOperations: readonly ProtectedConnectorOperation[];
+      projection: ProtectedConnectorBindingProjection;
+      target: ProtectedConnectorTarget;
+      credentialReference: string | null;
+    }>
   | Readonly<{ operation: "installation.doctor"; installationId: string }>
   | Readonly<{ operation: "broker.status" }>;
 
@@ -64,6 +85,9 @@ export type AdminFailureCode =
   | "binding_missing"
   | "binding_inactive"
   | "binding_limit"
+  | "connector_invalid"
+  | "connector_policy_invalid"
+  | "connector_store_unavailable"
   | "store_failure";
 
 const ADMIN_FAILURE_CODES = [
@@ -79,6 +103,9 @@ const ADMIN_FAILURE_CODES = [
   "binding_missing",
   "binding_inactive",
   "binding_limit",
+  "connector_invalid",
+  "connector_policy_invalid",
+  "connector_store_unavailable",
   "store_failure",
 ] as const;
 
@@ -102,6 +129,16 @@ export type AdminResponse =
       bindingId: string;
       state: "revoked";
       generation: number;
+    }>
+  | Readonly<{
+      ok: true;
+      operation: "connector.binding.enroll";
+      installationId: string;
+      projectId: string;
+      bindingId: string;
+      state: Exclude<ProtectedConnectorBindingProjection["state"], "active">;
+      generation: number;
+      projection: ProtectedConnectorBindingProjection;
     }>
   | Readonly<{
       ok: true;
@@ -134,6 +171,10 @@ const BINDING_ADD_KEYS = [
   "operation", "installationId", "reference", "label", "capabilityIds", "risk", "mfaMode", "approvalMode",
 ] as const;
 const BINDING_REVOKE_KEYS = ["operation", "installationId", "bindingId"] as const;
+const CONNECTOR_ENROLL_KEYS = [
+  "operation", "installationId", "projectId", "policyDigest", "enabledOperations",
+  "projection", "target", "credentialReference",
+] as const;
 const OPERATION_ONLY_KEYS = ["operation"] as const;
 
 function isPlainObject(input: unknown): input is Record<string, unknown> {
@@ -229,6 +270,25 @@ export function parseAdminRequest(input: unknown): AdminParseResult<AdminRequest
     return { ok: true, value: Object.freeze({ ...input }) as AdminRequest };
   }
 
+  if (input.operation === "connector.binding.enroll") {
+    if (!hasExactKeys(input, CONNECTOR_ENROLL_KEYS) || !isOpaqueId(input.installationId) ||
+        !isOpaqueId(input.projectId) || !isDigest(input.policyDigest) ||
+        !Array.isArray(input.enabledOperations) || input.enabledOperations.length === 0 ||
+        input.enabledOperations.length > PROTECTED_CONNECTOR_OPERATIONS.length ||
+        new Set(input.enabledOperations).size !== input.enabledOperations.length ||
+        !input.enabledOperations.every((operation) => PROTECTED_CONNECTOR_OPERATIONS.includes(operation as ProtectedConnectorOperation)) ||
+        (input.credentialReference !== null && !isBoundedText(input.credentialReference, 512))) {
+      return { ok: false, code: "invalid_field" };
+    }
+    const projection = parseProtectedConnectorBindingProjection(input.projection);
+    const target = parseProtectedConnectorTarget(input.target);
+    if (!projection.ok || !target.ok || projection.value.installationId !== input.installationId ||
+        projection.value.operation !== target.value.operation || projection.value.state === "active") {
+      return { ok: false, code: "invalid_field" };
+    }
+    return { ok: true, value: Object.freeze({ ...input, projection: projection.value, target: target.value }) as AdminRequest };
+  }
+
   if (!hasExactKeys(input, OPERATION_ONLY_KEYS)) return { ok: false, code: "unknown_field" };
   return { ok: true, value: Object.freeze({ operation: "broker.status" }) };
 }
@@ -270,6 +330,15 @@ export function parseAdminResponse(input: unknown): AdminParseResult<AdminRespon
         !Number.isSafeInteger(input.generation) || (input.generation as number) < 1) {
       return { ok: false, code: "invalid_field" };
     }
+    return { ok: true, value: input as AdminResponse };
+  }
+  if (input.operation === "connector.binding.enroll") {
+    if (!hasExactKeys(input, ["ok", "operation", "installationId", "projectId", "bindingId", "state", "generation", "projection"]) ||
+        !isOpaqueId(input.installationId) || !isOpaqueId(input.projectId) || !isOpaqueId(input.bindingId) ||
+        !Number.isSafeInteger(input.generation) || (input.generation as number) < 1) return { ok: false, code: "invalid_field" };
+    const projection = parseProtectedConnectorBindingProjection(input.projection);
+    if (!projection.ok || projection.value.installationId !== input.installationId ||
+        projection.value.bindingId !== input.bindingId || projection.value.state !== input.state) return { ok: false, code: "invalid_field" };
     return { ok: true, value: input as AdminResponse };
   }
   if (input.operation === "installation.doctor") {

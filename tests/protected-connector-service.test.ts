@@ -104,6 +104,33 @@ describe("protected connector Hanoon boundary", () => {
     expect(call).not.toHaveBeenCalled();
   });
 
+  it("denies when the current full broker readiness is unavailable before dispatch", async () => {
+    const call = vi.fn();
+    const store = { listProtectedConnectorBindings: () => [binding] } as unknown as ProtectedConnectorAccessStore;
+    const service = new ProtectedConnectorAccessService({
+      store,
+      client: () => ({ call }),
+      config: () => config,
+      trustKernelReady: () => true,
+      topologyReady: () => true,
+      browserAdministrationIsolated: () => false,
+      auditWritable: () => true,
+      projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
+      fullReadiness: async () => ({ state: "unavailable" as const }),
+      now: () => NOW,
+    });
+
+    const result = await service.inspect({
+      operation: binding.operation,
+      projectId: "project-1",
+      bindingId: binding.bindingId,
+      authorized,
+    });
+
+    expect(result).toEqual({ outcome: "denied", reason: "unavailable" });
+    expect(call).not.toHaveBeenCalled();
+  });
+
   it("uses one broker response and returns only the receipted identity", async () => {
     let current = binding;
     let preparedRequest: ProtectedConnectorRequestEnvelope | null = null;
@@ -180,5 +207,90 @@ describe("protected connector Hanoon boundary", () => {
     expect(result).toMatchObject({ outcome: "succeeded", receiptId: "receipt-1", identity: { projectSlug: "hanoon" } });
     expect(events).toEqual(["provider-response", "complete"]);
     expect(JSON.stringify(result)).not.toContain("token");
+  });
+
+  it("reuses the persisted envelope after an ambiguous broker call", async () => {
+    let current = binding;
+    let persisted: {
+      request: ProtectedConnectorRequestEnvelope;
+      state: "prepared" | "ambiguous" | "completed";
+      receiptId: string | null;
+      createdAt: number;
+      updatedAt: number;
+    } | null = null;
+    const sent: ProtectedConnectorRequestEnvelope[] = [];
+    const store: ProtectedConnectorAccessStore = {
+      listProtectedConnectorBindings: () => [current],
+      getProtectedConnectorBinding: () => current,
+      getProtectedConnectorOperation: () => persisted,
+      prepareProtectedConnectorOperation: ({ request }) => {
+        persisted ??= { request, state: "prepared", receiptId: null, createdAt: NOW, updatedAt: NOW };
+        return { outcome: persisted.state, operation: persisted };
+      },
+      completeProtectedConnectorOperation: ({ response }) => {
+        persisted = { ...persisted!, state: "completed", receiptId: response.receiptId, updatedAt: NOW + 1 };
+        current = { ...current, state: "active", verifiedAt: NOW + 1 };
+        return {
+          outcome: "completed",
+          operation: persisted,
+          receipt: {
+            receiptId: response.receiptId!,
+            installationId: response.installationId,
+            requestId: response.requestId,
+            idempotencyKey: persisted.request.idempotencyKey,
+            operation: response.operation,
+            bindingId: binding.bindingId,
+            bindingGeneration: 1,
+            taskId: "turn-1",
+            projectId: "project-1",
+            capabilityId: protectedConnectorCapabilityFor(binding.operation),
+            policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+            fenceOwner: "executor-1",
+            fenceGeneration: 1,
+            outcome: "succeeded",
+            failureClass: null,
+            retryable: false,
+            retryAfterMs: null,
+            identity: response.result,
+            responseSha256: protectedConnectorResponseDigest(response),
+            completedAt: response.completedAt,
+            createdAt: NOW + 1,
+          },
+        };
+      },
+      markProtectedConnectorOperationAmbiguous: () => {
+        persisted = persisted ? { ...persisted, state: "ambiguous" } : null;
+        return persisted;
+      },
+      getProtectedConnectorReceipt: () => null,
+      runControllerMutation: (_fence, mutation) => ({ outcome: "applied", mutationValue: mutation(NOW) }),
+    };
+    let calls = 0;
+    const service = new ProtectedConnectorAccessService({
+      store,
+      client: () => ({
+        call: vi.fn(async (request: ProtectedConnectorRequestEnvelope) => {
+          sent.push(request);
+          calls += 1;
+          return calls === 1
+            ? { outcome: "ambiguous" as const }
+            : { outcome: "succeeded" as const, response: requestFrom(request) };
+        }),
+      }),
+      config: () => config,
+      trustKernelReady: () => true,
+      topologyReady: () => true,
+      browserAdministrationIsolated: () => false,
+      auditWritable: () => true,
+      projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
+      now: () => NOW,
+    });
+
+    await expect(service.inspect({ operation: binding.operation, projectId: "project-1", bindingId: binding.bindingId, authorized }))
+      .resolves.toMatchObject({ outcome: "ambiguous" });
+    await expect(service.inspect({ operation: binding.operation, projectId: "project-1", bindingId: binding.bindingId, authorized }))
+      .resolves.toMatchObject({ outcome: "succeeded" });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
   });
 });

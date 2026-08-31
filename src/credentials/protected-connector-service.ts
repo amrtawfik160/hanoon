@@ -38,7 +38,7 @@ export type ProtectedConnectorAccessStore = Pick<
   | "markProtectedConnectorOperationAmbiguous"
   | "getProtectedConnectorReceipt"
   | "runControllerMutation"
->;
+> & Partial<Pick<TelegramAgentStore, "getProtectedConnectorOperation">>;
 
 export type ProtectedConnectorCaller = Readonly<{
   call(
@@ -79,6 +79,7 @@ export type ProtectedConnectorAccessDependencies = Readonly<{
   browserAdministrationIsolated(): boolean;
   auditWritable(): boolean;
   projectPolicyDigest(projectId: string): string | null;
+  fullReadiness?(): Promise<Readonly<{ state: "ready" | "disabled" | "unsafe_topology" | "unavailable" }>>;
   now(): number;
 }>;
 
@@ -172,7 +173,7 @@ export class ProtectedConnectorAccessService {
     authorized: AuthorizedControllerCapability;
     signal?: AbortSignal;
   }>): Promise<ProtectedConnectorInspectionResult> {
-    const readiness = this.readiness(input.operation, input.projectId);
+    const readiness = await this.currentReadiness(input.operation, input.projectId);
     if (readiness.state !== "ready") return { outcome: "denied", reason: readiness.reason ?? readiness.state };
     const config = this.deps.config();
     const client = this.deps.client();
@@ -183,7 +184,17 @@ export class ProtectedConnectorAccessService {
     const binding = this.deps.store.getProtectedConnectorBinding(config.value.installationId, input.bindingId);
     if (!binding || binding.operation !== input.operation) return { outcome: "denied", reason: "binding_missing" };
     if (readiness.bindingId !== binding.bindingId) return { outcome: "denied", reason: "binding_not_ready" };
-    const envelope = this.buildRequest(config.value.installationId, input, binding);
+    const persisted = this.deps.store.getProtectedConnectorOperation?.({
+      installationId: config.value.installationId,
+      bindingId: binding.bindingId,
+      operation: input.operation,
+      bindingGeneration: binding.generation,
+      taskId: input.authorized.turn.id,
+      projectId: input.projectId,
+      fenceOwner: input.authorized.fence.ownerId,
+      fenceGeneration: input.authorized.fence.generation,
+    });
+    const envelope = persisted?.request ?? this.buildRequest(config.value.installationId, input, binding);
     const preparedWrite = this.mutate(input.authorized, (now) => this.deps.store.prepareProtectedConnectorOperation({
       request: envelope,
       capabilityProfileId: input.authorized.turn.capabilityProfileId ?? undefined,
@@ -195,9 +206,9 @@ export class ProtectedConnectorAccessService {
       return { outcome: "denied", reason: prepared.outcome };
     }
     if (prepared.outcome === "digest_mismatch") return { outcome: "denied", reason: "request_digest_mismatch" };
+    if (!("operation" in prepared)) return { outcome: "failed", failureClass: "reconciliation_required", receiptId: null };
     if (prepared.outcome === "completed") return replayInspection(this.deps, config.value.installationId, prepared.operation, input.operation, input.projectId);
-    if (prepared.outcome === "ambiguous") return { outcome: "ambiguous", requestId: prepared.operation.request.requestId };
-    const toSend = envelope;
+    const toSend = prepared.operation.request;
     const callOutcome = await client.call(toSend, { signal: input.signal });
     if (callOutcome.outcome !== "succeeded") {
       this.markAmbiguous(input.authorized, config.value.installationId, toSend.requestId);
@@ -208,7 +219,7 @@ export class ProtectedConnectorAccessService {
       this.markAmbiguous(input.authorized, config.value.installationId, toSend.requestId);
       return { outcome: "failed", failureClass: "invalid_response", receiptId: null };
     }
-    const postReadiness = this.readiness(input.operation, input.projectId);
+    const postReadiness = await this.currentReadiness(input.operation, input.projectId);
     if (postReadiness.state !== "ready" || postReadiness.bindingId !== toSend.bindingId) {
       this.markAmbiguous(input.authorized, config.value.installationId, toSend.requestId);
       return { outcome: "denied", reason: postReadiness.reason ?? "authority_changed" };
@@ -240,6 +251,17 @@ export class ProtectedConnectorAccessService {
       now: this.deps.now(),
     });
     return finalResult(finalization, toSend, receipt);
+  }
+
+  private async currentReadiness(
+    operation: ProtectedConnectorOperation,
+    projectId: string,
+  ): Promise<ProtectedConnectorReadiness> {
+    const local = this.readiness(operation, projectId);
+    if (!this.deps.fullReadiness) return local;
+    const full = await this.deps.fullReadiness();
+    if (full.state === "ready") return local;
+    return this.readinessResult(operation, projectId, full.state, null, full.state);
   }
 
   private readinessResult(

@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS broker_receipts (
 
 CREATE TABLE IF NOT EXISTS broker_admin_events (
   event_id TEXT PRIMARY KEY,
-  operation TEXT NOT NULL CHECK (operation IN ('installation.add', 'installation.attest', 'installation.revoke', 'binding.add', 'binding.revoke')),
+  operation TEXT NOT NULL CHECK (operation IN ('installation.add', 'installation.attest', 'installation.revoke', 'binding.add', 'binding.revoke', 'connector.binding.enroll')),
   installation_id TEXT NOT NULL,
   binding_id TEXT,
   before_topology_digest TEXT,

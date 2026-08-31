@@ -600,6 +600,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     }).state === "ready",
     browserAdministrationIsolated: () => false,
     auditWritable: () => true,
+    fullReadiness: async () => (await credentialAccessService.status({})).readiness,
     projectPolicyDigest: (projectId) => store.getProjectPolicy(projectId)?.policy.enabled
       ? PROTECTED_CONNECTOR_POLICY_DIGEST
       : null,

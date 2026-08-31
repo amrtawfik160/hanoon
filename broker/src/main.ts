@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import type { Server } from "node:https";
 
 import {
+  BROKER_MAX_TOPOLOGY_RECEIPT_AGE_MS,
   BROKER_SCHEMA_VERSION,
   type BrokerRequestEnvelope,
   type BrokerResponseEnvelope,
@@ -49,11 +50,26 @@ export type BrokerStartupOptions = Readonly<{
   protectedAuthority?: ProtectedConnectorAuthorityPort;
 }>;
 
-const DENY_PROTECTED_AUTHORITY: ProtectedConnectorAuthorityPort = {
-  topologyReady: () => false,
-  auditWritable: () => true,
-  fenceCurrent: () => false,
-};
+export function createDurableProtectedConnectorAuthority(
+  foundationStore: BrokerStore,
+  connectorStore: BrokerProtectedConnectorStore,
+  clock: () => number,
+): ProtectedConnectorAuthorityPort {
+  return {
+    topologyReady: (operation, context) => {
+      if (!context) return false;
+      const installation = foundationStore.getInstallation(context.installationId);
+      const policy = connectorStore.getPolicy(context.installationId, context.projectId);
+      const now = clock();
+      return installation?.state === "active" &&
+        installation.topologyReceiptExpiresAt > now &&
+        installation.topologyReceiptExpiresAt - now <= BROKER_MAX_TOPOLOGY_RECEIPT_AGE_MS &&
+        policy?.enabledOperations.includes(operation) === true;
+    },
+    auditWritable: () => foundationStore.auditWritable(),
+    fenceCurrent: (input) => connectorStore.fenceCurrent(input),
+  };
+}
 
 function parseConfigPath(argv: readonly string[]): string {
   if (argv.length !== 2 || argv[0] !== "--config" || !isAbsolute(argv[1])) {
@@ -113,6 +129,10 @@ export async function startBroker(
       retentionDays: config.retentionDays,
     });
     const adapter = await createOnePasswordAdapter({ serviceToken: credentials.onepasswordServiceToken });
+    const connectorStore = new BrokerProtectedConnectorStore(database, {
+      dataKey: credentials.brokerDataKey,
+      clock: Date.now,
+    });
     const legacyService = new BrokerOperationService({
       store,
       adapter,
@@ -121,10 +141,6 @@ export async function startBroker(
       clock: Date.now,
       brokerVersion: BROKER_VERSION,
     });
-    const connectorStore = new BrokerProtectedConnectorStore(database, {
-      dataKey: credentials.brokerDataKey,
-      clock: Date.now,
-    });
     const protectedService = new ProtectedConnectorAuthorityService({
       foundationStore: store,
       connectorStore,
@@ -132,7 +148,7 @@ export async function startBroker(
         http: createProtectedConnectorProviderHttpPort(),
         credentials: { resolve: adapter.resolveCredential },
       }),
-      authority: options.protectedAuthority ?? DENY_PROTECTED_AUTHORITY,
+      authority: options.protectedAuthority ?? createDurableProtectedConnectorAuthority(store, connectorStore, Date.now),
       clock: Date.now,
     });
     const service = {
@@ -165,6 +181,7 @@ export async function startBroker(
       socketPath: config.adminSocketPath,
       store,
       adapter,
+      connectorStore,
       clock: Date.now,
       brokerVersion: BROKER_VERSION,
     });

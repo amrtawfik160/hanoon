@@ -137,6 +137,19 @@ it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(
   },
 );
 
+it.each([
+  ["Inspect the enrolled Convex project", "telegram_agent_convex_project_inspect"],
+  ["Inspect the enrolled Vercel project", "telegram_agent_vercel_project_inspect"],
+  ["Inspect the enrolled Vercel browser session", "telegram_agent_browser_vercel_project_inspect"],
+] as const)("selects the exact connector assignment for %s", (inputText, capabilityId) => {
+  const selection = selectControllerCapabilityProfile(inputText, ["core-observation"]);
+
+  expect(selection.assignments).toEqual(expect.arrayContaining([
+    expect.objectContaining({ capabilityId, capabilityKind: "connector" }),
+  ]));
+  expect(selection.assignments.filter((entry) => entry.capabilityKind === "connector")).toHaveLength(1);
+});
+
 it("loads manual discovery skills only for an explicit slash invocation", () => {
     expect(controllerSkillsForTurn("Help me think this through")).toEqual([
     "driving-bb",

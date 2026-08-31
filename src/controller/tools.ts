@@ -124,6 +124,7 @@ import type { ProtectedConnectorAccessService } from "../credentials/protected-c
 const PROTECTED_PROVIDER_OPERATIONS = [
   "convex.project.inspect.v1",
   "vercel.project.inspect.v1",
+  "browser.vercel_project.inspect.v1",
 ] as const;
 
 export { CONTROLLER_TOOL_NAMES } from "./capability-policy";
@@ -2832,7 +2833,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
 
   registerTool({
     name: CONTROLLER_TOOL_NAMES[34],
-    description: "Inspect one exact enrolled Convex or Vercel project through the protected broker. The broker selects the enrolled target and resolves its credential privately; this returns only bounded identity, readiness, stable failure class, and receipt metadata.",
+    description: "Inspect one exact enrolled Convex, Vercel, or governed Vercel browser target through the protected broker. The broker selects the enrolled target and resolves any credential privately; this returns only bounded identity, readiness, stable failure class, and receipt metadata.",
     parameters: z.object({
       projectId: z.string().min(1).max(256),
       operation: z.enum(PROTECTED_PROVIDER_OPERATIONS),

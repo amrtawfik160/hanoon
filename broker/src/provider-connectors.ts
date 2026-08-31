@@ -1,5 +1,6 @@
 import https from "node:https";
 import type { IncomingMessage } from "node:http";
+import type { LookupFunction } from "node:net";
 import type {
   ConvexProjectIdentity,
   VercelProjectIdentity,
@@ -38,6 +39,14 @@ export type ProtectedConnectorProviderHttpPort = Readonly<{
     authorization: string;
     signal?: AbortSignal;
   }>): Promise<ProtectedConnectorProviderResponse>;
+}>;
+
+export type ProtectedConnectorProviderHttpOptions = Readonly<{
+  port?: number;
+  timeoutMs?: number;
+  caCertificatePem?: string;
+  lookup?: LookupFunction;
+  servername?: string;
 }>;
 
 type ConnectorFailure = Readonly<{
@@ -136,7 +145,7 @@ function vercelStatus(value: unknown): VercelProjectIdentity["status"] {
 function latestDeploymentState(body: ProviderObject): unknown {
   const deployments = body.latestDeployments;
   if (!Array.isArray(deployments) || deployments.length === 0) return body.status;
-  return objectValue(deployments[0])?.state;
+  return objectValue(deployments[0])?.readyState;
 }
 
 function convexIdentity(body: ProviderObject, version: string, observedAt: number): ConvexProjectIdentity | null {
@@ -159,14 +168,12 @@ function convexIdentity(body: ProviderObject, version: string, observedAt: numbe
 function vercelIdentity(body: ProviderObject, version: string, observedAt: number): VercelProjectIdentity | null {
   const projectId = boundedText(body.id) ? body.id : boundedText(body.projectId) ? body.projectId : null;
   const projectName = boundedText(body.name) ? body.name : boundedText(body.projectName) ? body.projectName : null;
-  const teamId = boundedText(body.accountId) ? body.accountId : nestedText(body, "account", "id");
-  const teamSlug = boundedText(body.teamSlug) ? body.teamSlug : nestedText(body, "account", "slug");
-  if (!projectId || !projectName || !teamId || !teamSlug) return null;
+  const teamId = boundedText(body.accountId) ? body.accountId : null;
+  if (!projectId || !projectName || !teamId) return null;
   return {
     projectId,
     projectName,
     teamId,
-    teamSlug,
     framework: vercelFramework(body.framework),
     status: vercelStatus(latestDeploymentState(body)),
     connectorVersion: version,
@@ -294,30 +301,53 @@ function fixedGet(hostname: "api.convex.dev" | "api.vercel.com", input: Readonly
   path: string;
   authorization: string;
   signal?: AbortSignal;
-}>): Promise<ProtectedConnectorProviderResponse> {
+}>, options: ProtectedConnectorProviderHttpOptions): Promise<ProtectedConnectorProviderResponse> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error: Error | null, response?: ProtectedConnectorProviderResponse): void => {
+      if (settled) return;
+      settled = true;
+      if (input.signal) input.signal.removeEventListener("abort", abort);
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(response!);
+    };
     const request = https.request({
       hostname,
+      port: options.port,
+      ca: options.caCertificatePem,
+      lookup: options.lookup,
+      servername: options.servername ?? hostname,
       method: "GET",
       path: input.path,
       headers: { Accept: "application/json", Authorization: input.authorization, "Cache-Control": "no-store" },
       rejectUnauthorized: true,
       minVersion: "TLSv1.3",
-      timeout: PROTECTED_PROVIDER_TIMEOUT_MS,
+      timeout: options.timeoutMs ?? PROTECTED_PROVIDER_TIMEOUT_MS,
     }, (response) => {
-      void readProviderResponse(response).then(resolve, reject);
+      void readProviderResponse(response).then(
+        (value) => finish(null, value),
+        (error: unknown) => finish(error instanceof Error ? error : new Error("provider_response_error")),
+      );
     });
     const abort = () => request.destroy(new Error("provider_aborted"));
+    const timer = setTimeout(
+      () => request.destroy(new Error("provider_timeout")),
+      options.timeoutMs ?? PROTECTED_PROVIDER_TIMEOUT_MS,
+    );
     if (input.signal?.aborted) abort();
     else input.signal?.addEventListener("abort", abort, { once: true });
-    request.once("error", reject);
+    request.once("timeout", () => request.destroy(new Error("provider_timeout")));
+    request.once("error", (error) => finish(error));
     request.end();
   });
 }
 
-export function createProtectedConnectorProviderHttpPort(): ProtectedConnectorProviderHttpPort {
+export function createProtectedConnectorProviderHttpPort(
+  options: ProtectedConnectorProviderHttpOptions = {},
+): ProtectedConnectorProviderHttpPort {
   return {
-    getConvexProject: (input) => fixedGet("api.convex.dev", input),
-    getVercelProject: (input) => fixedGet("api.vercel.com", input),
+    getConvexProject: (input) => fixedGet("api.convex.dev", input, options),
+    getVercelProject: (input) => fixedGet("api.vercel.com", input, options),
   };
 }

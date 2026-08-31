@@ -91,6 +91,14 @@ sudo -u hanoon-broker /usr/bin/node /opt/hanoon-credential-broker/current/dist/b
 
 `installation add` accepts the public client certificate, a topology receipt digest and expiry, and the expected vault id. It returns only a generated installation id and state. `binding add` accepts one exact `op://<26-character-vault>/<26-character-item>/<field>` reference and returns only an opaque binding id, state, and generation. It does not make a binding active; a later provider-authoritative connector is required for application use.
 
+Typed connector enrollment is separate from the legacy vault binding command. Submit bounded JSON on protected standard input; the target and credential reference remain broker-private:
+
+```bash
+sudo -u hanoon-broker /usr/bin/node /opt/hanoon-credential-broker/current/dist/broker/src/admin-cli.js connector binding enroll --stdin
+```
+
+The request contains the project policy digest, one fixed Convex/Vercel/browser operation, its typed target, and (for workload identities) an opaque vault reference. The broker atomically records policy, encrypted target/reference, and audit events. The response contains only ids, state, generation, and the secret-free projection; it does not create credentials or provider resources. Reconcile that projection into Hanoon's local store, then use the owner-only guarded inspection tool. Current installation topology, audit, fence, and policy evidence is required before provider I/O, and the exact request envelope is persisted for restart/ambiguity recovery.
+
 The HTTPS client certificate fingerprint, expected vault reference, encrypted external reference, and all resolved values remain broker-side. The local CLI output contains only stable states, opaque ids, counts, and failure classes.
 
 ## Attestation, revocation, and recovery

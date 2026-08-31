@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import https from "node:https";
 import {
   createProtectedConnectorExecutor,
+  createProtectedConnectorProviderHttpPort,
   type ProtectedConnectorCredentialResolver,
   type ProtectedConnectorProviderHttpPort,
 } from "../broker/src/provider-connectors";
 import type { ConvexProjectTarget, VercelProjectTarget } from "../src/credentials/connector-policy";
+import { createMtlsFixture } from "./support/mtls-fixtures";
 
 const TOKEN = "provider-token-canary";
 
@@ -25,6 +28,66 @@ function resolver(): ProtectedConnectorCredentialResolver {
 }
 
 describe("protected provider identity adapters", () => {
+  it("uses the fixed local TLS transport and terminates a stalled provider request", async () => {
+    const tls = createMtlsFixture();
+    let server: https.Server | null = null;
+    try {
+      server = https.createServer({ key: tls.serverPrivateKeyPem, cert: tls.serverCertificatePem }, (request, response) => {
+        if (request.url !== "/v1/teams/team-slug/projects/hanoon") {
+          response.writeHead(404).end();
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+          id: "convex-project-id",
+          slug: "hanoon",
+          teamId: "team-id",
+          teamSlug: "team-slug",
+          status: "active",
+        }));
+      });
+      await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("provider_test_address_missing");
+      const executor = createProtectedConnectorExecutor({
+        http: createProtectedConnectorProviderHttpPort({
+          port: address.port,
+          caCertificatePem: tls.caCertificatePem,
+          servername: "broker.test",
+          lookup: (_hostname, _options, callback) => callback(null, [{ address: "127.0.0.1", family: 4 }]),
+          timeoutMs: 5_000,
+        }),
+        credentials: resolver(),
+      });
+      const result = await executor.inspectConvex({ target: convexTarget, credentialReference: "broker-ref" });
+      expect(result).toMatchObject({ outcome: "succeeded", identity: { projectId: "convex-project-id" } });
+
+      await new Promise<void>((resolve, reject) => {
+        server!.close((error) => error ? reject(error) : resolve());
+      });
+      server = https.createServer({ key: tls.serverPrivateKeyPem, cert: tls.serverCertificatePem }, () => {
+        // Deliberately hold the response open; the adapter must destroy it at its deadline.
+      });
+      await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+      const stalledAddress = server.address();
+      if (!stalledAddress || typeof stalledAddress === "string") throw new Error("provider_test_address_missing");
+      const stalledExecutor = createProtectedConnectorExecutor({
+        http: createProtectedConnectorProviderHttpPort({
+          port: stalledAddress.port,
+          caCertificatePem: tls.caCertificatePem,
+          servername: "broker.test",
+          lookup: (_hostname, _options, callback) => callback(null, [{ address: "127.0.0.1", family: 4 }]),
+          timeoutMs: 25,
+        }),
+        credentials: resolver(),
+      });
+      await expect(stalledExecutor.inspectConvex({ target: convexTarget, credentialReference: "broker-ref" }))
+        .resolves.toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+    } finally {
+      if (server?.listening) await new Promise<void>((resolve) => server!.close(() => resolve()));
+      tls.cleanup();
+    }
+  });
+
   it("calls the fixed Convex operation and returns only the bounded identity", async () => {
     const calls: unknown[] = [];
     const http: ProtectedConnectorProviderHttpPort = {
@@ -79,9 +142,9 @@ describe("protected provider identity adapters", () => {
           body: JSON.stringify({
             id: "vercel-project-id",
             name: "hanoon",
-            account: { id: "team-id", slug: "team-slug" },
+            accountId: "team-id",
             framework: "nextjs",
-            latestDeployments: [{ state: "READY" }],
+            latestDeployments: [{ readyState: "READY" }],
           }),
         };
       },
@@ -90,7 +153,11 @@ describe("protected provider identity adapters", () => {
 
     const result = await executor.inspectVercel({ target: vercelTarget, credentialReference: "broker-ref" });
 
-    expect(result).toMatchObject({ outcome: "succeeded", identity: { projectId: "vercel-project-id", status: "ready" } });
+    expect(result).toMatchObject({
+      outcome: "succeeded",
+      identity: { projectId: "vercel-project-id", teamId: "team-id", status: "ready" },
+    });
+    expect(JSON.stringify(result)).not.toContain("teamSlug");
     expect(calls).toEqual([{
       path: "/v9/projects/hanoon?teamId=team-id",
       authorization: `Bearer ${TOKEN}`,

@@ -66,12 +66,14 @@ Every owner-visible reply is one accepted structured finalization, plus what the
 
 ## Credential broker foundation (disabled by default)
 
-Hanoon carries the first slice of a separate credential broker: a protected service, run outside this plugin, that can hold a 1Password service-account token and answer only two fixed operations — a health check and a single vault-item resolve. **Credential broker mode defaults to `disabled`**, and the subsystem cannot be safely turned on until a real disposable 1Password account, a protected broker host, and the live acceptance run in [Disposable live acceptance](docs/live-acceptance.md) exist.
+Hanoon carries the first slice of a separate credential broker: a protected service, run outside this plugin, that can answer a health check, a single vault-item resolve, and three fixed provider-identity probes (Convex, Vercel, and the governed Vercel browser journey). **Credential broker mode defaults to `disabled`**, and the subsystem cannot be safely turned on until a real disposable 1Password account, a protected broker host, and the live acceptance run in [Disposable live acceptance](docs/live-acceptance.md) exist.
 
 While it applies, this foundation only ever proves that the broker can reach a configured vault item — never that the resulting credential works for its application:
 
 - `bb telegram-agent access list` and `bb telegram-agent access status [binding-id]` are the only operator commands, and they read local, secret-free metadata; there is deliberately no `access verify` or enrollment command in this CLI.
 - The owner can ask Hanoon in Telegram to run a live verification of one known binding; a pass moves that binding to `vault_verified`, never `active`, and Hanoon never claims an application login succeeded from it.
+- A protected-host operator enrolls a typed connector target with `connector binding enroll --stdin`. The broker atomically stores the encrypted target/reference and policy, then returns a secret-free projection for Hanoon reconciliation. No credential or live provider resource is created by enrollment.
+- Connector inspection uses the exact selected capability and fixed adapter route. Current broker readiness, topology, audit, fence, receipt, and target identity are checked before and after dispatch; ambiguous retries reuse the persisted envelope.
 - `bb telegram-agent doctor` reports one `credential broker` row, `disabled`, until isolated mode is configured, and one row per readiness check afterwards; see [Configuration](docs/configuration.md#credential-broker-foundation) and [Operations](docs/operations.md#credential-broker).
 
 ## Architecture

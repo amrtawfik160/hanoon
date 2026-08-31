@@ -4428,6 +4428,16 @@ export interface TelegramAgentStore {
     requestId: string;
     now: number;
   }>): ProtectedConnectorOperationRecord | null;
+  getProtectedConnectorOperation(input: Readonly<{
+    installationId: string;
+    bindingId: string;
+    operation: ProtectedConnectorOperation;
+    bindingGeneration: number;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+  }>): ProtectedConnectorOperationRecord | null;
   getProtectedConnectorReceipt(installationId: string, receiptId: string): ProtectedConnectorReceiptRecord | null;
 }
 
@@ -5953,6 +5963,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number;
   }>): ProtectedConnectorOperationRecord | null {
     return this.protectedConnectorRepository.markOperationAmbiguous(input);
+  }
+
+  public getProtectedConnectorOperation(input: Readonly<{
+    installationId: string;
+    bindingId: string;
+    operation: ProtectedConnectorOperation;
+    bindingGeneration: number;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+  }>): ProtectedConnectorOperationRecord | null {
+    return this.protectedConnectorRepository.getOperation(input);
   }
 
   public getProtectedConnectorReceipt(

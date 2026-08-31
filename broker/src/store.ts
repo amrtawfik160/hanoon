@@ -77,7 +77,8 @@ export type BrokerAdminOperation =
   | "installation.attest"
   | "installation.revoke"
   | "binding.add"
-  | "binding.revoke";
+  | "binding.revoke"
+  | "connector.binding.enroll";
 
 export type BrokerRejectedAdminMutation = Readonly<{
   operation: BrokerAdminOperation;
@@ -284,6 +285,10 @@ export class BrokerStore {
     const row = this.db.prepare("SELECT * FROM broker_installations WHERE client_certificate_fingerprint = ?")
       .get(fingerprint) as DbInstallationRow | undefined;
     return row?.state === "active" ? installationFromRow(row) : null;
+  }
+
+  public auditWritable(): boolean {
+    return this.auditKey !== undefined;
   }
 
   getInstallationCount(): number {
