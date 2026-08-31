@@ -25,10 +25,22 @@ function releaseTitle(requestText: string): string {
   return trimmed.length <= 72 ? trimmed : `${trimmed.slice(0, 69).trimEnd()}...`;
 }
 
+function abortWhenSignaled(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new Error("navigator release was aborted"));
+      return;
+    }
+    signal.addEventListener("abort", () => {
+      reject(signal.reason ?? new Error("navigator release was aborted"));
+    }, { once: true });
+  });
+}
+
 export class NavigatorReleaseExecutor {
   public constructor(private readonly dependencies: NavigatorReleaseExecutorDependencies) {}
 
-  public async processOne(fence: EffectFence, _signal: AbortSignal): Promise<boolean> {
+  public async processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
     const now = this.dependencies.clock.now();
     const effect = this.dependencies.store.leaseNavigatorReleaseEffect({
       ownerId: fence.ownerId,
@@ -37,6 +49,10 @@ export class NavigatorReleaseExecutor {
       leaseMs: this.dependencies.leaseMs ?? 30_000,
     });
     if (!effect) return false;
+    return this.processLeased(effect, fence, signal);
+  }
+
+  public async processLeased(effect: StoredEffect, fence: EffectFence, signal: AbortSignal): Promise<boolean> {
     const attemptId = payloadIdentifier(effect, "attemptId");
     const workflowStepId = payloadIdentifier(effect, "workflowStepId");
     const attempt = this.dependencies.store.getNavigatorReleaseAttempt(attemptId);
@@ -60,34 +76,23 @@ export class NavigatorReleaseExecutor {
       );
       return true;
     }
-    const published = await this.dependencies.publishPullRequest({
-      jobId: effect.jobId,
-      title: releaseTitle(this.dependencies.store.getJob(effect.jobId)?.requestText ?? ""),
-      body: "Exact-head release of the accepted implementation tickets.",
-    });
-    const current = this.dependencies.store.getJob(effect.jobId);
-    if (current?.state === "implementing") {
-      const updated = this.dependencies.store.applyExecutorJobEvent({
-        jobId: current.id,
-        expectedVersion: current.version,
-        event: {
-          type: "RELEASE_STARTED",
-          number: published.number,
-          url: published.url,
-          environmentId: this.dependencies.integrationWorktreeId(current.id),
-        },
-        ownerId: fence.ownerId,
-        generation: fence.generation,
-        now: this.dependencies.clock.now(),
-      });
-      if (!updated) throw new Error("executor refused the RELEASE_STARTED job transition");
-    }
-    if (!this.dependencies.store.completeEffect(
-      effect.idempotencyKey,
-      fence.ownerId,
-      fence.generation,
-      this.dependencies.clock.now(),
-    )) {
+    const published = await Promise.race([
+      this.dependencies.publishPullRequest({
+        jobId: effect.jobId,
+        title: releaseTitle(this.dependencies.store.getJob(effect.jobId)?.requestText ?? ""),
+        body: "Exact-head release of the accepted implementation tickets.",
+      }),
+      abortWhenSignaled(signal),
+    ]);
+    if (!this.dependencies.store.settleNavigatorReleaseEffect({
+      effectIdempotencyKey: effect.idempotencyKey,
+      number: published.number,
+      url: published.url,
+      environmentId: this.dependencies.integrationWorktreeId(effect.jobId),
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now: this.dependencies.clock.now(),
+    })) {
       throw new Error("navigator release effect lease changed before settlement");
     }
     return true;

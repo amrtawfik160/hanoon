@@ -875,6 +875,11 @@ export class NavigatorImplementationExecutor {
     const now = this.dependencies.clock.now();
     const effect = this.leaseEffect(fence, now);
     if (!effect) return false;
+    return this.processLeased(effect, fence, signal);
+  }
+
+  public async processLeased(effect: StoredEffect, fence: EffectFence, signal: AbortSignal): Promise<boolean> {
+    const now = this.dependencies.clock.now();
     const attemptId = effectPayload(effect, "attemptId");
     const attempt = this.getAttempt(attemptId);
     if (!attempt || attempt.effectIdempotencyKey !== effect.idempotencyKey) {

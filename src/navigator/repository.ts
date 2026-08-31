@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { modelRouteSchema, type ModelRoute } from "../capabilities/models";
 import type { Job, StoredEffect } from "../domain/models";
+import type { TaskAuthorityEffect } from "../domain/task-authority";
 import type { OwnerBoundaryDraft } from "../domain/owner-boundary";
 import {
   type EffectRow,
@@ -140,6 +141,80 @@ function serializeNavigatorJson(value: unknown, field: string): string {
   }
   return json;
 }
+
+const NAVIGATOR_EFFECT_LEASE_QUERY = `SELECT effect.*
+  FROM effects AS effect
+  JOIN jobs AS job ON job.id = effect.job_id
+ WHERE job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
+   AND job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+   AND job.cancel_requested_at IS NULL
+   AND (
+     (
+       effect.kind = 'run_navigator_skill'
+       AND EXISTS (
+         SELECT 1
+           FROM navigator_skill_attempts AS attempt
+           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
+          WHERE attempt.effect_idempotency_key = effect.idempotency_key
+            AND attempt.job_id = effect.job_id AND attempt.job_id = step.job_id
+            AND step.job_id = snapshot.job_id
+            AND attempt.job_version = step.job_version
+            AND step.job_version = snapshot.job_version
+            AND attempt.workflow_revision = step.workflow_revision
+            AND step.workflow_revision = snapshot.workflow_revision
+            AND attempt.snapshot_digest = snapshot.digest
+            AND job.workflow_revision = step.workflow_revision
+            AND job.current_workflow_step_id = attempt.workflow_step_id
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_step_outcomes AS outcome
+               WHERE outcome.workflow_step_id = attempt.workflow_step_id
+            )
+       )
+     )
+     OR (
+       effect.kind = 'run_navigator_ticket_worker'
+       AND EXISTS (
+         SELECT 1
+           FROM navigator_ticket_worker_attempts AS attempt
+           JOIN navigator_integrations AS integration ON integration.job_id = attempt.job_id
+          WHERE attempt.effect_idempotency_key = effect.idempotency_key
+            AND attempt.job_id = effect.job_id
+            AND integration.state = 'implementing'
+            AND NOT EXISTS (
+              SELECT 1 FROM navigator_ticket_worker_outcomes AS outcome
+               WHERE outcome.attempt_id = attempt.id
+            )
+       )
+     )
+     OR (
+       effect.kind = 'run_navigator_release'
+       AND EXISTS (
+         SELECT 1
+           FROM navigator_release_attempts AS attempt
+           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
+          WHERE attempt.effect_idempotency_key = effect.idempotency_key
+            AND attempt.job_id = effect.job_id AND attempt.job_id = step.job_id
+            AND step.job_id = snapshot.job_id
+            AND attempt.job_version = step.job_version
+            AND step.job_version = snapshot.job_version
+            AND attempt.workflow_revision = step.workflow_revision
+            AND step.workflow_revision = snapshot.workflow_revision
+            AND attempt.snapshot_digest = snapshot.digest
+            AND job.workflow_revision = step.workflow_revision
+            AND job.current_workflow_step_id = attempt.workflow_step_id
+            AND NOT EXISTS (
+              SELECT 1 FROM navigator_release_outcomes AS outcome
+               WHERE outcome.attempt_id = attempt.id
+            )
+       )
+     )
+   )
+   AND ((effect.status IN ('pending', 'failed') AND effect.next_attempt_at <= ?)
+     OR (effect.status = 'leased' AND effect.lease_expires_at <= ?))
+ ORDER BY effect.created_at, effect.idempotency_key
+ LIMIT 1`;
 
 function parseSnapshot(row: SnapshotRow): NavigatorSnapshot {
   const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
@@ -982,6 +1057,11 @@ export class NavigatorRepository {
     return row ? parseProposal(row) : null;
   }
 
+  public getProposalDecision(id: string): NavigatorProposalDecision | null {
+    assertIdentifier(id, "proposalId");
+    return this.decisionForProposal(id);
+  }
+
   public getWorkflowStep(id: string): NavigatorWorkflowStep | null {
     const row = this.db.prepare("SELECT * FROM workflow_steps WHERE id = ?").get(id) as {
       id: string;
@@ -1218,6 +1298,95 @@ export class NavigatorRepository {
     const ticketIds = new Set(tickets.map((ticket) => ticket.artifact_id));
     return ticketIds.size !== implementationTicketIds.length ||
       implementationTicketIds.some((artifactId) => !ticketIds.has(artifactId));
+  }
+
+  public leaseEffect(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null {
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    assertPositiveInteger(input.leaseMs, "leaseMs");
+    return this.db.transaction(() => this.leaseEffectInTransaction(input)).immediate();
+  }
+
+  private leaseEffectInTransaction(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null {
+    if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return null;
+    const row = this.db.prepare(NAVIGATOR_EFFECT_LEASE_QUERY)
+      .get(input.now, input.now) as EffectRow | undefined;
+    if (!row) return null;
+    const effect = parseStoredEffect(row);
+    return this.admitAndLeaseEffect(effect, input);
+  }
+
+  private admitAndLeaseEffect(
+    effect: StoredEffect,
+    input: Readonly<{
+      ownerId: string;
+      generation: number;
+      now: number;
+      leaseMs: number;
+    }>,
+  ): StoredEffect | null {
+    if (!this.navigatorAuthorityCanBeAdmitted(effect, input.now)) return null;
+    if (!this.updateNavigatorEffectLease(effect, input)) return null;
+    return parseStoredEffect(this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?")
+      .get(effect.idempotencyKey) as EffectRow);
+  }
+
+  private navigatorAuthorityCanBeAdmitted(effect: StoredEffect, now: number): boolean {
+    return this.navigatorEffectAuthorityEffects(effect).every((authorityEffect) => this.taskAuthorities.admitEffect(
+      effect.jobId,
+      effect.idempotencyKey,
+      authorityEffect,
+      now,
+    ));
+  }
+
+  private updateNavigatorEffectLease(
+    effect: StoredEffect,
+    input: Readonly<{
+      ownerId: string;
+      generation: number;
+      now: number;
+      leaseMs: number;
+    }>,
+  ): boolean {
+    return this.db.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+           lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+        WHERE idempotency_key = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+          OR (status = 'leased' AND lease_expires_at <= ?))`,
+    ).run(
+      input.ownerId,
+      input.generation,
+      input.now + input.leaseMs,
+      input.now,
+      effect.idempotencyKey,
+      input.now,
+      input.now,
+    ).changes === 1;
+  }
+
+  private navigatorEffectAuthorityEffects(effect: StoredEffect): readonly TaskAuthorityEffect[] {
+    if (effect.kind === "run_navigator_ticket_worker") {
+      return ["worktree_write", "commit", "push", "pull_request"];
+    }
+    if (effect.kind === "run_navigator_release") return ["commit", "push", "pull_request"];
+    const attemptId = effect.payload.attemptId;
+    const attempt = typeof attemptId === "string"
+      ? this.db.prepare("SELECT skill_id FROM navigator_skill_attempts WHERE id = ?")
+        .get(attemptId) as { skill_id: string } | undefined
+      : undefined;
+    return [attempt?.skill_id === "prototype" ? "prototype_write" : "artifact_write"];
   }
 
   public leaseSkillEffect(input: Readonly<{

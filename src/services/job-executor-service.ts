@@ -66,16 +66,8 @@ export type JobExecutorDependencies = {
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
-  /** Deterministic navigator-v1 work. Recipe-v1 jobs never enter this executor. */
-  navigator?: {
-    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
-  };
-  /** Deterministic navigator-v1 ticket integration work. */
-  navigatorImplementation?: {
-    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
-  };
-  /** Deterministic navigator-v1 exact-head release work. */
-  navigatorRelease?: {
+  /** One fenced protocol for every deterministic navigator-v1 effect. */
+  navigatorEffects?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
   monitors?: {
@@ -939,14 +931,8 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (deps.operations) {
           didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
         }
-        if (deps.navigator) {
-          didWork = await deps.navigator.processOne(effectFence, workAbort.signal) || didWork;
-        }
-        if (deps.navigatorImplementation) {
-          didWork = await deps.navigatorImplementation.processOne(effectFence, workAbort.signal) || didWork;
-        }
-        if (deps.navigatorRelease) {
-          didWork = await deps.navigatorRelease.processOne(effectFence, workAbort.signal) || didWork;
+        if (deps.navigatorEffects) {
+          didWork = await deps.navigatorEffects.processOne(effectFence, workAbort.signal) || didWork;
         }
         if (deps.monitors) {
           didWork = await deps.monitors.processDue() || didWork;

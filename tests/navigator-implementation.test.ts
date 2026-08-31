@@ -18,6 +18,10 @@ import {
   type NavigatorGitObserver,
   type NavigatorTicketWorkerRunner,
 } from "../src/navigator/implementation-executor";
+import {
+  createNavigatorCompatibilityAdapter,
+  NavigatorEffectProtocol,
+} from "../src/navigator/effect-protocol";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import {
   ALL_MIGRATIONS,
@@ -512,7 +516,25 @@ describe("navigator ticket integration executor", () => {
       ownerId: "executor-40",
       generation: 1,
     });
-    await executor.processOne(
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: value.now },
+      adapters: [
+        {
+          kind: "run_navigator_skill",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
+        },
+        createNavigatorCompatibilityAdapter(
+          "run_navigator_ticket_worker",
+          (effect, fence, signal) => executor.processLeased(effect, fence, signal),
+        ),
+        {
+          kind: "run_navigator_release",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
+        },
+      ],
+    });
+    await protocol.processOne(
       { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },
       new AbortController().signal,
     );

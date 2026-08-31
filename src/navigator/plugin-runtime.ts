@@ -22,6 +22,11 @@ import {
   type NavigatorTicketWorkerRunner,
 } from "./implementation-executor";
 import { NavigatorReleaseExecutor } from "./release-executor";
+import {
+  createNavigatorCompatibilityAdapter,
+  NavigatorEffectProtocol,
+  type NavigatorEffectAdapter,
+} from "./effect-protocol";
 import { DeterministicWorkflowNavigator } from "./deterministic-navigator";
 import type { NavigatorInferenceObservation, NavigatorSkillAttempt, NavigatorSnapshot } from "./models";
 import {
@@ -42,6 +47,7 @@ const NATIVE_TOOL_ITEM_TYPES: Readonly<Record<string, string>> = {
 };
 
 export type NavigatorPluginRuntime = Readonly<{
+  effects: NavigatorEffectProtocol;
   navigator: NavigatorWorkflowExecutor;
   implementation: NavigatorImplementationExecutor;
   release: NavigatorReleaseExecutor;
@@ -565,16 +571,15 @@ export function createNavigatorRuntime(input: Readonly<{
   clock: { now(): number };
   navigator?: WorkflowNavigator;
 }>): NavigatorPluginRuntime {
-  return {
-    navigator: new NavigatorWorkflowExecutor({
+  const navigator = new NavigatorWorkflowExecutor({
       store: input.store,
       navigator: input.navigator ?? new DeterministicWorkflowNavigator(),
       observeInference: (snapshot) => observePluginNavigatorInference(input.store, input.sdk, snapshot),
       skillRunner: new PluginNavigatorSkillRunner(input.sdk),
       modelRoute: input.modelRoute,
       clock: input.clock,
-    }),
-    implementation: new NavigatorImplementationExecutor({
+    });
+  const implementation = new NavigatorImplementationExecutor({
       store: input.store,
       database: input.database,
       workerRunner: new PluginNavigatorTicketWorkerRunner(input.sdk, input.store),
@@ -582,12 +587,44 @@ export function createNavigatorRuntime(input: Readonly<{
       pullRequests: new PluginNavigatorPullRequestPublisher(input.sdk),
       modelRoute: () => input.modelRoute(),
       clock: input.clock,
-    }),
-    release: new NavigatorReleaseExecutor({
+    });
+  const release = new NavigatorReleaseExecutor({
       store: input.store,
       publishPullRequest: (request) => publishPluginNavigatorPullRequest(input.sdk, request),
       integrationWorktreeId: (jobId) => `env_${jobId}`,
       clock: input.clock,
+    });
+  const skillAdapter: NavigatorEffectAdapter = {
+    kind: "run_navigator_skill",
+    execute: async (context) => {
+      const processed = await navigator.processLeased(
+        context.effect,
+        { ...context.fence, signal: context.signal },
+        context.signal,
+      );
+      return processed
+        ? { outcome: "completed" }
+        : { outcome: "transient", reason: "navigator skill adapter did not settle" };
+    },
+  };
+  return {
+    effects: new NavigatorEffectProtocol({
+      store: input.store,
+      clock: input.clock,
+      adapters: [
+        skillAdapter,
+        createNavigatorCompatibilityAdapter(
+          "run_navigator_ticket_worker",
+          (effect, fence, signal) => implementation.processLeased(effect, fence, signal),
+        ),
+        createNavigatorCompatibilityAdapter(
+          "run_navigator_release",
+          (effect, fence, signal) => release.processLeased(effect, fence, signal),
+        ),
+      ],
     }),
+    navigator,
+    implementation,
+    release,
   };
 }

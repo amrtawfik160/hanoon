@@ -17,6 +17,10 @@ import { NavigatorImplementationExecutor } from "../src/navigator/implementation
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import {
+  createNavigatorCompatibilityAdapter,
+  NavigatorEffectProtocol,
+} from "../src/navigator/effect-protocol";
+import {
   ALL_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
@@ -579,7 +583,25 @@ describe("navigator exact-head release", () => {
       .toHaveLength(1);
 
     const { executor, publish } = releaseExecutor(fixture);
-    expect(await executor.processOne(fence(fixture), new AbortController().signal)).toBe(true);
+    const protocol = new NavigatorEffectProtocol({
+      store: fixture.store,
+      clock: { now: fixture.now },
+      adapters: [
+        {
+          kind: "run_navigator_skill",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
+        },
+        {
+          kind: "run_navigator_ticket_worker",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
+        },
+        createNavigatorCompatibilityAdapter(
+          "run_navigator_release",
+          (effect, releaseFence, signal) => executor.processLeased(effect, releaseFence, signal),
+        ),
+      ],
+    });
+    expect(await protocol.processOne(fence(fixture), new AbortController().signal)).toBe(true);
     expect(publish).toHaveBeenCalledTimes(1);
     expect(fixture.store.getJob(fixture.job.id)).toMatchObject({
       state: "resolving_pr_head",

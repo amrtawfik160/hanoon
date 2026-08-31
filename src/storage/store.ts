@@ -858,6 +858,25 @@ export type ExecutorEventInput = ExecutorFence & Readonly<{
   nativeAdapter?: NativeAdapterTransitionEnvelope;
 }>;
 
+export type NavigatorReleaseEffectSettlementInput = ExecutorFence & Readonly<{
+  effectIdempotencyKey: string;
+  number: number;
+  url: string;
+  environmentId: string;
+}>;
+
+function navigatorReleaseStartedEvent(
+  input: NavigatorReleaseEffectSettlementInput,
+  url: string,
+): Extract<JobEvent, { type: "RELEASE_STARTED" }> {
+  return {
+    type: "RELEASE_STARTED",
+    number: input.number,
+    url,
+    environmentId: input.environmentId,
+  };
+}
+
 export type ExecutorAttemptInput = ExecutorFence & Readonly<{
   id: string;
   jobId: string;
@@ -4003,6 +4022,7 @@ export interface TelegramAgentStore {
     now: number;
   }): NavigatorProposalDecision;
   getNavigatorProposal(id: string): NavigatorProposalRecord | null;
+  getNavigatorProposalDecision(id: string): NavigatorProposalDecision | null;
   getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null;
   getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
@@ -4017,6 +4037,13 @@ export interface TelegramAgentStore {
   }): NavigatorPlanningResultRecord | null;
   getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null;
   getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null;
+  leaseNavigatorEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null;
+  settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean;
   leaseNavigatorSkillEffect(input: {
     ownerId: string;
     generation: number;
@@ -12610,6 +12637,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.getProposal(id);
   }
 
+  public getNavigatorProposalDecision(id: string): NavigatorProposalDecision | null {
+    return this.navigatorRepository.getProposalDecision(id);
+  }
+
   public getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null {
     return this.navigatorRepository.getWorkflowStep(id);
   }
@@ -12640,6 +12671,104 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null {
     return this.navigatorRepository.getRoutingDecision(decisionDigest);
+  }
+
+  public leaseNavigatorEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null {
+    return this.navigatorRepository.leaseEffect(input);
+  }
+
+  public settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean {
+    this.assertExecutorFence(input);
+    if (!input.effectIdempotencyKey) throw new TypeError("navigator release effect identity is required");
+    if (!Number.isSafeInteger(input.number) || input.number < 1) throw new TypeError("release pull request number is invalid");
+    const url = assertSafeExternalHttpsUrl(input.url, "navigator release pull request URL");
+    if (!input.environmentId) throw new TypeError("navigator release environment identity is required");
+    const settle = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const effectRow = this.effectByKey(input.effectIdempotencyKey);
+      if (!effectRow || !this.navigatorReleaseEffectIsCurrent(effectRow, input)) return false;
+      const current = this.readJobById(effectRow.job_id);
+      if (!current || current.cancelRequestedAt !== null || current.state === "cancelled") return false;
+      if (current.state === "implementing" && !this.applyNavigatorReleaseStart(current, input, url)) return false;
+      return this.completeNavigatorReleaseEffect(effectRow, input);
+    });
+    return settle.immediate();
+  }
+
+  private navigatorReleaseEffectIsCurrent(
+    effect: EffectRow,
+    input: NavigatorReleaseEffectSettlementInput,
+  ): boolean {
+    if (effect.kind !== "run_navigator_release" ||
+      !this.effectLeaseIsActiveForRow(effect, input.ownerId, input.generation, input.now)) return false;
+    return (["commit", "push", "pull_request"] as const).every((authorityEffect) =>
+      this.taskAuthorityRepository.effectAdmissionIsCurrent(
+        effect.job_id,
+        input.effectIdempotencyKey,
+        authorityEffect,
+      ));
+  }
+
+  private applyNavigatorReleaseStart(
+    current: Job,
+    input: NavigatorReleaseEffectSettlementInput,
+    url: string,
+  ): boolean {
+    const event = navigatorReleaseStartedEvent(input, url);
+    const evidenceGate = this.executorEvidenceGate(current, event);
+    if (!evidenceGate.valid) return false;
+    const transitioned = transition(current, event, input.now);
+    this.persistNavigatorReleaseStart({ current, input, transitioned, event, evidenceGate });
+    return true;
+  }
+
+  private persistNavigatorReleaseStart(input: Readonly<{
+    current: Job;
+    input: NavigatorReleaseEffectSettlementInput;
+    transitioned: ReturnType<typeof transition>;
+    event: JobEvent;
+    evidenceGate: { valid: boolean; completeReviewAttemptIds: readonly string[] };
+  }>): void {
+    const { current, input: settlement, transitioned, event, evidenceGate } = input;
+    persistJobTransition(this.db, current.id, current.version, transitioned.job);
+    persistPendingEffects(this.db, transitioned.effects, settlement.now);
+    this.settleNavigatorReleaseReturn({
+      previous: current,
+      next: transitioned.job,
+      event,
+      now: settlement.now,
+      reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
+    });
+    this.enqueueFinishNoteInTransaction(current, transitioned.job, settlement.now);
+    this.markAdmissionDrainingForTerminal(transitioned.job, settlement.now);
+  }
+
+  private completeNavigatorReleaseEffect(
+    effect: EffectRow,
+    input: NavigatorReleaseEffectSettlementInput,
+  ): boolean {
+    return this.db.prepare(
+      `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
+          lease_expires_at = NULL, last_error = NULL, updated_at = ?
+        WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+          AND lease_generation = ? AND lease_expires_at > ?
+          AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
+            AND generation = ? AND lease_expires_at > ?)`,
+    ).run(
+      input.now,
+      effect.idempotency_key,
+      input.ownerId,
+      input.generation,
+      input.now,
+      input.ownerId,
+      input.generation,
+      input.now,
+    ).changes === 1;
   }
 
   public leaseNavigatorSkillEffect(input: {

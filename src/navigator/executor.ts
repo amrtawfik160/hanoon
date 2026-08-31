@@ -101,6 +101,10 @@ export class NavigatorWorkflowExecutor {
       leaseMs: this.dependencies.leaseMs ?? 30_000,
     });
     if (!effect) return false;
+    return this.processLeased(effect, fence, signal);
+  }
+
+  public async processLeased(effect: StoredEffect, fence: EffectFence, signal: AbortSignal): Promise<boolean> {
     const attemptId = payloadIdentifier(effect, "attemptId");
     const attempt = this.dependencies.store.getNavigatorSkillAttempt(attemptId);
     if (!attempt || attempt.effectIdempotencyKey !== effect.idempotencyKey) {
