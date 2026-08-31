@@ -1,5 +1,6 @@
 import { vi } from "vitest";
-import type { BbAutomation, BbAutomationDefinition } from "../../src/bb/automation";
+import type { BbAutomationDefinition } from "../../src/bb/automation";
+import type { ManagedAutomationObservation } from "../../src/domain/managed-automation";
 import type {
   CreateManagedAutomationInput,
   ManagedAutomationService,
@@ -7,36 +8,15 @@ import type {
 import type { ManagedAutomationBinding } from "../../src/storage/managed-automation-repository";
 import { isCurrentManagedAutomationAuthority } from "../../src/domain/managed-automation";
 
-function observed(definition: BbAutomationDefinition, id: string, now: number): BbAutomation {
+function observed(definition: BbAutomationDefinition, id: string, now: number): ManagedAutomationObservation {
   return {
-    id,
+    providerAutomationId: id,
     projectId: definition.projectId,
     name: definition.name,
     enabled: true,
-    trigger: definition.trigger.kind === "cron"
-      ? { triggerType: "schedule", cron: definition.trigger.cron, timezone: definition.trigger.timezone }
-      : { triggerType: "once", runAt: Date.parse(definition.trigger.at) },
-    execution: definition.mode === "agent"
-      ? {
-          mode: "agent",
-          prompt: definition.prompt,
-          providerId: definition.providerId,
-          model: definition.model,
-          ...(definition.reasoningLevel ? { reasoningLevel: definition.reasoningLevel } : {}),
-          ...(definition.serviceTier ? { serviceTier: definition.serviceTier } : {}),
-          permissionMode: definition.permissionMode,
-          environment: { type: "project-default" },
-        }
-      : {
-          mode: "script",
-          interpreter: definition.interpreter,
-          timeoutMs: definition.timeoutMs,
-          script: definition.source.kind === "inline" ? definition.source.script : "",
-          env: definition.env,
-          storedScriptPath: "/test/automation.sh",
-        },
-    origin: "agent",
-    createdByThreadId: "thr_controller",
+    trigger: definition.trigger,
+    mode: definition.mode,
+    target: definition.mode === "agent" ? definition.target : null,
     nextRunAt: now + 60_000,
     lastRunAt: null,
     runCount: 0,
@@ -58,7 +38,8 @@ export function createTestManagedAutomations() {
       controllerKey: input.controllerKey,
       sourceKey: input.sourceKey,
       projectId: input.definition.projectId,
-      bbAutomationId: automation.id,
+      bbAutomationId: automation.providerAutomationId,
+      providerOwnershipMarker: null,
       name: input.definition.name,
       mode: input.definition.mode,
       definition: input.definition,

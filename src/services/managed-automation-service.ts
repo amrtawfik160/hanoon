@@ -15,9 +15,11 @@ import {
 } from "../storage/managed-automation-repository";
 import type {
   ManagedAutomationCapabilities,
+  ManagedAutomationCreateReceipt,
   ManagedAutomationDefinition,
   ManagedAutomationObservation,
   ManagedAutomationOperationRequest,
+  ManagedAutomationProviderIdentity,
   ManagedAutomationRun,
   ManagedAutomationScope,
   ManagedAutomationTarget,
@@ -31,13 +33,15 @@ export type ManagedAutomationAdapter = Readonly<{
   create(input: {
     scope: ManagedAutomationScope;
     definition: ManagedAutomationDefinition;
+    identity: ManagedAutomationProviderIdentity;
     signal?: AbortSignal;
-  }): Promise<ManagedAutomationObservation>;
+  }): Promise<ManagedAutomationCreateReceipt>;
   update(input: {
     scope: ManagedAutomationScope;
     definition: ManagedAutomationDefinition;
     automationId: string;
     expectedEnabled: boolean;
+    identity?: ManagedAutomationProviderIdentity;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationObservation>;
   show(input: {
@@ -46,6 +50,7 @@ export type ManagedAutomationAdapter = Readonly<{
     automationId: string;
     expectedDefinition?: ManagedAutomationDefinition;
     expectedEnabled?: boolean;
+    identity?: ManagedAutomationProviderIdentity;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationObservation>;
   setEnabled(input: {
@@ -53,6 +58,8 @@ export type ManagedAutomationAdapter = Readonly<{
     projectId: string;
     automationId: string;
     enabled: boolean;
+    expectedDefinition?: ManagedAutomationDefinition;
+    identity?: ManagedAutomationProviderIdentity;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationObservation>;
   runNow(input: {
@@ -78,6 +85,7 @@ export type ManagedAutomationAdapter = Readonly<{
   findByDefinition?(input: {
     scope: ManagedAutomationScope;
     definition: ManagedAutomationDefinition;
+    identity: ManagedAutomationProviderIdentity;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationObservation | null>;
 }>;
@@ -111,6 +119,22 @@ export type ManagedAutomationMutation = <T>(mutation: () => T) => T;
 
 function applyMutation<T>(mutate: ManagedAutomationMutation | undefined, mutation: () => T): T {
   return mutate ? mutate(mutation) : mutation();
+}
+
+function ownershipMarkerFor(identity: string): string {
+  return `hanoon:${managedAutomationDigest(identity).slice(0, 40)}`;
+}
+
+function existingProviderIdentity(
+  binding: ManagedAutomationBinding,
+  operation?: ManagedAutomationOperation,
+): ManagedAutomationProviderIdentity | undefined {
+  const ownershipMarker = operation?.providerOwnershipMarker ?? binding.providerOwnershipMarker;
+  if (!ownershipMarker) return undefined;
+  return {
+    operationId: operation?.id ?? binding.lastOperationId ?? binding.id,
+    ownershipMarker,
+  };
 }
 
 class ManagedAutomationExecutorFenceLostError extends Error {
@@ -217,36 +241,51 @@ export class ManagedAutomationService {
         signal: input.signal,
       });
     }
-    let automation: ManagedAutomationObservation | null = null;
+    const providerIdentity: ManagedAutomationProviderIdentity = {
+      operationId: reserved.id,
+      ownershipMarker: ownershipMarkerFor(reserved.id),
+    };
+    applyMutation(input.mutate, () => this.repository.setProviderOwnershipMarker({
+      id: reserved.id,
+      ownershipMarker: providerIdentity.ownershipMarker,
+      now: input.now,
+    }));
+    let receipt: ManagedAutomationCreateReceipt | null = null;
     try {
-      automation = await this.adapter.create({
+      receipt = await this.adapter.create({
         scope: input.scope,
         definition: input.definition,
+        identity: providerIdentity,
+        signal: input.signal,
+      });
+      if (receipt.operationId !== providerIdentity.operationId ||
+        receipt.ownershipMarker !== providerIdentity.ownershipMarker) {
+        throw new TypeError("managed automation provider acknowledgement identity does not match its binding");
+      }
+      const acknowledged = applyMutation(input.mutate, () => this.repository.attachProviderAutomation({
+        id: reserved.id,
+        providerAutomationId: receipt!.providerAutomationId,
+        ownershipMarker: receipt!.ownershipMarker,
+        now: input.now,
+      }));
+      const automation = await this.adapter.show({
+        scope: input.scope,
+        projectId: input.definition.projectId,
+        automationId: acknowledged.bbAutomationId!,
+        expectedDefinition: input.definition,
+        identity: providerIdentity,
         signal: input.signal,
       });
       return applyMutation(input.mutate, () => this.repository.activate({
         id: reserved.id,
-        automation: automation!,
+        automation,
         now: input.now,
       }));
     } catch (error) {
-      if (automation !== null) {
-        try {
-          await this.adapter.delete({
-            scope: input.scope,
-            projectId: input.definition.projectId,
-            automationId: automation.id,
-            signal: input.signal,
-          });
-        } catch {
-          // The durable binding remains pending/failed and cannot be reported
-          // as active. A later reconciliation must resolve this closed state.
-        }
-      }
       try {
         applyMutation(input.mutate, () => this.repository.fail(
           reserved.id,
-          automationErrorClass(error),
+          receipt === null ? automationErrorClass(error) : "bb_automation_provider_readback_failed",
           input.now,
         ));
       } catch {
@@ -298,23 +337,75 @@ export class ManagedAutomationService {
     operation: ManagedAutomationOperation;
     scope: ManagedAutomationScope;
     signal?: AbortSignal;
+    now?: number;
   }): Promise<ManagedAutomationObservation> {
     const admission = this.admitOperation(input.binding, input.operation);
     if (!admission.allowed) throw new Error(admission.errorClass);
-    if (input.operation.attempts > 1 && !this.adapter.findByDefinition) {
+    const providerIdentity = existingProviderIdentity(input.binding, input.operation);
+    if (!providerIdentity) throw new Error("managed_automation_provider_identity_missing");
+    if (input.operation.attempts > 1 && !this.adapter.findByDefinition &&
+      input.operation.providerAutomationId === null && input.binding.bbAutomationId === null) {
       throw new Error("managed_automation_reconciliation_unsupported");
     }
-    const existing = this.adapter.findByDefinition
+    const knownProviderAutomationId = input.operation.providerAutomationId ?? input.binding.bbAutomationId;
+    if (knownProviderAutomationId !== null) {
+      return this.adapter.show({
+        scope: input.scope,
+        projectId: input.binding.projectId,
+        automationId: knownProviderAutomationId,
+        expectedDefinition: input.binding.definition,
+        expectedEnabled: true,
+        identity: providerIdentity,
+        signal: input.signal,
+      });
+    }
+    const existing = input.operation.attempts > 1 && this.adapter.findByDefinition
       ? await this.adapter.findByDefinition({
           scope: input.scope,
           definition: input.binding.definition,
+          identity: providerIdentity,
           signal: input.signal,
         })
       : null;
     if (input.signal?.aborted) throw new Error("managed_automation_operation_aborted");
-    return existing ?? this.adapter.create({
+    if (existing) {
+      const acknowledged = this.repository.acknowledgeOperation({
+        operationId: input.operation.id,
+        ownerId: input.operation.leaseOwner!,
+        generation: input.operation.leaseGeneration!,
+        now: input.now ?? input.binding.updatedAt,
+        receipt: {
+          version: 1,
+          operationId: providerIdentity.operationId,
+          ownershipMarker: providerIdentity.ownershipMarker,
+          providerAutomationId: existing.providerAutomationId,
+        },
+      });
+      if (!acknowledged) throw new ManagedAutomationExecutorFenceLostError();
+      return existing;
+    }
+    const receipt = await this.adapter.create({
       scope: input.scope,
       definition: input.binding.definition,
+      identity: providerIdentity,
+      signal: input.signal,
+    });
+    const acknowledged = this.repository.acknowledgeOperation({
+      operationId: input.operation.id,
+      ownerId: input.operation.leaseOwner!,
+      generation: input.operation.leaseGeneration!,
+      now: input.now ?? input.binding.updatedAt,
+      receipt,
+    });
+    if (!acknowledged) throw new ManagedAutomationExecutorFenceLostError();
+    if (input.signal?.aborted) throw new Error("managed_automation_operation_aborted");
+    return this.adapter.show({
+      scope: input.scope,
+      projectId: input.binding.projectId,
+      automationId: receipt.providerAutomationId,
+      expectedDefinition: input.binding.definition,
+      expectedEnabled: true,
+      identity: providerIdentity,
       signal: input.signal,
     });
   }
@@ -360,6 +451,7 @@ export class ManagedAutomationService {
         definition: input.binding.definition,
         automationId: input.binding.bbAutomationId,
         expectedEnabled: input.binding.observed?.enabled ?? true,
+        identity: existingProviderIdentity(input.binding),
         signal: input.signal,
       });
       return applyMutation(input.mutate, () => this.repository.activate({
@@ -375,6 +467,7 @@ export class ManagedAutomationService {
         automationId: input.binding.bbAutomationId,
         expectedDefinition: input.binding.definition,
         expectedEnabled: input.binding.state !== "paused",
+        identity: existingProviderIdentity(input.binding),
         signal: input.signal,
       });
       const active = applyMutation(input.mutate, () => this.repository.activate({
@@ -425,6 +518,8 @@ export class ManagedAutomationService {
       projectId: binding.projectId,
       automationId: binding.bbAutomationId!,
       enabled: input.enabled,
+      expectedDefinition: binding.definition,
+      identity: existingProviderIdentity(binding),
       signal: input.signal,
     });
     return applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation, now: input.now }));
@@ -459,6 +554,7 @@ export class ManagedAutomationService {
       definition: updating.definition,
       automationId: updating.bbAutomationId!,
       expectedEnabled: updating.observed?.enabled ?? true,
+      identity: existingProviderIdentity(updating),
       signal: input.signal,
     });
     return applyMutation(input.mutate, () => this.repository.activate({
@@ -482,6 +578,7 @@ export class ManagedAutomationService {
         definition: binding.definition,
         automationId: binding.bbAutomationId!,
         expectedEnabled: binding.observed?.enabled ?? true,
+        identity: existingProviderIdentity(binding),
         signal: input.signal,
       });
       binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: updated, now: input.now }));
@@ -492,6 +589,8 @@ export class ManagedAutomationService {
         projectId: binding.projectId,
         automationId: binding.bbAutomationId!,
         enabled: false,
+        expectedDefinition: binding.definition,
+        identity: existingProviderIdentity(binding),
         signal: input.signal,
       });
       binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: paused, now: input.now }));
@@ -513,6 +612,8 @@ export class ManagedAutomationService {
         projectId: binding.projectId,
         automationId: binding.bbAutomationId!,
         enabled: false,
+        expectedDefinition: binding.definition,
+        identity: existingProviderIdentity(binding),
         signal: input.signal,
       });
       binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: paused, now: input.now }));
@@ -833,6 +934,7 @@ export class ManagedAutomationReconciler {
         binding,
         operation,
         scope: { kind: "host", hostId, cwd: null },
+        now: this.dependencies.clock?.now() ?? now,
         signal: operationSignal,
       });
       if (operationSignal.aborted) return;

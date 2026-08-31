@@ -506,13 +506,15 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-2)).toBe(MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.at(-2));
-    expect(ALL_MIGRATIONS.at(-3)).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-4)).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-5)).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-6)).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-7)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
+    });
+    const stateUpgradeOffset = MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");

@@ -51,53 +51,14 @@ export type ManagedAutomationDefinition =
   | ManagedAutomationAgentDefinition
   | ManagedAutomationScriptDefinition;
 
-type ManagedAutomationObservedTrigger =
-  | Readonly<{ triggerType: "schedule"; cron: string; timezone: string }>
-  | Readonly<{ triggerType: "once"; runAt: number }>;
-
-type ManagedAutomationObservedEnvironment =
-  | Readonly<{ type: "project-default" }>
-  | Readonly<{ type: "reuse"; environmentId: string }>
-  | Readonly<{
-      type: "host";
-      hostId: string;
-      workspace: Readonly<{
-        type: "managed-worktree";
-        baseBranch: Readonly<{ kind: "named"; name: string }>;
-      }>;
-    }>;
-
-type ManagedAutomationObservedExecution =
-  | Readonly<{
-      mode: "agent";
-      prompt: string;
-      providerId: string;
-      model: string;
-      reasoningLevel?: string;
-      serviceTier?: string;
-      permissionMode: "accept-edits" | "auto" | "full";
-      targetThreadId?: string;
-      environment: ManagedAutomationObservedEnvironment;
-    }>
-  | Readonly<{
-      mode: "script";
-      interpreter?: "bash" | "sh" | "node" | "python3";
-      timeoutMs: number;
-      scriptFile?: string;
-      storedScriptPath?: string;
-      script?: string;
-      env?: Readonly<Record<string, string>>;
-    }>;
-
 export type ManagedAutomationObservation = Readonly<{
-  id: string;
+  providerAutomationId: string;
   projectId: string;
   name: string;
   enabled: boolean;
-  trigger: ManagedAutomationObservedTrigger;
-  execution: ManagedAutomationObservedExecution;
-  origin: "human" | "app" | "agent";
-  createdByThreadId: string | null;
+  trigger: ManagedAutomationTrigger;
+  mode: "agent" | "script";
+  target: ManagedAutomationTarget | null;
   nextRunAt: number | null;
   lastRunAt: number | null;
   runCount: number;
@@ -106,6 +67,18 @@ export type ManagedAutomationObservation = Readonly<{
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
+}>;
+
+export type ManagedAutomationProviderIdentity = Readonly<{
+  operationId: string;
+  ownershipMarker: string;
+}>;
+
+export type ManagedAutomationCreateReceipt = Readonly<{
+  version: 1;
+  operationId: string;
+  ownershipMarker: string;
+  providerAutomationId: string;
 }>;
 
 export type ManagedAutomationRun = Readonly<{
@@ -134,6 +107,106 @@ const boundedId = z.string().min(1).max(256);
 const positiveRevision = z.number().int().positive().safe();
 const sha256 = z.string().regex(/^[0-9a-f]{64}$/u);
 const evidenceReference = z.string().min(1).max(512);
+const timestamp = z.string().min(1).max(128).refine((value) => Number.isFinite(Date.parse(value)), {
+  message: "must be a parseable timestamp",
+});
+
+export const managedAutomationTriggerSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("cron"),
+    cron: z.string().min(1).max(256),
+    timezone: z.string().min(1).max(128),
+  }).strict(),
+  z.object({
+    kind: z.literal("once"),
+    at: timestamp,
+  }).strict(),
+]);
+
+export const managedAutomationTargetSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("project-default") }).strict(),
+  z.object({ kind: z.literal("target-thread"), threadId: boundedId }).strict(),
+  z.object({ kind: z.literal("environment"), environmentId: boundedId }).strict(),
+  z.object({ kind: z.literal("new-worktree"), baseBranch: boundedId }).strict(),
+]);
+
+const managedAutomationResultContractSchema = z.object({
+  kind: z.literal("bounded-text"),
+  maximumBytes: z.number().int().positive().safe().max(1_048_576),
+}).strict();
+
+const managedAutomationScriptSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("inline"), script: z.string().max(1_048_576) }).strict(),
+  z.object({
+    kind: z.literal("file"),
+    path: boundedId,
+    sha256,
+    hostId: boundedId.optional(),
+  }).strict(),
+]);
+
+export const managedAutomationDefinitionSchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("agent"),
+    projectId: boundedId,
+    name: z.string().min(1).max(200),
+    trigger: managedAutomationTriggerSchema,
+    prompt: z.string().max(1_048_576),
+    providerId: boundedId,
+    model: boundedId,
+    reasoningLevel: z.string().max(256).optional(),
+    serviceTier: z.enum(["default", "fast"]).optional(),
+    permissionMode: z.enum(["accept-edits", "auto", "full"]),
+    target: managedAutomationTargetSchema,
+    timeoutMs: z.number().int().positive().safe().max(14_400_000),
+    resultContract: managedAutomationResultContractSchema,
+  }).strict(),
+  z.object({
+    mode: z.literal("script"),
+    projectId: boundedId,
+    name: z.string().min(1).max(200),
+    trigger: managedAutomationTriggerSchema,
+    source: managedAutomationScriptSourceSchema,
+    interpreter: z.enum(["bash", "sh", "node", "python3"]),
+    timeoutMs: z.number().int().positive().safe().max(14_400_000),
+    env: z.record(z.string().max(256), z.string().max(16_384)).optional(),
+  }).strict(),
+]);
+
+export const managedAutomationDefinitionEnvelopeSchema = z.object({
+  version: z.literal(1),
+  value: managedAutomationDefinitionSchema,
+}).strict();
+
+export const managedAutomationObservationSchema = z.object({
+  providerAutomationId: boundedId,
+  projectId: boundedId,
+  name: z.string().min(1).max(200),
+  enabled: z.boolean(),
+  trigger: managedAutomationTriggerSchema,
+  mode: z.enum(["agent", "script"]),
+  target: managedAutomationTargetSchema.nullable(),
+  nextRunAt: z.number().int().nonnegative().nullable(),
+  lastRunAt: z.number().int().nonnegative().nullable(),
+  runCount: z.number().int().nonnegative(),
+  lastRunStatus: z.enum(["running", "succeeded", "failed", "skipped"]).nullable(),
+  lastRunThreadId: boundedId.nullable(),
+  lastError: z.string().max(16_384).nullable(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+}).strict();
+
+export const managedAutomationObservationEnvelopeSchema = z.object({
+  version: z.literal(1),
+  value: managedAutomationObservationSchema,
+}).strict();
+
+export const managedAutomationCreateReceiptSchema = z.object({
+  version: z.literal(1),
+  operationId: boundedId,
+  ownershipMarker: boundedId,
+  providerAutomationId: boundedId,
+}).strict();
 
 export const managedAutomationCapabilityEvidenceSchema = z.object({
   version: z.literal(1),
@@ -269,8 +342,44 @@ export const managedAutomationOperationRequestSchema = z.object({
 export type ManagedAutomationOperationClass = z.infer<typeof managedAutomationOperationClassSchema>;
 export type ManagedAutomationOperationRequest = z.infer<typeof managedAutomationOperationRequestSchema>;
 
+const managedAutomationOutcomeValueSchema = z.enum(["succeeded", "failed", "ambiguous"]);
+
+export const managedAutomationProviderAcknowledgementSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("provider-acknowledgement"),
+  operationId: boundedId,
+  ownershipMarker: boundedId,
+  providerAutomationId: boundedId,
+}).strict();
+
+export const managedAutomationOutcomeReceiptSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("settled"),
+  operationId: boundedId,
+  operationClass: managedAutomationOperationClassSchema,
+  outcome: managedAutomationOutcomeValueSchema,
+  authority: managedAutomationAuthoritySchema,
+  capabilityEvidence: managedAutomationCapabilityEvidenceSchema.nullable(),
+  providerAutomationId: boundedId.nullable(),
+  ownershipMarker: boundedId.nullable(),
+  observedSha256: sha256.nullable(),
+  evidence: z.record(z.string().max(256), z.unknown()).nullable(),
+  errorClass: boundedId.nullable(),
+}).strict();
+
+export const managedAutomationStoredOutcomeSchema = z.discriminatedUnion("kind", [
+  managedAutomationProviderAcknowledgementSchema,
+  managedAutomationOutcomeReceiptSchema,
+]);
+
+export type ManagedAutomationProviderAcknowledgement = z.infer<typeof managedAutomationProviderAcknowledgementSchema>;
+export type ManagedAutomationOutcomeReceipt = z.infer<typeof managedAutomationOutcomeReceiptSchema>;
+export type ManagedAutomationStoredOutcome = z.infer<typeof managedAutomationStoredOutcomeSchema>;
+
 export type LegacyManagedAutomationAuthority = Readonly<Record<string, unknown>>;
 export type StoredManagedAutomationAuthority = ManagedAutomationAuthority | LegacyManagedAutomationAuthority;
+export type LegacyManagedAutomationOutcome = Readonly<Record<string, unknown>>;
+export type StoredManagedAutomationOutcome = ManagedAutomationStoredOutcome | LegacyManagedAutomationOutcome;
 
 export function parseManagedAutomationAuthority(value: unknown): StoredManagedAutomationAuthority {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {

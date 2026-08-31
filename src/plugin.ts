@@ -687,12 +687,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         operation.definitionRevision !== binding.definitionRevision) return false;
       const assignment = profile.assignments.find((candidate) => candidate.capabilityId === evidence.capabilityId);
       const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
-      if (!descriptor || (assignment && assignment.descriptorDigest !== evidence.descriptorDigest) ||
+      if (!descriptor || !assignment || assignment.descriptorDigest !== evidence.descriptorDigest ||
         descriptor.version !== evidence.descriptorVersion) return false;
       const profileRef = `capability-profile:${profile.id}:${profile.revision}`;
       if (!evidence.evidenceRefs.includes(profileRef)) return false;
-      const receiptRef = evidence.evidenceRefs.find((ref) => ref.startsWith("capability-receipt:"));
-      return receiptRef === undefined || store.listCapabilityReceipts(profile.id, 256).some((receipt) =>
+      const receiptRefs = evidence.evidenceRefs.filter((ref) => ref.startsWith("capability-receipt:"));
+      if (receiptRefs.length !== 1) return false;
+      const receiptRef = receiptRefs[0]!;
+      return store.listCapabilityReceipts(profile.id, 256).some((receipt) =>
         receipt.eventType === "selected" && receipt.id === receiptRef.slice("capability-receipt:".length) &&
         receipt.capabilityId === evidence.capabilityId && receipt.descriptorDigest === evidence.descriptorDigest &&
         receipt.profileRevision === evidence.profileRevision);

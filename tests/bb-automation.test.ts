@@ -93,9 +93,8 @@ describe("BB automation adapter", () => {
     expect(command.endsWith("--json")).toBe(true);
   });
 
-  it("does not accept create success until an exact show read-back passes", async () => {
+  it("returns the provider create acknowledgement before read-back", async () => {
     const results: CommandResult[] = [
-      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
       { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
     ];
     const run = vi.fn(async (_input: unknown) => results.shift()!);
@@ -104,14 +103,75 @@ describe("BB automation adapter", () => {
     await expect(adapter.create({
       scope: { kind: "environment", environmentId: "env_owner" },
       definition,
-    })).resolves.toMatchObject({ id: "auto_1", enabled: true });
+      identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
+    })).resolves.toMatchObject({ version: 1, operationId: "managed-operation-1", providerAutomationId: "auto_1" });
 
-    expect(run).toHaveBeenCalledTimes(2);
-    expect((run.mock.calls[1]?.[0] as { command: string } | undefined)?.command)
-      .toBe("bb automation show 'auto_1' --project 'proj_owner' --json");
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("translates a BB response into provider-neutral Hanoon observation values", async () => {
+    const adapter = new TerminalBbAutomationAdapter({
+      run: async () => ({ outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) }),
+    });
+
+    const result = await adapter.show({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      projectId: definition.projectId,
+      automationId: "auto_1",
+    });
+
+    expect(result).toMatchObject({
+      providerAutomationId: "auto_1",
+      projectId: definition.projectId,
+      name: definition.name,
+      enabled: true,
+      trigger: { kind: "cron", cron: "0 9 * * *", timezone: "Etc/UTC" },
+      mode: "agent",
+      target: { kind: "environment", environmentId: "env_owner" },
+    });
+    expect(result).not.toHaveProperty("triggerType");
+    expect(result).not.toHaveProperty("execution");
+    expect(result).not.toHaveProperty("origin");
+  });
+
+  it("returns an acknowledged create receipt without compensating for read-back", async () => {
+    const run = vi.fn(async () => ({
+      outcome: "exited" as const,
+      exitCode: 0,
+      output: JSON.stringify(observed()),
+    }));
+    const adapter = new TerminalBbAutomationAdapter({ run });
+
+    await expect(adapter.create({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      definition,
+      identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
+    })).resolves.toMatchObject({
+      version: 1,
+      operationId: "managed-operation-1",
+      ownershipMarker: "hanoon:marker-1",
+      providerAutomationId: "auto_1",
+    });
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed when BB reads back a different schedule", async () => {
+    const results: CommandResult[] = [
+      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed({
+        trigger: { triggerType: "schedule", cron: "0 10 * * *", timezone: "Etc/UTC" },
+      })) },
+    ];
+    const adapter = new TerminalBbAutomationAdapter({ run: async () => results.shift()! });
+
+    await expect(adapter.show({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      projectId: definition.projectId,
+      automationId: "auto_1",
+      expectedDefinition: definition,
+    })).rejects.toThrow("schedule did not reconcile");
+  });
+
+  it("verifies the provider definition after an update", async () => {
     const results: CommandResult[] = [
       { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
       { outcome: "exited", exitCode: 0, output: JSON.stringify(observed({
@@ -120,9 +180,11 @@ describe("BB automation adapter", () => {
     ];
     const adapter = new TerminalBbAutomationAdapter({ run: async () => results.shift()! });
 
-    await expect(adapter.create({
+    await expect(adapter.update({
       scope: { kind: "environment", environmentId: "env_owner" },
       definition,
+      automationId: "auto_1",
+      expectedEnabled: true,
     })).rejects.toThrow("schedule did not reconcile");
   });
 

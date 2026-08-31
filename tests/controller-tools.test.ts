@@ -206,6 +206,7 @@ function fixture(options: {
   controllerTools?: "bundled" | "all-tools";
   origin?: "owner" | "system";
   inputText?: string;
+  automationCapability?: boolean;
 } = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: `telegram-controller-tools-${fixtureNumber++}`,
@@ -249,6 +250,17 @@ function fixture(options: {
     generation: lease.generation,
     now: 10_000,
   })).toBe(true);
+  if (options.automationCapability) {
+    const currentTurn = store.getControllerTurn(turn.id);
+    if (!currentTurn?.capabilityProfileId) throw new Error("missing controller capability profile");
+    expect(store.requestControllerCapabilityExpansion({
+      controllerKey: turn.controllerKey,
+      turnId: turn.id,
+      expectedProfileId: currentTurn.capabilityProfileId,
+      bundleIds: ["monitoring"],
+      now: 10_001,
+    }).outcome).toBe("resume_required");
+  }
   let activeFence = { ownerId: "executor", generation: lease.generation, now: 10_000 };
   const deactivate = () => {
     if (store.isExecutorLeaseCurrent(activeFence.ownerId, activeFence.generation, activeFence.now)) {
@@ -1499,7 +1511,7 @@ it("exposes an approved bundle only after the persisted continuation profile is 
 });
 
 it("rejects repeating schedules that poll live work", async () => {
-  const { bb, harness, store } = fixture({ active: true });
+  const { bb, harness, store } = fixture({ active: true, automationCapability: true });
   const automations = createTestManagedAutomations();
   registerControllerTools(bb, {
     store,
@@ -1538,7 +1550,7 @@ it("rejects repeating schedules that poll live work", async () => {
 });
 
 it("updates an owned BB schedule through the governed controller seam without widening its execution", async () => {
-  const { bb, harness, store } = fixture({ active: true });
+  const { bb, harness, store } = fixture({ active: true, automationCapability: true });
   const automations = createTestManagedAutomations();
   registerControllerTools(bb, {
     store,

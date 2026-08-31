@@ -490,22 +490,25 @@ function ownerAutomationCapabilityEvidence(
 ) {
   const descriptor = CAPABILITY_BY_ID.get("telegram_agent_watch");
   const assignment = profile.assignments.find((candidate) => candidate.capabilityId === "telegram_agent_watch");
-  if (!descriptor || (assignment && assignment.descriptorDigest !== descriptor.digest)) {
+  if (!descriptor || !assignment || assignment.descriptorDigest !== descriptor.digest) {
     throw new Error("The controller capability profile does not authorize BB schedule management");
   }
   const selected = dependencies.store.listCapabilityReceipts(profile.id, 256).find((receipt) =>
     receipt.eventType === "selected" && receipt.capabilityId === "telegram_agent_watch" &&
     receipt.profileRevision === profile.revision && receipt.descriptorDigest === descriptor.digest);
+  if (!selected) {
+    throw new Error("The controller capability profile does not authorize BB schedule management");
+  }
   return {
     version: 1 as const,
     profileId: profile.id,
     profileRevision: profile.revision,
-    capabilityId: assignment?.capabilityId ?? descriptor.id,
+    capabilityId: assignment.capabilityId,
     descriptorVersion: descriptor.version,
     descriptorDigest: descriptor.digest,
     evidenceRefs: [
       `capability-profile:${profile.id}:${profile.revision}`,
-      ...(selected ? [`capability-receipt:${selected.id}`] : []),
+      `capability-receipt:${selected.id}`,
     ],
   };
 }
@@ -783,7 +786,7 @@ function automationProjection(binding: ManagedAutomationBinding) {
     observed: binding.observed === null
       ? null
       : {
-          id: binding.observed.id,
+          id: binding.observed.providerAutomationId,
           enabled: binding.observed.enabled,
           nextRunAt: binding.observed.nextRunAt,
           lastRunAt: binding.observed.lastRunAt,

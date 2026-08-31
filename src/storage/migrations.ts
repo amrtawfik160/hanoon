@@ -4624,6 +4624,13 @@ CREATE INDEX managed_automation_operations_due
   ON managed_automation_operations(state, next_attempt_at, created_at);
 CREATE INDEX managed_automation_operations_binding
   ON managed_automation_operations(binding_id, created_at);
+`, String.raw`
+ALTER TABLE managed_automations ADD COLUMN provider_ownership_marker TEXT CHECK (
+  provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+);
+ALTER TABLE managed_automation_operations ADD COLUMN provider_ownership_marker TEXT CHECK (
+  provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+);
 `] as const;
 
 export const ALL_MIGRATIONS = [
