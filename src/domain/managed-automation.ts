@@ -112,6 +112,13 @@ const timestamp = z.string().min(1).max(128).refine((value) => Number.isFinite(D
   message: "must be a parseable timestamp",
 });
 
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+  Object.freeze(value);
+  return value;
+}
+
 export const managedAutomationTriggerSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("cron"),
@@ -202,6 +209,48 @@ export const managedAutomationObservationEnvelopeSchema = z.object({
   value: managedAutomationObservationSchema,
 }).strict();
 
+export const managedAutomationOperationClassSchema = z.enum([
+  "create",
+  "update",
+  "enable",
+  "disable",
+  "run_now",
+  "retire",
+  "reconcile",
+]);
+
+const managedAutomationRecursionSchema = z.object({
+  version: z.literal(1),
+  rootAutomationId: boundedId,
+  parentAutomationId: boundedId,
+  depth: z.number().int().nonnegative().safe().max(8),
+  maxDepth: z.number().int().positive().safe().max(8),
+  lineage: z.array(boundedId).min(1).max(9),
+}).strict().superRefine((recursion, context) => {
+  if (recursion.depth > recursion.maxDepth) {
+    context.addIssue({ code: "custom", path: ["depth"], message: "recursion depth exceeds its bound" });
+  }
+  if (recursion.lineage.length !== recursion.depth + 1) {
+    context.addIssue({ code: "custom", path: ["lineage"], message: "recursion lineage does not match its depth" });
+  }
+  if (recursion.lineage[0] !== recursion.rootAutomationId) {
+    context.addIssue({ code: "custom", path: ["lineage", 0], message: "recursion lineage has the wrong root" });
+  }
+  if (recursion.lineage[recursion.lineage.length - 1] !== recursion.parentAutomationId) {
+    context.addIssue({ code: "custom", path: ["lineage"], message: "recursion lineage has the wrong parent" });
+  }
+  if (new Set(recursion.lineage).size !== recursion.lineage.length) {
+    context.addIssue({ code: "custom", path: ["lineage"], message: "recursion lineage contains a cycle" });
+  }
+}).transform((value) => deepFreeze(value));
+
+const managedAutomationOperationScopeSchema = z.object({
+  version: z.literal(1),
+  operationClass: managedAutomationOperationClassSchema,
+  targetProjectId: boundedId,
+  targetHostId: boundedId,
+}).strict();
+
 export const managedAutomationCreateReceiptSchema = z.object({
   version: z.literal(1),
   operationId: boundedId,
@@ -217,7 +266,7 @@ export const managedAutomationCapabilityEvidenceSchema = z.object({
   descriptorVersion: boundedId,
   descriptorDigest: sha256,
   evidenceRefs: z.array(evidenceReference).min(1).max(32),
-}).strict();
+}).strict().transform((value) => deepFreeze(value));
 
 const taskAuthoritySchema = z.discriminatedUnion("kind", [
   z.object({
@@ -312,11 +361,29 @@ export const managedAutomationAuthoritySchema = z.discriminatedUnion("origin", [
       operationId: boundedId,
       revision: positiveRevision,
     }).strict(),
-    standingAuthority: z.null(),
+    standingAuthority: z.object({
+      version: z.literal(1),
+      kind: z.literal("project-policy"),
+      policyId: boundedId,
+      revision: positiveRevision,
+    }).strict(),
+    recursion: managedAutomationRecursionSchema,
+    operationScope: managedAutomationOperationScopeSchema,
     capabilityEvidence: managedAutomationCapabilityEvidenceSchema,
     mayWidenAutomation: z.literal(false),
   }).strict(),
-]);
+]).superRefine((authority, context) => {
+  if (authority.origin !== "automation-triggered") return;
+  if (authority.recursion.parentAutomationId !== authority.taskAuthority.automationId) {
+    context.addIssue({ code: "custom", path: ["recursion", "parentAutomationId"], message: "recursive parent does not match task authority" });
+  }
+  if (authority.operationScope.targetProjectId !== authority.projectId) {
+    context.addIssue({ code: "custom", path: ["operationScope", "targetProjectId"], message: "operation target project is outside authority" });
+  }
+  if (authority.operationScope.targetHostId !== authority.hostId) {
+    context.addIssue({ code: "custom", path: ["operationScope", "targetHostId"], message: "operation target host is outside authority" });
+  }
+}).transform((value) => deepFreeze(value));
 
 export type ManagedAutomationAuthority = z.infer<typeof managedAutomationAuthoritySchema>;
 export type ManagedAutomationCapabilityEvidence = z.infer<typeof managedAutomationCapabilityEvidenceSchema>;
@@ -361,20 +428,11 @@ export const managedAutomationRunReceiptSchema = z.object({
   }
 });
 
-export const managedAutomationOperationClassSchema = z.enum([
-  "create",
-  "update",
-  "enable",
-  "disable",
-  "run_now",
-  "retire",
-  "reconcile",
-]);
-
 export const managedAutomationOperationRequestSchema = z.object({
   version: z.literal(1),
   operationClass: managedAutomationOperationClassSchema,
   targetProjectId: boundedId,
+  targetHostId: boundedId.optional(),
   definitionRevision: positiveRevision,
   intentKey: boundedId.optional(),
 }).strict();
@@ -429,13 +487,11 @@ export function parseManagedAutomationAuthority(value: unknown): StoredManagedAu
     throw new TypeError("managed automation authority must be an object");
   }
   const record = value as Record<string, unknown>;
-  return "version" in record
-    ? managedAutomationAuthoritySchema.parse(value)
-    : record;
+  return "version" in record ? managedAutomationAuthoritySchema.parse(value) : record;
 }
 
 export function isCurrentManagedAutomationAuthority(value: StoredManagedAutomationAuthority): value is ManagedAutomationAuthority {
-  return typeof value === "object" && value !== null && "version" in value && value.version === 1;
+  return typeof value === "object" && value !== null && managedAutomationAuthoritySchema.safeParse(value).success;
 }
 
 export function currentManagedAutomationAuthority(
@@ -443,4 +499,23 @@ export function currentManagedAutomationAuthority(
 ): ManagedAutomationAuthority | null {
   const parsed = parseManagedAutomationAuthority(value);
   return isCurrentManagedAutomationAuthority(parsed) ? parsed : null;
+}
+
+export function managedAutomationAuthorityCoversOperation(
+  authority: StoredManagedAutomationAuthority,
+  operation: Readonly<{
+    operationClass: ManagedAutomationOperationClass;
+    targetProjectId: string;
+    targetHostId?: string | null;
+  }>,
+): boolean {
+  if (!isCurrentManagedAutomationAuthority(authority)) return false;
+  if (authority.projectId !== operation.targetProjectId) return false;
+  if (operation.targetHostId !== undefined && operation.targetHostId !== null &&
+    authority.hostId !== operation.targetHostId) return false;
+  if (authority.origin !== "automation-triggered") return true;
+  if (operation.targetHostId === undefined || operation.targetHostId === null) return false;
+  return authority.operationScope.operationClass === operation.operationClass &&
+    authority.operationScope.targetProjectId === operation.targetProjectId &&
+    authority.operationScope.targetHostId === operation.targetHostId;
 }

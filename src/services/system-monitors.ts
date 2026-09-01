@@ -4,6 +4,11 @@ import { capabilityDescriptorById } from "../capabilities/catalog";
 import type {
   ManagedAutomationAuthority,
   ManagedAutomationCapabilityEvidence,
+  ManagedAutomationOperationRequest,
+} from "../domain/managed-automation";
+import {
+  managedAutomationAuthoritySchema,
+  managedAutomationCapabilityEvidenceSchema,
 } from "../domain/managed-automation";
 import {
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
@@ -12,6 +17,7 @@ import {
 import {
   ManagedAutomationService,
   migrateLegacyClockMonitor,
+  type ManagedAutomationMutation,
 } from "./managed-automation-service";
 
 /**
@@ -60,7 +66,7 @@ export function systemMaintenanceCapabilityEvidence(systemKey: string): ManagedA
   if (!descriptor || descriptor.status !== "admitted") {
     throw new Error("system-maintenance capability is not admitted");
   }
-  return {
+  return managedAutomationCapabilityEvidenceSchema.parse({
     version: 1,
     profileId: `system-maintenance:${systemKey}`,
     profileRevision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
@@ -71,7 +77,7 @@ export function systemMaintenanceCapabilityEvidence(systemKey: string): ManagedA
       `capability-admission:${descriptor.id}:${descriptor.version}:${descriptor.digest}`,
       `system-maintenance:${systemKey}:standing-authority:${SYSTEM_MAINTENANCE_AUTHORITY_REVISION}`,
     ],
-  };
+  });
 }
 
 export function systemMaintenanceAuthority(input: Readonly<{
@@ -80,7 +86,7 @@ export function systemMaintenanceAuthority(input: Readonly<{
   projectId: string;
   hostId: string;
 }>): SystemMaintenanceAuthority {
-  return {
+  const authority = managedAutomationAuthoritySchema.parse({
     version: 1,
     origin: "system-maintenance",
     controllerKey: input.controllerKey,
@@ -95,7 +101,9 @@ export function systemMaintenanceAuthority(input: Readonly<{
     },
     capabilityEvidence: systemMaintenanceCapabilityEvidence(input.systemKey),
     mayWidenAutomation: false,
-  };
+  });
+  if (authority.origin !== "system-maintenance") throw new Error("system-maintenance authority has the wrong origin");
+  return authority;
 }
 
 export function systemAutomationInstallationComplete(installed: number): boolean {
@@ -136,7 +144,7 @@ export function installSystemMonitors(dependencies: SystemMonitorInstaller): num
         now,
       });
       installed += 1;
-    } catch (error) {
+    } catch {
       dependencies.warn?.(`System monitor ${definition.systemKey} could not be installed`);
     }
   }
@@ -157,6 +165,7 @@ export type SystemAutomationInstaller = Readonly<{
     permissionMode: "accept-edits" | "auto" | "full";
   }>;
   clock: { now(): number };
+  mutate?: ManagedAutomationMutation;
   signal?: AbortSignal;
   warn?: (message: string) => void;
 }>;
@@ -178,6 +187,20 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
   for (const definition of SYSTEM_MONITORS) {
     try {
       const old = legacy.get(definition.systemKey);
+      const authority = systemMaintenanceAuthority({
+        systemKey: definition.systemKey,
+        controllerKey: controller.controllerKey,
+        projectId: controller.projectId,
+        hostId: controller.hostId,
+      });
+      const operation = {
+        version: 1 as const,
+        operationClass: "create" as const,
+        targetProjectId: controller.projectId,
+        targetHostId: controller.hostId,
+        definitionRevision: 1,
+        intentKey: `system-maintenance:${definition.systemKey}`,
+      };
       if (old?.state === "armed") {
         await migrateLegacyClockMonitor({
           monitor: old,
@@ -192,13 +215,10 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
           serviceTier: dependencies.execution.serviceTier,
           permissionMode: dependencies.execution.permissionMode,
           hostId: controller.hostId,
-          authority: systemMaintenanceAuthority({
-            systemKey: definition.systemKey,
-            controllerKey: controller.controllerKey,
-            projectId: controller.projectId,
-            hostId: controller.hostId,
-          }),
+          authority,
+          operation,
           now,
+          mutate: dependencies.mutate,
           signal: dependencies.signal,
         });
       } else {
@@ -225,14 +245,12 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
             timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
             resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
           },
-          authority: systemMaintenanceAuthority({
-            systemKey: definition.systemKey,
-            controllerKey: controller.controllerKey,
-            projectId: controller.projectId,
-            hostId: controller.hostId,
-          }),
+          authority,
           notificationPolicy: "material",
           now,
+          mutate: dependencies.mutate,
+          deferProvider: true,
+          operation,
           signal: dependencies.signal,
         });
       }

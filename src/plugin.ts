@@ -10,7 +10,10 @@ import {
   CAPABILITY_REGISTRY_DIGEST,
   capabilityDescriptorById,
 } from "./capabilities/catalog";
-import { isCurrentManagedAutomationAuthority } from "./domain/managed-automation";
+import {
+  isCurrentManagedAutomationAuthority,
+  managedAutomationAuthorityCoversOperation,
+} from "./domain/managed-automation";
 import {
   guardRequirementBindings,
   persistBlockedGuardSettlement,
@@ -138,8 +141,12 @@ import {
   ManagedAutomationReconciler,
   ManagedAutomationService,
   managedAutomationAuthorityIsCurrent,
+  type ManagedAutomationCapabilityOperation,
 } from "./services/managed-automation-service";
-import { ManagedAutomationRepository, managedAutomationDigest } from "./storage/managed-automation-repository";
+import {
+  managedAutomationDigest,
+  type ManagedAutomationBinding,
+} from "./storage/managed-automation-repository";
 import { ProductionHealthService } from "./services/production-health-service";
 import { RegressionWatchService } from "./services/regression-watch-service";
 import { FailureLoopService } from "./services/failure-loop-service";
@@ -173,6 +180,58 @@ import {
 
 function clock(): number {
   return Date.now();
+}
+
+export function managedAutomationCapabilityIsCurrent(
+  store: Pick<TelegramAgentStore, "getProjectPolicy" | "getCapabilityProfileById" | "listCapabilityReceipts">,
+  binding: ManagedAutomationBinding,
+  operation: ManagedAutomationCapabilityOperation,
+): boolean {
+  const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
+  const evidence = binding.capabilityEvidence;
+  if (!authority || !evidence || !operation.capabilityEvidence ||
+    managedAutomationDigest(operation.capabilityEvidence) !== managedAutomationDigest(evidence) ||
+    evidence.capabilityId !== "telegram_agent_watch" ||
+    !(["create", "update", "enable", "disable", "run_now", "retire", "reconcile"] as const)
+      .includes(operation.operationClass) ||
+    operation.targetProjectId !== binding.projectId ||
+    operation.definitionRevision !== binding.definitionRevision ||
+    (operation.targetHostId !== null && operation.targetHostId !== authority.hostId) ||
+    !managedAutomationAuthorityCoversOperation(authority, operation)) return false;
+
+  if (authority.origin === "system-maintenance") {
+    return authority.standingAuthority.revision === 1 &&
+      managedAutomationDigest(evidence) === managedAutomationDigest(
+        systemMaintenanceCapabilityEvidence(authority.standingAuthority.systemKey),
+      );
+  }
+
+  const policy = store.getProjectPolicy(authority.projectId);
+  if (!policy || !policy.policy.enabled || policy.policy.projectId !== authority.projectId) return false;
+  if (authority.origin === "standing-policy" || authority.origin === "automation-triggered") {
+    if (policy.version !== authority.standingAuthority.revision) return false;
+    const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
+    return descriptor?.status === "admitted" && descriptor.version === evidence.descriptorVersion;
+  }
+
+  if (authority.taskAuthority.kind !== "controller-turn" || authority.taskAuthority.turnId === "") return false;
+  const profile = store.getCapabilityProfileById(evidence.profileId);
+  if (!profile || profile.mode !== "active" || profile.subjectKind !== "controller_turn" ||
+    profile.subjectId !== authority.taskAuthority.turnId || profile.revision !== evidence.profileRevision ||
+    profile.registryDigest !== CAPABILITY_REGISTRY_DIGEST || profile.graphDigest !== CAPABILITY_GRAPH_DIGEST) return false;
+  const assignment = profile.assignments.find((candidate) => candidate.capabilityId === evidence.capabilityId);
+  const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
+  if (!descriptor || !assignment || assignment.descriptorDigest !== evidence.descriptorDigest ||
+    descriptor.version !== evidence.descriptorVersion) return false;
+  const profileRef = `capability-profile:${profile.id}:${profile.revision}`;
+  if (!evidence.evidenceRefs.includes(profileRef)) return false;
+  const receiptRefs = evidence.evidenceRefs.filter((ref) => ref.startsWith("capability-receipt:"));
+  if (receiptRefs.length !== 1) return false;
+  const receiptRef = receiptRefs[0]!;
+  return store.listCapabilityReceipts(profile.id, 256).some((receipt) =>
+    receipt.eventType === "selected" && receipt.id === receiptRef.slice("capability-receipt:".length) &&
+    receipt.capabilityId === evidence.capabilityId && receipt.descriptorDigest === evidence.descriptorDigest &&
+    receipt.profileRevision === evidence.profileRevision);
 }
 
 const SELF_DIAGNOSIS_LEDGER_KEY = "self-diagnosis:ledger:v1";
@@ -655,7 +714,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
   });
   const terminal = new TerminalCommandRunner(bb.sdk);
-  const managedAutomationRepository = new ManagedAutomationRepository(bb.storage.database());
+  const managedAutomationRepository = store.getManagedAutomationRepository();
   const managedAutomations = new ManagedAutomationService(
     managedAutomationRepository,
     new TerminalBbAutomationAdapter(terminal),
@@ -671,44 +730,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       if (isCurrentManagedAutomationAuthority(binding.authority)) {
         return binding.authority.hostId === controller.hostId;
       }
-      // Legacy bindings remain readable and reconcilable for migration. The
-      // system-maintenance retirement path upgrades them before reserving work.
-      return true;
+      return false;
     },
-    (binding, operation) => {
-      const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
-      const evidence = binding.capabilityEvidence;
-      if (!authority || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
-        !(["create", "update", "enable", "disable", "run_now", "retire", "reconcile"] as const).includes(operation.operationClass) ||
-        operation.targetProjectId !== binding.projectId ||
-        operation.definitionRevision !== binding.definitionRevision) return false;
-      if (authority.origin === "system-maintenance") {
-        return authority.standingAuthority.revision === 1 &&
-          managedAutomationDigest(evidence) === managedAutomationDigest(
-            systemMaintenanceCapabilityEvidence(authority.standingAuthority.systemKey),
-          );
-      }
-      if (authority.origin !== "owner" || authority.taskAuthority.kind !== "controller-turn" ||
-        authority.taskAuthority.turnId === "") return false;
-      const profile = store.getCapabilityProfileById(evidence.profileId);
-      if (!profile || profile.mode !== "active" || profile.subjectKind !== "controller_turn" ||
-        profile.subjectId !== authority.taskAuthority.turnId || profile.revision !== evidence.profileRevision ||
-        profile.registryDigest !== CAPABILITY_REGISTRY_DIGEST || profile.graphDigest !== CAPABILITY_GRAPH_DIGEST ||
-        operation.definitionRevision !== binding.definitionRevision) return false;
-      const assignment = profile.assignments.find((candidate) => candidate.capabilityId === evidence.capabilityId);
-      const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
-      if (!descriptor || !assignment || assignment.descriptorDigest !== evidence.descriptorDigest ||
-        descriptor.version !== evidence.descriptorVersion) return false;
-      const profileRef = `capability-profile:${profile.id}:${profile.revision}`;
-      if (!evidence.evidenceRefs.includes(profileRef)) return false;
-      const receiptRefs = evidence.evidenceRefs.filter((ref) => ref.startsWith("capability-receipt:"));
-      if (receiptRefs.length !== 1) return false;
-      const receiptRef = receiptRefs[0]!;
-      return store.listCapabilityReceipts(profile.id, 256).some((receipt) =>
-        receipt.eventType === "selected" && receipt.id === receiptRef.slice("capability-receipt:".length) &&
-        receipt.capabilityId === evidence.capabilityId && receipt.descriptorDigest === evidence.descriptorDigest &&
-        receipt.profileRevision === evidence.profileRevision);
-    },
+    (binding, operation) => managedAutomationCapabilityIsCurrent(store, binding, operation),
   );
   const managedAutomationReconciler = new ManagedAutomationReconciler({
     repository: managedAutomationRepository,
@@ -1475,10 +1499,18 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   let systemMonitorsInstalled = false;
   const systemMonitors = {
     install: async (fence: EffectFence) => {
+      const mutate = <T>(mutation: () => T): T => {
+        const result = store.runExecutorMutation(
+          { ownerId: fence.ownerId, generation: fence.generation },
+          mutation,
+        );
+        if (result.outcome === "stale") throw new Error("executor lease was lost before system monitor mutation");
+        return result.mutationValue;
+      };
       // Turning the setting off has to retire what is already armed, or the
       // owner keeps getting the daily sweep they just switched off.
       if (config.ok && !systemUpkeepEnabled(config.value)) {
-        if (store.cancelSystemMonitors(clock()) > 0) systemMonitorsInstalled = false;
+        if (mutate(() => store.cancelSystemMonitors(clock())) > 0) systemMonitorsInstalled = false;
         const owner = store.getOwner();
         const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
         if (controller?.hostId) {
@@ -1494,17 +1526,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
                 projectId: binding.projectId,
                 hostId: controller.hostId,
               });
-              const reserved = store.runExecutorMutation(
-                { ownerId: fence.ownerId, generation: fence.generation },
-                () => managedAutomations.submitSystemMaintenanceRetirementOperation({
-                  id: binding.id,
-                  systemKey: binding.sourceKey,
-                  authority,
-                  now: clock(),
-                  mutate: (mutation) => mutation(),
-                }),
-              );
-              if (reserved.outcome === "stale") throw new Error("executor lease was lost before system retirement reservation");
+              mutate(() => managedAutomations.submitSystemMaintenanceRetirementOperation({
+                id: binding.id,
+                systemKey: binding.sourceKey,
+                authority,
+                now: clock(),
+                mutate: (mutation) => mutation(),
+              }));
               systemMonitorsInstalled = false;
             } catch {
               bb.log.warn(`System automation ${binding.id} could not be retired`);
@@ -1522,6 +1550,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         providerId: controllerProviderFor(execution.model),
         execution,
         clock: { now: clock },
+        mutate,
         signal: fence.signal,
         warn: (message) => bb.log.warn(message),
       });

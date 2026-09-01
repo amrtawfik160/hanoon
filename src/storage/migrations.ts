@@ -4719,6 +4719,11 @@ CREATE INDEX managed_automation_operations_due
   ON managed_automation_operations(state, next_attempt_at, created_at);
 CREATE INDEX managed_automation_operations_binding
   ON managed_automation_operations(binding_id, created_at);
+`,
+  String.raw`
+ALTER TABLE managed_automation_operations ADD COLUMN target_host_id TEXT CHECK (
+  target_host_id IS NULL OR length(target_host_id) BETWEEN 1 AND 256
+);
 `] as const;
 
 export const ALL_MIGRATIONS = [

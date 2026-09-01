@@ -220,6 +220,7 @@ import {
   type SettleModelRouteTrialInput,
   type SkillReceiptProjection,
 } from "./capability-repository";
+import { ManagedAutomationRepository } from "./managed-automation-repository";
 import {
   ReferenceRepository,
   type ReferenceDocumentRecord,
@@ -3149,6 +3150,7 @@ export function migrateControllerInteractionStorage(
 }
 
 export interface TelegramAgentStore {
+  getManagedAutomationRepository(): ManagedAutomationRepository;
   runExecutorMutation<T>(
     input: ExecutorMutationFence,
     mutation: (now: number) => T,
@@ -5572,6 +5574,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
   private readonly workflowEngineRepository: WorkflowEngineRepository;
+  private readonly managedAutomationRepository: ManagedAutomationRepository;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -5593,6 +5596,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.releaseAuthorityRepository = new ReleaseAuthorityRepository(db);
     this.ownerBoundaryRepository = new OwnerBoundaryRepository(db);
     this.workflowEngineRepository = new WorkflowEngineRepository(db);
+    this.managedAutomationRepository = new ManagedAutomationRepository(db);
+  }
+
+  public getManagedAutomationRepository(): ManagedAutomationRepository {
+    return this.managedAutomationRepository;
   }
 
   private createOwnerTaskAuthority(input: Readonly<{

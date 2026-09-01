@@ -21,9 +21,13 @@ import {
 import { ManagedAutomationRepository, type ManagedAutomationBinding } from "../src/storage/managed-automation-repository";
 import { openStore, type MonitorRecord } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
-import { systemMaintenanceAuthority } from "../src/services/system-monitors";
+import {
+  installSystemAutomations,
+  systemMaintenanceAuthority,
+} from "../src/services/system-monitors";
 import { hashSecret } from "../src/crypto";
 import { registerControllerTools } from "../src/controller/tools";
+import { managedAutomationCapabilityIsCurrent } from "../src/plugin";
 import { policyFixture } from "./helpers";
 import { submittedControllerFixture } from "./support/controller-trust-fixtures";
 import type {
@@ -32,6 +36,12 @@ import type {
   ManagedAutomationObservation,
   ManagedAutomationProviderIdentity,
 } from "../src/domain/managed-automation";
+import {
+  currentManagedAutomationAuthority,
+  managedAutomationAuthoritySchema,
+  parseManagedAutomationAuthority,
+} from "../src/domain/managed-automation";
+import { capabilityDescriptorById } from "../src/capabilities/catalog";
 
 const NOW = 1_800_000_000_000;
 const SCOPE = { kind: "environment", environmentId: "env_owner" } as const;
@@ -252,13 +262,7 @@ function createInput() {
     controllerKey: "owner-7-controller",
     sourceKey: "owner-schedule:daily-health",
     definition,
-    authority: {
-      source: "owner",
-      controllerKey: "owner-7-controller",
-      projectId: "proj_owner",
-      hostId: "host_owner",
-      mayWidenAutomation: false,
-    },
+    authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
     notificationPolicy: "material" as const,
     now: NOW,
   };
@@ -300,6 +304,57 @@ function versionedSystemMaintenanceAuthority(
     projectId: "proj_owner",
     hostId: "host_owner",
   });
+}
+
+function automationTriggeredAuthority(
+  operationClass: "create" | "update" | "enable" | "disable" | "run_now" | "retire" = "run_now",
+  overrides: Record<string, unknown> = {},
+): ManagedAutomationAuthority {
+  return managedAutomationAuthoritySchema.parse({
+    version: 1,
+    origin: "automation-triggered",
+    controllerKey: "owner-7-controller",
+    projectId: "proj_owner",
+    hostId: "host_owner",
+    taskAuthority: {
+      version: 1,
+      kind: "automation",
+      automationId: "auto_parent",
+      operationId: "parent-operation",
+      revision: 1,
+    },
+    standingAuthority: {
+      version: 1,
+      kind: "project-policy",
+      policyId: "policy_owner",
+      revision: 1,
+    },
+    recursion: {
+      version: 1,
+      rootAutomationId: "auto_root",
+      parentAutomationId: "auto_parent",
+      depth: 1,
+      maxDepth: 3,
+      lineage: ["auto_root", "auto_parent"],
+    },
+    operationScope: {
+      version: 1,
+      operationClass,
+      targetProjectId: "proj_owner",
+      targetHostId: "host_owner",
+    },
+    capabilityEvidence: {
+      version: 1,
+      profileId: "profile_automation",
+      profileRevision: 1,
+      capabilityId: "telegram_agent_watch",
+      descriptorVersion: "1",
+      descriptorDigest: "a".repeat(64),
+      evidenceRefs: ["capability-profile:profile_automation:1"],
+    },
+    mayWidenAutomation: false,
+    ...overrides,
+  }) as ManagedAutomationAuthority;
 }
 
 async function settledRunNowFixture() {
@@ -980,7 +1035,27 @@ describe("managed BB automations", () => {
         ...createInput(),
         sourceKey: systemKey,
         authority,
+        deferProvider: true,
+        operation: {
+          version: 1,
+          operationClass: "create",
+          targetProjectId: definition.projectId,
+          targetHostId: authority.hostId,
+          definitionRevision: 1,
+        },
       });
+      const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
+      if (!setupLease.acquired) throw new Error("missing setup executor lease");
+      const setupReconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+      const setupSignal = new AbortController().signal;
+      await setupReconciler.processDue(NOW + 1, setupSignal, {
+        ownerId: "automation-setup",
+        generation: setupLease.generation,
+        signal: setupSignal,
+      });
+      if (!store.releaseExecutorLease("automation-setup", setupLease.generation, NOW + 1)) {
+        throw new Error("setup executor lease could not be released");
+      }
       const submitted = { value: null as ManagedAutomationBinding | null };
       const releaseCurrentLease = (now: number): void => {
         const row = bb.storage.database().prepare(
@@ -2900,15 +2975,18 @@ describe("managed BB automations", () => {
       providerId: "codex-provider",
       model: "gpt-5.6-sol",
       permissionMode: "full",
+      authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_owner" },
       now: NOW,
     });
 
-    expect(binding.state).toBe("active");
+    expect(binding.state).toBe("pending");
+    expect(binding.bbAutomationId).toBeNull();
     expect(store.listMonitors("owner-7-controller", true)).toMatchObject([{ id: monitor.id, state: "cancelled" }]);
-    expect(fake.create).toHaveBeenCalledTimes(1);
+    expect(fake.create).not.toHaveBeenCalled();
   });
 
-  it("leaves the legacy clock armed when BB creation or read-back fails", async () => {
+  it("leaves a legacy clock armed until its authority is revalidated", async () => {
     const { store, repository } = fixture();
     const monitor = store.createMonitor({
       controllerKey: "owner-7-controller",
@@ -2919,10 +2997,7 @@ describe("managed BB automations", () => {
       now: NOW,
     });
     const fake = fakeAdapter();
-    const service = new ManagedAutomationService(repository, {
-      ...fake.adapter,
-      create: vi.fn(async () => { throw new Error("BB read-back mismatch"); }),
-    }, () => true);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
 
     await expect(migrateLegacyClockMonitor({
       monitor,
@@ -2935,9 +3010,10 @@ describe("managed BB automations", () => {
       model: "gpt-5.6-sol",
       permissionMode: "full",
       now: NOW,
-    })).rejects.toThrow("read-back mismatch");
+    })).rejects.toThrow("current authority revalidation");
 
     expect(store.listArmedMonitors(10)).toMatchObject([{ id: monitor.id, state: "armed" }]);
+    expect(fake.create).not.toHaveBeenCalled();
   });
 
   it("pauses BB if the local disable fence is lost, so two schedulers cannot stay active", async () => {
@@ -2972,10 +3048,372 @@ describe("managed BB automations", () => {
       providerId: "codex-provider",
       model: "gpt-5.6-sol",
       permissionMode: "full",
+      authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_owner" },
       now: NOW,
     })).rejects.toThrow("could not be disabled");
 
-    expect(fake.adapter.setEnabled).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
-    expect(service.list("owner-7-controller")).toMatchObject([{ state: "paused" }]);
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+    expect(service.list("owner-7-controller")).toMatchObject([{ state: "pending", bbAutomationId: null }]);
   });
+
+  it("keeps legacy authority displayable but refuses it before a new provider mutation", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const legacyAuthority = {
+      source: "owner",
+      controllerKey: "owner-7-controller",
+      projectId: "proj_owner",
+      hostId: "host_owner",
+      mayWidenAutomation: false,
+    };
+
+    expect(parseManagedAutomationAuthority(legacyAuthority)).toEqual(legacyAuthority);
+    expect(currentManagedAutomationAuthority(legacyAuthority)).toBeNull();
+
+    await expect(service.create({
+      ...createInput(),
+      authority: legacyAuthority,
+    })).rejects.toThrow(/revalidat|current/i);
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(repository.list("owner-7-controller", true)).toEqual([]);
+  });
+
+  it("revalidates a script authority before its legacy direct provider creation", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => false);
+
+    await expect(service.create({
+      ...createInput(),
+      definition: {
+        mode: "script",
+        projectId: definition.projectId,
+        name: definition.name,
+        trigger: definition.trigger,
+        source: { kind: "inline", script: "printf managed" },
+        interpreter: "sh",
+        timeoutMs: 60_000,
+      },
+    })).rejects.toThrow(/authority is not current/i);
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(repository.list("owner-7-controller", true)).toMatchObject([{
+      state: "failed",
+      lastError: "managed_automation_authority_stale",
+    }]);
+  });
+
+  it("records system automations as durable create intents without calling the provider at setup", async () => {
+    const controllerFixture = submittedControllerFixture();
+    try {
+      const fake = fakeAdapter();
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      const lease = controllerFixture.store.acquireExecutorLease("system-installer", NOW, 120_000);
+      if (!lease.acquired) throw new Error("missing system installer executor lease");
+      let fencedMutations = 0;
+      const mutate = <T>(mutation: () => T): T => {
+        fencedMutations += 1;
+        const result = controllerFixture.store.runExecutorMutation(
+          { ownerId: "system-installer", generation: lease.generation },
+          mutation,
+        );
+        if (result.outcome === "stale") throw new Error("system installer executor lease was lost");
+        return result.mutationValue;
+      };
+
+      await expect(installSystemAutomations({
+        store: controllerFixture.store,
+        service,
+        providerId: "codex-provider",
+        execution: { model: "gpt-5.6-sol", permissionMode: "auto" },
+        clock: { now: () => NOW },
+        mutate,
+      })).resolves.toBe(3);
+
+      expect(fake.create).not.toHaveBeenCalled();
+      expect(fencedMutations).toBe(3);
+      const bindings = repository.list(controllerFixture.turn.controllerKey, true);
+      expect(bindings).toHaveLength(3);
+      expect(bindings.every((binding) => binding.state === "pending" && binding.bbAutomationId === null)).toBe(true);
+      expect(bindings.every((binding) => binding.lastOperationOutcome === "pending")).toBe(true);
+      expect(bindings.every((binding) => binding.lastOperationId !== null)).toBe(true);
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it("admits an automation-triggered operation only with exact target and bounded lineage", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
+    });
+    const authority = automationTriggeredAuthority();
+
+    const submitted = service.submitLifecycleOperation({
+      id: binding.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority,
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+
+    expect(submitted.lastOperationOutcome).toBe("pending");
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({
+      operationClass: "run_now",
+      state: "pending",
+      authority: {
+        origin: "automation-triggered",
+        taskAuthority: { automationId: "auto_parent", operationId: "parent-operation" },
+        recursion: { depth: 1, maxDepth: 3, lineage: ["auto_root", "auto_parent"] },
+      },
+    });
+    expect(fake.adapter.runNow).not.toHaveBeenCalled();
+
+    expect(() => service.submitLifecycleOperation({
+      id: binding.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority: automationTriggeredAuthority("run_now", {
+        operationScope: {
+          version: 1,
+          operationClass: "retire",
+          targetProjectId: "proj_owner",
+          targetHostId: "host_owner",
+        },
+      }),
+      now: NOW + 2,
+      mutate: (mutation) => mutation(),
+    })).toThrow(/operation|admit|authority/i);
+
+    expect(() => service.submitLifecycleOperation({
+      id: binding.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority: automationTriggeredAuthority("run_now", {
+        recursion: {
+          version: 1,
+          rootAutomationId: "auto_root",
+          parentAutomationId: "auto_parent",
+          depth: 4,
+          maxDepth: 3,
+          lineage: ["auto_root", "auto_parent", "auto_child", "auto_grandchild", "auto_loop"],
+        },
+      }),
+      now: NOW + 3,
+      mutate: (mutation) => mutation(),
+    })).toThrow(/recursion|lineage|authority/i);
+  });
+
+  it("does not fall back to a provider reconciliation when a fenced durable admission is denied", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const setupService = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
+    await setupService.create({
+      ...createInput(),
+      definition: {
+        mode: "script",
+        projectId: definition.projectId,
+        name: definition.name,
+        trigger: definition.trigger,
+        source: { kind: "inline", script: "printf managed" },
+        interpreter: "sh",
+        timeoutMs: 60_000,
+      },
+      authority: versionedSystemMaintenanceAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        targetHostId: "host_owner",
+        definitionRevision: 1,
+      },
+    });
+    const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
+    if (!setupLease.acquired) throw new Error("missing setup executor lease");
+    const setupReconciler = new ManagedAutomationReconciler({ repository, service: setupService, store, notify: vi.fn() });
+    const setupSignal = new AbortController().signal;
+    await setupReconciler.processDue(NOW + 1, setupSignal, {
+      ownerId: "automation-setup",
+      generation: setupLease.generation,
+      signal: setupSignal,
+    });
+    if (!store.releaseExecutorLease("automation-setup", setupLease.generation, NOW + 1)) {
+      throw new Error("setup executor lease could not be released");
+    }
+    vi.clearAllMocks();
+
+    const deniedService = new ManagedAutomationService(repository, fake.adapter, () => true, () => false);
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 60_001, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service: deniedService,
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+
+    await reconciler.processDue(NOW + 60_001, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(fake.adapter.show).not.toHaveBeenCalled();
+    expect(fake.adapter.update).not.toHaveBeenCalled();
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it("refuses a legacy binding before any direct provider reconciliation", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    const legacyAuthority = {
+      source: "owner",
+      controllerKey: binding.controllerKey,
+      projectId: binding.projectId,
+      hostId: "host_owner",
+      mayWidenAutomation: false,
+    };
+    bb.storage.database().prepare(
+      `UPDATE managed_automations
+          SET authority_json = ?, authority_version = 0,
+              capability_profile_id = NULL, capability_profile_revision = NULL,
+              capability_evidence_json = NULL
+        WHERE id = ?`,
+    ).run(JSON.stringify(legacyAuthority), binding.id);
+    vi.clearAllMocks();
+    const legacyBinding = repository.get(binding.id);
+    if (!legacyBinding) throw new Error("legacy binding was not readable");
+
+    await expect(service.reconcile({
+      binding: legacyBinding,
+      scope: SCOPE,
+      now: NOW + 1,
+    })).rejects.toThrow(/revalidat|current/i);
+    expect(fake.adapter.show).not.toHaveBeenCalled();
+    expect(fake.adapter.runs).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a durable operation target host is changed in SQLite", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const pending = await service.create({
+      ...createInput(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        targetHostId: "host_owner",
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const operationId = pending.lastOperationId!;
+    bb.storage.database().prepare(
+      "UPDATE managed_automation_operations SET target_host_id = ? WHERE id = ?",
+    ).run("host_other", operationId);
+
+    expect(() => repository.getOperation(operationId)).toThrow(/target|authority|binding/i);
+    expect(fake.create).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a durable operation has a malformed SQLite attempt counter", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const pending = await service.create({
+      ...createInput(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const operationId = pending.lastOperationId!;
+    bb.storage.database().prepare(
+      "UPDATE managed_automation_operations SET attempts = ? WHERE id = ?",
+    ).run(1.5, operationId);
+
+    expect(() => repository.getOperation(operationId)).toThrow();
+  });
+
+  it.each(["standing-policy", "automation-triggered"] as const)(
+    "uses current project policy and admitted descriptor evidence for a %s operation",
+    async (origin) => {
+      const { store, repository } = fixture();
+      store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
+      const descriptor = capabilityDescriptorById("telegram_agent_watch");
+      if (!descriptor) throw new Error("managed automation descriptor is missing");
+      const capabilityEvidence = {
+        version: 1 as const,
+        profileId: `profile_${origin}`,
+        profileRevision: 1,
+        capabilityId: descriptor.id,
+        descriptorVersion: descriptor.version,
+        descriptorDigest: descriptor.digest,
+        evidenceRefs: [`managed-automation:${origin}:policy_owner:1`],
+      };
+      const operationClass = "create" as const;
+      const authority = origin === "standing-policy"
+        ? managedAutomationAuthoritySchema.parse({
+            version: 1,
+            origin,
+            controllerKey: "owner-7-controller",
+            projectId: "proj_owner",
+            hostId: "host_owner",
+            taskAuthority: null,
+            standingAuthority: { version: 1, kind: "project-policy", policyId: "policy_owner", revision: 1 },
+            capabilityEvidence,
+            mayWidenAutomation: false,
+          })
+        : automationTriggeredAuthority(operationClass, { capabilityEvidence });
+      const service = new ManagedAutomationService(repository, fakeAdapter().adapter, () => true, () => true);
+      const binding = await service.create({
+        ...createInput(),
+        sourceKey: `origin:${origin}`,
+        authority,
+        deferProvider: true,
+        operation: {
+          version: 1,
+          operationClass,
+          targetProjectId: definition.projectId,
+          targetHostId: "host_owner",
+          definitionRevision: 1,
+        },
+      });
+      const operation = {
+        operationClass,
+        targetProjectId: binding.projectId,
+        targetHostId: "host_owner",
+        definitionRevision: binding.definitionRevision,
+        capabilityEvidence: binding.capabilityEvidence,
+      };
+
+      expect(managedAutomationCapabilityIsCurrent(store, binding, operation)).toBe(true);
+    },
+  );
 });

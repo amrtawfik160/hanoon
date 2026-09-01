@@ -118,7 +118,7 @@ export function createTestManagedAutomations() {
         lastOperationOutcome: "pending",
         updatedAt: input.now,
       };
-      return input.mutate(() => {
+      return (input.mutate ?? ((mutation: () => ManagedAutomationBinding) => mutation()))(() => {
         bindings.set(input.id, updated);
         return updated;
       });
