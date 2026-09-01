@@ -193,10 +193,17 @@ type ManagedAutomationRunEvidenceRow = Readonly<{
   binding_id: string;
   bb_run_id: string;
   bb_automation_id: string;
+  status: string;
+  run_mode: string;
+  trigger_kind: string;
+  thread_id: string | null;
+  output_sha256: string | null;
+  error_class: string | null;
   scheduled_for: number;
   started_at: number;
   finished_at: number | null;
   observed_at: number;
+  evidence_json: string;
   receipt_version: number | null;
   initiating_operation_id: string | null;
   definition_revision: number | null;
@@ -204,6 +211,13 @@ type ManagedAutomationRunEvidenceRow = Readonly<{
   capability_evidence_json: string | null;
   idempotency_key: string | null;
   outcome_class: string | null;
+}>;
+
+type RunEvidenceFacts = Readonly<{
+  binding: ManagedAutomationBinding;
+  run: ManagedAutomationRun;
+  outputSha256: string | null;
+  errorClass: string | null;
 }>;
 
 type OperationRelationshipContext = Readonly<{
@@ -526,13 +540,74 @@ function correlatedRunEvidence(
   relationshipContext: OperationRelationshipContext,
 ): ManagedAutomationRunEvidenceRow | undefined {
   return relationshipContext.db.prepare(
-    `SELECT binding_id, bb_run_id, bb_automation_id, scheduled_for, started_at,
-            finished_at, observed_at, receipt_version, initiating_operation_id,
+    `SELECT binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+            thread_id, output_sha256, error_class, scheduled_for, started_at,
+            finished_at, observed_at, evidence_json, receipt_version, initiating_operation_id,
             definition_revision, authority_json, capability_evidence_json,
             idempotency_key, outcome_class
        FROM managed_automation_run_evidence
-      WHERE binding_id = ? AND bb_run_id = ?`,
-  ).get(relationshipContext.binding.id, receipt.providerRunId) as ManagedAutomationRunEvidenceRow | undefined;
+      WHERE binding_id = ? AND bb_run_id = ? AND initiating_operation_id = ?`,
+  ).get(
+    relationshipContext.binding.id,
+    receipt.providerRunId,
+    receipt.initiatingOperationId,
+  ) as ManagedAutomationRunEvidenceRow | undefined;
+}
+
+function existingRunEvidence(
+  db: SqliteDatabase,
+  run: ManagedAutomationRun,
+): ManagedAutomationRunEvidenceRow | undefined {
+  return db.prepare(
+    `SELECT binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+            thread_id, output_sha256, error_class, scheduled_for, started_at,
+            finished_at, observed_at, evidence_json, receipt_version, initiating_operation_id,
+            definition_revision, authority_json, capability_evidence_json,
+            idempotency_key, outcome_class
+       FROM managed_automation_run_evidence
+      WHERE bb_run_id = ? AND status = ?`,
+  ).get(run.id, run.status) as ManagedAutomationRunEvidenceRow | undefined;
+}
+
+function assertRunEvidenceFacts(
+  evidence: ManagedAutomationRunEvidenceRow,
+  facts: RunEvidenceFacts,
+): void {
+  const { binding, run, outputSha256, errorClass } = facts;
+  if (evidence.binding_id !== binding.id || evidence.bb_run_id !== run.id ||
+    evidence.bb_automation_id !== run.automationId || evidence.status !== run.status ||
+    evidence.run_mode !== run.runMode || evidence.trigger_kind !== run.trigger ||
+    evidence.thread_id !== run.threadId || evidence.output_sha256 !== outputSha256 ||
+    evidence.error_class !== errorClass || evidence.scheduled_for !== run.scheduledFor ||
+    evidence.started_at !== run.startedAt || evidence.finished_at !== run.finishedAt) {
+    throw new TypeError("managed automation run evidence does not match its provider run");
+  }
+}
+
+function assertExistingRunProvenance(
+  evidence: ManagedAutomationRunEvidenceRow,
+  receipt: ManagedAutomationRunReceipt | null,
+): void {
+  if (!receipt) return;
+  if (evidence.initiating_operation_id === null) {
+    throw new TypeError("managed automation exact run provenance was preempted by an uncorrelated observation");
+  }
+  if (evidence.initiating_operation_id !== receipt.initiatingOperationId ||
+    evidence.receipt_version !== receipt.version || evidence.definition_revision !== receipt.definitionRevision ||
+    evidence.authority_json !== canonical(receipt.authority) ||
+    evidence.capability_evidence_json !== canonical(receipt.capabilityEvidence) ||
+    evidence.idempotency_key !== receipt.initiatingOperationId || evidence.outcome_class !== receipt.outcomeClass) {
+    throw new TypeError("managed automation run evidence has conflicting authoritative provenance");
+  }
+}
+
+function hasRetryableRunNowOperation(db: SqliteDatabase, bindingId: string): boolean {
+  const row = db.prepare(
+    `SELECT 1 FROM managed_automation_operations
+      WHERE binding_id = ? AND operation_class = 'run_now'
+        AND state IN ('pending', 'leased', 'ambiguous') LIMIT 1`,
+  ).get(bindingId) as { 1: number } | undefined;
+  return row !== undefined;
 }
 
 function assertRunReceiptEvidence(
@@ -1622,12 +1697,16 @@ export class ManagedAutomationRepository {
     if (binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
       throw new Error("managed automation run does not match its active binding");
     }
+    if (initiatingOperationId && run.idempotencyKey !== initiatingOperationId) {
+      throw new TypeError("managed automation run idempotency does not match its operation");
+    }
     const outputSha256 = run.output === null ? null : managedAutomationDigest(run.output);
     const contract = managedAutomationRunContract(binding, run);
     const errorClass = contract.errorClass ?? (run.error === null ? null : "bb_automation_run_failed");
     const receipt = initiatingOperationId && isCurrentManagedAutomationAuthority(binding.authority) && binding.capabilityEvidence
       ? managedAutomationRunReceipt(binding, initiatingOperationId, binding.authority, binding.capabilityEvidence, run, now)
       : null;
+    if (!initiatingOperationId && hasRetryableRunNowOperation(this.db, binding.id)) return false;
     const evidenceJson = canonical({
       automationId: run.automationId,
       contractOutcome: contract.outcome,
@@ -1653,8 +1732,14 @@ export class ManagedAutomationRepository {
           }
         : {}),
     });
-    const inserted = this.db.prepare(
-      `INSERT OR IGNORE INTO managed_automation_run_evidence (
+    const existing = existingRunEvidence(this.db, run);
+    if (existing) {
+      assertRunEvidenceFacts(existing, { binding, run, outputSha256, errorClass });
+      assertExistingRunProvenance(existing, receipt);
+      return false;
+    }
+    this.db.prepare(
+      `INSERT INTO managed_automation_run_evidence (
          binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
          thread_id, output_sha256, error_class, scheduled_for, started_at,
          finished_at, observed_at, evidence_json, receipt_version,
@@ -1684,7 +1769,6 @@ export class ManagedAutomationRepository {
       run.idempotencyKey ?? null,
       receipt?.outcomeClass ?? null,
     );
-    if (inserted.changes === 0) return false;
     this.db.prepare(
       `UPDATE managed_automations
           SET last_run_id = ?, last_run_status = ?, updated_at = ?
