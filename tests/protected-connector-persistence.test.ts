@@ -1,5 +1,7 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
+import { createConnection } from "node:net";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CAPABILITY_BY_ID,
@@ -26,9 +28,28 @@ import {
   applyBrokerMigrations,
 } from "../broker/src/migrations";
 import { BrokerProtectedConnectorStore } from "../broker/src/connector-store";
+import { createAdminServer } from "../broker/src/admin-server";
+import { BrokerStore } from "../broker/src/store";
 import { temporaryBrokerDatabase } from "./support/credential-broker-fixtures";
 
 const NOW = 1_800_000_000_000;
+
+function sendAdminRequest(socketPath: string, request: unknown): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    const chunks: Buffer[] = [];
+    socket.once("connect", () => socket.end(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    socket.once("error", reject);
+    socket.once("close", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8").split("\n")[0]) as Record<string, unknown>);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
 
 function projection(overrides: Partial<ProtectedConnectorBindingProjection> = {}): ProtectedConnectorBindingProjection {
   return {
@@ -390,7 +411,7 @@ describe("append-only schema compatibility", () => {
       .toEqual({ name: "credential_connector_bindings" });
   });
 
-  it("migrates and restarts a shipped broker foundation without changing version-1 rows", () => {
+  it("migrates and restarts a shipped broker foundation without changing version-1 rows", async () => {
     const fixture = temporaryBrokerDatabase();
     try {
       fixture.db.exec(BROKER_FOUNDATION_SCHEMA);
@@ -474,6 +495,51 @@ describe("append-only schema compatibility", () => {
           { operation: "binding.enroll", installation_id: "installation-v1" },
         ]);
       expect(reopened.prepare("SELECT count(*) AS count FROM broker_admin_events").get()).toEqual({ count: 0 });
+      const adminServer = createAdminServer({
+        socketPath: join(fixture.directory, "legacy-admin.sock"),
+        store: new BrokerStore(reopened, {
+          dataKey: new Uint8Array(32).fill(0x11),
+          auditKey: new Uint8Array(32).fill(0x22),
+          clock: () => NOW,
+        }),
+        connectorStore: new BrokerProtectedConnectorStore(reopened, {
+          dataKey: new Uint8Array(32).fill(0x11),
+          clock: () => NOW,
+        }),
+        adapter: {
+          health: async () => ({ outcome: "ready" as const }),
+          verify: async () => ({ outcome: "valid" as const, versionHmac: "d".repeat(64) }),
+        },
+        clock: () => NOW,
+        brokerVersion: "0.1.0",
+      });
+      await adminServer.start();
+      try {
+        const rejected = await sendAdminRequest(join(fixture.directory, "legacy-admin.sock"), {
+          operation: "connector.binding.enroll",
+          installationId: "installation-v1",
+          projectId: "project-v1",
+          policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+          enabledOperations: ["convex.project.inspect.v1"],
+          projection: projection({
+            installationId: "installation-v1",
+            bindingId: "binding-rejected",
+            state: "active",
+          }),
+          target: convexTarget,
+          credentialReference: null,
+        });
+        expect(rejected).toEqual({
+          ok: false,
+          operation: "connector.binding.enroll",
+          code: "invalid_request",
+        });
+        expect(reopened.prepare(
+          "SELECT operation, outcome FROM broker_admin_events WHERE operation = 'connector.binding.enroll' ORDER BY occurred_at",
+        ).all()).toEqual([{ operation: "connector.binding.enroll", outcome: "failed" }]);
+      } finally {
+        await adminServer.close();
+      }
       reopened.close();
     } finally {
       fixture.close();

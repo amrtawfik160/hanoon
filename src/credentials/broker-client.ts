@@ -24,6 +24,16 @@ import {
 import type { IsolatedCredentialBrokerConfig } from "./config";
 
 const OPERATIONS_PATH = "/v1/operations";
+const FENCE_ATTESTATION_PATH = "/v1/fences";
+
+export type CredentialBrokerFenceAttestation = Readonly<{
+  installationId: string;
+  taskId: string;
+  projectId: string;
+  fenceOwner: string;
+  fenceGeneration: number;
+  expiresAt: number;
+}>;
 
 export type CredentialBrokerClientFailureReason =
   | "connection_failed"
@@ -85,6 +95,50 @@ export class CredentialBrokerClient {
   /** Closes idle keep-alive sockets when the owning composition is disposed. */
   public close(): void {
     this.agent.destroy();
+  }
+
+  /** Establishes the broker's independent executor-fence evidence over mTLS. */
+  public attestExecutorFence(input: CredentialBrokerFenceAttestation): Promise<boolean> {
+    const now = this.clock();
+    if (!Number.isSafeInteger(now) || input.expiresAt <= now) return Promise.resolve(false);
+    const body = Buffer.from(JSON.stringify(input), "utf8");
+    const origin = new URL(this.config.endpointOrigin);
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (accepted: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(accepted);
+      };
+      const request = https.request({
+        agent: this.agent,
+        lookup: this.lookup,
+        servername: origin.hostname,
+        method: "POST",
+        hostname: origin.hostname,
+        port: origin.port ? Number(origin.port) : 443,
+        path: FENCE_ATTESTATION_PATH,
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "Cache-Control": "no-store",
+          "Content-Length": body.byteLength,
+        },
+      }, (response) => {
+        const accepted = response.statusCode === 204;
+        response.resume();
+        response.once("end", () => finish(accepted));
+        response.once("error", () => finish(false));
+      });
+      timer = setTimeout(() => {
+        request.destroy();
+        finish(false);
+      }, Math.max(1, input.expiresAt - now));
+      request.once("error", () => finish(false));
+      request.end(body);
+    });
   }
 
   public call(

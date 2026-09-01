@@ -11,7 +11,9 @@ import {
 } from "../../src/credentials/connector-policy";
 import { CredentialBrokerClient } from "../../src/credentials/broker-client";
 import type { IsolatedCredentialBrokerConfig } from "../../src/credentials/config";
+import { CredentialAccessService } from "../../src/credentials/service";
 import { ProtectedConnectorAccessService } from "../../src/credentials/protected-connector-service";
+import type { BrokerResponseEnvelope } from "../../src/credentials/protocol";
 import { openStore, type TelegramAgentStore } from "../../src/storage/store";
 import { hashSecret } from "../../src/crypto";
 import { registerControllerTools } from "../../src/controller/tools";
@@ -68,10 +70,10 @@ export const integrationTarget: ProtectedConnectorTarget = {
 
 type RunningServer = ReturnType<typeof createBrokerServer>;
 
-function listen(server: RunningServer | https.Server): Promise<number> {
+function listen(server: RunningServer | https.Server, port = 0): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(port, "127.0.0.1", () => {
       server.off("error", reject);
       const address = server.address() as AddressInfo;
       resolve(address.port);
@@ -120,7 +122,7 @@ export type ProtectedConnectorIntegrationHarness = Readonly<{
   turnId: string;
   providerCalls: string[];
   releaseStalledProvider(): void;
-  restartBrokerAuthority(): void;
+  restartBrokerAuthority(): Promise<void>;
   provider: https.Server;
   brokerServer: RunningServer;
   client: CredentialBrokerClient;
@@ -131,7 +133,9 @@ export type ProtectedConnectorIntegrationHarness = Readonly<{
 
 export type ProtectedConnectorIntegrationHarnessOptions = Readonly<{
   credentialToken?: string;
+  credentialError?: string;
   providerMode?: "success" | "failure" | "stall";
+  auditWritable?: boolean;
 }>;
 
 export function cleanupProtectedConnectorIntegrationFixtures(): void {
@@ -191,7 +195,7 @@ export async function createProtectedConnectorIntegrationHarness(
     });
     const providerPort = await listen(provider);
 
-    const broker = new BrokerStore(brokerDatabase.db, {
+    let broker = new BrokerStore(brokerDatabase.db, {
       dataKey: new Uint8Array(32).fill(0x11),
       auditKey: new Uint8Array(32).fill(0x22),
       clock: () => INTEGRATION_NOW,
@@ -205,7 +209,7 @@ export async function createProtectedConnectorIntegrationHarness(
       expectedVaultId: "vault-integration",
       now: INTEGRATION_NOW,
     });
-    const connectors = new BrokerProtectedConnectorStore(brokerDatabase.db, {
+    let connectors = new BrokerProtectedConnectorStore(brokerDatabase.db, {
       dataKey: new Uint8Array(32).fill(0x11),
       clock: () => INTEGRATION_NOW,
     });
@@ -241,12 +245,15 @@ export async function createProtectedConnectorIntegrationHarness(
       serviceToken: "synthetic-onepassword-service-token",
       port: {
         listVaults: async () => [{ id: "vault-integration" }],
-        resolveOne: async () => ({
-          outcome: "resolved" as const,
-          secret: options.credentialToken ?? INTEGRATION_TOKEN,
-          vaultId: "vault-integration",
-          itemId: "item-integration",
-        }),
+        resolveOne: async () => {
+          if (options.credentialError) throw new Error(options.credentialError);
+          return {
+            outcome: "resolved" as const,
+            secret: options.credentialToken ?? INTEGRATION_TOKEN,
+            vaultId: "vault-integration",
+            itemId: "item-integration",
+          };
+        },
       },
     });
     const providerExecutor = createProtectedConnectorExecutor({
@@ -259,20 +266,51 @@ export async function createProtectedConnectorIntegrationHarness(
       credentials: { resolve: adapter.resolveCredential },
       clock: () => INTEGRATION_NOW,
     });
-    const authorityDependencies = {
-      foundationStore: broker,
-      connectorStore: connectors,
-      executor: providerExecutor,
-      authority: createDurableProtectedConnectorAuthority(broker, connectors, () => INTEGRATION_NOW),
-      clock: () => INTEGRATION_NOW,
-    } as const;
-    authority = new ProtectedConnectorAuthorityService(authorityDependencies);
-    brokerServer = createBrokerServer({
+    const createAuthority = (): void => {
+      const durableAuthority = createDurableProtectedConnectorAuthority(broker, connectors, () => INTEGRATION_NOW);
+      authority = new ProtectedConnectorAuthorityService({
+        foundationStore: broker,
+        connectorStore: connectors,
+        executor: providerExecutor,
+        authority: options.auditWritable === undefined
+          ? durableAuthority
+          : { ...durableAuthority, auditWritable: () => options.auditWritable === true },
+        clock: () => INTEGRATION_NOW,
+      });
+    };
+    const createBrokerHttpServer = (): RunningServer => createBrokerServer({
       serverCertificatePem: fixture.serverCertificatePem,
       serverPrivateKeyPem: fixture.serverPrivateKeyPem,
       clientCaCertificatePem: fixture.caCertificatePem,
       service: {
         execute: (input) => {
+          if (input.request.schemaVersion === 1) {
+            if (input.request.operation !== "broker.health") throw new Error("integration_health_operation_mismatch");
+            return Promise.resolve({
+              schemaVersion: 1,
+              installationId: input.request.installationId,
+              requestId: input.request.requestId,
+              operation: "broker.health",
+              outcome: "succeeded",
+              result: "ready",
+              failureClass: null,
+              retryable: false,
+              retryAfterMs: null,
+              receiptId: `receipt_${input.request.requestId}`,
+              health: {
+                protocolVersion: 1,
+                brokerVersion: "0.1.0",
+                adapter: "onepassword",
+                adapterState: "ready",
+                auditWritable: true,
+                bindingCount: 0,
+                topologyReceiptDigest: "c".repeat(64),
+                topologyReceiptExpiresAt: INTEGRATION_NOW + 60_000,
+              },
+              bindings: [],
+              completedAt: INTEGRATION_NOW,
+            } satisfies BrokerResponseEnvelope);
+          }
           if (input.request.schemaVersion !== 2) throw new Error("integration_protocol_version_mismatch");
           return authority!.execute({
             certificateFingerprint: input.certificateFingerprint,
@@ -280,9 +318,16 @@ export async function createProtectedConnectorIntegrationHarness(
             now: input.now,
           });
         },
+        attestExecutorFence: ({ certificateFingerprint, now, attestation }) => {
+          const installation = broker.getInstallationByCertificate(certificateFingerprint);
+          return installation?.installationId === attestation.installationId &&
+            broker.attestExecutorFence({ ...attestation, now });
+        },
       },
       clock: () => INTEGRATION_NOW,
     });
+    createAuthority();
+    brokerServer = createBrokerHttpServer();
     const brokerPort = await listen(brokerServer);
     const clientConfig: IsolatedCredentialBrokerConfig = {
       mode: "isolated",
@@ -297,6 +342,14 @@ export async function createProtectedConnectorIntegrationHarness(
     const client = new CredentialBrokerClient(clientConfig, {
       clock: () => INTEGRATION_NOW,
       lookup: loopbackLookup,
+    });
+    const credentialAccess = new CredentialAccessService({
+      store: hanoon,
+      client,
+      config: () => ({ state: "isolated", value: clientConfig }),
+      trustKernelReady: () => true,
+      controllerPermissionMode: () => "auto",
+      now: () => INTEGRATION_NOW,
     });
 
     hanoon.upsertProjectPolicy(policyFixture({ projectId: INTEGRATION_PROJECT_ID }), INTEGRATION_NOW);
@@ -333,16 +386,6 @@ export async function createProtectedConnectorIntegrationHarness(
     const authorized = { controller, turn: submittedTurn, fence };
     const brokerBinding = connectors.getBinding(INTEGRATION_INSTALLATION_ID, INTEGRATION_BINDING_ID);
     if (!brokerBinding) throw new Error("integration_broker_binding_missing");
-    if (!broker.attestExecutorFence({
-      installationId: INTEGRATION_INSTALLATION_ID,
-      taskId: turn.id,
-      projectId: INTEGRATION_PROJECT_ID,
-      fenceOwner: fence.ownerId,
-      fenceGeneration: fence.generation,
-      expiresAt: INTEGRATION_NOW + 60_000,
-      now: INTEGRATION_NOW,
-    })) throw new Error("integration_fence_attestation_failed");
-
     const protectedAccess = new ProtectedConnectorAccessService({
       store: hanoon,
       client: () => client,
@@ -351,6 +394,7 @@ export async function createProtectedConnectorIntegrationHarness(
       topologyReady: () => true,
       browserAdministrationIsolated: () => false,
       auditWritable: () => true,
+      fullReadiness: async () => (await credentialAccess.status({})).readiness,
       projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
       now: () => INTEGRATION_NOW,
     });
@@ -392,8 +436,31 @@ export async function createProtectedConnectorIntegrationHarness(
         stalledProviderResponse?.writeHead(503, { "content-type": "application/json" }).end("{}");
         stalledProviderResponse = undefined;
       },
-      restartBrokerAuthority: () => {
-        authority = new ProtectedConnectorAuthorityService(authorityDependencies);
+      restartBrokerAuthority: async () => {
+        await closeServer(brokerServer!);
+        await adminServer?.close();
+        brokerDatabase.reopen();
+        broker = new BrokerStore(brokerDatabase.db, {
+          dataKey: new Uint8Array(32).fill(0x11),
+          auditKey: new Uint8Array(32).fill(0x22),
+          clock: () => INTEGRATION_NOW,
+        });
+        connectors = new BrokerProtectedConnectorStore(brokerDatabase.db, {
+          dataKey: new Uint8Array(32).fill(0x11),
+          clock: () => INTEGRATION_NOW,
+        });
+        createAuthority();
+        brokerServer = createBrokerHttpServer();
+        await listen(brokerServer, brokerPort);
+        adminServer = createAdminServer({
+          socketPath: adminSocketPath,
+          store: broker,
+          connectorStore: connectors,
+          adapter: adminAdapter,
+          clock: () => INTEGRATION_NOW,
+          brokerVersion: "0.1.0",
+        });
+        await adminServer.start();
       },
       close: async () => {
         stalledProviderResponse?.destroy();

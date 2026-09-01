@@ -607,9 +607,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     now: clock,
   });
   bb.onDispose(() => {
-    // CredentialBrokerClient exposes rotate(config) but no bare close, so
-    // this can only drop the reference rather than force-close its
-    // keep-alive TLS agent.
+    credentialClient?.close();
     credentialClient = null;
   });
 
@@ -724,6 +722,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     // requires a plugin reload"), and leaving isolated drops the client.
     // Either way `client` — captured by value, not by closure — is now
     // stale, so the service must be rebuilt and re-published.
+    credentialClient?.close();
     credentialClient = null;
     credentialAccessService = buildCredentialAccessService();
     toolDependencies.credentialAccess = credentialAccessService;
@@ -740,7 +739,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
       { name: "capability", summary: "Inspect capability evidence and control recipe and navigator-v1 rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
-      { name: "access", summary: "Inspect read-only credential broker bindings and status", usage: "bb telegram-agent access <list|status> [binding-id] [--json]" },
+      { name: "access", summary: "Inspect and reconcile secret-free credential broker projections", usage: "bb telegram-agent access <list|status|reconcile> ... [--json]" },
       { name: "reference", summary: "Read the specifications filed for a project", usage: "bb telegram-agent reference <search|show|list> ... [--project <project-id>] [--json]" },
       { name: "doctor", summary: "Check Telegram, BB, host, provider, GitHub, and credential broker readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
     ],
@@ -760,6 +759,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         workflowEngineGraph: "adaptive",
       },
       credentialAccess: credentialAccessService,
+      protectedConnectorAccess: protectedConnectorAccessService,
       runtime: runtimeHealth,
       unpairNonceKey,
       recordOperatorAudit: async (auditEntry) => {

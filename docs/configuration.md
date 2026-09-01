@@ -199,14 +199,15 @@ This is the first slice of a separate credential broker: a protected service tha
 
 Turning isolated mode on for the first time needs `bb plugin reload telegram-agent` before verification becomes reachable, because the complete capability manifest is rebuilt at reload. Once isolated, changing the endpoint, installation id, certificates, key, or topology digest/expiry rotates the live connection immediately, without a reload — the next `access status` or doctor call re-attempts the broker health check under the new material. An endpoint change does not migrate existing bindings.
 
-The only operator commands are read-only:
+The operator commands are:
 
 ```bash
 bb telegram-agent access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
 bb telegram-agent access status [binding-id] [--json]
+bb telegram-agent access reconcile <project-id> --projection-json '<secret-free projection JSON>' [--json]
 ```
 
-`access list` reads locally stored, secret-free binding metadata and never contacts the broker. `access status` runs the same diagnostic health check the doctor uses and reports one selected binding. There is deliberately no `access verify` or enrollment command here — a live verification or typed provider identity probe can only be requested by the owner from Telegram, through Hanoon's guarded tool. Binding enrollment happens on the protected broker host itself with `connector binding enroll --stdin`; the returned `projection` must be passed through the authenticated `ProtectedConnectorAccessService.reconcileEnrollment` channel before it is usable locally. Enrollment creates no credentials or live provider resources. The checked-in proof for this flow uses synthetic local fixtures only; see `broker/README.md`.
+`access list` reads locally stored, secret-free binding metadata and never contacts the broker. `access status` runs the same diagnostic health check the doctor uses and reports one selected binding. `access reconcile` accepts only a validated, secret-free projection returned by protected-host `connector binding enroll --stdin`; it requires the active controller project/thread and executor lease, writes the local projection, and never contacts the broker or verifies a credential. A live verification or typed provider identity probe can only be requested by the owner from Telegram, through Hanoon's guarded tool. Enrollment creates no credentials or live provider resources. The checked-in proof for this flow uses synthetic local fixtures only; see `broker/README.md`.
 
 `bb telegram-agent doctor` includes one `credential broker` row while disabled, or `credential: <check>` rows once isolated — `trust_kernel`, `controller_permission`, `isolated_configuration`, `topology_receipt`, `broker_tls`, `broker_identity`, `protocol_version`, `installation_identity`, `broker_audit`, and `onepassword_adapter`, in that order — with only 3 or 4 rows when an early check already fails and all 10 otherwise; see [Operations](operations.md#credential-broker) for exactly which. None of these rows print a certificate, endpoint, digest value, vault id, or raw broker error.
 

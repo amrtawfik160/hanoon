@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   cleanupProtectedConnectorIntegrationFixtures,
@@ -7,6 +10,7 @@ import {
 } from "./support/protected-connector-integration-harness";
 import { ProtectedConnectorAuthorityService } from "../broker/src/connector-authority-service";
 import { PROTECTED_CONNECTOR_POLICY_DIGEST } from "../src/credentials/connector-policy";
+import { protectedConnectorRequestDigest } from "../src/credentials/connector-protocol";
 import { assertCanaryAbsent, sqliteCanarySurfaces } from "./support/credential-broker-fixtures";
 
 afterAll(() => cleanupProtectedConnectorIntegrationFixtures());
@@ -102,11 +106,44 @@ describe("protected connector production composition", () => {
       expect(harness.providerCalls).toHaveLength(1);
       controller.abort();
       expect(parsed(await call).outcome).toBe("ambiguous");
+      const beforeRestart = harness.hanoon.getProtectedConnectorOperation?.({
+        installationId: "installation-integration",
+        bindingId: INTEGRATION_BINDING_ID,
+        operation: "convex.project.inspect.v1",
+        bindingGeneration: 1,
+        taskId: harness.turnId,
+        projectId: INTEGRATION_PROJECT_ID,
+        fenceOwner: "executor-integration",
+        fenceGeneration: 1,
+      });
+      const brokerRequestBeforeRestart = harness.brokerDatabase.db.prepare(
+        "SELECT request_id, idempotency_key, request_digest FROM broker_connector_requests WHERE installation_id = ?",
+      ).get("installation-integration");
+      if (!beforeRestart) throw new Error("integration_operation_missing_before_restart");
+      expect(brokerRequestBeforeRestart).toEqual({
+        request_id: beforeRestart.request.requestId,
+        idempotency_key: beforeRestart.request.idempotencyKey,
+        request_digest: protectedConnectorRequestDigest(beforeRestart.request),
+      });
 
-      harness.restartBrokerAuthority();
+      await harness.restartBrokerAuthority();
       const restarted = parsed(await inspect(harness, new AbortController().signal));
       expect(restarted).toMatchObject({ outcome: "failed", failureClass: "result_ambiguous" });
       expect(harness.providerCalls).toHaveLength(1);
+      const brokerRequestAfterRestart = harness.brokerDatabase.db.prepare(
+        "SELECT request_id, idempotency_key, request_digest FROM broker_connector_requests WHERE installation_id = ?",
+      ).get("installation-integration");
+      expect(brokerRequestAfterRestart).toEqual(brokerRequestBeforeRestart);
+      expect(harness.hanoon.getProtectedConnectorOperation?.({
+        installationId: "installation-integration",
+        bindingId: INTEGRATION_BINDING_ID,
+        operation: "convex.project.inspect.v1",
+        bindingGeneration: 1,
+        taskId: harness.turnId,
+        projectId: INTEGRATION_PROJECT_ID,
+        fenceOwner: "executor-integration",
+        fenceGeneration: 1,
+      })?.request).toEqual(beforeRestart.request);
     } finally {
       harness.releaseStalledProvider();
       await harness.close();
@@ -162,17 +199,78 @@ describe("protected connector production composition", () => {
   it("keeps a provider-token canary out of controller, receipts, stores, and transport evidence", async () => {
     const canary = "TOK-INTEGRATION-CANARY-68";
     const harness = await createProtectedConnectorIntegrationHarness({ credentialToken: canary });
+    const errorHarness = await createProtectedConnectorIntegrationHarness({ credentialToken: canary, credentialError: canary });
+    const artifactDirectory = mkdtempSync(join(tmpdir(), "protected-connector-canary-"));
     try {
       const result = await inspect(harness, new AbortController().signal);
+      const errorResult = await inspect(errorHarness, new AbortController().signal);
+      const artifactPath = join(artifactDirectory, "canary-evidence.json");
+      writeFileSync(artifactPath, JSON.stringify({
+        argv: process.argv,
+        result,
+        errorResult,
+        providerTransport: harness.providerCalls,
+        resolverErrorTransport: errorHarness.providerCalls,
+        logs: harness.hostHarness.inspection.logEntries,
+        errors: [errorResult],
+        threadOutput: [result, errorResult],
+        receipts: {
+          broker: harness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
+          hanoon: harness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
+        },
+      }));
       assertCanaryAbsent([
         { name: "controller-result", value: typeof result === "string" ? result : JSON.stringify(result) },
+        { name: "resolver-error-result", value: typeof errorResult === "string" ? errorResult : JSON.stringify(errorResult) },
+        { name: "argv", value: JSON.stringify(process.argv) },
         { name: "provider-evidence", value: JSON.stringify(harness.providerCalls) },
+        { name: "resolver-error-provider-evidence", value: JSON.stringify(errorHarness.providerCalls) },
+        { name: "logs", value: JSON.stringify(harness.hostHarness.inspection.logEntries) },
+        { name: "resolver-error-logs", value: JSON.stringify(errorHarness.hostHarness.inspection.logEntries) },
+        { name: "errors", value: JSON.stringify([errorResult]) },
+        { name: "thread-output", value: JSON.stringify([result, errorResult]) },
+        { name: "receipts", value: JSON.stringify({
+          broker: harness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
+          hanoon: harness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
+        }) },
+        { name: "test-artifact", path: artifactPath },
         ...sqliteCanarySurfaces(harness.brokerDatabase.databasePath, "broker"),
         ...sqliteCanarySurfaces(harness.bb.storage.database().name, "hanoon"),
       ], [canary]);
+      expect(parsed(errorResult)).toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+      expect(errorHarness.providerCalls).toHaveLength(0);
       expect(typeof result).toBe("string");
     } finally {
       await harness.close();
+      await errorHarness.close();
+      rmSync(artifactDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("closes the real composed path on audit failure before provider I/O and on receipt persistence failure", async () => {
+    const auditHarness = await createProtectedConnectorIntegrationHarness({ auditWritable: false });
+    try {
+      const denied = parsed(await inspect(auditHarness, new AbortController().signal));
+      expect(denied).toMatchObject({ outcome: "failed", failureClass: "receipt_persistence_failed" });
+      expect(auditHarness.providerCalls).toHaveLength(0);
+    } finally {
+      await auditHarness.close();
+    }
+
+    const persistenceHarness = await createProtectedConnectorIntegrationHarness();
+    try {
+      persistenceHarness.brokerDatabase.db.exec(`
+        CREATE TRIGGER fail_connector_receipt BEFORE INSERT ON broker_connector_receipts
+        BEGIN SELECT RAISE(ABORT, 'receipt persistence test'); END
+      `);
+      const failed = parsed(await inspect(persistenceHarness, new AbortController().signal));
+      expect(failed).toMatchObject({ outcome: "failed", failureClass: "receipt_persistence_failed" });
+      expect(persistenceHarness.providerCalls).toHaveLength(1);
+      expect(persistenceHarness.brokerDatabase.db.prepare(
+        "SELECT count(*) AS count FROM broker_connector_receipts",
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      await persistenceHarness.close();
     }
   });
 });

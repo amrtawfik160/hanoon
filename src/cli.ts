@@ -46,6 +46,12 @@ import { TASK_RECIPES, type TaskRecipe } from "./domain/recipes";
 import { BROKER_BINDING_STATES, type BrokerBindingState } from "./credentials/protocol";
 import type { CredentialReadinessCheck } from "./credentials/topology";
 import type { CredentialAccessService } from "./credentials/service";
+import {
+  parseProtectedConnectorBindingProjection,
+  type ProtectedConnectorBindingProjection,
+} from "./credentials/connector-policy";
+import type { ProtectedConnectorAccessService } from "./credentials/protected-connector-service";
+import type { AuthorizedControllerCapability } from "./controller/capability-executor";
 import { activationSummary, type ActivationHealth } from "./services/runtime-identity";
 
 type BbSdk = BbPluginApi["sdk"];
@@ -73,6 +79,7 @@ export type TelegramAgentCliDependencies = {
     workflowEngineGraph: WorkflowEngineGraphMode;
   }>;
   credentialAccess: Pick<CredentialAccessService, "list" | "status">;
+  protectedConnectorAccess: Pick<ProtectedConnectorAccessService, "reconcileEnrollment">;
   runtime: () => ActivationHealth;
   unpairNonceKey: string;
   recordOperatorAudit(input: Readonly<{
@@ -193,6 +200,10 @@ const ACCESS_LIST_FLAGS: Record<string, FlagSpec> = {
   limit: { kind: "value" },
 };
 const ACCESS_STATUS_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
+const ACCESS_RECONCILE_FLAGS: Record<string, FlagSpec> = {
+  json: JSON_FLAG,
+  "projection-json": { kind: "value" },
+};
 const REFERENCE_SEARCH_FLAGS: Record<string, FlagSpec> = {
   json: JSON_FLAG,
   project: { kind: "value" },
@@ -203,6 +214,7 @@ const REFERENCE_SHOW_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG, projec
 
 const MAX_COLLECTION_SIZE = 100;
 const MAX_ACCESS_LIST_LIMIT = 10;
+const MAX_PROTECTED_CONNECTOR_PROJECTION_BYTES = 16 * 1024;
 const PAIRING_TTL_MS = 10 * 60 * 1_000;
 const MAX_ERROR_LENGTH = 240;
 const CLI_HELP = `Usage: bb telegram-agent <command> [options]
@@ -226,6 +238,7 @@ Commands:
   capability rollback <recipe|navigator-v1> [--json]
   access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
   access status [binding-id] [--json]
+  access reconcile <project-id> --projection-json <json> [--json]
   reference <search|show|list> ... [--project <project-id>] [--json]
   doctor [project-id] [--json]
 `;
@@ -1601,9 +1614,73 @@ async function accessStatus(
   return success(result, lines.join("\n"), json);
 }
 
+function protectedProjectionFromFlags(parsed: ParsedFlags): ProtectedConnectorBindingProjection {
+  const projectionJson = parsed.values.get("projection-json");
+  if (projectionJson === undefined) throw new CliInputError("access reconcile requires --projection-json");
+  if (Buffer.byteLength(projectionJson, "utf8") > MAX_PROTECTED_CONNECTOR_PROJECTION_BYTES) {
+    throw new CliInputError("--projection-json is too large");
+  }
+  const parsedProjection = parseProtectedConnectorBindingProjection(
+    parseJsonValue(projectionJson, "--projection-json"),
+  );
+  if (!parsedProjection.ok) throw new CliInputError("--projection-json must be a valid protected connector projection");
+  return parsedProjection.value;
+}
+
+function activeControllerForReconciliation(
+  deps: TelegramAgentCliDependencies,
+  projectId: string,
+  context: PluginCliContext,
+): AuthorizedControllerCapability {
+  if (!context.threadId || context.projectId !== projectId) {
+    throw new CliPreconditionError("access reconcile requires the active controller project context");
+  }
+  const controller = deps.store.getControllerByThreadId(context.threadId);
+  if (!controller || controller.projectId !== projectId || controller.threadId !== context.threadId) {
+    throw new CliPreconditionError("active controller context is unavailable");
+  }
+  const turn = deps.store.getPendingControllerTurn(controller.controllerKey);
+  if (!turn || turn.state !== "submitted" || !turn.leaseOwner || turn.leaseGeneration === null) {
+    throw new CliPreconditionError("active controller turn is unavailable");
+  }
+  const now = deps.now();
+  if (!deps.store.isExecutorLeaseCurrent(turn.leaseOwner, turn.leaseGeneration, now)) {
+    throw new CliPreconditionError("active controller lease is unavailable");
+  }
+  return {
+    controller,
+    turn,
+    fence: { ownerId: turn.leaseOwner, generation: turn.leaseGeneration, now },
+  };
+}
+
+function accessReconcile(
+  deps: TelegramAgentCliDependencies,
+  parsed: ParsedFlags,
+  context: PluginCliContext,
+  json: boolean,
+): PluginCliResult {
+  const projectId = onePositional(parsed, "access reconcile");
+  const projection = protectedProjectionFromFlags(parsed);
+  const result = deps.protectedConnectorAccess.reconcileEnrollment({
+    projectId,
+    projection,
+    authorized: activeControllerForReconciliation(deps, projectId, context),
+  });
+  if (result.outcome !== "reconciled") {
+    throw new CliOperationError(`protected connector reconciliation ${result.outcome}: ${result.reason}`);
+  }
+  return success(
+    result,
+    `Reconciled ${result.projection.bindingId} generation=${result.projection.generation}`,
+    json,
+  );
+}
+
 async function runAccess(
   deps: TelegramAgentCliDependencies,
   argv: readonly string[],
+  context: PluginCliContext,
 ): Promise<PluginCliResult> {
   if (argv.length === 0) throw new CliInputError("access requires a subcommand");
   const subcommand = argv[0];
@@ -1614,6 +1691,10 @@ async function runAccess(
   if (subcommand === "status") {
     const parsed = parseFlags(argv.slice(1), ACCESS_STATUS_FLAGS);
     return accessStatus(deps, parsed, parsed.flags.has("json"));
+  }
+  if (subcommand === "reconcile") {
+    const parsed = parseFlags(argv.slice(1), ACCESS_RECONCILE_FLAGS);
+    return accessReconcile(deps, parsed, context, parsed.flags.has("json"));
   }
   throw new CliInputError(`Unknown access subcommand ${subcommand}`);
 }
@@ -1999,7 +2080,7 @@ export async function runTelegramAgentCli(
     if (command === "project") return await runProject(deps, argv.slice(1), context);
     if (command === "job") return await runJob(deps, argv.slice(1));
     if (command === "capability") return await runCapability(deps, argv.slice(1));
-    if (command === "access") return await runAccess(deps, argv.slice(1));
+    if (command === "access") return await runAccess(deps, argv.slice(1), context);
     if (command === "reference") return await runReference(deps, argv.slice(1), context);
     if (command === "doctor") {
       const parsed = parseFlags(argv.slice(1), DOCTOR_FLAGS);

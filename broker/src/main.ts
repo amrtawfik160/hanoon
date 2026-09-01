@@ -18,7 +18,7 @@ import { readSystemdCredentials } from "./credentials.js";
 import { createOnePasswordAdapter } from "./onepassword-adapter.js";
 import { BrokerOperationService } from "./operation-service.js";
 import { BrokerStore } from "./store.js";
-import { createBrokerServer } from "./server.js";
+import { createBrokerServer, type BrokerFenceAttestation } from "./server.js";
 import { createAdminServer } from "./admin-server.js";
 import {
   ProtectedConnectorAuthorityService,
@@ -121,6 +121,7 @@ export async function startBroker(
   const database = new Database(config.databasePath);
   let server: Server | null = null;
   let adminServer: BrokerAdminLifecycle | null = null;
+  let adapter: Awaited<ReturnType<typeof createOnePasswordAdapter>> | null = null;
   try {
     const store = new BrokerStore(database, {
       dataKey: credentials.brokerDataKey,
@@ -128,7 +129,7 @@ export async function startBroker(
       clock: Date.now,
       retentionDays: config.retentionDays,
     });
-    const adapter = await createOnePasswordAdapter({ serviceToken: credentials.onepasswordServiceToken });
+    adapter = await createOnePasswordAdapter({ serviceToken: credentials.onepasswordServiceToken });
     const connectorStore = new BrokerProtectedConnectorStore(database, {
       dataKey: credentials.brokerDataKey,
       clock: Date.now,
@@ -166,6 +167,16 @@ export async function startBroker(
             now: input.now,
             request: input.request,
           }),
+      attestExecutorFence: (input: {
+        certificateFingerprint: string;
+        now: number;
+        attestation: BrokerFenceAttestation;
+      }) => {
+        const { certificateFingerprint, now, attestation } = input;
+        const installation = store.getInstallationByCertificate(certificateFingerprint);
+        return installation?.installationId === attestation.installationId &&
+          store.attestExecutorFence({ ...attestation, now });
+      },
     };
     const httpsServer = createBrokerServer({
       serverCertificatePem: credentials.serverCertificatePem,
@@ -196,7 +207,11 @@ export async function startBroker(
           try {
             await closeServer(httpsServer);
           } finally {
-            database.close();
+            try {
+              await adapter?.close();
+            } finally {
+              database.close();
+            }
           }
         }
       },
@@ -207,6 +222,7 @@ export async function startBroker(
   } catch (error) {
     await adminServer?.close().catch(() => undefined);
     if (server) await closeServer(server).catch(() => undefined);
+    await adapter?.close().catch(() => undefined);
     database.close();
     throw error;
   }

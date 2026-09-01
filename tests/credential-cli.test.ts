@@ -1,6 +1,8 @@
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import plugin from "../server";
+import { protectedConnectorCapabilityFor } from "../src/credentials/connector-protocol";
+import { openStore } from "../src/storage/store";
 
 const VALID_PEM_CERT = `-----BEGIN CERTIFICATE-----
 MIIBgzCCASmgAwIBAgIUW1L4gC6MeV+Ud+wNnC7kU0bN+s0wCgYIKoZIzj0EAwIw
@@ -264,4 +266,89 @@ it("reports an unknown binding id as not found rather than throwing", async () =
   const result = await harness.behavior.runCli(["access", "status", "binding_nonexistent", "--json"]);
   expect(result.exitCode).toBe(0);
   expect(parseJson<{ binding: unknown }>(result.stdout).binding).toBeNull();
+});
+
+it("reconciles a broker projection through the controller-fenced CLI path", async () => {
+  const { bb, harness } = await loadPlugin({
+    botToken: "123:test-token",
+    controllerPermissionMode: "auto",
+    ...isolatedSettings(),
+  });
+  const now = Date.now();
+  const store = openStore(bb.storage, bb.storage.kv, () => now);
+  const threadId = "thr_cli_reconcile";
+  const projectId = "project_cli_reconcile";
+  const controllerKey = "owner-7-cli-reconcile";
+  bb.storage.database().prepare(
+    "INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at, revoked_at) VALUES (1, '7', '70', ?, NULL)",
+  ).run(now);
+  const queued = store.enqueueControllerTurn({
+    controllerKey,
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId: 701,
+    inputText: "Reconcile the protected connector projection.",
+    now,
+    origin: "owner",
+  });
+  const lease = store.acquireExecutorLease("executor-cli-reconcile", now, 60_000);
+  if (!lease.acquired) throw new Error("cli_reconcile_executor_lease_missing");
+  expect(store.claimNextControllerTurn({ ownerId: "executor-cli-reconcile", generation: lease.generation, now: now + 1 })?.id)
+    .toBe(queued.id);
+  expect(store.markControllerSpawned({
+    turnId: queued.id,
+    ownerId: "executor-cli-reconcile",
+    generation: lease.generation,
+    now: now + 2,
+    projectId,
+    hostId: "host-cli-reconcile",
+    threadId,
+  })).toBe(true);
+  expect(store.markControllerTurnSubmitted({
+    turnId: queued.id,
+    ownerId: "executor-cli-reconcile",
+    generation: lease.generation,
+    now: now + 3,
+  })).toBe(true);
+
+  const projection = {
+    schemaVersion: 2,
+    installationId: "install_1",
+    bindingId: "binding_cli_reconcile",
+    operation: "convex.project.inspect.v1",
+    bindingKind: "workload_identity",
+    authorityProvider: "convex",
+    secretProvider: "provider_native",
+    principalLabel: "CLI reconciliation workload",
+    capabilityIds: [protectedConnectorCapabilityFor("convex.project.inspect.v1")],
+    audiences: ["api.convex.dev"],
+    origins: [],
+    scopes: ["project:read"],
+    riskClass: "low",
+    mfaMode: "workload_identity",
+    approvalMode: "standing_policy",
+    state: "vault_verified",
+    generation: 1,
+    verifiedAt: null,
+    expiresAt: null,
+  } as const;
+  const result = await harness.behavior.runCli([
+    "access",
+    "reconcile",
+    projectId,
+    "--projection-json",
+    JSON.stringify(projection),
+    "--json",
+  ], { threadId, projectId });
+
+  expect(result.exitCode).toBe(0);
+  expect(parseJson<{ outcome: string; projection: typeof projection }>(result.stdout)).toMatchObject({
+    outcome: "reconciled",
+    projection,
+  });
+  expect(store.getProtectedConnectorBinding("install_1", "binding_cli_reconcile")).toEqual(projection);
+
+  const reloaded = await harness.lifecycle.reload(plugin);
+  const restartedStore = openStore(reloaded.bb.storage, reloaded.bb.storage.kv, () => now);
+  expect(restartedStore.getProtectedConnectorBinding("install_1", "binding_cli_reconcile")).toEqual(projection);
 });

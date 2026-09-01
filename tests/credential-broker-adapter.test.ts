@@ -142,4 +142,33 @@ describe("isolated onepassword adapter", () => {
       consoleError.mockRestore();
     }
   });
+
+  it("stops waiting on an aborted credential resolution and exposes lifecycle cleanup", async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    let closeCalls = 0;
+    const adapter = await createOnePasswordAdapter({
+      serviceToken: "service-token-is-test-only",
+      port: {
+        listVaults: async () => [{ id: EXPECTED_VAULT_ID }],
+        resolveOne: async (_reference, signal) => {
+          receivedSignal = signal;
+          return new Promise<never>(() => undefined);
+        },
+        close: () => { closeCalls += 1; },
+      },
+    });
+
+    const pending = adapter.resolveCredential(REFERENCE, controller.signal);
+    await vi.waitFor(() => expect(receivedSignal).toBe(controller.signal));
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({
+      outcome: "failed",
+      failureClass: "provider_unavailable",
+      retryable: true,
+    });
+    await adapter.close();
+    expect(closeCalls).toBe(1);
+  });
 });

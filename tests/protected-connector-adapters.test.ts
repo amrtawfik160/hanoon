@@ -33,6 +33,9 @@ describe("protected provider identity adapters", () => {
     let server: https.Server | null = null;
     try {
       server = https.createServer({ key: tls.serverPrivateKeyPem, cert: tls.serverCertificatePem }, (request, response) => {
+        expect(request.headers.authorization).toBe(`Bearer ${TOKEN}`);
+        expect(request.headers.accept).toBe("application/json");
+        expect(request.headers["cache-control"]).toBe("no-store");
         if (request.url !== "/v1/teams/team-slug/projects/hanoon") {
           response.writeHead(404).end();
           return;
@@ -81,6 +84,73 @@ describe("protected provider identity adapters", () => {
         credentials: resolver(),
       });
       await expect(stalledExecutor.inspectConvex({ target: convexTarget, credentialReference: "broker-ref" }))
+        .resolves.toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+
+      const cancelledExecutor = createProtectedConnectorExecutor({
+        http: createProtectedConnectorProviderHttpPort({
+          port: stalledAddress.port,
+          caCertificatePem: tls.caCertificatePem,
+          servername: "broker.test",
+          lookup: (_hostname, _options, callback) => callback(null, [{ address: "127.0.0.1", family: 4 }]),
+          timeoutMs: 5_000,
+        }),
+        credentials: resolver(),
+      });
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      const cancelled = cancelledExecutor.inspectConvex({
+        target: convexTarget,
+        credentialReference: "broker-ref",
+        signal: controller.signal,
+      });
+      setTimeout(() => controller.abort(), 10);
+      await expect(cancelled).resolves.toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      if (server?.listening) await new Promise<void>((resolve) => server!.close(() => resolve()));
+      tls.cleanup();
+    }
+  });
+
+  it("rejects redirects, provider statuses, and streamed response overflow on the real TLS port", async () => {
+    const tls = createMtlsFixture();
+    let server: https.Server | null = null;
+    let mode: "redirect" | "status" | "overflow" = "redirect";
+    try {
+      server = https.createServer({ key: tls.serverPrivateKeyPem, cert: tls.serverCertificatePem }, (_request, response) => {
+        if (mode === "redirect") {
+          response.writeHead(302, { location: "https://outside.example/elsewhere" }).end();
+          return;
+        }
+        if (mode === "status") {
+          response.writeHead(503, { "content-type": "application/json" }).end("{}");
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        for (let index = 0; index < 5; index += 1) response.write("x".repeat(16 * 1024));
+        response.end();
+      });
+      await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("provider_test_address_missing");
+      const executor = () => createProtectedConnectorExecutor({
+        http: createProtectedConnectorProviderHttpPort({
+          port: address.port,
+          caCertificatePem: tls.caCertificatePem,
+          servername: "broker.test",
+          lookup: (_hostname, _options, callback) => callback(null, [{ address: "127.0.0.1", family: 4 }]),
+          timeoutMs: 1_000,
+        }),
+        credentials: resolver(),
+      });
+
+      await expect(executor().inspectConvex({ target: convexTarget, credentialReference: "broker-ref" }))
+        .resolves.toMatchObject({ outcome: "failed", failureClass: "destination_denied" });
+      mode = "status";
+      await expect(executor().inspectConvex({ target: convexTarget, credentialReference: "broker-ref" }))
+        .resolves.toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+      mode = "overflow";
+      await expect(executor().inspectConvex({ target: convexTarget, credentialReference: "broker-ref" }))
         .resolves.toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
     } finally {
       if (server?.listening) await new Promise<void>((resolve) => server!.close(() => resolve()));

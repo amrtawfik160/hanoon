@@ -3,6 +3,11 @@ import { randomUUID } from "node:crypto";
 import type { CredentialBrokerConfigResult } from "./config.js";
 import { BROKER_MAX_DEADLINE_MS } from "./protocol.js";
 import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+  capabilityDescriptorById,
+} from "../capabilities/catalog.js";
+import {
   PROTECTED_CONNECTOR_OPERATIONS,
   PROTECTED_CONNECTOR_SCHEMA_VERSION,
   protectedConnectorCapabilityFor,
@@ -27,6 +32,7 @@ import type {
   ProtectedConnectorOperationRecord,
   ProtectedConnectorReceiptRecord,
 } from "../storage/protected-connector-repository.js";
+import type { CapabilityProfile, CapabilityReceipt } from "../storage/capability-repository.js";
 import type { ControllerMutationFence, TelegramAgentStore } from "../storage/store.js";
 
 export type ProtectedConnectorAccessStore = Pick<
@@ -38,6 +44,8 @@ export type ProtectedConnectorAccessStore = Pick<
   | "markProtectedConnectorOperationAmbiguous"
   | "getProtectedConnectorReceipt"
   | "runControllerMutation"
+  | "getCapabilityProfileById"
+  | "listCapabilityReceipts"
 > & Partial<Pick<TelegramAgentStore, "getProtectedConnectorOperation" | "reconcileProtectedConnectorBinding">>;
 
 export type ProtectedConnectorCaller = Readonly<{
@@ -45,6 +53,14 @@ export type ProtectedConnectorCaller = Readonly<{
     envelope: ProtectedConnectorRequestEnvelope,
     options?: Readonly<{ signal?: AbortSignal }>,
   ): Promise<ProtectedConnectorCallOutcome>;
+  attestExecutorFence?(input: Readonly<{
+    installationId: string;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+    expiresAt: number;
+  }>): Promise<boolean>;
 }>;
 
 export type ProtectedConnectorReadiness = Readonly<{
@@ -137,6 +153,50 @@ function failedResponseResult(
   return { outcome: "failed", failureClass: response.failureClass ?? "receipt_persistence_failed", receiptId: null };
 }
 
+function hasCurrentProfile(
+  profile: CapabilityProfile | null,
+  authorized: AuthorizedControllerCapability,
+): profile is CapabilityProfile {
+  return !!profile &&
+    profile.subjectKind === "controller_turn" &&
+    profile.subjectId === authorized.turn.id &&
+    profile.revision === authorized.turn.capabilityProfileRevision &&
+    profile.mode === "active" &&
+    profile.registryDigest === CAPABILITY_REGISTRY_DIGEST &&
+    profile.graphDigest === CAPABILITY_GRAPH_DIGEST;
+}
+
+function hasSelectedConnectorReceipt(
+  receipts: readonly CapabilityReceipt[],
+  profile: CapabilityProfile,
+  capabilityId: string,
+  descriptorDigest: string,
+): boolean {
+  return receipts.some((receipt) =>
+    receipt.profileId === profile.id && receipt.profileRevision === profile.revision &&
+    receipt.subjectKind === profile.subjectKind && receipt.subjectId === profile.subjectId &&
+    receipt.capabilityId === capabilityId && receipt.capabilityKind === "connector" &&
+    receipt.descriptorDigest === descriptorDigest && receipt.eventType === "selected" &&
+    receipt.reasonCode === "profile_selected" && receipt.mandatory,
+  );
+}
+
+function hasCurrentControllerConnectorEvidence(
+  store: ProtectedConnectorAccessStore,
+  authorized: AuthorizedControllerCapability,
+  operation: ProtectedConnectorOperation,
+): boolean {
+  const profileId = authorized.turn.capabilityProfileId;
+  if (!profileId || authorized.turn.capabilityProfileRevision < 1) return false;
+  const profile = store.getCapabilityProfileById(profileId);
+  if (!hasCurrentProfile(profile, authorized)) return false;
+  const capabilityId = protectedConnectorCapabilityFor(operation);
+  const assignment = profile.assignments.find((candidate) => candidate.capabilityId === capabilityId);
+  const descriptor = assignment ? capabilityDescriptorById(capabilityId, assignment.descriptorDigest) : undefined;
+  return !!assignment && descriptor?.kind === "connector" && assignment.mandatory &&
+    hasSelectedConnectorReceipt(store.listCapabilityReceipts(profile.id, 256), profile, capabilityId, descriptor.digest);
+}
+
 export class ProtectedConnectorAccessService {
   public constructor(private readonly deps: ProtectedConnectorAccessDependencies) {}
 
@@ -208,6 +268,9 @@ export class ProtectedConnectorAccessService {
   }>): Promise<ProtectedConnectorInspectionResult> {
     const readiness = await this.currentReadiness(input.operation, input.projectId);
     if (readiness.state !== "ready") return { outcome: "denied", reason: readiness.reason ?? readiness.state };
+    if (!hasCurrentControllerConnectorEvidence(this.deps.store, input.authorized, input.operation)) {
+      return { outcome: "denied", reason: "capability_evidence_missing" };
+    }
     const config = this.deps.config();
     const client = this.deps.client();
     if (config.state !== "isolated" || !client) return { outcome: "denied", reason: "unavailable" };
@@ -242,6 +305,16 @@ export class ProtectedConnectorAccessService {
     if (!("operation" in prepared)) return { outcome: "failed", failureClass: "reconciliation_required", receiptId: null };
     if (prepared.outcome === "completed") return replayInspection(this.deps, config.value.installationId, prepared.operation, input.operation, input.projectId);
     const toSend = prepared.operation.request;
+    if (!client.attestExecutorFence || !await client.attestExecutorFence({
+      installationId: toSend.installationId,
+      taskId: toSend.taskId,
+      projectId: toSend.projectId,
+      fenceOwner: toSend.fenceOwner,
+      fenceGeneration: toSend.fenceGeneration,
+      expiresAt: toSend.deadlineAt,
+    }).catch(() => false)) {
+      return { outcome: "denied", reason: "authority_unavailable" };
+    }
     const callOutcome = await client.call(toSend, { signal: input.signal });
     if (callOutcome.outcome !== "succeeded") {
       this.markAmbiguous(input.authorized, config.value.installationId, toSend.requestId);

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   PROTECTED_CONNECTOR_POLICY_DIGEST,
+  VERCEL_BROWSER_ORIGIN,
   type ProtectedConnectorBindingProjection,
 } from "../src/credentials/connector-policy";
 import {
@@ -10,6 +11,11 @@ import {
   type ProtectedConnectorRequestEnvelope,
   type ProtectedConnectorResponseEnvelope,
 } from "../src/credentials/connector-protocol";
+import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+  capabilityDescriptorById,
+} from "../src/capabilities/catalog";
 import { ProtectedConnectorAccessService, type ProtectedConnectorAccessStore } from "../src/credentials/protected-connector-service";
 import type { CredentialBrokerConfigResult } from "../src/credentials/config";
 
@@ -37,6 +43,32 @@ const binding: ProtectedConnectorBindingProjection = {
   expiresAt: null,
 };
 
+function operationBinding(operation: ProtectedConnectorBindingProjection["operation"]): ProtectedConnectorBindingProjection {
+  if (operation === "convex.project.inspect.v1") return binding;
+  if (operation === "vercel.project.inspect.v1") return {
+    ...binding,
+    bindingId: "binding-vercel",
+    operation,
+    authorityProvider: "vercel",
+    capabilityIds: [protectedConnectorCapabilityFor(operation)],
+    audiences: ["api.vercel.com"],
+  };
+  return {
+    ...binding,
+    bindingId: "binding-browser",
+    operation,
+    bindingKind: "browser_session",
+    authorityProvider: "bb_browser",
+    secretProvider: "broker_session",
+    capabilityIds: [protectedConnectorCapabilityFor(operation)],
+    audiences: [],
+    origins: [VERCEL_BROWSER_ORIGIN],
+    scopes: [],
+    mfaMode: "human_presence",
+    state: "pending",
+  };
+}
+
 const config = {
   state: "isolated",
   value: { installationId: "installation-1" },
@@ -49,6 +81,7 @@ const authorized = {
     origin: "owner",
     submittedAt: NOW,
     capabilityProfileId: "profile-1",
+    capabilityProfileRevision: 1,
   },
   fence: { ownerId: "executor-1", generation: 1, now: NOW },
 } as never;
@@ -135,6 +168,24 @@ describe("protected connector Hanoon boundary", () => {
     let current = binding;
     let preparedRequest: ProtectedConnectorRequestEnvelope | null = null;
     const events: string[] = [];
+    const descriptor = capabilityDescriptorById("telegram_agent_convex_project_inspect")!;
+    const profile = {
+      id: "profile-1", subjectKind: "controller_turn" as const, subjectId: "turn-1", threadId: "thread-1",
+      revision: 1, recipeId: "architectural", recipeVersion: 1,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST, graphDigest: CAPABILITY_GRAPH_DIGEST,
+      mode: "active" as const, model: { pool: "standard" as const, providerId: "claude-code", modelId: "model", reasoning: "xhigh" as const, serviceTier: "default" as const },
+      reasonCodes: [], traits: [], assignments: [{
+        capabilityId: "telegram_agent_convex_project_inspect", capabilityKind: "connector" as const,
+        descriptorDigest: descriptor.digest, mandatory: true,
+      }], createdAt: NOW,
+    };
+    const selection = {
+      id: "selection-1",
+      profileId: "profile-1", profileRevision: 1, subjectKind: "controller_turn" as const, subjectId: "turn-1",
+      capabilityId: "telegram_agent_convex_project_inspect", capabilityKind: "connector" as const, descriptorDigest: descriptor.digest,
+      eventType: "selected" as const, reasonCode: "profile_selected", mandatory: true,
+      outcome: null, evidenceRefs: [], createdAt: NOW,
+    };
     const store: ProtectedConnectorAccessStore = {
       listProtectedConnectorBindings: () => [current],
       getProtectedConnectorBinding: () => current,
@@ -178,11 +229,14 @@ describe("protected connector Hanoon boundary", () => {
       },
       markProtectedConnectorOperationAmbiguous: () => null,
       getProtectedConnectorReceipt: () => null,
+      getCapabilityProfileById: () => profile,
+      listCapabilityReceipts: () => [selection],
       runControllerMutation: (_fence, mutation) => ({ outcome: "applied", mutationValue: mutation(NOW) }),
     };
     const service = new ProtectedConnectorAccessService({
       store,
       client: () => ({
+        attestExecutorFence: async () => true,
         call: vi.fn(async (request: ProtectedConnectorRequestEnvelope) => {
           events.push("provider-response");
           return { outcome: "succeeded", response: requestFrom(request) } as const;
@@ -219,6 +273,24 @@ describe("protected connector Hanoon boundary", () => {
       updatedAt: number;
     } | null = null;
     const sent: ProtectedConnectorRequestEnvelope[] = [];
+    const descriptor = capabilityDescriptorById("telegram_agent_convex_project_inspect")!;
+    const profile = {
+      id: "profile-1", subjectKind: "controller_turn" as const, subjectId: "turn-1", threadId: "thread-1",
+      revision: 1, recipeId: "architectural", recipeVersion: 1,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST, graphDigest: CAPABILITY_GRAPH_DIGEST,
+      mode: "active" as const, model: { pool: "standard" as const, providerId: "claude-code", modelId: "model", reasoning: "xhigh" as const, serviceTier: "default" as const },
+      reasonCodes: [], traits: [], assignments: [{
+        capabilityId: "telegram_agent_convex_project_inspect", capabilityKind: "connector" as const,
+        descriptorDigest: descriptor.digest, mandatory: true,
+      }], createdAt: NOW,
+    };
+    const selection = {
+      id: "selection-1",
+      profileId: "profile-1", profileRevision: 1, subjectKind: "controller_turn" as const, subjectId: "turn-1",
+      capabilityId: "telegram_agent_convex_project_inspect", capabilityKind: "connector" as const, descriptorDigest: descriptor.digest,
+      eventType: "selected" as const, reasonCode: "profile_selected", mandatory: true,
+      outcome: null, evidenceRefs: [], createdAt: NOW,
+    };
     const store: ProtectedConnectorAccessStore = {
       listProtectedConnectorBindings: () => [current],
       getProtectedConnectorBinding: () => current,
@@ -263,12 +335,15 @@ describe("protected connector Hanoon boundary", () => {
         return persisted;
       },
       getProtectedConnectorReceipt: () => null,
+      getCapabilityProfileById: () => profile,
+      listCapabilityReceipts: () => [selection],
       runControllerMutation: (_fence, mutation) => ({ outcome: "applied", mutationValue: mutation(NOW) }),
     };
     let calls = 0;
     const service = new ProtectedConnectorAccessService({
       store,
       client: () => ({
+        attestExecutorFence: async () => true,
         call: vi.fn(async (request: ProtectedConnectorRequestEnvelope) => {
           sent.push(request);
           calls += 1;
@@ -292,5 +367,99 @@ describe("protected connector Hanoon boundary", () => {
       .resolves.toMatchObject({ outcome: "succeeded" });
     expect(sent).toHaveLength(2);
     expect(sent[1]).toEqual(sent[0]);
+  });
+
+  it("denies missing selected connector evidence before the broker caller", async () => {
+    const call = vi.fn();
+    const store = {
+      listProtectedConnectorBindings: () => [binding],
+      getCapabilityProfileById: () => null,
+      listCapabilityReceipts: () => [],
+    } as unknown as ProtectedConnectorAccessStore;
+    const service = new ProtectedConnectorAccessService({
+      store,
+      client: () => ({ call }),
+      config: () => config,
+      trustKernelReady: () => true,
+      topologyReady: () => true,
+      browserAdministrationIsolated: () => false,
+      auditWritable: () => true,
+      projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
+      now: () => NOW,
+    });
+
+    await expect(service.inspect({
+      operation: binding.operation,
+      projectId: "project-1",
+      bindingId: binding.bindingId,
+      authorized,
+    })).resolves.toEqual({ outcome: "denied", reason: "capability_evidence_missing" });
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", "convex.project.inspect.v1"],
+    ["stale", "convex.project.inspect.v1"],
+    ["missing", "vercel.project.inspect.v1"],
+    ["stale", "vercel.project.inspect.v1"],
+    ["missing", "browser.vercel_project.inspect.v1"],
+    ["stale", "browser.vercel_project.inspect.v1"],
+  ] as const)("requires a %s selected receipt for the operation-specific %s assignment", async (evidenceState, operation) => {
+    const candidate = operationBinding(operation);
+    const call = vi.fn();
+    const selectedReceipts = evidenceState === "missing" ? [] : [{
+      id: "stale-selection",
+      profileId: "profile-1",
+      profileRevision: 0,
+      subjectKind: "controller_turn" as const,
+      subjectId: "turn-1",
+      capabilityId: protectedConnectorCapabilityFor(operation),
+      capabilityKind: "connector" as const,
+      descriptorDigest: capabilityDescriptorById(protectedConnectorCapabilityFor(operation))!.digest,
+      eventType: "selected" as const,
+      reasonCode: "profile_selected",
+      mandatory: true,
+      outcome: null,
+      evidenceRefs: [],
+      createdAt: NOW,
+    }];
+    const store = {
+      listProtectedConnectorBindings: () => [candidate],
+      getCapabilityProfileById: () => ({
+        id: "profile-1",
+        subjectKind: "controller_turn" as const,
+        subjectId: "turn-1",
+        revision: 1,
+        mode: "active" as const,
+        registryDigest: CAPABILITY_REGISTRY_DIGEST,
+        graphDigest: CAPABILITY_GRAPH_DIGEST,
+        assignments: [{
+          capabilityId: protectedConnectorCapabilityFor(operation),
+          capabilityKind: "connector" as const,
+          descriptorDigest: capabilityDescriptorById(protectedConnectorCapabilityFor(operation))!.digest,
+          mandatory: true,
+        }],
+      }),
+      listCapabilityReceipts: () => selectedReceipts,
+    } as unknown as ProtectedConnectorAccessStore;
+    const service = new ProtectedConnectorAccessService({
+      store,
+      client: () => ({ call }),
+      config: () => config,
+      trustKernelReady: () => true,
+      topologyReady: () => true,
+      browserAdministrationIsolated: () => operation === "browser.vercel_project.inspect.v1",
+      auditWritable: () => true,
+      projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
+      now: () => NOW,
+    });
+
+    await expect(service.inspect({
+      operation,
+      projectId: "project-1",
+      bindingId: candidate.bindingId,
+      authorized,
+    })).resolves.toEqual({ outcome: "denied", reason: "capability_evidence_missing" });
+    expect(call).not.toHaveBeenCalled();
   });
 });

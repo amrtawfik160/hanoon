@@ -12,6 +12,7 @@ type ResolvedSecret = Readonly<{
 export type OnePasswordPort = Readonly<{
   listVaults(): Promise<readonly { id: string }[]>;
   resolveOne(reference: string, signal?: AbortSignal): Promise<ResolvedSecret | { outcome: "invalid" }>;
+  close?(): void | Promise<void>;
 }>;
 
 type AdapterFailureClass = "vault_auth_failed" | "provider_rate_limited" | "provider_unavailable";
@@ -102,7 +103,12 @@ async function createSdkPort(serviceToken: string): Promise<OnePasswordPort> {
       const vaults = await client.vaults.list({ decryptDetails: false });
       return vaults.map((vault) => ({ id: vault.id }));
     },
-    resolveOne: async (reference) => resolveSdkReference(client, reference),
+    resolveOne: async (reference, signal) => abortable(resolveSdkReference(client, reference), signal),
+    // The SDK owns its transport and exposes no public close operation. Keep a
+    // lifecycle seam here so a future SDK can release it without changing the
+    // broker composition; request cancellation still stops this adapter's
+    // caller from waiting on the SDK promise.
+    close: () => undefined,
   };
 }
 
@@ -225,7 +231,7 @@ async function resolveProviderCredential(
 
 export async function createOnePasswordAdapter(
   options: OnePasswordAdapterOptions,
-): Promise<VaultAdapter & { resolveCredential: ProviderCredentialResolver["resolve"] }> {
+): Promise<VaultAdapter & { resolveCredential: ProviderCredentialResolver["resolve"]; close(): Promise<void> }> {
   let port = options.port;
   let initializationFailure: AdapterFailure | null = null;
   if (!port) {
@@ -250,5 +256,8 @@ export async function createOnePasswordAdapter(
           retryAfterMs: initializationFailure.retryAfterMs,
         }
       : resolveProviderCredential(port!, reference, signal),
+    close: async () => {
+      await port?.close?.();
+    },
   };
 }

@@ -70,11 +70,11 @@ Hanoon carries the first slice of a separate credential broker: a protected serv
 
 While it applies, this foundation only ever proves that the broker can reach a configured vault item — never that the resulting credential works for its application:
 
-- `bb telegram-agent access list` and `bb telegram-agent access status [binding-id]` are the only operator commands, and they read local, secret-free metadata; there is deliberately no `access verify` or enrollment command in this CLI.
+- `bb telegram-agent access list` and `bb telegram-agent access status [binding-id]` read local, secret-free metadata. `bb telegram-agent access reconcile <project-id> --projection-json <json> --json` imports only a validated, secret-free projection from protected-host enrollment while an active controller project/thread and executor lease are present; it never resolves or verifies a credential.
 - The owner can ask Hanoon in Telegram to run a live verification of one known binding; a pass moves that binding to `vault_verified`, never `active`, and Hanoon never claims an application login succeeded from it.
 - A protected-host operator enrolls a typed connector target with `connector binding enroll --stdin`. The broker atomically stores the encrypted target/reference and policy, then returns a secret-free projection for Hanoon reconciliation. No credential or live provider resource is created by enrollment.
 - Connector inspection uses the exact selected capability and fixed adapter route. Current broker readiness, topology, audit, fence, receipt, and target identity are checked before and after dispatch; ambiguous retries reuse the persisted envelope.
-- The checked-in recovery proof uses only local synthetic vault and TLS-provider fixtures. It proves projection reconciliation, bounded cancellation, receipts, restart/ambiguity replay, and canary absence without claiming that a live provider or credential was contacted.
+- The checked-in recovery proof uses only local synthetic vault and TLS-provider fixtures. It proves controller-fenced projection reconciliation, bounded cancellation, receipts, restart/ambiguity replay, and canary absence without claiming that a live provider or credential was contacted.
 - `bb telegram-agent doctor` reports one `credential broker` row, `disabled`, until isolated mode is configured, and one row per readiness check afterwards; see [Configuration](docs/configuration.md#credential-broker-foundation) and [Operations](docs/operations.md#credential-broker).
 
 ## Architecture

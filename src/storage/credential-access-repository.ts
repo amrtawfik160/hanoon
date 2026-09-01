@@ -243,17 +243,11 @@ export class CredentialAccessRepository {
     failureClass: BrokerFailureClass;
     now: number;
   }>): CredentialHealthRecord | null {
-    const row = this.healthRow(input.installationId);
-    if (!row) return null;
-    this.db.prepare(`
-      UPDATE credential_health
-         SET adapter_state = 'unavailable', audit_writable = 0,
-             last_attempt_at = ?, last_failure_at = ?, last_failure_class = ?,
-             updated_at = ?
-       WHERE installation_id = ?
-    `).run(input.now, input.now, input.failureClass, input.now, input.installationId);
-    const updated = this.healthRow(input.installationId);
-    return updated ? toHealthRecord(updated) : null;
+    return this.db.transaction(() => {
+      this.markHealthUnavailableInTransaction(input);
+      const updated = this.healthRow(input.installationId);
+      return updated ? toHealthRecord(updated) : null;
+    }).immediate();
   }
 
   public listCredentialBindings(input: Readonly<{
@@ -494,6 +488,20 @@ export class CredentialAccessRepository {
     ).get(installationId) as HealthRow | undefined;
   }
 
+  private markHealthUnavailableInTransaction(input: Readonly<{
+    installationId: string;
+    failureClass: BrokerFailureClass;
+    now: number;
+  }>): void {
+    this.db.prepare(`
+      UPDATE credential_health
+         SET adapter_state = 'unavailable', audit_writable = 0,
+             last_attempt_at = ?, last_failure_at = ?, last_failure_class = ?,
+             updated_at = ?
+       WHERE installation_id = ?
+    `).run(input.now, input.now, input.failureClass, input.now, input.installationId);
+  }
+
   // --- private: operations ----------------------------------------------------
 
   private operationByRequestId(installationId: string, requestId: string): OperationRow | undefined {
@@ -612,6 +620,12 @@ export class CredentialAccessRepository {
         health: input.response.health,
         bindings: input.response.bindings,
         responseSha256: hashResponse(input.response),
+        now: input.now,
+      });
+    } else if (input.response.operation === "broker.health" && input.response.outcome === "failed") {
+      this.markHealthUnavailableInTransaction({
+        installationId: input.installationId,
+        failureClass: input.response.failureClass ?? "provider_unavailable",
         now: input.now,
       });
     }
