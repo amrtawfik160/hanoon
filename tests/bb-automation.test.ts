@@ -188,6 +188,23 @@ describe("BB automation adapter", () => {
     })).rejects.toThrow("schedule did not reconcile");
   });
 
+  it("verifies the requested paused state after a pause command", async () => {
+    const paused = observed({ enabled: false, nextRunAt: null });
+    const responses: CommandResult[] = [
+      { outcome: "exited", exitCode: 0, output: JSON.stringify(paused) },
+      { outcome: "exited", exitCode: 0, output: JSON.stringify(paused) },
+    ];
+    const adapter = new TerminalBbAutomationAdapter({ run: async () => responses.shift()! });
+
+    await expect(adapter.setEnabled({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      projectId: definition.projectId,
+      automationId: "auto_1",
+      enabled: false,
+      expectedDefinition: definition,
+    })).resolves.toMatchObject({ enabled: false });
+  });
+
   it("can reconcile an intentionally paused automation without treating it as drift", () => {
     expect(() => assertAutomationMatches(definition, observed({ enabled: false, nextRunAt: null }), false))
       .not.toThrow();

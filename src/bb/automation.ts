@@ -96,6 +96,7 @@ export type BbAutomation = z.infer<typeof bbAutomationSchema>;
 const bbAutomationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),
+  idempotencyKey: z.string().min(1).max(256).nullable().optional(),
   runMode: z.enum(["agent", "script"]),
   threadId: z.string().min(1).nullable(),
   status: z.enum(["running", "succeeded", "failed", "skipped"]),
@@ -500,7 +501,7 @@ export class TerminalBbAutomationAdapter {
       schema: bbAutomationSchema,
       signal: input.signal,
     });
-    const observed = await this.show(input);
+    const observed = await this.show({ ...input, expectedEnabled: input.enabled });
     if (observed.enabled !== input.enabled) throw new Error("BB automation enabled state did not reconcile");
     return observed;
   }
@@ -519,7 +520,13 @@ export class TerminalBbAutomationAdapter {
       schema: z.object({ run: bbAutomationRunSchema }).passthrough(),
       signal: input.signal,
     });
-    return response.run;
+    if (response.run.idempotencyKey !== undefined && response.run.idempotencyKey !== null &&
+      response.run.idempotencyKey !== input.idempotencyKey) {
+      throw new TypeError("BB automation run acknowledgement identity did not match its idempotency key");
+    }
+    return response.run.idempotencyKey === input.idempotencyKey
+      ? response.run
+      : { ...response.run, idempotencyKey: input.idempotencyKey };
   }
 
   public async runs(input: {

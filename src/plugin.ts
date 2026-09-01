@@ -678,7 +678,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
       const evidence = binding.capabilityEvidence;
       if (!authority || authority.origin !== "owner" || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
-        operation.operationClass !== "create" || operation.targetProjectId !== binding.projectId ||
+        !(["create", "update", "enable", "disable", "run_now", "retire", "reconcile"] as const).includes(operation.operationClass) ||
+        operation.targetProjectId !== binding.projectId ||
         authority.taskAuthority.kind !== "controller-turn" || authority.taskAuthority.turnId === "") return false;
       const profile = store.getCapabilityProfileById(evidence.profileId);
       if (!profile || profile.mode !== "active" || profile.subjectKind !== "controller_turn" ||

@@ -19,6 +19,7 @@ import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import {
   ALL_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
+  MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
@@ -506,10 +507,14 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+    [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const stateUpgradeOffset = MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+    const lifecycleOffset = MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
+    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(lifecycleOffset + index + 1))).toBe(migration);
+    });
+    const stateUpgradeOffset = lifecycleOffset + MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));

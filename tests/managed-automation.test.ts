@@ -25,6 +25,7 @@ import { registerControllerTools } from "../src/controller/tools";
 import { policyFixture } from "./helpers";
 import { submittedControllerFixture } from "./support/controller-trust-fixtures";
 import type {
+  ManagedAutomationAuthority,
   ManagedAutomationCreateReceipt,
   ManagedAutomationObservation,
   ManagedAutomationProviderIdentity,
@@ -156,7 +157,7 @@ function fixture() {
   return { bb, store, repository };
 }
 
-function fakeAdapter() {
+function fakeAdapter(runClock = NOW) {
   const automations = new Map<string, BbAutomation>();
   const runs = new Map<string, BbAutomationRun[]>();
   const create = vi.fn(async ({ definition: value, identity }: {
@@ -210,7 +211,20 @@ function fakeAdapter() {
       automations.set(automationId, updated);
       return managedObservation(updated, expectedDefinition);
     }),
-    runNow: vi.fn(async ({ automationId }) => runEvidence({ automationId, trigger: "manual" })),
+    runNow: vi.fn(async ({ automationId, idempotencyKey }) => {
+      const previous = (runs.get(automationId) ?? []).find((candidate) => candidate.idempotencyKey === idempotencyKey);
+      if (previous) return previous;
+      const run = runEvidence({
+        automationId,
+        trigger: "manual",
+        idempotencyKey,
+        scheduledFor: runClock,
+        startedAt: runClock + 1,
+        finishedAt: runClock + 2,
+      });
+      runs.set(automationId, [...(runs.get(automationId) ?? []), run]);
+      return run;
+    }),
     runs: vi.fn(async ({ automationId }) => runs.get(automationId) ?? []),
     delete: vi.fn(async ({ automationId }) => {
       if (!automations.delete(automationId)) throw new BbAutomationNotFoundError();
@@ -372,6 +386,944 @@ describe("managed BB automations", () => {
       await controllerFixture.dispose();
     }
   });
+
+  it("queues an owner definition update without calling BB during controller submission", async () => {
+    const controllerFixture = submittedControllerFixture();
+    try {
+      const controller = controllerFixture.store.getControllerForOwner("7", "7");
+      if (!controller?.threadId || !controller.projectId || !controller.hostId) {
+        throw new Error("controller fixture is incomplete");
+      }
+      controllerFixture.store.upsertProjectPolicy(policyFixture(), 2_000);
+      if (!controllerFixture.turn.capabilityProfileId) throw new Error("controller profile is missing");
+      expect(controllerFixture.store.requestControllerCapabilityExpansion({
+        controllerKey: controller.controllerKey,
+        turnId: controllerFixture.turn.id,
+        expectedProfileId: controllerFixture.turn.capabilityProfileId,
+        bundleIds: ["monitoring"],
+        now: 2_000,
+      }).outcome).toBe("resume_required");
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      registerControllerTools(controllerFixture.bb, {
+        store: controllerFixture.store,
+        sdk: controllerFixture.bb.sdk,
+        threadOperations: { request: vi.fn() },
+        health: () => ({ ok: true }),
+        notify: vi.fn(),
+        now: () => 2_000,
+        controllerProviderId: () => "codex-provider",
+        controllerExecution: () => ({
+          model: "gpt-5.6-sol",
+          reasoningLevel: "high",
+          serviceTier: "default",
+          permissionMode: "auto",
+        }),
+        automations: service,
+      });
+      const context = {
+        threadId: controller.threadId,
+        projectId: controller.projectId,
+        signal: new AbortController().signal,
+      };
+      const createdValue = await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+        context,
+      );
+      const created = JSON.parse(typeof createdValue === "string" ? createdValue : JSON.stringify(createdValue)) as {
+        watching: { id: string };
+      };
+      const reconciler = new ManagedAutomationReconciler({
+        repository,
+        service,
+        store: controllerFixture.store,
+        notify: vi.fn(),
+      });
+      await reconciler.processDue(2_001, context.signal, {
+        ownerId: controllerFixture.fence.ownerId,
+        generation: controllerFixture.fence.generation,
+        signal: context.signal,
+      });
+      expect(fake.create).toHaveBeenCalledOnce();
+      vi.mocked(fake.adapter.update).mockClear();
+
+      const updatedValue = await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        {
+          kind: "update_schedule",
+          id: created.watching.id,
+          cron: "30 9 * * 1-5",
+          instruction: "Send the revised weekday digest.",
+        },
+        context,
+      );
+      const updated = JSON.parse(typeof updatedValue === "string" ? updatedValue : JSON.stringify(updatedValue)) as {
+        watching: { id: string; state: string; definitionRevision: number; desiredState: string; observed: unknown };
+      };
+
+      expect(fake.adapter.update).not.toHaveBeenCalled();
+      expect(updated.watching).toMatchObject({
+        id: created.watching.id,
+        state: "updating",
+        definitionRevision: 2,
+        desiredState: "enabled",
+        observed: expect.objectContaining({ enabled: true }),
+      });
+      expect(repository.get(created.watching.id)).toMatchObject({
+        state: "updating",
+        definitionRevision: 2,
+        desiredState: "enabled",
+        lastOperationOutcome: "pending",
+        lastReconciledOperationId: expect.any(String),
+      });
+      expect(repository.getOperation(repository.get(created.watching.id)!.lastOperationId!)).toMatchObject({
+        operationClass: "update",
+        state: "pending",
+        definitionRevision: 2,
+        intentKey: controllerFixture.turn.id,
+      });
+
+      const retriedValue = await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        {
+          kind: "update_schedule",
+          id: created.watching.id,
+          cron: "30 9 * * 1-5",
+          instruction: "Send the revised weekday digest.",
+        },
+        context,
+      );
+      const retried = JSON.parse(typeof retriedValue === "string" ? retriedValue : JSON.stringify(retriedValue)) as {
+        watching: { id: string; state: string; definitionRevision: number };
+      };
+      expect(fake.adapter.update).not.toHaveBeenCalled();
+      expect(retried.watching).toMatchObject({
+        id: created.watching.id,
+        state: "updating",
+        definitionRevision: 2,
+      });
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it("routes registered owner pause, resume, run-now, and retirement through the durable executor", async () => {
+    const controllerFixture = submittedControllerFixture();
+    try {
+      const controller = controllerFixture.store.getControllerForOwner("7", "7");
+      if (!controller?.threadId || !controller.projectId || !controller.hostId) {
+        throw new Error("controller fixture is incomplete");
+      }
+      controllerFixture.store.upsertProjectPolicy(policyFixture(), 2_000);
+      if (!controllerFixture.turn.capabilityProfileId) throw new Error("controller profile is missing");
+      expect(controllerFixture.store.requestControllerCapabilityExpansion({
+        controllerKey: controller.controllerKey,
+        turnId: controllerFixture.turn.id,
+        expectedProfileId: controllerFixture.turn.capabilityProfileId,
+        bundleIds: ["monitoring"],
+        now: 2_000,
+      }).outcome).toBe("resume_required");
+
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter(2_000);
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      registerControllerTools(controllerFixture.bb, {
+        store: controllerFixture.store,
+        sdk: controllerFixture.bb.sdk,
+        threadOperations: { request: vi.fn() },
+        health: () => ({ ok: true }),
+        notify: vi.fn(),
+        now: () => 2_000,
+        controllerProviderId: () => "codex-provider",
+        controllerExecution: () => ({
+          model: "gpt-5.6-sol",
+          reasoningLevel: "high",
+          serviceTier: "default",
+          permissionMode: "auto",
+        }),
+        automations: service,
+      });
+      const context = {
+        threadId: controller.threadId,
+        projectId: controller.projectId,
+        signal: new AbortController().signal,
+      };
+      const process = async (now: number): Promise<void> => {
+        const reconciler = new ManagedAutomationReconciler({
+          repository,
+          service,
+          store: controllerFixture.store,
+          notify: vi.fn(),
+        });
+        await reconciler.processDue(now, context.signal, {
+          ownerId: controllerFixture.fence.ownerId,
+          generation: controllerFixture.fence.generation,
+          signal: context.signal,
+        });
+      };
+      const parseWatching = (value: unknown) => JSON.parse(
+        typeof value === "string" ? value : JSON.stringify(value),
+      ) as { watching: { id: string; state: string; desiredState: string } };
+
+      const created = parseWatching(await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+        context,
+      ));
+      await process(2_001);
+      expect(fake.create).toHaveBeenCalledOnce();
+
+      const paused = parseWatching(await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "pause_schedule", id: created.watching.id },
+        context,
+      ));
+      expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+      expect(paused.watching).toMatchObject({ state: "updating", desiredState: "paused" });
+      await process(2_002);
+      expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(1);
+      expect(repository.get(created.watching.id)).toMatchObject({ state: "paused", desiredState: "paused" });
+
+      const pausedUpdate = parseWatching(await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        {
+          kind: "update_schedule",
+          id: created.watching.id,
+          cron: "15 9 * * 1-5",
+          instruction: "Send the revised paused weekday digest.",
+        },
+        context,
+      ));
+      expect(pausedUpdate.watching).toMatchObject({ state: "updating", desiredState: "paused" });
+      await process(2_003);
+      expect(repository.get(created.watching.id)).toMatchObject({
+        state: "paused",
+        desiredState: "paused",
+        definitionRevision: 2,
+      });
+
+      const resumed = parseWatching(await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "resume_schedule", id: created.watching.id },
+        context,
+      ));
+      expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(1);
+      expect(resumed.watching).toMatchObject({ state: "updating", desiredState: "enabled" });
+      await process(2_003);
+      expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(2);
+      expect(repository.get(created.watching.id)).toMatchObject({ state: "active", desiredState: "enabled" });
+
+      const runNow = parseWatching(await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "run_now", id: created.watching.id },
+        context,
+      ));
+      expect(fake.adapter.runNow).not.toHaveBeenCalled();
+      expect(runNow.watching).toMatchObject({ state: "active", desiredState: "enabled" });
+      await process(2_004);
+      expect(fake.adapter.runNow).toHaveBeenCalledOnce();
+      const runOperation = repository.getOperation(repository.get(created.watching.id)!.lastOperationId!);
+      expect(runOperation).toMatchObject({
+        operationClass: "run_now",
+        state: "succeeded",
+        outcome: { kind: "settled", runReceipt: expect.objectContaining({
+          version: 1,
+          automationBindingId: created.watching.id,
+          initiatingOperationId: runOperation?.id,
+          outcomeClass: "succeeded",
+        }) },
+      });
+
+      const cancelled = await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_cancel_watch",
+        { id: created.watching.id },
+        context,
+      );
+      expect(cancelled).toContain('"cancelled":true');
+      expect(fake.adapter.delete).not.toHaveBeenCalled();
+      expect(repository.get(created.watching.id)).toMatchObject({ state: "retiring", desiredState: "retired" });
+      await process(2_005);
+      expect(fake.adapter.delete).toHaveBeenCalledOnce();
+      expect(repository.get(created.watching.id)).toMatchObject({ state: "retired", desiredState: "retired" });
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it("settles an owner definition update through the real SQLite executor", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
+    });
+    const updatedDefinition = {
+      ...definition,
+      trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
+      prompt: "Check production and report the revised material change.",
+    };
+    const updateAuthority = versionedOwnerAuthority("turn_update") as ManagedAutomationAuthority;
+    const submitted = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "update",
+      desiredState: "enabled",
+      authority: updateAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_update" },
+      definition: updatedDefinition,
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+
+    await reconciler.processDue(NOW + 2, new AbortController().signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal: new AbortController().signal,
+    });
+
+    expect(fake.adapter.update).toHaveBeenCalledOnce();
+    expect(repository.get(submitted.id)).toMatchObject({
+      state: "active",
+      definitionRevision: 2,
+      desiredState: "enabled",
+      definition: updatedDefinition,
+      lastOperationOutcome: "succeeded",
+      lastReconciledOperationId: submitted.lastOperationId,
+      lastReconciledOperationOutcome: "succeeded",
+    });
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({
+      state: "succeeded",
+      operationClass: "update",
+      definitionRevision: 2,
+    });
+  });
+
+  it("routes pause, resume, and run-now through durable operations", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const execute = async (
+      turnId: string,
+      operationClass: "disable" | "enable" | "run_now",
+      desiredState: "paused" | "enabled",
+      now: number,
+    ) => {
+      const callsBefore = vi.mocked(fake.adapter.setEnabled).mock.calls.length + vi.mocked(fake.adapter.runNow).mock.calls.length;
+      const submitted = service.submitLifecycleOperation({
+        id: created.id,
+        operationClass,
+        desiredState,
+        authority: versionedOwnerAuthority(turnId) as ManagedAutomationAuthority,
+        controllerFence: { ownerId: "controller-executor", generation: 1, turnId },
+        now,
+        mutate: (mutation) => mutation(),
+      });
+      expect(vi.mocked(fake.adapter.setEnabled).mock.calls.length + vi.mocked(fake.adapter.runNow).mock.calls.length).toBe(callsBefore);
+      const reconciler = new ManagedAutomationReconciler({
+        repository,
+        service,
+        store,
+        notify: vi.fn(),
+      });
+      await reconciler.processDue(now + 1, new AbortController().signal, {
+        ownerId: "automation-executor",
+        generation: lease.generation,
+        signal: new AbortController().signal,
+      });
+      return submitted;
+    };
+
+    const paused = await execute("turn_pause", "disable", "paused", NOW + 1);
+    expect(repository.get(paused.id)).toMatchObject({ state: "paused", desiredState: "paused" });
+    const resumed = await execute("turn_resume", "enable", "enabled", NOW + 3);
+    expect(repository.get(resumed.id)).toMatchObject({ state: "active", desiredState: "enabled" });
+    const run = await execute("turn_run", "run_now", "enabled", NOW + 5);
+
+    expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(2);
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
+    expect(repository.getOperation(run.lastOperationId!)).toMatchObject({
+      operationClass: "run_now",
+      state: "succeeded",
+      outcome: {
+        kind: "settled",
+        runReceipt: expect.objectContaining({
+          version: 1,
+          providerRunId: "run_1",
+          automationBindingId: created.id,
+          definitionRevision: 1,
+          initiatingOperationId: run.lastOperationId,
+          outcomeClass: "succeeded",
+        }),
+      },
+    });
+    expect(repository.get(created.id)).toMatchObject({
+      lastReconciledOperationId: run.lastOperationId,
+      lastReconciledOperationOutcome: "succeeded",
+      lastRunId: "run_1",
+    });
+    const retry = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("turn_run") as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_run" },
+      now: NOW + 7,
+      mutate: (mutation) => mutation(),
+    });
+    expect(retry.lastOperationId).toBe(run.lastOperationId);
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects lifecycle submission when persisted capability evidence is not current", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => false);
+    const created = await service.create(createInput());
+
+    expect(() => service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "disable",
+      desiredState: "paused",
+      authority: versionedOwnerAuthority("turn_denied") as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_denied" },
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    })).toThrow("capability evidence is not current");
+
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+    expect(repository.get(created.id)).toMatchObject({
+      state: "active",
+      desiredState: "enabled",
+      lastOperationId: null,
+    });
+  });
+
+  it("executes lifecycle submissions promptly when the reconciler instance is reused", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter(2_000);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+
+    service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "disable",
+      desiredState: "paused",
+      authority: versionedOwnerAuthority("turn_prompt_pause") as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_prompt_pause" },
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "enable",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("turn_prompt_resume") as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_prompt_resume" },
+      now: NOW + 3,
+      mutate: (mutation) => mutation(),
+    });
+    await reconciler.processDue(NOW + 4, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(2);
+    expect(repository.get(created.id)).toMatchObject({ state: "active", desiredState: "enabled" });
+  });
+
+  it("routes retirement through a durable operation and makes the terminal state idempotent", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const authority = versionedOwnerAuthority("turn_retire") as ManagedAutomationAuthority;
+    const submitted = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "retire",
+      desiredState: "retired",
+      authority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_retire" },
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+
+    expect(fake.adapter.delete).not.toHaveBeenCalled();
+    expect(submitted).toMatchObject({
+      state: "retiring",
+      desiredState: "retired",
+      observed: expect.objectContaining({ providerAutomationId: "auto_1" }),
+      lastOperationOutcome: "pending",
+    });
+
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(fake.adapter.delete).toHaveBeenCalledOnce();
+    expect(repository.get(created.id)).toMatchObject({
+      state: "retired",
+      desiredState: "retired",
+      lastOperationId: submitted.lastOperationId,
+      lastOperationOutcome: "succeeded",
+      lastReconciledOperationId: submitted.lastOperationId,
+      lastReconciledOperationOutcome: "succeeded",
+    });
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({
+      operationClass: "retire",
+      state: "succeeded",
+    });
+
+    const retry = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "retire",
+      desiredState: "retired",
+      authority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_retire" },
+      now: NOW + 3,
+      mutate: (mutation) => mutation(),
+    });
+    expect(retry.lastOperationId).toBe(submitted.lastOperationId);
+    expect(fake.adapter.delete).toHaveBeenCalledOnce();
+  });
+
+  it("retries an ambiguous retirement by observing absence before deleting again", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const submitted = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "retire",
+      desiredState: "retired",
+      authority: versionedOwnerAuthority("turn_retire_timeout") as ManagedAutomationAuthority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_retire_timeout" },
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    const originalDelete = fake.adapter.delete;
+    const deleteCall = vi.spyOn(fake.adapter, "delete").mockImplementationOnce(async (input) => {
+      await originalDelete(input);
+      throw new Error("BB automation delete timed out after applying");
+    });
+    const originalShow = fake.adapter.show;
+    const showCall = vi.spyOn(fake.adapter, "show").mockImplementation(async (input) => {
+      try {
+        return await originalShow(input);
+      } catch {
+        throw new BbAutomationNotFoundError();
+      }
+    });
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({ state: "ambiguous" });
+
+    await reconciler.processDue(NOW + 60_003, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(deleteCall).toHaveBeenCalledOnce();
+    expect(showCall).toHaveBeenCalledOnce();
+    expect(repository.get(created.id)).toMatchObject({ state: "retired", desiredState: "retired" });
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({ state: "succeeded" });
+  });
+
+  it("runs reconciliation as the same durable operation path and records observed provider truth", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
+    });
+    fake.automations.set(created.bbAutomationId!, automation(definition, {
+      id: created.bbAutomationId!,
+      name: providerName(definition.name, {
+        operationId: created.id,
+        ownershipMarker: created.providerOwnershipMarker!,
+      }),
+      enabled: false,
+    }));
+    vi.mocked(fake.adapter.show).mockClear();
+    vi.mocked(fake.adapter.update).mockClear();
+    vi.mocked(fake.adapter.setEnabled).mockClear();
+    vi.mocked(fake.adapter.runs).mockClear();
+
+    const submitted = service.submitReconciliationOperation({
+      binding: created,
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    expect(submitted).toMatchObject({ state: "active", lastOperationOutcome: "pending" });
+    expect(repository.getOperation(submitted!.lastOperationId!)).toMatchObject({
+      operationClass: "reconcile",
+      state: "pending",
+      intentKey: "reconcile:initial",
+    });
+    expect(fake.adapter.show).toHaveBeenCalledTimes(0);
+    expect(fake.adapter.update).toHaveBeenCalledTimes(0);
+    expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(0);
+
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(fake.adapter.show).toHaveBeenCalledOnce();
+    expect(fake.adapter.update).toHaveBeenCalledOnce();
+    expect(fake.adapter.setEnabled).toHaveBeenCalledOnce();
+    expect(fake.adapter.runs).toHaveBeenCalledOnce();
+    expect(repository.get(created.id)).toMatchObject({
+      state: "active",
+      desiredState: "enabled",
+      observed: expect.objectContaining({ enabled: true }),
+      lastOperationOutcome: "succeeded",
+      lastReconciledOperationOutcome: "succeeded",
+    });
+  });
+
+  it("reconciles an update timeout by operation identity before retrying the provider", async () => {
+    const { store, repository } = fixture();
+    store.createPairingCode(hashSecret("pair-update-timeout"), NOW - 1_000, NOW + 10_000);
+    expect(store.pairOwnerWithPrivateChatCode(
+      hashSecret("pair-update-timeout"),
+      "7",
+      "70",
+      NOW - 500,
+    )).toEqual({ ok: true });
+    store.enqueueControllerTurn({
+      controllerKey: "owner-7-controller",
+      telegramUserId: "7",
+      telegramChatId: "70",
+      updateId: 1,
+      inputText: "Create the controller fixture.",
+      now: NOW - 400,
+    });
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW - 300);
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const updatedDefinition = {
+      ...definition,
+      trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
+    };
+    const submitted = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "update",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("turn_update_timeout") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_update_timeout",
+      },
+      definition: updatedDefinition,
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    const originalUpdate = fake.adapter.update;
+    let updateCalls = 0;
+    const timedOutUpdate = vi.spyOn(fake.adapter, "update").mockImplementation(async (input) => {
+      updateCalls += 1;
+      const observed = await originalUpdate(input);
+      throw new Error("BB automation command timed out after applying the update");
+    });
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(updateCalls).toBe(1);
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({ state: "ambiguous" });
+    expect(repository.get(submitted.id)).toMatchObject({
+      state: "updating",
+      lastReconciledOperationOutcome: "ambiguous",
+    });
+
+    timedOutUpdate.mockRestore();
+    await reconciler.processDue(NOW + 60_003, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(updateCalls).toBe(1);
+    expect(repository.get(submitted.id)).toMatchObject({
+      state: "active",
+      definitionRevision: 2,
+      lastOperationOutcome: "succeeded",
+      lastReconciledOperationOutcome: "succeeded",
+    });
+  });
+
+  it("reconciles a run-now timeout from its stable idempotency key before retrying", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const authority = versionedOwnerAuthority("turn_run_timeout") as ManagedAutomationAuthority;
+    const submitted = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority,
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_run_timeout" },
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    const originalRunNow = fake.adapter.runNow;
+    let runNowCalls = 0;
+    const timedOutRunNow = vi.spyOn(fake.adapter, "runNow").mockImplementation(async (input) => {
+      runNowCalls += 1;
+      const run = await originalRunNow(input);
+      throw new Error("BB automation command timed out after accepting the run");
+    });
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(runNowCalls).toBe(1);
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({ state: "ambiguous" });
+    timedOutRunNow.mockRestore();
+    await reconciler.processDue(NOW + 60_003, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(runNowCalls).toBe(1);
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({
+      state: "succeeded",
+      outcome: { kind: "settled", runReceipt: expect.objectContaining({
+        initiatingOperationId: submitted.lastOperationId,
+        providerRunId: "run_1",
+      }) },
+    });
+  });
+
+  it.each(["update", "run_now"] as const)(
+    "does not call BB when the executor lease is lost before a %s operation",
+    async (operationClass) => {
+      const { bb, store, repository } = fixture();
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      const created = await service.create(createInput());
+      const updatedDefinition = {
+        ...definition,
+        trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
+      };
+      const submitted = operationClass === "update"
+        ? service.submitLifecycleOperation({
+            id: created.id,
+            operationClass,
+            desiredState: "enabled",
+            authority: versionedOwnerAuthority(`turn_before_${operationClass}`) as ManagedAutomationAuthority,
+            controllerFence: {
+              ownerId: "controller-executor",
+              generation: 1,
+              turnId: `turn_before_${operationClass}`,
+            },
+            definition: updatedDefinition,
+            now: NOW + 1,
+            mutate: (mutation) => mutation(),
+          })
+        : service.submitLifecycleOperation({
+            id: created.id,
+            operationClass,
+            desiredState: "enabled",
+            authority: versionedOwnerAuthority(`turn_before_${operationClass}`) as ManagedAutomationAuthority,
+            controllerFence: {
+              ownerId: "controller-executor",
+              generation: 1,
+              turnId: `turn_before_${operationClass}`,
+            },
+            now: NOW + 1,
+            mutate: (mutation) => mutation(),
+          });
+      const originalRenew = repository.renewOperationLease.bind(repository);
+      const renewal = vi.spyOn(repository, "renewOperationLease").mockImplementation((input) => {
+        const row = bb.storage.database().prepare(
+          "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+        ).get() as { owner_id: string | null; generation: number } | undefined;
+        if (row?.owner_id !== null && row?.owner_id !== undefined) {
+          store.releaseExecutorLease(row.owner_id, row.generation, input.now);
+        }
+        return originalRenew(input);
+      });
+      const stop = new AbortController();
+      const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+      await runJobExecutorService({
+        store,
+        clock: { now: () => NOW + 2 },
+        automations: reconciler,
+        releaseOnShutdown: true,
+        sleep: async () => stop.abort(),
+      }, stop.signal);
+      renewal.mockRestore();
+
+      expect(operationClass === "update" ? fake.adapter.update : fake.adapter.runNow).not.toHaveBeenCalled();
+      expect(repository.get(submitted.id)).toMatchObject({
+        state: operationClass === "update" ? "updating" : "active",
+      });
+      expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({
+        state: "leased",
+        attempts: 1,
+      });
+    },
+  );
+
+  it.each(["update", "run_now"] as const)(
+    "reconciles a %s after the provider call loses its executor lease without duplicating the effect",
+    async (operationClass) => {
+      const { bb, store, repository } = fixture();
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      const created = await service.create(createInput());
+      const updatedDefinition = {
+        ...definition,
+        trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
+      };
+      const turnId = `turn_after_${operationClass}`;
+      const submitted = operationClass === "update"
+        ? service.submitLifecycleOperation({
+            id: created.id,
+            operationClass,
+            desiredState: "enabled",
+            authority: versionedOwnerAuthority(turnId) as ManagedAutomationAuthority,
+            controllerFence: { ownerId: "controller-executor", generation: 1, turnId },
+            definition: updatedDefinition,
+            now: NOW + 1,
+            mutate: (mutation) => mutation(),
+          })
+        : service.submitLifecycleOperation({
+            id: created.id,
+            operationClass,
+            desiredState: "enabled",
+            authority: versionedOwnerAuthority(turnId) as ManagedAutomationAuthority,
+            controllerFence: { ownerId: "controller-executor", generation: 1, turnId },
+            now: NOW + 1,
+            mutate: (mutation) => mutation(),
+          });
+      const firstStop = new AbortController();
+      let now = NOW + 2;
+      let providerCalls = 0;
+      const releaseExecutorLeaseAfterProvider = (): void => {
+        const row = bb.storage.database().prepare(
+          "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+        ).get() as { owner_id: string | null; generation: number } | undefined;
+        if (!row?.owner_id) throw new Error("executor lease was missing during provider call");
+        if (!store.releaseExecutorLease(row.owner_id, row.generation, now)) {
+          throw new Error("executor lease could not be released during provider call");
+        }
+        firstStop.abort(new Error("test lease lost after provider call"));
+      };
+      const originalUpdate = fake.adapter.update;
+      const originalRunNow = fake.adapter.runNow;
+      const update = vi.spyOn(fake.adapter, "update").mockImplementation(async (input) => {
+        providerCalls += 1;
+        const result = await originalUpdate(input);
+        if (providerCalls === 1) releaseExecutorLeaseAfterProvider();
+        return result;
+      });
+      const runNow = vi.spyOn(fake.adapter, "runNow").mockImplementation(async (input) => {
+        providerCalls += 1;
+        const result = await originalRunNow(input);
+        if (providerCalls === 1) releaseExecutorLeaseAfterProvider();
+        return result;
+      });
+      const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+      await runJobExecutorService({
+        store,
+        clock: { now: () => now },
+        automations: reconciler,
+        releaseOnShutdown: true,
+        sleep: async () => firstStop.abort(),
+      }, firstStop.signal);
+
+      expect(providerCalls).toBe(1);
+      expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({ state: "leased" });
+      expect(operationClass === "update" ? update : runNow).toHaveBeenCalledOnce();
+
+      now = NOW + 120_003;
+      const successorStop = new AbortController();
+      await runJobExecutorService({
+        store,
+        clock: { now: () => now },
+        automations: reconciler,
+        releaseOnShutdown: true,
+        sleep: async () => successorStop.abort(),
+      }, successorStop.signal);
+
+      expect(providerCalls).toBe(1);
+      expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({ state: "succeeded" });
+      expect(repository.get(submitted.id)).toMatchObject({ lastOperationOutcome: "succeeded" });
+    },
+  );
 
   it("refuses an owner schedule when its profile has no assignment or selected receipt", async () => {
     const controllerFixture = submittedControllerFixture();

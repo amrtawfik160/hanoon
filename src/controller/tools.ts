@@ -128,6 +128,7 @@ import type {
   ManagedAutomationService,
 } from "../services/managed-automation-service";
 import type { ManagedAutomationBinding } from "../storage/managed-automation-repository";
+import type { ManagedAutomationAuthority } from "../domain/managed-automation";
 
 export { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 export const CONTROLLER_METADATA_TOOL_NAMES = CONTROLLER_METADATA_TOOL_IDS;
@@ -161,7 +162,7 @@ type ToolDependencies = {
   /** Absent exactly when credential mode is disabled; the three access tools fail closed. */
   credentialAccess?: CredentialAccessService;
   /** BB's scheduler. Absent means clock-based work fails closed. */
-  automations?: Pick<ManagedAutomationService, "create" | "get" | "list" | "update" | "retire">;
+  automations?: Pick<ManagedAutomationService, "create" | "get" | "list" | "submitLifecycleOperation">;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
   /** Current controller execution tuple, used when this turn opens a child thread. */
@@ -513,6 +514,31 @@ function ownerAutomationCapabilityEvidence(
   };
 }
 
+type OwnerAutomationCapabilityEvidence = Extract<ManagedAutomationAuthority, { origin: "owner" }>["capabilityEvidence"];
+
+function ownerAutomationAuthority(
+  controller: { controllerKey: string; projectId: string; hostId: string },
+  turnId: string,
+  capabilityEvidence: OwnerAutomationCapabilityEvidence,
+): Extract<ManagedAutomationAuthority, { origin: "owner" }> {
+  return {
+    version: 1,
+    origin: "owner",
+    controllerKey: controller.controllerKey,
+    projectId: controller.projectId,
+    hostId: controller.hostId,
+    taskAuthority: {
+      version: 1,
+      kind: "controller-turn",
+      turnId,
+      revision: 1,
+    },
+    standingAuthority: null,
+    capabilityEvidence,
+    mayWidenAutomation: false,
+  };
+}
+
 async function ownerTurnImages(
   dependencies: ToolDependencies,
   controllerKey: string,
@@ -782,6 +808,13 @@ function automationProjection(binding: ManagedAutomationBinding) {
     cron: definition.trigger.kind === "cron" ? definition.trigger.cron : null,
     instruction: definition.mode === "agent" ? definition.prompt : definition.name,
     state: binding.state,
+    lifecycleState: binding.state,
+    desiredState: binding.desiredState,
+    definitionRevision: binding.definitionRevision,
+    lastOperationId: binding.lastOperationId,
+    lastOperationOutcome: binding.lastOperationOutcome,
+    lastReconciledOperationId: binding.lastReconciledOperationId,
+    lastReconciledOperationOutcome: binding.lastReconciledOperationOutcome,
     lastError: binding.lastError,
     observed: binding.observed === null
       ? null
@@ -1099,18 +1132,22 @@ async function resolveTrustedScope(
       if (params.kind === "thread_idle") {
         return visibleThreadResolution(dependencies, String(params.threadId), context);
       }
-      if (params.kind === "update_schedule") {
+      if (params.kind === "update_schedule" || params.kind === "pause_schedule" ||
+        params.kind === "resume_schedule" || params.kind === "run_now") {
         const id = String(params.id);
         const binding = dependencies.automations?.get(id) ?? null;
         const ownsAutomation = binding !== null &&
           binding.controllerKey === authorized.controller.controllerKey &&
           binding.projectId === context.projectId &&
           binding.definition.mode === "agent" && binding.definition.trigger.kind === "cron" &&
-          ["active", "paused", "failed"].includes(binding.state);
-        const cron = String(params.cron);
+          ["active", "paused", "updating", "failed"].includes(binding.state) &&
+          (params.kind !== "run_now" || (binding.state === "active" && binding.desiredState === "enabled"));
+        const validCron = params.kind === "update_schedule"
+          ? nextCronOccurrence(String(params.cron), dependencies.now()) !== null
+          : true;
         return exactScope(
           [`monitor:${id}`, `project:${context.projectId}`],
-          ownsAutomation && nextCronOccurrence(cron, dependencies.now()) !== null,
+          ownsAutomation && validCron,
           ownsAutomation ? { automationBindingId: id } : {},
         );
       }
@@ -1127,7 +1164,10 @@ async function resolveTrustedScope(
       const automation = dependencies.automations?.get(id) ?? null;
       const ownsAutomation = automation !== null &&
         automation.controllerKey === authorized.controller.controllerKey &&
-        automation.state !== "retired";
+        automation.projectId === context.projectId &&
+        automation.definition.mode === "agent" &&
+        automation.definition.trigger.kind === "cron" &&
+        ["active", "paused", "failed"].includes(automation.state);
       return exactScope([`monitor:${id}`], monitor !== null || ownsAutomation, {
         ...(ownsAutomation ? { automationBindingId: id } : {}),
       });
@@ -1707,17 +1747,30 @@ async function projectTrustedEvidence(
       const monitor = id ? dependencies.store.getControllerMonitor(authorized.controller.controllerKey, id) : null;
       const automation = id ? dependencies.automations?.get(id) ?? null : null;
       const capturedId = trustedState(resolution).monitorId ?? trustedState(resolution).automationBindingId;
-      const localArmed = monitor?.state === "armed" && monitor.kind === params.kind &&
-        monitor.instruction === params.instruction &&
-        monitor.threadId === (params.kind === "thread_idle" ? params.threadId : null) &&
-        monitor.cron === (params.kind === "schedule" ? params.cron : null) &&
+      const localArmed = params.kind === "thread_idle" && monitor?.state === "armed" && monitor.kind === params.kind &&
+        monitor.instruction === params.instruction && monitor.threadId === params.threadId &&
+        monitor.cron === null &&
         (capturedId === undefined || capturedId === monitor.id);
-      const automated = (params.kind === "schedule" || params.kind === "update_schedule") &&
-        (automation?.state === "active" || automation?.state === "pending") &&
+      const automatedKind = params.kind === "schedule" || params.kind === "update_schedule" ||
+        params.kind === "pause_schedule" || params.kind === "resume_schedule" || params.kind === "run_now";
+      const definitionMatches = params.kind === "pause_schedule" || params.kind === "resume_schedule" || params.kind === "run_now"
+        ? true
+        : automation?.definition.mode === "agent" && automation.definition.prompt === params.instruction &&
+          automation.definition.trigger.kind === "cron" &&
+          automation.definition.trigger.cron === params.cron;
+      const desiredMatches = params.kind === "pause_schedule"
+        ? automation?.desiredState === "paused"
+        : params.kind === "resume_schedule" || params.kind === "run_now" || params.kind === "schedule"
+          ? automation?.desiredState === "enabled"
+          : params.kind === "update_schedule"
+            ? automation?.desiredState === "enabled" || automation?.desiredState === "paused"
+          : false;
+      const automated = automatedKind && automation !== null &&
+        (automation?.state === "active" || automation?.state === "pending" || automation?.state === "updating" ||
+          automation?.state === "paused" || automation?.state === "retiring") &&
         automation.controllerKey === authorized.controller.controllerKey &&
         automation.projectId === context.projectId && automation.definition.mode === "agent" &&
-        automation.definition.prompt === params.instruction && automation.definition.trigger.kind === "cron" &&
-        automation.definition.trigger.cron === params.cron &&
+        definitionMatches && desiredMatches &&
         (capturedId === undefined || capturedId === automation.id);
       const armed = localArmed || automated;
       if (!armed) throw new Error("monitor proof is not bound to the exact authorized watch");
@@ -2361,6 +2414,18 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         cron: z.string().trim().min(1).max(120).describe("5-field cron in UTC"),
         instruction: z.string().trim().min(1).max(1_000),
       }).strict(),
+      z.object({
+        kind: z.literal("pause_schedule"),
+        id: z.string().min(1).max(256),
+      }).strict(),
+      z.object({
+        kind: z.literal("resume_schedule"),
+        id: z.string().min(1).max(256),
+      }).strict(),
+      z.object({
+        kind: z.literal("run_now"),
+        id: z.string().min(1).max(256),
+      }).strict(),
     ]),
     execute: async (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
@@ -2401,21 +2466,79 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         requireCronOccurrence(params.cron, dependencies.now());
         const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
           runControllerMutation(dependencies, authorized, context, () => mutation());
-        const updated = await automations.update({
+        const capabilityContext = authorizedControllerCapabilityContext(dependencies.store, context);
+        const capabilityEvidence = ownerAutomationCapabilityEvidence(dependencies, capabilityContext.profile);
+        const authority = ownerAutomationAuthority({
+          controllerKey: controller.controllerKey,
+          projectId: context.projectId,
+          hostId: controller.hostId,
+        }, authorized.turn.id, capabilityEvidence);
+        const definition = {
+          ...binding.definition,
+          trigger: { kind: "cron" as const, cron: params.cron, timezone: "Etc/UTC" },
+          prompt: params.instruction,
+        };
+        const updated = automations.submitLifecycleOperation({
           id: binding.id,
-          scope: { kind: "host", hostId: controller.hostId, cwd: null },
-          definition: {
-            ...binding.definition,
-            trigger: { kind: "cron", cron: params.cron, timezone: "Etc/UTC" },
-            prompt: params.instruction,
+          operationClass: "update",
+          desiredState: binding.desiredState,
+          authority,
+          controllerFence: {
+            ownerId: authorized.fence.ownerId,
+            generation: authorized.fence.generation,
+            turnId: authorized.turn.id,
           },
+          definition,
           now: dependencies.now(),
           mutate,
-          signal: context.signal,
         });
         trustedState(resolution).automationBindingId = updated.id;
         dependencies.notify();
         return { watching: automationProjection(updated) };
+      }
+      if (params.kind === "pause_schedule" || params.kind === "resume_schedule" || params.kind === "run_now") {
+        if (!automations) {
+          throw new Error("Durable BB automation lifecycle is not configured for this controller");
+        }
+        if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
+        const binding = automations.get(params.id);
+        if (!binding || binding.controllerKey !== controller.controllerKey ||
+          binding.projectId !== context.projectId || binding.definition.mode !== "agent" ||
+          binding.definition.trigger.kind !== "cron" || binding.state === "retired") {
+          throw new Error("That managed BB schedule is unavailable");
+        }
+        if (params.kind === "run_now" && (binding.state !== "active" || binding.desiredState !== "enabled")) {
+          throw new Error("That managed BB schedule is not active");
+        }
+        const capabilityContext = authorizedControllerCapabilityContext(dependencies.store, context);
+        const capabilityEvidence = ownerAutomationCapabilityEvidence(dependencies, capabilityContext.profile);
+        const authority = ownerAutomationAuthority({
+          controllerKey: controller.controllerKey,
+          projectId: context.projectId,
+          hostId: controller.hostId,
+        }, authorized.turn.id, capabilityEvidence);
+        const operationClass = params.kind === "pause_schedule"
+          ? "disable" as const
+          : params.kind === "resume_schedule" ? "enable" as const : "run_now" as const;
+        const desiredState = params.kind === "pause_schedule" ? "paused" as const : "enabled" as const;
+        const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
+          runControllerMutation(dependencies, authorized, context, () => mutation());
+        const submitted = automations.submitLifecycleOperation({
+          id: binding.id,
+          operationClass,
+          desiredState,
+          authority,
+          controllerFence: {
+            ownerId: authorized.fence.ownerId,
+            generation: authorized.fence.generation,
+            turnId: authorized.turn.id,
+          },
+          now: dependencies.now(),
+          mutate,
+        });
+        trustedState(resolution).automationBindingId = submitted.id;
+        dependencies.notify();
+        return { watching: automationProjection(submitted) };
       }
       const execution = dependencies.controllerExecution?.();
       const providerId = dependencies.controllerProviderId?.();
@@ -2517,13 +2640,33 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
         const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
           runControllerMutation(dependencies, authorized, context, () => mutation());
-        await automations.retire({
-          id: params.id,
-          scope: { kind: "host", hostId: controller.hostId, cwd: null },
+        const binding = automations.get(params.id);
+        if (!binding || binding.controllerKey !== controller.controllerKey ||
+          binding.projectId !== context.projectId || binding.definition.mode !== "agent" ||
+          binding.definition.trigger.kind !== "cron" || binding.state === "retired") {
+          throw new Error("That managed BB schedule is unavailable");
+        }
+        const capabilityContext = authorizedControllerCapabilityContext(dependencies.store, context);
+        const capabilityEvidence = ownerAutomationCapabilityEvidence(dependencies, capabilityContext.profile);
+        const authority = ownerAutomationAuthority({
+          controllerKey: controller.controllerKey,
+          projectId: context.projectId,
+          hostId: controller.hostId,
+        }, authorized.turn.id, capabilityEvidence);
+        automations.submitLifecycleOperation({
+          id: binding.id,
+          operationClass: "retire",
+          desiredState: "retired",
+          authority,
+          controllerFence: {
+            ownerId: authorized.fence.ownerId,
+            generation: authorized.fence.generation,
+            turnId: authorized.turn.id,
+          },
           now: dependencies.now(),
           mutate,
-          signal: context.signal,
         });
+        dependencies.notify();
         return { cancelled: true };
       }
       return {
