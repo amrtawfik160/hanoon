@@ -25,11 +25,11 @@ import { runJobExecutorService } from "../src/services/job-executor-service";
 import {
   installSystemAutomations,
   SYSTEM_MONITORS,
-  systemMaintenanceAuthority,
 } from "../src/services/system-monitors";
 import { hashSecret } from "../src/crypto";
 import { registerControllerTools } from "../src/controller/tools";
 import { managedAutomationCapabilityIsCurrent } from "../src/plugin";
+import { HISTORICAL_RECIPE_CAPABILITY_BY_ID } from "../src/capabilities/catalog";
 import { policyFixture } from "./helpers";
 import { submittedControllerFixture } from "./support/controller-trust-fixtures";
 import type {
@@ -267,6 +267,9 @@ function createInput(overrides: Partial<CreateManagedAutomationInput> = {}): Cre
     authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
     notificationPolicy: "material" as const,
     now: NOW,
+    mutate: () => {
+      throw new Error("test create input requires an executor fence");
+    },
     operation: {
       version: 1,
       operationClass: "create",
@@ -350,17 +353,6 @@ function versionedOwnerAuthority(turnId = "turn_owner"): Record<string, unknown>
     },
     mayWidenAutomation: false,
   };
-}
-
-function versionedSystemMaintenanceAuthority(
-  systemKey = "system-stale-jobs",
-): Extract<ManagedAutomationAuthority, { origin: "system-maintenance" }> {
-  return systemMaintenanceAuthority({
-    systemKey,
-    controllerKey: "owner-7-controller",
-    projectId: "proj_owner",
-    hostId: "host_owner",
-  });
 }
 
 function automationTriggeredAuthority(
@@ -1089,7 +1081,7 @@ describe("managed BB automations", () => {
       const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
       const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
       if (!setupLease.acquired) throw new Error("missing setup executor lease");
-      const createdPending = await service.createSystemMaintenanceIntent({
+      const createdPending = await service.intentAdapters.systemMaintenance.create({
         ...createInput({
           sourceKey: systemKey,
           controllerFence: undefined,
@@ -1136,7 +1128,7 @@ describe("managed BB automations", () => {
       const systemMonitors = {
         install: (fence: { ownerId: string; generation: number; signal: AbortSignal }): void => {
           if (!fence || submitted.value) return;
-          submitted.value = service.submitSystemMaintenanceRetirementOperation({
+          submitted.value = service.intentAdapters.systemMaintenance.retire({
             id: created.id,
             systemKey,
             now: NOW + 1,
@@ -2511,22 +2503,16 @@ describe("managed BB automations", () => {
       },
       mutate: executorMutation(store, "automation-executor", firstLease.generation),
     });
-    const operation = repository.claimOperation({
-      operationId: pending.lastOperationId!,
+    const firstReconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await firstReconciler.processDue(NOW + 1, signal, {
       ownerId: "automation-executor",
       generation: firstLease.generation,
-      now: NOW + 1,
-      leaseMs: 120_000,
-    });
-    if (!operation) throw new Error("missing claimed automation operation");
-    await service.executeClaimedOperation({
-      binding: pending,
-      operation,
-      scope: SCOPE,
+      signal,
     });
     expect(store.releaseExecutorLease("automation-executor", firstLease.generation, NOW + 2)).toBe(true);
 
-    const secondLease = store.acquireExecutorLease("automation-restart", NOW + 120_002, 120_000);
+    const secondLease = store.acquireExecutorLease("automation-restart", NOW + 3, 120_000);
     if (!secondLease.acquired) throw new Error("missing replacement executor lease");
     const restarted = new ManagedAutomationReconciler({
       repository,
@@ -2534,8 +2520,7 @@ describe("managed BB automations", () => {
       store,
       notify: vi.fn(),
     });
-    const signal = new AbortController().signal;
-    await restarted.processDue(NOW + 120_002, signal, {
+    await restarted.processDue(NOW + 3, signal, {
       ownerId: "automation-restart",
       generation: secondLease.generation,
       signal,
@@ -3152,6 +3137,8 @@ describe("managed BB automations", () => {
       providerId: "codex-provider",
       model: "gpt-5.6-sol",
       permissionMode: "full",
+      controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_owner" },
+      mutate: (mutation) => mutation(),
       now: NOW,
     })).rejects.toThrow("current authority revalidation");
 
@@ -3273,7 +3260,7 @@ describe("managed BB automations", () => {
 
       await expect(installSystemAutomations({
         store: controllerFixture.store,
-        service,
+        adapters: service.intentAdapters,
         providerId: "codex-provider",
         execution: { model: "gpt-5.6-sol", permissionMode: "auto" },
         clock: { now: () => NOW },
@@ -3322,7 +3309,7 @@ describe("managed BB automations", () => {
       signal,
     });
 
-    const submitted = service.submitAutomationTriggeredOperation({
+    const submitted = service.intentAdapters.automationTriggered.submit({
       id: child.id,
       operationClass: "run_now",
       desiredState: "enabled",
@@ -3351,7 +3338,7 @@ describe("managed BB automations", () => {
     const setupService = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
     const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
     if (!setupLease.acquired) throw new Error("missing setup executor lease");
-    await setupService.createSystemMaintenanceIntent({
+    await setupService.intentAdapters.systemMaintenance.create({
       scope: SCOPE,
       controllerKey: "owner-7-controller",
       sourceKey: "system-stale-jobs",
@@ -3430,6 +3417,7 @@ describe("managed BB automations", () => {
     expect(service.submitReconciliationOperation({
       binding: legacyBinding,
       now: NOW + 1,
+      mutate: (mutation) => mutation(),
     })).toBeNull();
     expect(fake.adapter.show).not.toHaveBeenCalled();
     expect(fake.adapter.runs).not.toHaveBeenCalled();
@@ -3522,7 +3510,7 @@ describe("managed BB automations", () => {
       if (origin === "standing-policy") {
         const lease = store.acquireExecutorLease("standing-policy-admission", NOW, 120_000);
         if (!lease.acquired) throw new Error("missing standing-policy admission lease");
-        binding = await service.createStandingPolicyIntent({
+        binding = await service.intentAdapters.standingPolicy.create({
           scope: SCOPE,
           controllerKey: "owner-7-controller",
           sourceKey: "origin:standing-policy",
@@ -3564,7 +3552,7 @@ describe("managed BB automations", () => {
           generation: lease.generation,
           signal,
         });
-        binding = service.submitAutomationTriggeredOperation({
+        binding = service.intentAdapters.automationTriggered.submit({
           id: child.id,
           operationClass: "run_now",
           desiredState: "enabled",
@@ -3602,7 +3590,7 @@ describe("managed BB automations", () => {
         const lease = store.acquireExecutorLease(executorOwner, NOW, 120_000);
         if (!lease.acquired) throw new Error("missing standing-policy admission lease");
         executorGeneration = lease.generation;
-        pending = await service.createStandingPolicyIntent({
+        pending = await service.intentAdapters.standingPolicy.create({
           scope: SCOPE,
           controllerKey: "owner-7-controller",
           sourceKey: `missing-receipt:${origin}`,
@@ -3624,7 +3612,7 @@ describe("managed BB automations", () => {
         const lease = store.acquireExecutorLease(executorOwner, NOW, 120_000);
         if (!lease.acquired) throw new Error("missing system-maintenance admission lease");
         executorGeneration = lease.generation;
-        pending = await service.createSystemMaintenanceIntent({
+        pending = await service.intentAdapters.systemMaintenance.create({
           scope: SCOPE,
           controllerKey: "owner-7-controller",
           sourceKey: `missing-receipt:${origin}`,
@@ -3669,7 +3657,7 @@ describe("managed BB automations", () => {
           generation: executorGeneration,
           signal,
         });
-        pending = service.submitAutomationTriggeredOperation({
+        pending = service.intentAdapters.automationTriggered.submit({
           id: child.id,
           operationClass: "run_now",
           desiredState: "enabled",
@@ -3721,11 +3709,141 @@ describe("managed BB automations", () => {
     expect(Reflect.get(service, "setEnabled")).toBeUndefined();
     expect(Reflect.get(service, "runNow")).toBeUndefined();
     expect(Reflect.get(service, "retire")).toBeUndefined();
+    expect(Reflect.get(service, "executeClaimedOperation")).toBeUndefined();
+    expect(Reflect.get(service, "adapter")).toBeUndefined();
+    expect(Reflect.get(service, "executeCreateOperation")).toBeUndefined();
+    expect(Reflect.get(service, "executeUpdateOperation")).toBeUndefined();
+    expect(Reflect.get(service, "executeRunNowOperation")).toBeUndefined();
     await expect(Reflect.apply(reconciler.processDue, reconciler, [NOW + 60_001, undefined, undefined]))
       .rejects.toThrow(/effect.?fence/i);
     expect(fake.adapter.show).not.toHaveBeenCalled();
     expect(fake.adapter.update).not.toHaveBeenCalled();
     expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-owner admission when durable evidence names a historical descriptor", async () => {
+    const { bb, store, repository } = fixture();
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const setupLease = store.acquireExecutorLease("descriptor-drift-setup", NOW, 120_000);
+    if (!setupLease.acquired) throw new Error("missing descriptor drift setup lease");
+    const pending = await service.intentAdapters.standingPolicy.create({
+      scope: SCOPE,
+      controllerKey: "owner-7-controller",
+      sourceKey: "descriptor-drift",
+      definition,
+      hostId: "host_owner",
+      notificationPolicy: "material",
+      now: NOW,
+      mutate: executorMutation(store, "descriptor-drift-setup", setupLease.generation),
+    });
+    if (!store.releaseExecutorLease("descriptor-drift-setup", setupLease.generation, NOW + 1)) {
+      throw new Error("descriptor drift setup lease could not be released");
+    }
+    const historical = HISTORICAL_RECIPE_CAPABILITY_BY_ID.get("telegram_agent_watch");
+    if (!historical || !pending.capabilityEvidence) throw new Error("missing descriptor fixtures");
+    const evidence = { ...pending.capabilityEvidence, descriptorDigest: historical.digest };
+    const authority = managedAutomationAuthoritySchema.parse({
+      ...pending.authority,
+      capabilityEvidence: evidence,
+    });
+    const database = bb.storage.database();
+    database.exec("DROP TRIGGER managed_automation_capability_profiles_append_only_update");
+    database.exec("DROP TRIGGER managed_automation_capability_receipts_append_only_update");
+    database.prepare(
+      "UPDATE managed_automation_capability_profiles SET descriptor_digest = ? WHERE id = ?",
+    ).run(historical.digest, evidence.profileId);
+    database.prepare(
+      "UPDATE managed_automation_capability_receipts SET descriptor_digest = ? WHERE profile_id = ?",
+    ).run(historical.digest, evidence.profileId);
+    database.prepare(
+      "UPDATE managed_automations SET authority_json = ?, capability_evidence_json = ? WHERE id = ?",
+    ).run(JSON.stringify(authority), JSON.stringify(evidence), pending.id);
+    database.prepare(
+      "UPDATE managed_automation_operations SET authority_json = ?, capability_evidence_json = ? WHERE id = ?",
+    ).run(JSON.stringify(authority), JSON.stringify(evidence), pending.lastOperationId);
+    const lease = store.acquireExecutorLease("descriptor-drift-executor", NOW + 2, 120_000);
+    if (!lease.acquired) throw new Error("missing descriptor drift executor lease");
+    vi.clearAllMocks();
+
+    const signal = new AbortController().signal;
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "descriptor-drift-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({
+      state: "failed",
+      lastError: "managed_automation_capability_evidence_stale",
+    });
+  });
+
+  it("rejects a recursive target already present in the parent lineage before BB", async () => {
+    const { store, repository } = fixture();
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const parent = await createActiveBinding(store, repository, service, createInput({ sourceKey: "cycle-parent" }));
+    const child = await createActiveBinding(store, repository, service, createInput({ sourceKey: "cycle-child" }));
+    const lease = store.acquireExecutorLease("recursive-cycle", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing recursive cycle lease");
+    const parentRun = service.submitLifecycleOperation({
+      id: parent.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("recursive-cycle-parent") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "recursive-cycle-parent",
+      },
+      now: NOW + 1,
+      mutate: executorMutation(store, "recursive-cycle", lease.generation),
+    });
+    const signal = new AbortController().signal;
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "recursive-cycle",
+      generation: lease.generation,
+      signal,
+    });
+    const childOperationBefore = repository.get(child.id)?.lastOperationId;
+
+    expect(() => service.intentAdapters.automationTriggered.submit({
+      id: child.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      parentOperationId: parentRun.lastOperationId!,
+      rootAutomationId: child.id,
+      now: NOW + 3,
+      mutate: executorMutation(store, "recursive-cycle", lease.generation),
+    })).toThrow(/cycle|lineage|recursive/i);
+    expect(repository.get(child.id)?.lastOperationId).toBe(childOperationBefore);
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers standing, recursive, and system intent producers as production adapters", () => {
+    const { repository } = fixture();
+    const service = new ManagedAutomationService(repository, fakeAdapter().adapter, () => true);
+    const adapters = Reflect.get(service, "intentAdapters") as Record<string, unknown> | undefined;
+
+    expect(adapters).toBeDefined();
+    expect(adapters?.standingPolicy).toBeDefined();
+    expect(adapters?.automationTriggered).toBeDefined();
+    expect(adapters?.systemMaintenance).toBeDefined();
+  });
+
+  it("does not expose the concrete managed-automation repository through the store facade", () => {
+    const { store } = fixture();
+    const persistence = Reflect.get(store, "getManagedAutomationPersistence") as (() => object) | undefined;
+
+    expect(Reflect.get(store, "getManagedAutomationRepository")).toBeUndefined();
+    expect(persistence).toEqual(expect.any(Function));
+    expect(Reflect.get(persistence!.call(store), "activate")).toBeUndefined();
   });
 
   it("reserves a changed built-in definition at the next revision and converges once after restart", async () => {
@@ -3748,38 +3866,45 @@ describe("managed BB automations", () => {
         timeoutMs: 900_000,
         resultContract: { kind: "bounded-text", maximumBytes: 32_768 },
       };
-      const seeded = await fake.adapter.create({
+      const seedLease = controllerFixture.store.acquireExecutorLease("automation-seed", NOW, 120_000);
+      if (!seedLease.acquired) throw new Error("missing automation seed lease");
+      const mutateSeed = <T>(mutation: () => T): T => {
+        const result = controllerFixture.store.runExecutorMutation(
+          { ownerId: "automation-seed", generation: seedLease.generation },
+          mutation,
+        );
+        if (result.outcome === "stale") throw new Error("automation seed executor lease was lost");
+        return result.mutationValue;
+      };
+      const reserved = await service.intentAdapters.systemMaintenance.create({
         scope: { kind: "host", hostId: "host_1", cwd: null },
-        definition: oldDefinition,
-        identity: { operationId: "seed", ownershipMarker: "seed" },
-      });
-      const authority = systemMaintenanceAuthority({
-        systemKey,
-        controllerKey: controllerFixture.turn.controllerKey,
-        projectId: "proj_1",
-        hostId: "host_1",
-      });
-      const reserved = repository.reserve({
         controllerKey: controllerFixture.turn.controllerKey,
         sourceKey: systemKey,
-        projectId: oldDefinition.projectId,
-        name: oldDefinition.name,
+        systemKey,
+        hostId: "host_1",
         definition: oldDefinition,
-        authority,
         notificationPolicy: "material",
         now: NOW,
+        mutate: mutateSeed,
       });
-      repository.activate({
-        id: reserved.id,
-        automation: managedObservation(automation(oldDefinition, {
-          id: seeded.providerAutomationId,
-          name: oldDefinition.name,
-        }), oldDefinition),
-        now: NOW,
+      const seedReconciler = new ManagedAutomationReconciler({
+        repository,
+        service,
+        store: controllerFixture.store,
+        notify: vi.fn(),
       });
+      const seedSignal = new AbortController().signal;
+      await seedReconciler.processDue(NOW + 1, seedSignal, {
+        ownerId: "automation-seed",
+        generation: seedLease.generation,
+        signal: seedSignal,
+      });
+      if (!controllerFixture.store.releaseExecutorLease("automation-seed", seedLease.generation, NOW + 2)) {
+        throw new Error("automation seed lease could not be released");
+      }
       vi.clearAllMocks();
 
-      const setupLease = controllerFixture.store.acquireExecutorLease("automation-setup", NOW, 120_000);
+      const setupLease = controllerFixture.store.acquireExecutorLease("automation-setup", NOW + 2, 120_000);
       if (!setupLease.acquired) throw new Error("missing setup executor lease");
       const mutate = <T>(mutation: () => T): T => {
         const result = controllerFixture.store.runExecutorMutation(
@@ -3791,7 +3916,7 @@ describe("managed BB automations", () => {
       };
       await expect(installSystemAutomations({
         store: controllerFixture.store,
-        service,
+        adapters: service.intentAdapters,
         providerId: "codex-provider",
         execution: { model: "gpt-5.6-sol", permissionMode: "auto" },
         clock: { now: () => NOW },

@@ -1,21 +1,11 @@
 import { nextCronOccurrence } from "./monitor-service";
 import type { TelegramAgentStore } from "../storage/store";
-import { capabilityDescriptorById } from "../capabilities/catalog";
-import type {
-  ManagedAutomationAuthority,
-  ManagedAutomationCapabilityEvidence,
-  ManagedAutomationOperationRequest,
-} from "../domain/managed-automation";
-import {
-  managedAutomationAuthoritySchema,
-  managedAutomationCapabilityEvidenceSchema,
-} from "../domain/managed-automation";
 import {
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
 } from "../bb/automation";
 import {
-  ManagedAutomationService,
+  type ManagedAutomationIntentAdapters,
   type ManagedAutomationMutation,
 } from "./managed-automation-service";
 
@@ -55,55 +45,6 @@ export const SYSTEM_MONITORS: readonly SystemMonitorDefinition[] = Object.freeze
       "Write the weekly scorecard. Read it from durable state and report: work completed, blocked, and cancelled; decisions you needed from the owner; remediation cycles; delivery retries and anything undeliverable. Give the numbers you have and the window they cover, never a rate you cannot support. Keep it to a short message; end with the one thing most worth their attention this week.",
   }),
 ]);
-
-const SYSTEM_MAINTENANCE_CAPABILITY_ID = "telegram_agent_watch";
-const SYSTEM_MAINTENANCE_AUTHORITY_REVISION = 1;
-type SystemMaintenanceAuthority = Extract<ManagedAutomationAuthority, { origin: "system-maintenance" }>;
-
-export function systemMaintenanceCapabilityEvidence(systemKey: string): ManagedAutomationCapabilityEvidence {
-  const descriptor = capabilityDescriptorById(SYSTEM_MAINTENANCE_CAPABILITY_ID);
-  if (!descriptor || descriptor.status !== "admitted") {
-    throw new Error("system-maintenance capability is not admitted");
-  }
-  return managedAutomationCapabilityEvidenceSchema.parse({
-    version: 1,
-    profileId: `system-maintenance:${systemKey}`,
-    profileRevision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
-    capabilityId: descriptor.id,
-    descriptorVersion: descriptor.version,
-    descriptorDigest: descriptor.digest,
-    evidenceRefs: [
-      `capability-admission:${descriptor.id}:${descriptor.version}:${descriptor.digest}`,
-      `system-maintenance:${systemKey}:standing-authority:${SYSTEM_MAINTENANCE_AUTHORITY_REVISION}`,
-    ],
-  });
-}
-
-export function systemMaintenanceAuthority(input: Readonly<{
-  systemKey: string;
-  controllerKey: string;
-  projectId: string;
-  hostId: string;
-}>): SystemMaintenanceAuthority {
-  const authority = managedAutomationAuthoritySchema.parse({
-    version: 1,
-    origin: "system-maintenance",
-    controllerKey: input.controllerKey,
-    projectId: input.projectId,
-    hostId: input.hostId,
-    taskAuthority: null,
-    standingAuthority: {
-      version: 1,
-      kind: "system-maintenance",
-      systemKey: input.systemKey,
-      revision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
-    },
-    capabilityEvidence: systemMaintenanceCapabilityEvidence(input.systemKey),
-    mayWidenAutomation: false,
-  });
-  if (authority.origin !== "system-maintenance") throw new Error("system-maintenance authority has the wrong origin");
-  return authority;
-}
 
 export function systemAutomationInstallationComplete(installed: number): boolean {
   return installed === SYSTEM_MONITORS.length;
@@ -155,7 +96,7 @@ export type SystemAutomationInstaller = Readonly<{
     TelegramAgentStore,
     "getOwner" | "getControllerForOwner" | "listSystemMonitors" | "cancelMonitor"
   >;
-  service: ManagedAutomationService;
+  adapters: Pick<ManagedAutomationIntentAdapters, "systemMaintenance">;
   providerId: string;
   execution: Readonly<{
     model: string;
@@ -205,7 +146,7 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
         timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
         resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
       };
-      await dependencies.service.createSystemMaintenanceIntent({
+      await dependencies.adapters.systemMaintenance.create({
         scope: { kind: "host", hostId: controller.hostId, cwd: null },
         controllerKey: controller.controllerKey,
         sourceKey: definition.systemKey,

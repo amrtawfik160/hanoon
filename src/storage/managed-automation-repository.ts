@@ -88,7 +88,7 @@ export type ManagedAutomationLifecycleReservation = Readonly<{
   desiredState: ManagedAutomationDesiredState;
   authority: ManagedAutomationAuthority;
   operation: ManagedAutomationOperationRequest;
-  controllerFence?: ManagedAutomationControllerFence;
+  controllerFence: ManagedAutomationControllerFence | null;
   now: number;
 }>;
 
@@ -263,7 +263,7 @@ const reserveSchema = z.object({
   now: z.number().int().nonnegative().safe(),
   definitionRevision: z.number().int().positive().safe().default(1),
   operation: managedAutomationOperationRequestSchema.optional(),
-  controllerFence: controllerFenceSchema.optional(),
+  controllerFence: controllerFenceSchema.nullable().default(null),
 }).strict();
 
 const operationStateSchema = z.enum(["pending", "leased", "succeeded", "failed", "ambiguous"]);
@@ -1372,7 +1372,14 @@ export class ManagedAutomationRepository {
     const definitionRevision = input.operation?.definitionRevision ?? input.definitionRevision;
     const currentAuthority = input.operation && isCurrentManagedAutomationAuthority(authority) ? authority : null;
     if (input.operation) {
-      assertCurrentOperationInput(authority, input.operation, input.controllerFence, input.controllerKey, input.projectId, definitionRevision);
+      assertCurrentOperationInput(
+        authority,
+        input.operation,
+        input.controllerFence ?? undefined,
+        input.controllerKey,
+        input.projectId,
+        definitionRevision,
+      );
     }
     const definitionJson = canonical({ version: 1, value: definition });
     const authorityJson = canonical(authority);
@@ -1455,7 +1462,7 @@ export class ManagedAutomationRepository {
       assertCurrentOperationInput(
         authority,
         operation,
-        input.controllerFence,
+        input.controllerFence ?? undefined,
         binding.controllerKey,
         binding.projectId,
         operation.definitionRevision,

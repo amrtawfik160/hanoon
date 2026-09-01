@@ -221,6 +221,7 @@ import {
   type SkillReceiptProjection,
 } from "./capability-repository";
 import { ManagedAutomationRepository } from "./managed-automation-repository";
+import type { ManagedAutomationPersistence } from "../services/managed-automation-service";
 import {
   ReferenceRepository,
   type ReferenceDocumentRecord,
@@ -3150,7 +3151,7 @@ export function migrateControllerInteractionStorage(
 }
 
 export interface TelegramAgentStore {
-  getManagedAutomationRepository(): ManagedAutomationRepository;
+  getManagedAutomationPersistence(): ManagedAutomationPersistence;
   runExecutorMutation<T>(
     input: ExecutorMutationFence,
     mutation: (now: number) => T,
@@ -5575,6 +5576,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
   private readonly workflowEngineRepository: WorkflowEngineRepository;
   private readonly managedAutomationRepository: ManagedAutomationRepository;
+  private readonly managedAutomationPersistence: ManagedAutomationPersistence;
 
   public constructor(
     private readonly db: SqliteDatabase,
@@ -5597,10 +5599,39 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.ownerBoundaryRepository = new OwnerBoundaryRepository(db);
     this.workflowEngineRepository = new WorkflowEngineRepository(db);
     this.managedAutomationRepository = new ManagedAutomationRepository(db);
+    const provenance = this.managedAutomationRepository.getProvenanceRepository();
+    this.managedAutomationPersistence = {
+      get: (id) => this.managedAutomationRepository.get(id),
+      getBySource: (controllerKey, sourceKey) => this.managedAutomationRepository.getBySource(controllerKey, sourceKey),
+      list: (controllerKey, includeRetired) => this.managedAutomationRepository.list(controllerKey, includeRetired),
+      listReconciliationCandidates: (before, limit) => this.managedAutomationRepository.listReconciliationCandidates(before, limit),
+      getOperation: (id) => this.managedAutomationRepository.getOperation(id),
+      findOperation: (bindingId, operationClass, intentKey) =>
+        this.managedAutomationRepository.findOperation(bindingId, operationClass, intentKey),
+      listDueOperations: (now, limit) => this.managedAutomationRepository.listDueOperations(now, limit),
+      claimOperation: (input) => this.managedAutomationRepository.claimOperation(input),
+      renewOperationLease: (input) => this.managedAutomationRepository.renewOperationLease(input),
+      acknowledgeOperation: (input) => this.managedAutomationRepository.acknowledgeOperation(input),
+      settleOperation: (input) => this.managedAutomationRepository.settleOperation(input),
+      reserve: (input) => this.managedAutomationRepository.reserve(input),
+      reserveLifecycle: (input) => this.managedAutomationRepository.reserveLifecycle(input),
+      refreshAuthority: (input) => this.managedAutomationRepository.refreshAuthority(input),
+      fail: (id, error, now) => this.managedAutomationRepository.fail(id, error, now),
+      markPolicyBlocked: (id, now) => this.managedAutomationRepository.markPolicyBlocked(id, now),
+      listPendingNotifications: (limit) => this.managedAutomationRepository.listPendingNotifications(limit),
+      markNotificationEnqueued: (sequence, now) => this.managedAutomationRepository.markNotificationEnqueued(sequence, now),
+      getProvenanceRepository: () => ({
+        ensureProfile: (input) => provenance.ensureProfile(input),
+        getProfile: (profileId) => provenance.getProfile(profileId),
+        getAdmission: (profileId) => provenance.getAdmission(profileId),
+        getProjectPolicy: (projectId) => provenance.getProjectPolicy(projectId),
+        resolveEvidence: (evidence) => provenance.resolveEvidence(evidence),
+      }),
+    };
   }
 
-  public getManagedAutomationRepository(): ManagedAutomationRepository {
-    return this.managedAutomationRepository;
+  public getManagedAutomationPersistence(): ManagedAutomationPersistence {
+    return this.managedAutomationPersistence;
   }
 
   private createOwnerTaskAuthority(input: Readonly<{
