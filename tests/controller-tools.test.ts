@@ -1607,7 +1607,6 @@ it("updates an owned BB schedule through the governed controller seam without wi
       prompt: "Send the revised weekday digest.",
     }),
   }));
-  expect(automations.update).not.toHaveBeenCalled();
 });
 
 it("retires an already-armed live-work poller without touching clock-time schedules", () => {

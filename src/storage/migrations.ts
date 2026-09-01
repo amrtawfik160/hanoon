@@ -4726,6 +4726,59 @@ ALTER TABLE managed_automation_operations ADD COLUMN target_host_id TEXT CHECK (
 );
 `] as const;
 
+export const MANAGED_AUTOMATION_PROVENANCE_MIGRATIONS = [String.raw`
+CREATE TABLE managed_automation_capability_profiles (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  origin TEXT NOT NULL CHECK (origin IN ('standing-policy', 'automation-triggered', 'system-maintenance')),
+  subject_key TEXT NOT NULL CHECK (length(subject_key) BETWEEN 1 AND 256),
+  project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 256),
+  host_id TEXT NOT NULL CHECK (length(host_id) BETWEEN 1 AND 256),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  descriptor_version TEXT NOT NULL CHECK (length(descriptor_version) BETWEEN 1 AND 256),
+  descriptor_digest TEXT NOT NULL CHECK (length(descriptor_digest) = 64),
+  selected_receipt_id TEXT NOT NULL CHECK (length(selected_receipt_id) BETWEEN 1 AND 256),
+  policy_id TEXT,
+  policy_revision INTEGER CHECK (policy_revision IS NULL OR policy_revision >= 1),
+  parent_operation_id TEXT,
+  parent_run_receipt_digest TEXT CHECK (
+    parent_run_receipt_digest IS NULL OR length(parent_run_receipt_digest) = 64
+  ),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  CHECK ((policy_id IS NULL) = (policy_revision IS NULL)),
+  CHECK ((parent_operation_id IS NULL) = (parent_run_receipt_digest IS NULL)),
+  UNIQUE(origin, subject_key, revision)
+);
+CREATE INDEX managed_automation_capability_profiles_subject
+  ON managed_automation_capability_profiles(origin, subject_key, revision DESC);
+
+CREATE TABLE managed_automation_capability_receipts (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  profile_id TEXT NOT NULL REFERENCES managed_automation_capability_profiles(id),
+  profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  descriptor_version TEXT NOT NULL CHECK (length(descriptor_version) BETWEEN 1 AND 256),
+  descriptor_digest TEXT NOT NULL CHECK (length(descriptor_digest) = 64),
+  event_type TEXT NOT NULL CHECK (event_type = 'selected'),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE(profile_id, profile_revision, capability_id)
+);
+CREATE INDEX managed_automation_capability_receipts_profile
+  ON managed_automation_capability_receipts(profile_id, profile_revision);
+CREATE TRIGGER managed_automation_capability_profiles_append_only_update
+BEFORE UPDATE ON managed_automation_capability_profiles
+BEGIN SELECT RAISE(ABORT, 'managed automation capability profiles are append-only'); END;
+CREATE TRIGGER managed_automation_capability_profiles_append_only_delete
+BEFORE DELETE ON managed_automation_capability_profiles
+BEGIN SELECT RAISE(ABORT, 'managed automation capability profiles are append-only'); END;
+CREATE TRIGGER managed_automation_capability_receipts_append_only_update
+BEFORE UPDATE ON managed_automation_capability_receipts
+BEGIN SELECT RAISE(ABORT, 'managed automation capability receipts are append-only'); END;
+CREATE TRIGGER managed_automation_capability_receipts_append_only_delete
+BEFORE DELETE ON managed_automation_capability_receipts
+BEGIN SELECT RAISE(ABORT, 'managed automation capability receipts are append-only'); END;
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -4822,4 +4875,5 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   ...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   ...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
+  ...MANAGED_AUTOMATION_PROVENANCE_MIGRATIONS,
 ] as const;

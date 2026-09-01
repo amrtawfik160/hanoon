@@ -20,6 +20,7 @@ import {
   ALL_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
   MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
+  MANAGED_AUTOMATION_PROVENANCE_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
@@ -508,9 +509,9 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
     [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
+      expect(ALL_MIGRATIONS.at(-(MANAGED_AUTOMATION_PROVENANCE_MIGRATIONS.length + index + 1))).toBe(migration);
     });
-    const lifecycleOffset = MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
+    const lifecycleOffset = MANAGED_AUTOMATION_PROVENANCE_MIGRATIONS.length + MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
     [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(lifecycleOffset + index + 1))).toBe(migration);
     });

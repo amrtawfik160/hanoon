@@ -16,7 +16,6 @@ import {
 } from "../bb/automation";
 import {
   ManagedAutomationService,
-  migrateLegacyClockMonitor,
   type ManagedAutomationMutation,
 } from "./managed-automation-service";
 
@@ -165,7 +164,7 @@ export type SystemAutomationInstaller = Readonly<{
     permissionMode: "accept-edits" | "auto" | "full";
   }>;
   clock: { now(): number };
-  mutate?: ManagedAutomationMutation;
+  mutate: ManagedAutomationMutation;
   signal?: AbortSignal;
   warn?: (message: string) => void;
 }>;
@@ -187,72 +186,40 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
   for (const definition of SYSTEM_MONITORS) {
     try {
       const old = legacy.get(definition.systemKey);
-      const authority = systemMaintenanceAuthority({
-        systemKey: definition.systemKey,
-        controllerKey: controller.controllerKey,
+      const automationDefinition = {
+        mode: "agent" as const,
         projectId: controller.projectId,
-        hostId: controller.hostId,
-      });
-      const operation = {
-        version: 1 as const,
-        operationClass: "create" as const,
-        targetProjectId: controller.projectId,
-        targetHostId: controller.hostId,
-        definitionRevision: 1,
-        intentKey: `system-maintenance:${definition.systemKey}`,
+        name: `Hanoon ${definition.systemKey}`,
+        trigger: { kind: "cron" as const, cron: definition.cron, timezone: "Etc/UTC" },
+        prompt: definition.instruction,
+        providerId: dependencies.providerId,
+        model: dependencies.execution.model,
+        ...(dependencies.execution.reasoningLevel
+          ? { reasoningLevel: dependencies.execution.reasoningLevel }
+          : {}),
+        ...(dependencies.execution.serviceTier
+          ? { serviceTier: dependencies.execution.serviceTier }
+          : {}),
+        permissionMode: dependencies.execution.permissionMode,
+        target: { kind: "project-default" as const },
+        timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+        resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
       };
-      if (old?.state === "armed") {
-        await migrateLegacyClockMonitor({
-          monitor: old,
-          store: dependencies.store,
-          service: dependencies.service,
-          scope: { kind: "host", hostId: controller.hostId, cwd: null },
-          projectId: controller.projectId,
-          controllerKey: controller.controllerKey,
-          providerId: dependencies.providerId,
-          model: dependencies.execution.model,
-          reasoningLevel: dependencies.execution.reasoningLevel,
-          serviceTier: dependencies.execution.serviceTier,
-          permissionMode: dependencies.execution.permissionMode,
-          hostId: controller.hostId,
-          authority,
-          operation,
-          now,
-          mutate: dependencies.mutate,
-          signal: dependencies.signal,
-        });
-      } else {
-        await dependencies.service.create({
-          scope: { kind: "host", hostId: controller.hostId, cwd: null },
-          controllerKey: controller.controllerKey,
-          sourceKey: definition.systemKey,
-          definition: {
-            mode: "agent",
-            projectId: controller.projectId,
-            name: `Hanoon ${definition.systemKey}`,
-            trigger: { kind: "cron", cron: definition.cron, timezone: "Etc/UTC" },
-            prompt: definition.instruction,
-            providerId: dependencies.providerId,
-            model: dependencies.execution.model,
-            ...(dependencies.execution.reasoningLevel
-              ? { reasoningLevel: dependencies.execution.reasoningLevel }
-              : {}),
-            ...(dependencies.execution.serviceTier
-              ? { serviceTier: dependencies.execution.serviceTier }
-              : {}),
-            permissionMode: dependencies.execution.permissionMode,
-            target: { kind: "project-default" },
-            timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
-            resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
-          },
-          authority,
-          notificationPolicy: "material",
-          now,
-          mutate: dependencies.mutate,
-          deferProvider: true,
-          operation,
-          signal: dependencies.signal,
-        });
+      await dependencies.service.createSystemMaintenanceIntent({
+        scope: { kind: "host", hostId: controller.hostId, cwd: null },
+        controllerKey: controller.controllerKey,
+        sourceKey: definition.systemKey,
+        systemKey: definition.systemKey,
+        hostId: controller.hostId,
+        definition: automationDefinition,
+        notificationPolicy: "material",
+        legacyMonitorId: old?.state === "armed" ? old.id : null,
+        now,
+        mutate: dependencies.mutate,
+        signal: dependencies.signal,
+      });
+      if (old?.state === "armed" && !dependencies.mutate(() => dependencies.store.cancelMonitor(old.id, now))) {
+        throw new Error("legacy Hanoon schedule could not be disabled after durable handoff");
       }
       installed += 1;
     } catch {

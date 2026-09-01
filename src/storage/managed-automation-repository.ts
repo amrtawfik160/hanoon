@@ -31,6 +31,7 @@ import {
   type ManagedAutomationOutcomeReceipt,
   type StoredManagedAutomationAuthority,
 } from "../domain/managed-automation";
+import { ManagedAutomationProvenanceRepository } from "./managed-automation-provenance-repository";
 
 type SqliteDatabase = Database.Database;
 
@@ -952,7 +953,15 @@ function assertCurrentOperationInput(
 }
 
 export class ManagedAutomationRepository {
-  public constructor(private readonly db: SqliteDatabase) {}
+  private readonly provenanceRepository: ManagedAutomationProvenanceRepository;
+
+  public constructor(private readonly db: SqliteDatabase) {
+    this.provenanceRepository = new ManagedAutomationProvenanceRepository(db);
+  }
+
+  public getProvenanceRepository(): ManagedAutomationProvenanceRepository {
+    return this.provenanceRepository;
+  }
 
   public get(id: string): ManagedAutomationBinding | null {
     const row = this.db.prepare("SELECT * FROM managed_automations WHERE id = ?").get(id) as ManagedAutomationRow | undefined;
@@ -1561,6 +1570,51 @@ export class ManagedAutomationRepository {
         binding.providerOwnershipMarker,
       );
       return this.get(binding.id)!;
+    }).immediate();
+  }
+
+  public refreshAuthority(input: Readonly<{
+    id: string;
+    authority: ManagedAutomationAuthority;
+    now: number;
+  }>): ManagedAutomationBinding {
+    const authority = parseManagedAutomationAuthority(input.authority);
+    if (!isCurrentManagedAutomationAuthority(authority) ||
+      !Number.isSafeInteger(input.now) || input.now < 0) {
+      throw new TypeError("managed automation authority refresh is invalid");
+    }
+    return this.db.transaction(() => {
+      const binding = this.get(input.id);
+      if (!binding || binding.projectId !== authority.projectId ||
+        binding.controllerKey !== authority.controllerKey || binding.state === "retired") {
+        throw new Error("managed automation authority refresh does not match its binding");
+      }
+      this.db.prepare(
+        `UPDATE managed_automations
+            SET authority_json = ?, authority_version = 1,
+                capability_profile_id = ?, capability_profile_revision = ?,
+                capability_evidence_json = ?, updated_at = ?
+          WHERE id = ?`,
+      ).run(
+        canonical(authority),
+        authority.capabilityEvidence.profileId,
+        authority.capabilityEvidence.profileRevision,
+        canonical(authority.capabilityEvidence),
+        input.now,
+        input.id,
+      );
+      const pendingOperations = this.db.prepare(
+        `SELECT id FROM managed_automation_operations
+          WHERE binding_id = ? AND state IN ('pending', 'failed', 'ambiguous')`,
+      ).all(input.id) as Array<{ id: string }>;
+      for (const operation of pendingOperations) {
+        this.db.prepare(
+          `UPDATE managed_automation_operations
+              SET authority_json = ?, capability_evidence_json = ?, updated_at = ?
+            WHERE id = ?`,
+        ).run(canonical(authority), canonical(authority.capabilityEvidence), input.now, operation.id);
+      }
+      return this.get(input.id)!;
     }).immediate();
   }
 

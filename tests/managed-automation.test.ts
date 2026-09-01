@@ -13,16 +13,18 @@ import {
 } from "../src/bb/automation";
 import {
   ManagedAutomationReconciler,
-  ManagedAgentExecutionContractUnsupportedError,
   ManagedAutomationService,
   migrateLegacyClockMonitor,
+  type CreateManagedAutomationInput,
+  type ManagedAutomationMutation,
   type ManagedAutomationAdapter,
 } from "../src/services/managed-automation-service";
 import { ManagedAutomationRepository, type ManagedAutomationBinding } from "../src/storage/managed-automation-repository";
-import { openStore, type MonitorRecord } from "../src/storage/store";
+import { openStore, type MonitorRecord, type TelegramAgentStore } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
 import {
   installSystemAutomations,
+  SYSTEM_MONITORS,
   systemMaintenanceAuthority,
 } from "../src/services/system-monitors";
 import { hashSecret } from "../src/crypto";
@@ -38,10 +40,10 @@ import type {
 } from "../src/domain/managed-automation";
 import {
   currentManagedAutomationAuthority,
+  isCurrentManagedAutomationAuthority,
   managedAutomationAuthoritySchema,
   parseManagedAutomationAuthority,
 } from "../src/domain/managed-automation";
-import { capabilityDescriptorById } from "../src/capabilities/catalog";
 
 const NOW = 1_800_000_000_000;
 const SCOPE = { kind: "environment", environmentId: "env_owner" } as const;
@@ -256,7 +258,7 @@ function fakeAdapter(runClock = NOW) {
   return { adapter, automations, runs, create };
 }
 
-function createInput() {
+function createInput(overrides: Partial<CreateManagedAutomationInput> = {}): CreateManagedAutomationInput {
   return {
     scope: SCOPE,
     controllerKey: "owner-7-controller",
@@ -265,7 +267,62 @@ function createInput() {
     authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
     notificationPolicy: "material" as const,
     now: NOW,
+    operation: {
+      version: 1,
+      operationClass: "create",
+      targetProjectId: definition.projectId,
+      targetHostId: "host_owner",
+      definitionRevision: 1,
+      intentKey: "owner-schedule:daily-health",
+    },
+    controllerFence: {
+      ownerId: "controller-executor",
+      generation: 1,
+      turnId: "turn_owner",
+    },
+    ...overrides,
   };
+}
+
+function executorMutation(
+  store: Pick<TelegramAgentStore, "runExecutorMutation">,
+  ownerId: string,
+  generation: number,
+): ManagedAutomationMutation {
+  return <T>(mutation: () => T): T => {
+    const result = store.runExecutorMutation({ ownerId, generation }, mutation);
+    if (result.outcome === "stale") throw new Error("executor lease was lost");
+    return result.mutationValue;
+  };
+}
+
+async function createActiveBinding(
+  store: TelegramAgentStore,
+  repository: ManagedAutomationRepository,
+  service: ManagedAutomationService,
+  input: CreateManagedAutomationInput = createInput(),
+): Promise<ManagedAutomationBinding> {
+  const ownerId = `test-create-${fixtureNumber++}`;
+  const lease = store.acquireExecutorLease(ownerId, input.now, 120_000);
+  if (!lease.acquired) throw new Error("missing create executor lease");
+  const signal = new AbortController().signal;
+  try {
+    const pending = await service.create({
+      ...input,
+      mutate: executorMutation(store, ownerId, lease.generation),
+    });
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    await reconciler.processDue(input.now + 1, signal, {
+      ownerId,
+      generation: lease.generation,
+      signal,
+    });
+    const active = repository.get(pending.id);
+    if (!active) throw new Error("created managed automation disappeared");
+    return active;
+  } finally {
+    store.releaseExecutorLease(ownerId, lease.generation, input.now + 2);
+  }
 }
 
 function versionedOwnerAuthority(turnId = "turn_owner"): Record<string, unknown> {
@@ -361,7 +418,7 @@ async function settledRunNowFixture() {
   const { bb, store, repository } = fixture();
   const fake = fakeAdapter();
   const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-  const binding = await service.create(createInput());
+  const binding = await createActiveBinding(store, repository, service);
   const submitted = service.submitLifecycleOperation({
     id: binding.id,
     operationClass: "run_now",
@@ -758,10 +815,9 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create({
-      ...createInput(),
+    const created = await createActiveBinding(store, repository, service, createInput({
       authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
-    });
+    }));
     const updatedDefinition = {
       ...definition,
       trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
@@ -814,7 +870,7 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
     if (!lease.acquired) throw new Error("missing automation executor lease");
     const execute = async (
@@ -890,10 +946,11 @@ describe("managed BB automations", () => {
   });
 
   it("rejects lifecycle submission when persisted capability evidence is not current", async () => {
-    const { repository } = fixture();
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
+    const setupService = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await createActiveBinding(store, repository, setupService);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => false);
-    const created = await service.create(createInput());
 
     expect(() => service.submitLifecycleOperation({
       id: created.id,
@@ -909,7 +966,7 @@ describe("managed BB automations", () => {
     expect(repository.get(created.id)).toMatchObject({
       state: "active",
       desiredState: "enabled",
-      lastOperationId: null,
+      lastOperationId: expect.any(String),
     });
   });
 
@@ -917,7 +974,7 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter(2_000);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
     if (!lease.acquired) throw new Error("missing automation executor lease");
     const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
@@ -961,7 +1018,7 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const authority = versionedOwnerAuthority("turn_retire") as ManagedAutomationAuthority;
     const submitted = service.submitLifecycleOperation({
       id: created.id,
@@ -1029,23 +1086,18 @@ describe("managed BB automations", () => {
       const { bb, store, repository } = fixture();
       const fake = fakeAdapter();
       const systemKey = "system-stale-jobs";
-      const authority = versionedSystemMaintenanceAuthority(systemKey);
       const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
-      const created = await service.create({
-        ...createInput(),
-        sourceKey: systemKey,
-        authority,
-        deferProvider: true,
-        operation: {
-          version: 1,
-          operationClass: "create",
-          targetProjectId: definition.projectId,
-          targetHostId: authority.hostId,
-          definitionRevision: 1,
-        },
-      });
       const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
       if (!setupLease.acquired) throw new Error("missing setup executor lease");
+      const createdPending = await service.createSystemMaintenanceIntent({
+        ...createInput({
+          sourceKey: systemKey,
+          controllerFence: undefined,
+          mutate: executorMutation(store, "automation-setup", setupLease.generation),
+        }),
+        hostId: "host_owner",
+        systemKey,
+      });
       const setupReconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
       const setupSignal = new AbortController().signal;
       await setupReconciler.processDue(NOW + 1, setupSignal, {
@@ -1056,6 +1108,8 @@ describe("managed BB automations", () => {
       if (!store.releaseExecutorLease("automation-setup", setupLease.generation, NOW + 1)) {
         throw new Error("setup executor lease could not be released");
       }
+      const created = repository.get(createdPending.id);
+      if (!created) throw new Error("system automation disappeared after setup");
       const submitted = { value: null as ManagedAutomationBinding | null };
       const releaseCurrentLease = (now: number): void => {
         const row = bb.storage.database().prepare(
@@ -1080,20 +1134,14 @@ describe("managed BB automations", () => {
         }
       });
       const systemMonitors = {
-        install: (fence?: { ownerId: string; generation: number }): void => {
+        install: (fence: { ownerId: string; generation: number; signal: AbortSignal }): void => {
           if (!fence || submitted.value) return;
-          const result = store.runExecutorMutation(
-            { ownerId: fence.ownerId, generation: fence.generation },
-            () => service.submitSystemMaintenanceRetirementOperation({
-              id: created.id,
-              systemKey,
-              authority,
-              now: NOW + 1,
-              mutate: (mutation) => mutation(),
-            }),
-          );
-          if (result.outcome === "stale") throw new Error("system retirement reservation lost its executor fence");
-          submitted.value = result.mutationValue;
+          submitted.value = service.submitSystemMaintenanceRetirementOperation({
+            id: created.id,
+            systemKey,
+            now: NOW + 1,
+            mutate: executorMutation(store, fence.ownerId, fence.generation),
+          });
         },
       };
       const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
@@ -1143,7 +1191,7 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const submitted = service.submitLifecycleOperation({
       id: created.id,
       operationClass: "retire",
@@ -1194,10 +1242,9 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create({
-      ...createInput(),
+    const created = await createActiveBinding(store, repository, service, createInput({
       authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
-    });
+    }));
     fake.automations.set(created.bbAutomationId!, automation(definition, {
       id: created.bbAutomationId!,
       name: providerName(definition.name, {
@@ -1259,7 +1306,14 @@ describe("managed BB automations", () => {
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const revisionOne = versionedOwnerAuthority("turn_revision_1") as ManagedAutomationAuthority;
-    const created = await service.create({ ...createInput(), authority: revisionOne });
+    const created = await createActiveBinding(store, repository, service, createInput({
+      authority: revisionOne,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_revision_1",
+      },
+    }));
     fake.runs.set(created.bbAutomationId!, [runEvidence({
       id: "run_historical",
       automationId: created.bbAutomationId!,
@@ -1463,7 +1517,6 @@ describe("managed BB automations", () => {
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -1475,7 +1528,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", lease.generation),
     });
     const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
     const signal = new AbortController().signal;
@@ -1511,7 +1564,7 @@ describe("managed BB automations", () => {
     store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW - 300);
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const updatedDefinition = {
       ...definition,
       trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
@@ -1574,7 +1627,7 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const authority = versionedOwnerAuthority("turn_run_timeout") as ManagedAutomationAuthority;
     const submitted = service.submitLifecycleOperation({
       id: created.id,
@@ -1625,7 +1678,7 @@ describe("managed BB automations", () => {
     const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const operationAuthority = versionedOwnerAuthority("turn_ambiguous_run") as ManagedAutomationAuthority;
     const submitted = service.submitLifecycleOperation({
       id: created.id,
@@ -1745,7 +1798,7 @@ describe("managed BB automations", () => {
     const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const submitted = service.submitLifecycleOperation({
       id: created.id,
       operationClass: "run_now",
@@ -1802,10 +1855,30 @@ describe("managed BB automations", () => {
 
     const firstReconciliation = repository.get(created.id);
     if (!firstReconciliation) throw new Error("ambiguous automation binding is missing");
-    await service.reconcile({ binding: firstReconciliation, scope: SCOPE, now: NOW + 3, signal });
+    const firstReconciliationOperation = service.submitReconciliationOperation({
+      binding: firstReconciliation,
+      now: NOW + 3,
+      mutate: executorMutation(store, "automation-executor", lease.generation),
+    });
+    if (!firstReconciliationOperation) throw new Error("first reconciliation operation was not reserved");
+    await reconciler.processDue(NOW + 3, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
     const secondReconciliation = repository.get(created.id);
     if (!secondReconciliation) throw new Error("reconciled automation binding is missing");
-    await service.reconcile({ binding: secondReconciliation, scope: SCOPE, now: NOW + 4, signal });
+    const secondReconciliationOperation = service.submitReconciliationOperation({
+      binding: secondReconciliation,
+      now: NOW + 4,
+      mutate: executorMutation(store, "automation-executor", lease.generation),
+    });
+    if (!secondReconciliationOperation) throw new Error("second reconciliation operation was not reserved");
+    await reconciler.processDue(NOW + 4, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
 
     const historyRows = bb.storage.database().prepare(
       `SELECT bb_run_id, initiating_operation_id, idempotency_key
@@ -1859,7 +1932,7 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await service.create(createInput());
+    const created = await createActiveBinding(store, repository, service);
     const authority = versionedOwnerAuthority("turn_authoritative_run") as ManagedAutomationAuthority;
     const first = service.submitLifecycleOperation({
       id: created.id,
@@ -1930,7 +2003,7 @@ describe("managed BB automations", () => {
       const { bb, store, repository } = fixture();
       const fake = fakeAdapter();
       const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-      const created = await service.create(createInput());
+      const created = await createActiveBinding(store, repository, service);
       const updatedDefinition = {
         ...definition,
         trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
@@ -2001,7 +2074,7 @@ describe("managed BB automations", () => {
       const { bb, store, repository } = fixture();
       const fake = fakeAdapter();
       const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-      const created = await service.create(createInput());
+      const created = await createActiveBinding(store, repository, service);
       const updatedDefinition = {
         ...definition,
         trigger: { kind: "cron" as const, cron: "30 8 * * *", timezone: "Etc/UTC" },
@@ -2128,10 +2201,10 @@ describe("managed BB automations", () => {
     ["malformed", { version: 1, value: { mode: "agent" } }],
     ["unknown-versioned", { version: 2, value: definition }],
   ])("fails closed when a %s current definition crosses the store boundary", async (_label, serialized) => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
 
     bb.storage.database().prepare(
       "UPDATE managed_automations SET definition_json = ? WHERE id = ?",
@@ -2141,10 +2214,10 @@ describe("managed BB automations", () => {
   });
 
   it("keeps an immediately preceding legacy definition readable", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
 
     bb.storage.database().prepare(
       "UPDATE managed_automations SET definition_json = ? WHERE id = ?",
@@ -2157,10 +2230,10 @@ describe("managed BB automations", () => {
     ["malformed", { version: 1, value: { providerAutomationId: "auto_1" } }],
     ["unknown-versioned", { version: 2, value: { providerAutomationId: "auto_1" } }],
   ])("fails closed when a %s current observation crosses the store boundary", async (_label, serialized) => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
 
     bb.storage.database().prepare(
       "UPDATE managed_automations SET observed_json = ? WHERE id = ?",
@@ -2170,13 +2243,14 @@ describe("managed BB automations", () => {
   });
 
   it("fails closed on an unknown current operation outcome while preserving a legacy outcome", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("automation-submit", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation submission lease");
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2188,8 +2262,9 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-submit", lease.generation),
     });
+    store.releaseExecutorLease("automation-submit", lease.generation, NOW + 1);
     const operationId = pending.lastOperationId!;
     const db = bb.storage.database();
 
@@ -2211,7 +2286,6 @@ describe("managed BB automations", () => {
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2223,7 +2297,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", lease.generation),
     });
 
     expect(pending.state).toBe("pending");
@@ -2260,10 +2334,11 @@ describe("managed BB automations", () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const submitLease = store.acquireExecutorLease("automation-submit", NOW, 120_000);
+    if (!submitLease.acquired) throw new Error("missing automation submission lease");
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2275,8 +2350,9 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-submit", submitLease.generation),
     });
+    store.releaseExecutorLease("automation-submit", submitLease.generation, NOW + 1);
     const reconciler = new ManagedAutomationReconciler({
       repository,
       service,
@@ -2364,16 +2440,18 @@ describe("managed BB automations", () => {
   it("blocks a current owner operation before the provider when its capability receipt is stale", async () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
+    const setupService = new ManagedAutomationService(repository, fake.adapter, () => true);
     const service = new ManagedAutomationService(
       repository,
       fake.adapter,
       () => true,
       (_binding, operation) => operation.capabilityEvidence?.evidenceRefs.some((ref) => ref.startsWith("capability-receipt:")) === true,
     );
-    const pending = await service.create({
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const pending = await setupService.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2385,8 +2463,12 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", lease.generation),
     });
+    if (!store.releaseExecutorLease("automation-executor", lease.generation, NOW + 1)) {
+      throw new Error("automation submission lease could not be released");
+    }
+    vi.clearAllMocks();
     const reconciler = new ManagedAutomationReconciler({
       repository,
       service,
@@ -2416,7 +2498,6 @@ describe("managed BB automations", () => {
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2428,7 +2509,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", firstLease.generation),
     });
     const operation = repository.claimOperation({
       operationId: pending.lastOperationId!,
@@ -2472,13 +2553,13 @@ describe("managed BB automations", () => {
   it("does not call BB when current capability evidence denies the operation", async () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
+    const setupService = new ManagedAutomationService(repository, fake.adapter, () => true);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => false);
     const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
     if (!lease.acquired) throw new Error("missing automation executor lease");
-    const pending = await service.create({
+    const pending = await setupService.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2490,8 +2571,9 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", lease.generation),
     });
+    vi.clearAllMocks();
     const reconciler = new ManagedAutomationReconciler({
       repository,
       service,
@@ -2522,7 +2604,6 @@ describe("managed BB automations", () => {
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2534,7 +2615,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", firstLease.generation),
     });
     const claimed = repository.claimOperation({
       operationId: pending.lastOperationId!,
@@ -2607,7 +2688,6 @@ describe("managed BB automations", () => {
     const pending = await service.create({
       ...createInput(),
       authority: versionedOwnerAuthority(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -2619,7 +2699,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-executor", lease.generation),
     });
     const reconciler = new ManagedAutomationReconciler({
       repository,
@@ -2644,14 +2724,41 @@ describe("managed BB automations", () => {
   });
 
   it("restarts by reconciling the same durable BB id without creating a duplicate", async () => {
-    const { repository } = fixture();
+    const { store, repository } = fixture();
+    store.createPairingCode(hashSecret("pair-restart"), NOW - 1_000, NOW + 10_000);
+    expect(store.pairOwnerWithPrivateChatCode(
+      hashSecret("pair-restart"),
+      "7",
+      "70",
+      NOW - 500,
+    )).toEqual({ ok: true });
+    store.enqueueControllerTurn({
+      controllerKey: "owner-7-controller",
+      telegramUserId: "7",
+      telegramChatId: "70",
+      updateId: 1,
+      inputText: "Reconcile the restarted automation.",
+      now: NOW - 400,
+    });
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
     const fake = fakeAdapter();
     const firstService = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const created = await firstService.create(createInput());
+    const created = await createActiveBinding(store, repository, firstService);
     fake.runs.set(created.bbAutomationId!, [runEvidence({ automationId: created.bbAutomationId! })]);
 
     const restartedService = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const reconciled = await restartedService.create({ ...createInput(), now: NOW + 100 });
+    const lease = store.acquireExecutorLease("automation-restart", NOW + 60_001, 120_000);
+    if (!lease.acquired) throw new Error("missing restart executor lease");
+    const signal = new AbortController().signal;
+    const restarted = new ManagedAutomationReconciler({ repository, service: restartedService, store, notify: vi.fn() });
+    await restarted.processDue(NOW + 60_001, signal, {
+      ownerId: "automation-restart",
+      generation: lease.generation,
+      signal,
+    });
+    const reconciled = repository.get(created.id);
+    if (!reconciled) throw new Error("restarted binding disappeared");
+    store.releaseExecutorLease("automation-restart", lease.generation, NOW + 60_002);
 
     expect(reconciled.id).toBe(created.id);
     expect(reconciled.bbAutomationId).toBe(created.bbAutomationId);
@@ -2660,10 +2767,10 @@ describe("managed BB automations", () => {
   });
 
   it("keeps run evidence append-only and de-duplicates a repeated observation", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
     const run = runEvidence({ automationId: binding.bbAutomationId! });
 
     expect(repository.recordRun(binding.id, run, NOW + 1)).toBe(true);
@@ -2674,10 +2781,10 @@ describe("managed BB automations", () => {
   });
 
   it("screens worker output and errors before durable evidence or controller handoff", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
     const privateOutput = "deployment token: telegram-worker-output-secret";
     const privateError = "provider rejected telegram-worker-error-secret";
 
@@ -2702,10 +2809,10 @@ describe("managed BB automations", () => {
   });
 
   it("fails closed when an agent result exceeds its declared result contract", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
 
     repository.recordRun(binding.id, runEvidence({
       automationId: binding.bbAutomationId!,
@@ -2725,60 +2832,79 @@ describe("managed BB automations", () => {
     });
   });
 
-  it("persists retirement intent before deleting and reconciles an interrupted retirement", async () => {
-    const { repository } = fixture();
+  it("persists retirement intent before deleting and executes it through the durable executor", async () => {
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
-    let mutationCount = 0;
+    const binding = await createActiveBinding(store, repository, service);
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
 
-    await expect(service.retire({
+    const submitted = service.submitLifecycleOperation({
       id: binding.id,
-      scope: SCOPE,
-      now: NOW + 1,
-      mutate: (mutation) => {
-        mutationCount += 1;
-        if (mutationCount === 2) throw new Error("controller fence was lost");
-        return mutation();
+      operationClass: "retire",
+      desiredState: "retired",
+      authority: versionedOwnerAuthority("turn_retire_durable") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_retire_durable",
       },
-    })).rejects.toThrow("controller fence was lost");
+      now: NOW + 1,
+      mutate: executorMutation(store, "automation-executor", lease.generation),
+    });
+    expect(submitted).toMatchObject({ state: "retiring", lastOperationOutcome: "pending" });
 
-    const interrupted = service.get(binding.id)!;
-    expect(interrupted.state).toBe("retiring");
-    await service.reconcile({ binding: interrupted, scope: SCOPE, now: NOW + 2 });
-    expect(service.get(binding.id)?.state).toBe("retired");
-    expect(fake.adapter.delete).toHaveBeenCalledTimes(2);
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(service.get(binding.id)).toMatchObject({ state: "retired", desiredState: "retired" });
+    expect(fake.adapter.delete).toHaveBeenCalledOnce();
   });
 
-  it("reconciles an interrupted governed definition update from durable intent", async () => {
-    const { repository } = fixture();
+  it("executes a governed definition update through durable intent", async () => {
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
     const updatedDefinition: BbAutomationDefinition = {
       ...definition,
       name: "Twice-daily release health",
       trigger: { kind: "cron", cron: "0 8,20 * * *", timezone: "Etc/UTC" },
     };
-    let mutationCount = 0;
-
-    await expect(service.update({
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const submitted = service.submitLifecycleOperation({
       id: binding.id,
-      scope: SCOPE,
+      operationClass: "update",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("turn_update_durable") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_update_durable",
+      },
       definition: updatedDefinition,
       now: NOW + 1,
-      mutate: (mutation) => {
-        mutationCount += 1;
-        if (mutationCount === 2) throw new Error("controller fence was lost");
-        return mutation();
-      },
-    })).rejects.toThrow("controller fence was lost");
+      mutate: executorMutation(store, "automation-executor", lease.generation),
+    });
+    expect(submitted).toMatchObject({ state: "updating", name: updatedDefinition.name });
 
-    const interrupted = service.get(binding.id)!;
-    expect(interrupted).toMatchObject({ state: "updating", name: updatedDefinition.name });
-    await service.reconcile({ binding: interrupted, scope: SCOPE, now: NOW + 2 });
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
     expect(service.get(binding.id)).toMatchObject({ state: "active", name: updatedDefinition.name });
-    expect(fake.adapter.update).toHaveBeenCalledTimes(2);
+    expect(fake.adapter.update).toHaveBeenCalledOnce();
   });
 
   it("records running and terminal states once, then hands the terminal result to the controller exactly once", async () => {
@@ -2801,7 +2927,7 @@ describe("managed BB automations", () => {
     store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW - 300);
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
     fake.runs.set(binding.bbAutomationId!, [
       runEvidence({ automationId: binding.bbAutomationId!, status: "running", finishedAt: null, output: null }),
     ]);
@@ -2812,12 +2938,27 @@ describe("managed BB automations", () => {
       notify: vi.fn(),
     });
 
-    await reconciler.processDue(NOW + 60_001);
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 60_001, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 60_001, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
     fake.runs.set(binding.bbAutomationId!, [
       runEvidence({ automationId: binding.bbAutomationId!, status: "succeeded" }),
     ]);
-    await reconciler.processDue(NOW + 120_002);
-    await reconciler.processDue(NOW + 180_003);
+    await reconciler.processDue(NOW + 120_002, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+    await reconciler.processDue(NOW + 180_003, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
 
     expect(bb.storage.database().prepare(
       "SELECT status FROM managed_automation_run_evidence WHERE bb_run_id = 'run_1' ORDER BY sequence",
@@ -2856,7 +2997,7 @@ describe("managed BB automations", () => {
     }), NOW - 300);
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
     fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
     const reconciler = new ManagedAutomationReconciler({
       repository,
@@ -2865,9 +3006,16 @@ describe("managed BB automations", () => {
       notify: vi.fn(),
     });
 
-    await reconciler.processDue(NOW + 60_001);
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 60_001, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 60_001, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
 
-    expect(fake.adapter.setEnabled).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
     expect(fake.adapter.runs).not.toHaveBeenCalled();
     expect(service.get(binding.id)).toMatchObject({
       state: "paused",
@@ -2875,36 +3023,11 @@ describe("managed BB automations", () => {
     });
   });
 
-  it("pauses an existing agent schedule before reading runs when BB cannot enforce its execution contract", async () => {
-    const { repository } = fixture();
+  it("refuses an unsupported agent lifecycle operation at durable executor admission", async () => {
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
     const supportedService = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await supportedService.create(createInput());
-    fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
-    const service = new ManagedAutomationService(repository, {
-      ...fake.adapter,
-      agentAutomationCapabilities: {
-        executionTimeout: false,
-        resultContract: false,
-        preRunAuthority: false,
-      },
-    }, () => true);
-
-    await service.reconcile({ binding, scope: SCOPE, now: NOW + 1 });
-
-    expect(fake.adapter.setEnabled).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
-    expect(fake.adapter.runs).not.toHaveBeenCalled();
-    expect(service.get(binding.id)).toMatchObject({
-      state: "paused",
-      lastError: "bb_agent_execution_contract_unsupported",
-    });
-  });
-
-  it("refuses resume, update, and manual execution when an agent contract is unsupported", async () => {
-    const { repository } = fixture();
-    const fake = fakeAdapter();
-    const supportedService = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await supportedService.create(createInput());
+    const binding = await createActiveBinding(store, repository, supportedService);
     const adapter: ManagedAutomationAdapter = {
       ...fake.adapter,
       agentAutomationCapabilities: {
@@ -2917,33 +3040,49 @@ describe("managed BB automations", () => {
     vi.mocked(fake.adapter.setEnabled).mockClear();
     vi.mocked(fake.adapter.update).mockClear();
     vi.mocked(fake.adapter.runNow).mockClear();
-
-    await expect(service.setEnabled({ id: binding.id, scope: SCOPE, enabled: true, now: NOW + 1 }))
-      .rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
-    await expect(service.update({
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const submitted = service.submitLifecycleOperation({
       id: binding.id,
-      scope: SCOPE,
-      definition: { ...definition, prompt: "Updated prompt" },
+      operationClass: "enable",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("turn_unsupported") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_unsupported",
+      },
       now: NOW + 1,
-    })).rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
-    await expect(service.runNow({
-      id: binding.id,
-      scope: SCOPE,
-      idempotencyKey: "manual-unsupported",
-      now: NOW + 1,
-    })).rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
+      mutate: executorMutation(store, "automation-executor", lease.generation),
+    });
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
 
     expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
     expect(fake.adapter.update).not.toHaveBeenCalled();
     expect(fake.adapter.runNow).not.toHaveBeenCalled();
+    expect(submitted.state).toBe("updating");
+    expect(repository.getOperation(submitted.lastOperationId!)).toMatchObject({
+      state: "failed",
+      lastError: "bb_agent_execution_contract_unsupported",
+    });
   });
 
   it("does not create a scheduled agent when its current authority preflight fails", async () => {
-    const { repository } = fixture();
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => false);
+    const lease = store.acquireExecutorLease("automation-submit", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation submission lease");
 
-    await expect(service.create(createInput())).rejects.toThrow("authority is not current");
+    await expect(service.create(createInput({
+      mutate: executorMutation(store, "automation-submit", lease.generation),
+    }))).rejects.toThrow("authority is not current");
 
     expect(fake.create).not.toHaveBeenCalled();
     expect(service.list("owner-7-controller")).toMatchObject([{
@@ -2964,6 +3103,8 @@ describe("managed BB automations", () => {
     });
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("legacy-migration", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing legacy migration executor lease");
 
     const binding = await migrateLegacyClockMonitor({
       monitor,
@@ -2977,8 +3118,10 @@ describe("managed BB automations", () => {
       permissionMode: "full",
       authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
       controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_owner" },
+      mutate: executorMutation(store, "legacy-migration", lease.generation),
       now: NOW,
     });
+    store.releaseExecutorLease("legacy-migration", lease.generation, NOW + 1);
 
     expect(binding.state).toBe("pending");
     expect(binding.bbAutomationId).toBeNull();
@@ -3017,9 +3160,11 @@ describe("managed BB automations", () => {
   });
 
   it("pauses BB if the local disable fence is lost, so two schedulers cannot stay active", async () => {
-    const { repository } = fixture();
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("legacy-migration", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing legacy migration executor lease");
     const monitor: MonitorRecord = {
       id: "mon_legacy",
       controllerKey: "owner-7-controller",
@@ -3050,6 +3195,7 @@ describe("managed BB automations", () => {
       permissionMode: "full",
       authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
       controllerFence: { ownerId: "controller-executor", generation: 1, turnId: "turn_owner" },
+      mutate: executorMutation(store, "legacy-migration", lease.generation),
       now: NOW,
     })).rejects.toThrow("could not be disabled");
 
@@ -3081,12 +3227,13 @@ describe("managed BB automations", () => {
   });
 
   it("revalidates a script authority before its legacy direct provider creation", async () => {
-    const { repository } = fixture();
+    const { store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => false);
+    const lease = store.acquireExecutorLease("automation-submit", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation submission lease");
 
-    await expect(service.create({
-      ...createInput(),
+    await expect(service.create(createInput({
       definition: {
         mode: "script",
         projectId: definition.projectId,
@@ -3096,7 +3243,8 @@ describe("managed BB automations", () => {
         interpreter: "sh",
         timeoutMs: 60_000,
       },
-    })).rejects.toThrow(/authority is not current/i);
+      mutate: executorMutation(store, "automation-submit", lease.generation),
+    }))).rejects.toThrow(/authority is not current/i);
     expect(fake.create).not.toHaveBeenCalled();
     expect(repository.list("owner-7-controller", true)).toMatchObject([{
       state: "failed",
@@ -3133,7 +3281,7 @@ describe("managed BB automations", () => {
       })).resolves.toBe(3);
 
       expect(fake.create).not.toHaveBeenCalled();
-      expect(fencedMutations).toBe(3);
+      expect(fencedMutations).toBe(SYSTEM_MONITORS.length * 2);
       const bindings = repository.list(controllerFixture.turn.controllerKey, true);
       expect(bindings).toHaveLength(3);
       expect(bindings.every((binding) => binding.state === "pending" && binding.bbAutomationId === null)).toBe(true);
@@ -3144,23 +3292,44 @@ describe("managed BB automations", () => {
     }
   });
 
-  it("admits an automation-triggered operation only with exact target and bounded lineage", async () => {
-    const { repository } = fixture();
+  it("derives an automation-triggered operation from an authoritative parent run", async () => {
+    const { store, repository } = fixture();
+    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create({
-      ...createInput(),
-      authority: versionedOwnerAuthority() as ManagedAutomationAuthority,
-    });
-    const authority = automationTriggeredAuthority();
-
-    const submitted = service.submitLifecycleOperation({
-      id: binding.id,
+    const parent = await createActiveBinding(store, repository, service, createInput({ sourceKey: "origin-parent" }));
+    const child = await createActiveBinding(store, repository, service, createInput({ sourceKey: "origin-child" }));
+    const lease = store.acquireExecutorLease("automation-triggered", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation-triggered executor lease");
+    const parentRun = service.submitLifecycleOperation({
+      id: parent.id,
       operationClass: "run_now",
       desiredState: "enabled",
-      authority,
+      authority: versionedOwnerAuthority("parent-run") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "parent-run",
+      },
       now: NOW + 1,
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-triggered", lease.generation),
+    });
+    const signal = new AbortController().signal;
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-triggered",
+      generation: lease.generation,
+      signal,
+    });
+
+    const submitted = service.submitAutomationTriggeredOperation({
+      id: child.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      parentOperationId: parentRun.lastOperationId!,
+      rootAutomationId: "automation-root",
+      now: NOW + 3,
+      mutate: executorMutation(store, "automation-triggered", lease.generation),
     });
 
     expect(submitted.lastOperationOutcome).toBe("pending");
@@ -3169,53 +3338,25 @@ describe("managed BB automations", () => {
       state: "pending",
       authority: {
         origin: "automation-triggered",
-        taskAuthority: { automationId: "auto_parent", operationId: "parent-operation" },
-        recursion: { depth: 1, maxDepth: 3, lineage: ["auto_root", "auto_parent"] },
+        taskAuthority: { automationId: parent.id, operationId: parentRun.lastOperationId },
+        recursion: { depth: 1, maxDepth: 3, lineage: ["automation-root", parent.id] },
       },
     });
-    expect(fake.adapter.runNow).not.toHaveBeenCalled();
-
-    expect(() => service.submitLifecycleOperation({
-      id: binding.id,
-      operationClass: "run_now",
-      desiredState: "enabled",
-      authority: automationTriggeredAuthority("run_now", {
-        operationScope: {
-          version: 1,
-          operationClass: "retire",
-          targetProjectId: "proj_owner",
-          targetHostId: "host_owner",
-        },
-      }),
-      now: NOW + 2,
-      mutate: (mutation) => mutation(),
-    })).toThrow(/operation|admit|authority/i);
-
-    expect(() => service.submitLifecycleOperation({
-      id: binding.id,
-      operationClass: "run_now",
-      desiredState: "enabled",
-      authority: automationTriggeredAuthority("run_now", {
-        recursion: {
-          version: 1,
-          rootAutomationId: "auto_root",
-          parentAutomationId: "auto_parent",
-          depth: 4,
-          maxDepth: 3,
-          lineage: ["auto_root", "auto_parent", "auto_child", "auto_grandchild", "auto_loop"],
-        },
-      }),
-      now: NOW + 3,
-      mutate: (mutation) => mutation(),
-    })).toThrow(/recursion|lineage|authority/i);
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
   });
 
   it("does not fall back to a provider reconciliation when a fenced durable admission is denied", async () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
     const setupService = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
-    await setupService.create({
-      ...createInput(),
+    const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
+    if (!setupLease.acquired) throw new Error("missing setup executor lease");
+    await setupService.createSystemMaintenanceIntent({
+      scope: SCOPE,
+      controllerKey: "owner-7-controller",
+      sourceKey: "system-stale-jobs",
+      hostId: "host_owner",
+      systemKey: "system-stale-jobs",
       definition: {
         mode: "script",
         projectId: definition.projectId,
@@ -3225,18 +3366,10 @@ describe("managed BB automations", () => {
         interpreter: "sh",
         timeoutMs: 60_000,
       },
-      authority: versionedSystemMaintenanceAuthority(),
-      deferProvider: true,
-      operation: {
-        version: 1,
-        operationClass: "create",
-        targetProjectId: definition.projectId,
-        targetHostId: "host_owner",
-        definitionRevision: 1,
-      },
+      notificationPolicy: "material",
+      now: NOW,
+      mutate: executorMutation(store, "automation-setup", setupLease.generation),
     });
-    const setupLease = store.acquireExecutorLease("automation-setup", NOW, 120_000);
-    if (!setupLease.acquired) throw new Error("missing setup executor lease");
     const setupReconciler = new ManagedAutomationReconciler({ repository, service: setupService, store, notify: vi.fn() });
     const setupSignal = new AbortController().signal;
     await setupReconciler.processDue(NOW + 1, setupSignal, {
@@ -3272,10 +3405,10 @@ describe("managed BB automations", () => {
   });
 
   it("refuses a legacy binding before any direct provider reconciliation", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await service.create(createInput());
+    const binding = await createActiveBinding(store, repository, service);
     const legacyAuthority = {
       source: "owner",
       controllerKey: binding.controllerKey,
@@ -3294,22 +3427,22 @@ describe("managed BB automations", () => {
     const legacyBinding = repository.get(binding.id);
     if (!legacyBinding) throw new Error("legacy binding was not readable");
 
-    await expect(service.reconcile({
+    expect(service.submitReconciliationOperation({
       binding: legacyBinding,
-      scope: SCOPE,
       now: NOW + 1,
-    })).rejects.toThrow(/revalidat|current/i);
+    })).toBeNull();
     expect(fake.adapter.show).not.toHaveBeenCalled();
     expect(fake.adapter.runs).not.toHaveBeenCalled();
   });
 
   it("fails closed when a durable operation target host is changed in SQLite", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("automation-submit", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation submission lease");
     const pending = await service.create({
       ...createInput(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -3322,7 +3455,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-submit", lease.generation),
     });
     const operationId = pending.lastOperationId!;
     bb.storage.database().prepare(
@@ -3334,12 +3467,13 @@ describe("managed BB automations", () => {
   });
 
   it("fails closed when a durable operation has a malformed SQLite attempt counter", async () => {
-    const { bb, repository } = fixture();
+    const { bb, store, repository } = fixture();
     const fake = fakeAdapter();
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("automation-submit", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation submission lease");
     const pending = await service.create({
       ...createInput(),
-      deferProvider: true,
       operation: {
         version: 1,
         operationClass: "create",
@@ -3351,7 +3485,7 @@ describe("managed BB automations", () => {
         generation: 1,
         turnId: "turn_owner",
       },
-      mutate: (mutation) => mutation(),
+      mutate: executorMutation(store, "automation-submit", lease.generation),
     });
     const operationId = pending.lastOperationId!;
     bb.storage.database().prepare(
@@ -3366,54 +3500,342 @@ describe("managed BB automations", () => {
     async (origin) => {
       const { store, repository } = fixture();
       store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
-      const descriptor = capabilityDescriptorById("telegram_agent_watch");
-      if (!descriptor) throw new Error("managed automation descriptor is missing");
-      const capabilityEvidence = {
-        version: 1 as const,
-        profileId: `profile_${origin}`,
-        profileRevision: 1,
-        capabilityId: descriptor.id,
-        descriptorVersion: descriptor.version,
-        descriptorDigest: descriptor.digest,
-        evidenceRefs: [`managed-automation:${origin}:policy_owner:1`],
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(
+        repository,
+        fake.adapter,
+        () => true,
+        (binding, operation) => isCurrentManagedAutomationAuthority(binding.authority) &&
+          binding.authority.origin === "owner"
+          ? true
+          : managedAutomationCapabilityIsCurrent(store, binding, operation),
+      );
+
+      let binding: ManagedAutomationBinding;
+      let operation: {
+        operationClass: "create" | "run_now";
+        targetProjectId: string;
+        targetHostId: string;
+        definitionRevision: number;
+        capabilityEvidence: ManagedAutomationBinding["capabilityEvidence"];
       };
-      const operationClass = "create" as const;
-      const authority = origin === "standing-policy"
-        ? managedAutomationAuthoritySchema.parse({
-            version: 1,
-            origin,
-            controllerKey: "owner-7-controller",
-            projectId: "proj_owner",
-            hostId: "host_owner",
-            taskAuthority: null,
-            standingAuthority: { version: 1, kind: "project-policy", policyId: "policy_owner", revision: 1 },
-            capabilityEvidence,
-            mayWidenAutomation: false,
-          })
-        : automationTriggeredAuthority(operationClass, { capabilityEvidence });
-      const service = new ManagedAutomationService(repository, fakeAdapter().adapter, () => true, () => true);
-      const binding = await service.create({
-        ...createInput(),
-        sourceKey: `origin:${origin}`,
-        authority,
-        deferProvider: true,
-        operation: {
-          version: 1,
-          operationClass,
-          targetProjectId: definition.projectId,
+      if (origin === "standing-policy") {
+        const lease = store.acquireExecutorLease("standing-policy-admission", NOW, 120_000);
+        if (!lease.acquired) throw new Error("missing standing-policy admission lease");
+        binding = await service.createStandingPolicyIntent({
+          scope: SCOPE,
+          controllerKey: "owner-7-controller",
+          sourceKey: "origin:standing-policy",
+          definition,
+          hostId: "host_owner",
+          notificationPolicy: "material",
+          now: NOW,
+          mutate: executorMutation(store, "standing-policy-admission", lease.generation),
+        });
+        operation = {
+          operationClass: "create",
+          targetProjectId: binding.projectId,
           targetHostId: "host_owner",
-          definitionRevision: 1,
-        },
-      });
-      const operation = {
-        operationClass,
-        targetProjectId: binding.projectId,
-        targetHostId: "host_owner",
-        definitionRevision: binding.definitionRevision,
-        capabilityEvidence: binding.capabilityEvidence,
-      };
+          definitionRevision: binding.definitionRevision,
+          capabilityEvidence: binding.capabilityEvidence,
+        };
+      } else {
+        const parent = await createActiveBinding(store, repository, service, createInput({ sourceKey: "origin:parent" }));
+        const child = await createActiveBinding(store, repository, service, createInput({ sourceKey: "origin:child" }));
+        const lease = store.acquireExecutorLease("automation-triggered-admission", NOW, 120_000);
+        if (!lease.acquired) throw new Error("missing automation-triggered admission lease");
+        const parentOperation = service.submitLifecycleOperation({
+          id: parent.id,
+          operationClass: "run_now",
+          desiredState: "enabled",
+          authority: versionedOwnerAuthority("origin-parent-run") as ManagedAutomationAuthority,
+          controllerFence: {
+            ownerId: "controller-executor",
+            generation: 1,
+            turnId: "origin-parent-run",
+          },
+          now: NOW + 1,
+          mutate: executorMutation(store, "automation-triggered-admission", lease.generation),
+        });
+        const signal = new AbortController().signal;
+        const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+        await reconciler.processDue(NOW + 2, signal, {
+          ownerId: "automation-triggered-admission",
+          generation: lease.generation,
+          signal,
+        });
+        binding = service.submitAutomationTriggeredOperation({
+          id: child.id,
+          operationClass: "run_now",
+          desiredState: "enabled",
+          parentOperationId: parentOperation.lastOperationId!,
+          now: NOW + 3,
+          mutate: executorMutation(store, "automation-triggered-admission", lease.generation),
+        });
+        operation = {
+          operationClass: "run_now",
+          targetProjectId: binding.projectId,
+          targetHostId: "host_owner",
+          definitionRevision: binding.definitionRevision,
+          capabilityEvidence: binding.capabilityEvidence,
+        };
+      }
 
       expect(managedAutomationCapabilityIsCurrent(store, binding, operation)).toBe(true);
     },
   );
+
+  it.each(["standing-policy", "automation-triggered", "system-maintenance"] as const)(
+    "fails closed before BB when a non-owner %s operation has no durable selected receipt",
+    async (origin) => {
+      const { bb, store, repository } = fixture();
+      if (origin !== "system-maintenance") {
+        store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
+      }
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
+      let pending: ManagedAutomationBinding;
+      let executorOwner: string;
+      let executorGeneration: number;
+      if (origin === "standing-policy") {
+        executorOwner = "standing-policy-admission";
+        const lease = store.acquireExecutorLease(executorOwner, NOW, 120_000);
+        if (!lease.acquired) throw new Error("missing standing-policy admission lease");
+        executorGeneration = lease.generation;
+        pending = await service.createStandingPolicyIntent({
+          scope: SCOPE,
+          controllerKey: "owner-7-controller",
+          sourceKey: `missing-receipt:${origin}`,
+          definition,
+          hostId: "host_owner",
+          notificationPolicy: "material",
+          now: NOW,
+          mutate: executorMutation(store, executorOwner, executorGeneration),
+        });
+        if (!store.releaseExecutorLease(executorOwner, executorGeneration, NOW + 1)) {
+          throw new Error("standing-policy admission lease could not be released");
+        }
+        executorOwner = "automation-executor";
+        const executorLease = store.acquireExecutorLease(executorOwner, NOW + 1, 120_000);
+        if (!executorLease.acquired) throw new Error("missing automation executor lease");
+        executorGeneration = executorLease.generation;
+      } else if (origin === "system-maintenance") {
+        executorOwner = "system-maintenance-admission";
+        const lease = store.acquireExecutorLease(executorOwner, NOW, 120_000);
+        if (!lease.acquired) throw new Error("missing system-maintenance admission lease");
+        executorGeneration = lease.generation;
+        pending = await service.createSystemMaintenanceIntent({
+          scope: SCOPE,
+          controllerKey: "owner-7-controller",
+          sourceKey: `missing-receipt:${origin}`,
+          hostId: "host_owner",
+          systemKey: "system-stale-jobs",
+          definition,
+          notificationPolicy: "material",
+          now: NOW,
+          mutate: executorMutation(store, executorOwner, executorGeneration),
+        });
+        if (!store.releaseExecutorLease(executorOwner, executorGeneration, NOW + 1)) {
+          throw new Error("system-maintenance admission lease could not be released");
+        }
+        executorOwner = "automation-executor";
+        const executorLease = store.acquireExecutorLease(executorOwner, NOW + 1, 120_000);
+        if (!executorLease.acquired) throw new Error("missing automation executor lease");
+        executorGeneration = executorLease.generation;
+      } else {
+        const parent = await createActiveBinding(store, repository, service, createInput({ sourceKey: "missing-receipt:parent" }));
+        const child = await createActiveBinding(store, repository, service, createInput({ sourceKey: "missing-receipt:child" }));
+        executorOwner = "automation-triggered-admission";
+        const lease = store.acquireExecutorLease(executorOwner, NOW, 120_000);
+        if (!lease.acquired) throw new Error("missing automation-triggered admission lease");
+        executorGeneration = lease.generation;
+        const parentOperation = service.submitLifecycleOperation({
+          id: parent.id,
+          operationClass: "run_now",
+          desiredState: "enabled",
+          authority: versionedOwnerAuthority("missing-receipt-parent") as ManagedAutomationAuthority,
+          controllerFence: {
+            ownerId: "controller-executor",
+            generation: 1,
+            turnId: "missing-receipt-parent",
+          },
+          now: NOW + 1,
+          mutate: executorMutation(store, executorOwner, executorGeneration),
+        });
+        const signal = new AbortController().signal;
+        const setupReconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+        await setupReconciler.processDue(NOW + 2, signal, {
+          ownerId: executorOwner,
+          generation: executorGeneration,
+          signal,
+        });
+        pending = service.submitAutomationTriggeredOperation({
+          id: child.id,
+          operationClass: "run_now",
+          desiredState: "enabled",
+          parentOperationId: parentOperation.lastOperationId!,
+          now: NOW + 3,
+          mutate: executorMutation(store, executorOwner, executorGeneration),
+        });
+      }
+      const database = bb.storage.database();
+      database.exec("DROP TRIGGER managed_automation_capability_receipts_append_only_delete");
+      database.prepare(
+        "DELETE FROM managed_automation_capability_receipts WHERE profile_id = ?",
+      ).run(pending.capabilityEvidence?.profileId);
+      vi.clearAllMocks();
+      const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+      const signal = new AbortController().signal;
+
+      await reconciler.processDue(origin === "automation-triggered" ? NOW + 4 : NOW + 1, signal, {
+        ownerId: executorOwner,
+        generation: executorGeneration,
+        signal,
+      });
+
+      expect(fake.create).not.toHaveBeenCalled();
+      expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({
+        state: "failed",
+        lastError: "managed_automation_capability_evidence_stale",
+      });
+    },
+  );
+
+  it("requires an EffectFence for due processing and exposes no direct provider lifecycle bypasses", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("mandatory-fence-setup", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing mandatory-fence setup lease");
+    await service.create(createInput({
+      mutate: executorMutation(store, "mandatory-fence-setup", lease.generation),
+    }));
+    if (!store.releaseExecutorLease("mandatory-fence-setup", lease.generation, NOW + 1)) {
+      throw new Error("mandatory-fence setup lease could not be released");
+    }
+    vi.clearAllMocks();
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+
+    expect(Reflect.get(service, "reconcile")).toBeUndefined();
+    expect(Reflect.get(service, "update")).toBeUndefined();
+    expect(Reflect.get(service, "setEnabled")).toBeUndefined();
+    expect(Reflect.get(service, "runNow")).toBeUndefined();
+    expect(Reflect.get(service, "retire")).toBeUndefined();
+    await expect(Reflect.apply(reconciler.processDue, reconciler, [NOW + 60_001, undefined, undefined]))
+      .rejects.toThrow(/effect.?fence/i);
+    expect(fake.adapter.show).not.toHaveBeenCalled();
+    expect(fake.adapter.update).not.toHaveBeenCalled();
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it("reserves a changed built-in definition at the next revision and converges once after restart", async () => {
+    const controllerFixture = submittedControllerFixture();
+    try {
+      const fake = fakeAdapter();
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
+      const systemKey = SYSTEM_MONITORS[0]!.systemKey;
+      const oldDefinition: BbAutomationDefinition = {
+        mode: "agent",
+        projectId: "proj_1",
+        name: `Hanoon ${systemKey}`,
+        trigger: { kind: "cron", cron: "1 7 * * *", timezone: "Etc/UTC" },
+        prompt: "previous built-in definition",
+        providerId: "codex-provider",
+        model: "gpt-5.6-sol",
+        permissionMode: "auto",
+        target: { kind: "project-default" },
+        timeoutMs: 900_000,
+        resultContract: { kind: "bounded-text", maximumBytes: 32_768 },
+      };
+      const seeded = await fake.adapter.create({
+        scope: { kind: "host", hostId: "host_1", cwd: null },
+        definition: oldDefinition,
+        identity: { operationId: "seed", ownershipMarker: "seed" },
+      });
+      const authority = systemMaintenanceAuthority({
+        systemKey,
+        controllerKey: controllerFixture.turn.controllerKey,
+        projectId: "proj_1",
+        hostId: "host_1",
+      });
+      const reserved = repository.reserve({
+        controllerKey: controllerFixture.turn.controllerKey,
+        sourceKey: systemKey,
+        projectId: oldDefinition.projectId,
+        name: oldDefinition.name,
+        definition: oldDefinition,
+        authority,
+        notificationPolicy: "material",
+        now: NOW,
+      });
+      repository.activate({
+        id: reserved.id,
+        automation: managedObservation(automation(oldDefinition, {
+          id: seeded.providerAutomationId,
+          name: oldDefinition.name,
+        }), oldDefinition),
+        now: NOW,
+      });
+      vi.clearAllMocks();
+
+      const setupLease = controllerFixture.store.acquireExecutorLease("automation-setup", NOW, 120_000);
+      if (!setupLease.acquired) throw new Error("missing setup executor lease");
+      const mutate = <T>(mutation: () => T): T => {
+        const result = controllerFixture.store.runExecutorMutation(
+          { ownerId: "automation-setup", generation: setupLease.generation },
+          mutation,
+        );
+        if (result.outcome === "stale") throw new Error("setup executor lease was lost");
+        return result.mutationValue;
+      };
+      await expect(installSystemAutomations({
+        store: controllerFixture.store,
+        service,
+        providerId: "codex-provider",
+        execution: { model: "gpt-5.6-sol", permissionMode: "auto" },
+        clock: { now: () => NOW },
+        mutate,
+      })).resolves.toBe(SYSTEM_MONITORS.length);
+      expect(fake.adapter.update).not.toHaveBeenCalled();
+      expect(repository.get(reserved.id)).toMatchObject({
+        definitionRevision: 2,
+        state: "updating",
+        lastOperationOutcome: "pending",
+      });
+      expect(repository.getOperation(repository.get(reserved.id)!.lastOperationId!)).toMatchObject({
+        operationClass: "update",
+        definitionRevision: 2,
+        state: "pending",
+      });
+
+      if (!controllerFixture.store.releaseExecutorLease("automation-setup", setupLease.generation, NOW)) {
+        throw new Error("setup executor lease could not be released");
+      }
+      const lease = controllerFixture.store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+      if (!lease.acquired) throw new Error("missing automation executor lease");
+      const reconciler = new ManagedAutomationReconciler({ repository, service, store: controllerFixture.store, notify: vi.fn() });
+      const signal = new AbortController().signal;
+      await reconciler.processDue(NOW + 2, signal, {
+        ownerId: "automation-executor",
+        generation: lease.generation,
+        signal,
+      });
+      expect(fake.adapter.update).toHaveBeenCalledOnce();
+      expect(repository.get(reserved.id)).toMatchObject({
+        state: "active",
+        definitionRevision: 2,
+        lastOperationOutcome: "succeeded",
+      });
+      const restarted = new ManagedAutomationReconciler({ repository, service, store: controllerFixture.store, notify: vi.fn() });
+      await restarted.processDue(NOW + 60_003, signal, {
+        ownerId: "automation-executor",
+        generation: lease.generation,
+        signal,
+      });
+      expect(fake.adapter.update).toHaveBeenCalledOnce();
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
 });

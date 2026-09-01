@@ -2596,7 +2596,6 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         now,
         mutate,
         signal: context.signal,
-        deferProvider: true,
         operation: {
           version: 1,
           operationClass: "create",

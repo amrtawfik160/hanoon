@@ -45,7 +45,7 @@ export function createTestManagedAutomations() {
       definition: input.definition,
       definitionSha256: "d".repeat(64),
       authority: input.authority,
-      definitionRevision: input.operation?.definitionRevision ?? 1,
+      definitionRevision: input.operation.definitionRevision,
       authorityVersion: isCurrentManagedAutomationAuthority(input.authority) ? 1 : 0,
       capabilityEvidence: isCurrentManagedAutomationAuthority(input.authority)
         ? input.authority.capabilityEvidence
@@ -60,8 +60,8 @@ export function createTestManagedAutomations() {
       lastRunId: null,
       lastRunStatus: null,
       lastError: null,
-      lastOperationId: input.deferProvider ? "managed-automation-operation-test" : null,
-      lastOperationOutcome: input.deferProvider ? "pending" : null,
+      lastOperationId: "managed-automation-operation-test",
+      lastOperationOutcome: "pending",
       lastReconciledOperationId: null,
       lastReconciledOperationOutcome: null,
       createdAt: input.now,
@@ -74,31 +74,6 @@ export function createTestManagedAutomations() {
   const list = vi.fn((controllerKey: string, includeRetired = false) =>
     [...bindings.values()].filter((binding) =>
       binding.controllerKey === controllerKey && (includeRetired || binding.state !== "retired")));
-  const update = vi.fn(async (
-    input: Parameters<ManagedAutomationService["update"]>[0],
-  ): Promise<ManagedAutomationBinding> => {
-    const binding = bindings.get(input.id);
-    if (!binding) throw new Error("missing test automation");
-    const automation = observed(input.definition, binding.bbAutomationId!, input.now);
-    const updated: ManagedAutomationBinding = {
-      ...binding,
-      name: input.definition.name,
-      mode: input.definition.mode,
-      definition: input.definition,
-      observed: automation,
-      lastReconciledAt: input.now,
-      updatedAt: input.now,
-    };
-    bindings.set(input.id, updated);
-    return updated;
-  });
-  const retire = vi.fn(async (input: { id: string; now: number }) => {
-    const binding = bindings.get(input.id);
-    if (!binding) throw new Error("missing test automation");
-    const retired = { ...binding, state: "retired" as const, updatedAt: input.now };
-    bindings.set(input.id, retired);
-    return retired;
-  });
   const submitLifecycleOperation = vi.fn(
     (input: Parameters<ManagedAutomationService["submitLifecycleOperation"]>[0]): ManagedAutomationBinding => {
       const binding = bindings.get(input.id);
@@ -118,11 +93,12 @@ export function createTestManagedAutomations() {
         lastOperationOutcome: "pending",
         updatedAt: input.now,
       };
-      return (input.mutate ?? ((mutation: () => ManagedAutomationBinding) => mutation()))(() => {
+      if (!input.mutate) throw new Error("test managed automation mutation requires an execution fence");
+      return input.mutate(() => {
         bindings.set(input.id, updated);
         return updated;
       });
     },
   );
-  return { bindings, create, get, list, update, retire, submitLifecycleOperation };
+  return { bindings, create, get, list, submitLifecycleOperation };
 }

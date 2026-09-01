@@ -13,7 +13,9 @@ import {
 import {
   isCurrentManagedAutomationAuthority,
   managedAutomationAuthorityCoversOperation,
+  managedAutomationOutcomeReceiptSchema,
 } from "./domain/managed-automation";
+import type { ManagedAutomationRunReceipt } from "./domain/managed-automation";
 import {
   guardRequirementBindings,
   persistBlockedGuardSettlement,
@@ -133,8 +135,6 @@ import { MemoryCurationService } from "./services/memory-curation-service";
 import { MemoryEmbeddingService } from "./services/memory-embedding-service";
 import {
   installSystemAutomations,
-  systemMaintenanceAuthority,
-  systemMaintenanceCapabilityEvidence,
   systemAutomationInstallationComplete,
 } from "./services/system-monitors";
 import {
@@ -183,7 +183,7 @@ function clock(): number {
 }
 
 export function managedAutomationCapabilityIsCurrent(
-  store: Pick<TelegramAgentStore, "getProjectPolicy" | "getCapabilityProfileById" | "listCapabilityReceipts">,
+  store: Pick<TelegramAgentStore, "getProjectPolicy" | "getCapabilityProfileById" | "listCapabilityReceipts" | "getManagedAutomationRepository">,
   binding: ManagedAutomationBinding,
   operation: ManagedAutomationCapabilityOperation,
 ): boolean {
@@ -200,18 +200,52 @@ export function managedAutomationCapabilityIsCurrent(
     !managedAutomationAuthorityCoversOperation(authority, operation)) return false;
 
   if (authority.origin === "system-maintenance") {
-    return authority.standingAuthority.revision === 1 &&
-      managedAutomationDigest(evidence) === managedAutomationDigest(
-        systemMaintenanceCapabilityEvidence(authority.standingAuthority.systemKey),
-      );
+    const admission = store.getManagedAutomationRepository().getProvenanceRepository().resolveEvidence(evidence);
+    return authority.standingAuthority.revision === 1 && admission !== null &&
+      admission.profile.origin === "system-maintenance" &&
+      admission.profile.projectId === authority.projectId &&
+      admission.profile.hostId === authority.hostId &&
+      admission.profile.subjectKey ===
+        `system:${authority.standingAuthority.systemKey}:${authority.projectId}:${authority.hostId}`;
   }
 
   const policy = store.getProjectPolicy(authority.projectId);
   if (!policy || !policy.policy.enabled || policy.policy.projectId !== authority.projectId) return false;
   if (authority.origin === "standing-policy" || authority.origin === "automation-triggered") {
-    if (policy.version !== authority.standingAuthority.revision) return false;
     const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
-    return descriptor?.status === "admitted" && descriptor.version === evidence.descriptorVersion;
+    const provenance = store.getManagedAutomationRepository().getProvenanceRepository();
+    const admission = provenance.resolveEvidence(evidence);
+    if (authority.standingAuthority.policyId !== `project-policy:${authority.projectId}` ||
+      policy.version !== authority.standingAuthority.revision || !admission ||
+      admission.profile.origin !== authority.origin || admission.profile.projectId !== authority.projectId ||
+      admission.profile.hostId !== authority.hostId || admission.profile.policyId !== authority.standingAuthority.policyId ||
+      admission.profile.policyRevision !== authority.standingAuthority.revision ||
+      descriptor?.status !== "admitted" || descriptor.version !== evidence.descriptorVersion) return false;
+    if (authority.origin === "standing-policy") {
+      return admission.profile.subjectKey === `project:${authority.projectId}`;
+    }
+    const parent = store.getManagedAutomationRepository().getOperation(authority.taskAuthority.operationId);
+    const parentBinding = parent ? store.getManagedAutomationRepository().get(parent.bindingId) : null;
+    const parentOutcome = parent?.outcome;
+    const settledOutcome = parentOutcome
+      ? managedAutomationOutcomeReceiptSchema.safeParse(parentOutcome)
+      : null;
+    const parentReceipt: ManagedAutomationRunReceipt | null = settledOutcome?.success &&
+      settledOutcome.data.outcome === "succeeded"
+      ? settledOutcome.data.runReceipt ?? null
+      : null;
+    return parent !== null && parentBinding !== null && parent.operationClass === "run_now" &&
+      parent.state === "succeeded" && parentReceipt !== null &&
+      parentReceipt.initiatingOperationId === parent.id &&
+      parentReceipt.automationBindingId === parentBinding.id &&
+      parentReceipt.definitionRevision === parent.definitionRevision &&
+      parentReceipt.providerAutomationId === parent.providerAutomationId &&
+      parentReceipt.outcomeClass === "succeeded" &&
+      authority.taskAuthority.automationId === parentBinding.id &&
+      authority.taskAuthority.revision === parent.definitionRevision &&
+      admission.profile.subjectKey === `parent:${parent.id}` &&
+      admission.profile.parentOperationId === parent.id &&
+      admission.profile.parentRunReceiptDigest === managedAutomationDigest(parentReceipt);
   }
 
   if (authority.taskAuthority.kind !== "controller-turn" || authority.taskAuthority.turnId === "") return false;
@@ -721,10 +755,14 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     (binding) => {
       const owner = store.getOwner();
       const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
+      const projectEnabled = isCurrentManagedAutomationAuthority(binding.authority) &&
+        binding.authority.origin === "system-maintenance"
+        ? true
+        : store.getProjectPolicy(binding.projectId)?.policy.enabled === true;
       const current = managedAutomationAuthorityIsCurrent(
         binding,
         controller?.controllerKey ?? null,
-        store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
+        projectEnabled,
       );
       if (!current || !controller?.hostId) return false;
       if (isCurrentManagedAutomationAuthority(binding.authority)) {
@@ -1520,19 +1558,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
               : binding.authority.source === "system";
             if (!isSystemBinding) continue;
             try {
-              const authority = systemMaintenanceAuthority({
-                systemKey: binding.sourceKey,
-                controllerKey: controller.controllerKey,
-                projectId: binding.projectId,
-                hostId: controller.hostId,
-              });
-              mutate(() => managedAutomations.submitSystemMaintenanceRetirementOperation({
+              managedAutomations.submitSystemMaintenanceRetirementOperation({
                 id: binding.id,
                 systemKey: binding.sourceKey,
-                authority,
                 now: clock(),
-                mutate: (mutation) => mutation(),
-              }));
+                mutate,
+              });
               systemMonitorsInstalled = false;
             } catch {
               bb.log.warn(`System automation ${binding.id} could not be retired`);

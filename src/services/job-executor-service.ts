@@ -118,7 +118,7 @@ export type JobExecutorDependencies = {
     install(fence: EffectFence): void | Promise<void>;
   };
   automations?: {
-    processDue(now: number, signal?: AbortSignal, fence?: EffectFence): Promise<boolean>;
+    processDue(now: number, signal: AbortSignal | undefined, fence: EffectFence): Promise<boolean>;
   };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
