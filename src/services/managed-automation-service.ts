@@ -137,6 +137,78 @@ export type SubmitManagedAutomationLifecycleInput = Readonly<{
   mutate: ManagedAutomationMutation;
 }>;
 
+type SystemMaintenanceAuthority = Extract<ManagedAutomationAuthority, { origin: "system-maintenance" }>;
+type SystemMaintenanceRetirementInput = Readonly<{
+  id: string;
+  systemKey: string;
+  authority: SystemMaintenanceAuthority;
+  now: number;
+  mutate: ManagedAutomationMutation;
+}>;
+
+function isSystemMaintenanceBinding(binding: ManagedAutomationBinding, systemKey: string): boolean {
+  if (binding.sourceKey !== systemKey) return false;
+  return isCurrentManagedAutomationAuthority(binding.authority)
+    ? binding.authority.origin === "system-maintenance" &&
+        binding.authority.standingAuthority.systemKey === systemKey
+    : binding.authority.source === "system";
+}
+
+function assertSystemMaintenanceAuthorityMatches(
+  binding: ManagedAutomationBinding,
+  authority: SystemMaintenanceAuthority,
+  systemKey: string,
+): void {
+  if (authority.controllerKey !== binding.controllerKey || authority.projectId !== binding.projectId ||
+    authority.hostId.length === 0 || authority.standingAuthority.systemKey !== systemKey) {
+    throw new Error("system-maintenance authority does not match its binding");
+  }
+}
+
+function systemMaintenanceRetirementOperation(
+  binding: ManagedAutomationBinding,
+  systemKey: string,
+): ManagedAutomationOperationRequest {
+  return {
+    version: 1,
+    operationClass: "retire",
+    targetProjectId: binding.projectId,
+    definitionRevision: binding.definitionRevision,
+    intentKey: `system-maintenance:${systemKey}`,
+  };
+}
+
+function assertSystemMaintenanceRetirementInput(
+  binding: ManagedAutomationBinding,
+  input: SystemMaintenanceRetirementInput,
+): void {
+  if (!isSystemMaintenanceBinding(binding, input.systemKey)) {
+    throw new Error("managed automation is not a system-maintenance binding");
+  }
+  assertSystemMaintenanceAuthorityMatches(binding, input.authority, input.systemKey);
+}
+
+function systemMaintenanceRetirementBinding(
+  binding: ManagedAutomationBinding,
+  authority: SystemMaintenanceAuthority,
+): ManagedAutomationBinding {
+  return { ...binding, authority, capabilityEvidence: authority.capabilityEvidence };
+}
+
+function systemMaintenanceRetirementReservation(
+  input: SystemMaintenanceRetirementInput,
+  binding: ManagedAutomationBinding,
+  operation: ManagedAutomationOperationRequest,
+) {
+  return {
+    id: binding.id,
+    desiredState: "retired" as const,
+    authority: input.authority,
+    operation,
+    now: input.now,
+  };
+}
+
 export type ManagedAutomationExecutionResult = Readonly<{
   automation: ManagedAutomationObservation | null;
   run: ManagedAutomationRun | null;
@@ -347,6 +419,26 @@ export class ManagedAutomationService {
     }));
   }
 
+  public submitSystemMaintenanceRetirementOperation(input: SystemMaintenanceRetirementInput): ManagedAutomationBinding {
+    const binding = this.repository.get(input.id);
+    if (!binding) {
+      throw new Error("managed automation is not a system-maintenance binding");
+    }
+    assertSystemMaintenanceRetirementInput(binding, input);
+    const retirementBinding = systemMaintenanceRetirementBinding(binding, input.authority);
+    if (!this.authorityIsCurrent(retirementBinding)) throw new Error("managed automation authority is not current");
+    const operation = systemMaintenanceRetirementOperation(binding, input.systemKey);
+    if (!this.capabilityIsCurrent(retirementBinding, {
+      ...operation,
+      capabilityEvidence: input.authority.capabilityEvidence,
+    })) {
+      throw new Error("managed automation capability evidence is not current");
+    }
+    return input.mutate(() => this.repository.reserveLifecycle(
+      systemMaintenanceRetirementReservation(input, binding, operation),
+    ));
+  }
+
   public submitReconciliationOperation(input: {
     binding: ManagedAutomationBinding;
     now: number;
@@ -506,7 +598,8 @@ export class ManagedAutomationService {
         managedAutomationDigest(operation.capabilityEvidence) !== managedAutomationDigest(binding.capabilityEvidence))) {
       return { allowed: false, errorClass: "managed_automation_capability_evidence_stale" };
     }
-    if (isCurrentManagedAutomationAuthority(operation.authority) && operation.operationClass !== "reconcile" && (!operation.controllerFence ||
+    if (isCurrentManagedAutomationAuthority(operation.authority) && operation.operationClass !== "reconcile" &&
+      operation.authority.origin !== "system-maintenance" && (!operation.controllerFence ||
       (operation.authority.origin === "owner" && operation.authority.taskAuthority.turnId !== operation.controllerFence.turnId))) {
       return { allowed: false, errorClass: "managed_automation_operation_stale" };
     }
@@ -1167,6 +1260,7 @@ export async function migrateLegacyClockMonitor(input: {
   permissionMode: "accept-edits" | "auto" | "full";
   target?: ManagedAutomationTarget;
   hostId?: string;
+  authority?: ManagedAutomationAuthority;
   now: number;
   signal?: AbortSignal;
 }): Promise<ManagedAutomationBinding> {
@@ -1192,7 +1286,7 @@ export async function migrateLegacyClockMonitor(input: {
       timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
       resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
     },
-    authority: {
+    authority: input.authority ?? {
       source: input.monitor.systemKey ? "system" : "owner",
       controllerKey: input.controllerKey,
       projectId: input.projectId,

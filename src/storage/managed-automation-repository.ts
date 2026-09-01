@@ -27,6 +27,7 @@ import {
   type ManagedAutomationOperationRequest,
   type ManagedAutomationRunOutcomeClass,
   type ManagedAutomationRunReceipt,
+  type ManagedAutomationOutcomeReceipt,
   type StoredManagedAutomationAuthority,
 } from "../domain/managed-automation";
 
@@ -186,6 +187,31 @@ type ManagedAutomationOperationRow = Readonly<{
   created_at: number;
   updated_at: number;
   settled_at: number | null;
+}>;
+
+type ManagedAutomationRunEvidenceRow = Readonly<{
+  binding_id: string;
+  bb_run_id: string;
+  bb_automation_id: string;
+  scheduled_for: number;
+  started_at: number;
+  finished_at: number | null;
+  observed_at: number;
+  receipt_version: number | null;
+  initiating_operation_id: string | null;
+  definition_revision: number | null;
+  authority_json: string | null;
+  capability_evidence_json: string | null;
+  idempotency_key: string | null;
+  outcome_class: string | null;
+}>;
+
+type OperationRelationshipContext = Readonly<{
+  row: ManagedAutomationOperationRow;
+  binding: ManagedAutomationBinding;
+  authority: StoredManagedAutomationAuthority;
+  capabilityEvidence: ManagedAutomationCapabilityEvidence | null;
+  db: SqliteDatabase;
 }>;
 
 const desiredStateSchema = z.enum(["enabled", "paused", "retired"]);
@@ -460,7 +486,150 @@ function parseRow(row: ManagedAutomationRow): ManagedAutomationBinding {
   };
 }
 
-function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOperation {
+function requireOperationBinding(
+  row: ManagedAutomationOperationRow,
+  binding: ManagedAutomationBinding | null,
+): ManagedAutomationBinding {
+  if (!binding || binding.id !== row.binding_id) {
+    throw new Error("Managed automation operation binding is unavailable");
+  }
+  if (binding.projectId !== row.target_project_id || binding.definitionRevision !== row.definition_revision) {
+    throw new Error("Managed automation operation does not match its binding");
+  }
+  return binding;
+}
+
+function assertOperationDigest(
+  label: string,
+  actual: unknown,
+  expected: unknown,
+): void {
+  if (managedAutomationDigest(actual) !== managedAutomationDigest(expected)) {
+    throw new Error(`Managed automation ${label} does not match its binding`);
+  }
+}
+
+function assertRunReceiptIdentity(
+  receipt: ManagedAutomationRunReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  const { row, binding } = relationshipContext;
+  if (receipt.automationBindingId !== binding.id || receipt.definitionRevision !== row.definition_revision ||
+    receipt.initiatingOperationId !== row.id || receipt.providerAutomationId !== row.provider_automation_id ||
+    (binding.bbAutomationId !== null && receipt.providerAutomationId !== binding.bbAutomationId)) {
+    throw new Error("Managed automation run receipt does not match its operation binding");
+  }
+}
+
+function correlatedRunEvidence(
+  receipt: ManagedAutomationRunReceipt,
+  relationshipContext: OperationRelationshipContext,
+): ManagedAutomationRunEvidenceRow | undefined {
+  return relationshipContext.db.prepare(
+    `SELECT binding_id, bb_run_id, bb_automation_id, scheduled_for, started_at,
+            finished_at, observed_at, receipt_version, initiating_operation_id,
+            definition_revision, authority_json, capability_evidence_json,
+            idempotency_key, outcome_class
+       FROM managed_automation_run_evidence
+      WHERE binding_id = ? AND bb_run_id = ?`,
+  ).get(relationshipContext.binding.id, receipt.providerRunId) as ManagedAutomationRunEvidenceRow | undefined;
+}
+
+function assertRunReceiptEvidence(
+  receipt: ManagedAutomationRunReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  const { row } = relationshipContext;
+  const evidence = correlatedRunEvidence(receipt, relationshipContext);
+  if (!evidence || evidence.binding_id !== relationshipContext.binding.id ||
+    evidence.bb_run_id !== receipt.providerRunId || evidence.bb_automation_id !== receipt.providerAutomationId ||
+    evidence.receipt_version !== receipt.version || evidence.initiating_operation_id !== row.id ||
+    evidence.definition_revision !== row.definition_revision ||
+    evidence.authority_json !== canonical(receipt.authority) ||
+    evidence.capability_evidence_json !== canonical(receipt.capabilityEvidence) ||
+    evidence.idempotency_key !== row.id || evidence.outcome_class !== receipt.outcomeClass ||
+    evidence.scheduled_for !== receipt.scheduledFor || evidence.started_at !== receipt.startedAt ||
+    evidence.finished_at !== receipt.finishedAt || evidence.observed_at !== receipt.observedAt) {
+    throw new Error("Managed automation run receipt does not match durable run evidence");
+  }
+}
+
+function assertRunReceiptRelationships(
+  receipt: ManagedAutomationRunReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  assertRunReceiptIdentity(receipt, relationshipContext);
+  assertOperationDigest("run receipt authority", receipt.authority, relationshipContext.authority);
+  assertOperationDigest(
+    "run receipt capability evidence",
+    receipt.capabilityEvidence,
+    relationshipContext.capabilityEvidence,
+  );
+  assertRunReceiptEvidence(receipt, relationshipContext);
+}
+
+function assertCurrentOutcomeIdentity(
+  outcome: ManagedAutomationOutcomeReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  const { row } = relationshipContext;
+  // A retry claim keeps the previous settled receipt while its new lease is active.
+  if (outcome.operationClass !== row.operation_class || outcome.operationId !== row.id ||
+    (outcome.outcome !== row.state && row.state !== "leased")) {
+    throw new Error("Managed automation outcome does not match its operation state or class");
+  }
+}
+
+function assertCurrentOutcomeProviderIdentity(
+  outcome: ManagedAutomationOutcomeReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  const { row, binding } = relationshipContext;
+  if (outcome.providerAutomationId !== row.provider_automation_id ||
+    outcome.ownershipMarker !== row.provider_ownership_marker ||
+    (binding.bbAutomationId !== null && outcome.providerAutomationId !== binding.bbAutomationId)) {
+    throw new Error("Managed automation outcome provider identity does not match its operation binding");
+  }
+  if (outcome.observedSha256 !== null && outcome.observedSha256 !== binding.observedSha256) {
+    throw new Error("Managed automation outcome observation does not match its binding");
+  }
+}
+
+function assertCurrentOutcomeReceipt(
+  outcome: ManagedAutomationOutcomeReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  const { row } = relationshipContext;
+  const receipt = outcome.runReceipt ?? null;
+  if (row.operation_class === "run_now" && outcome.outcome === "succeeded" && receipt === null) {
+    throw new Error("Successful managed automation run-now outcome has no run receipt");
+  }
+  if (row.operation_class !== "run_now" && receipt !== null) {
+    throw new Error("Managed automation run receipt belongs to an unrelated operation");
+  }
+  if (receipt !== null) assertRunReceiptRelationships(receipt, relationshipContext);
+}
+
+function assertCurrentOutcomeRelationships(
+  outcome: ManagedAutomationOutcomeReceipt,
+  relationshipContext: OperationRelationshipContext,
+): void {
+  assertCurrentOutcomeIdentity(outcome, relationshipContext);
+  assertOperationDigest("outcome authority", outcome.authority, relationshipContext.authority);
+  assertOperationDigest(
+    "outcome capability evidence",
+    outcome.capabilityEvidence,
+    relationshipContext.capabilityEvidence,
+  );
+  assertCurrentOutcomeProviderIdentity(outcome, relationshipContext);
+  assertCurrentOutcomeReceipt(outcome, relationshipContext);
+}
+
+function parseOperation(
+  row: ManagedAutomationOperationRow,
+  binding: ManagedAutomationBinding,
+  db: SqliteDatabase,
+): ManagedAutomationOperation {
   const operationClass = managedAutomationOperationRequestSchema.shape.operationClass.parse(row.operation_class);
   const version = z.literal(1).parse(row.operation_version);
   const state = operationStateSchema.parse(row.state);
@@ -470,11 +639,16 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
   const targetProjectId = z.string().min(1).max(256).parse(row.target_project_id);
   const intentKey = operationIntentKeySchema.parse(row.intent_key);
   const authority = parseManagedAutomationAuthority(JSON.parse(row.authority_json));
+  const operationBinding = requireOperationBinding(row, binding);
   const capabilityEvidence = row.capability_evidence_json === null
     ? authorityEvidence(authority)
     : managedAutomationCapabilityEvidenceSchema.parse(JSON.parse(row.capability_evidence_json));
   if (isCurrentManagedAutomationAuthority(authority) && capabilityEvidence === null) {
     throw new Error("Current managed automation operation has no capability evidence");
+  }
+  if (isCurrentManagedAutomationAuthority(authority)) {
+    assertOperationDigest("operation authority", authority, operationBinding.authority);
+    assertOperationDigest("operation capability evidence", capabilityEvidence, operationBinding.capabilityEvidence);
   }
   if (capabilityEvidence !== null && isCurrentManagedAutomationAuthority(authority) &&
     managedAutomationDigest(capabilityEvidence) !== managedAutomationDigest(authority.capabilityEvidence)) {
@@ -492,17 +666,22 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
         generation: z.number().int().positive().safe().parse(row.controller_generation),
         turnId: z.string().min(1).max(256).parse(row.controller_turn_id),
       };
-  if (isCurrentManagedAutomationAuthority(authority) && operationClass !== "reconcile" && (!controllerFence ||
+  if (isCurrentManagedAutomationAuthority(authority) && operationClass !== "reconcile" &&
+    authority.origin !== "system-maintenance" && (!controllerFence ||
     (authority.origin === "owner" && authority.taskAuthority.turnId !== controllerFence.turnId))) {
     throw new Error("Managed automation operation authority does not match its controller fence");
   }
   const rawOutcome = row.outcome_json === null ? null : JSON.parse(row.outcome_json);
   const outcome = rawOutcome === null ? null : decodeOutcome(rawOutcome);
-  if (outcome && hasVersionField(outcome) && outcome.operationId !== row.id) {
-    throw new Error("Managed automation operation outcome identity does not match its row");
-  }
   const providerAutomationId = providerAutomationIdSchema.parse(row.provider_automation_id);
   const providerOwnershipMarker = providerOwnershipMarkerSchema.parse(row.provider_ownership_marker);
+  if (providerAutomationId !== null && binding.bbAutomationId !== null && providerAutomationId !== binding.bbAutomationId) {
+    throw new Error("Managed automation operation provider identity does not match its binding");
+  }
+  if (providerOwnershipMarker !== null && binding.providerOwnershipMarker !== null &&
+    providerOwnershipMarker !== binding.providerOwnershipMarker) {
+    throw new Error("Managed automation operation ownership marker does not match its binding");
+  }
   if (outcome && hasVersionField(outcome) && outcome.kind === "provider-acknowledgement" &&
     (outcome.providerAutomationId !== providerAutomationId || outcome.ownershipMarker !== providerOwnershipMarker)) {
     throw new Error("Managed automation acknowledgement does not match its operation");
@@ -510,6 +689,18 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
   if (outcome && hasVersionField(outcome) && outcome.kind === "settled" &&
     (outcome.providerAutomationId !== providerAutomationId || outcome.ownershipMarker !== providerOwnershipMarker)) {
     throw new Error("Managed automation outcome does not match its operation");
+  }
+  if (outcome && hasVersionField(outcome) && outcome.kind === "provider-acknowledgement" && state !== "leased") {
+    throw new Error("Managed automation acknowledgement does not match its operation state");
+  }
+  if (outcome && hasVersionField(outcome) && outcome.kind === "settled") {
+    assertCurrentOutcomeRelationships(outcome as ManagedAutomationOutcomeReceipt, {
+      row,
+      binding,
+      authority,
+      capabilityEvidence,
+      db,
+    });
   }
   return {
     id: row.id,
@@ -587,7 +778,7 @@ function assertCurrentOperationInput(
     operation.targetProjectId !== projectId || operation.definitionRevision !== definitionRevision) {
     throw new TypeError("managed automation operation does not match its binding");
   }
-  if (!controllerFence && operation.operationClass !== "reconcile") {
+  if (!controllerFence && operation.operationClass !== "reconcile" && authority.origin !== "system-maintenance") {
     throw new TypeError("managed automation operation requires its controller fence");
   }
   if (controllerFence && authority.origin === "owner" && (authority.taskAuthority.kind !== "controller-turn" ||
@@ -638,7 +829,7 @@ export class ManagedAutomationRepository {
     const row = this.db.prepare(
       "SELECT * FROM managed_automation_operations WHERE id = ?",
     ).get(id) as ManagedAutomationOperationRow | undefined;
-    return row ? parseOperation(row) : null;
+    return row ? parseOperation(row, this.requireBindingForOperation(row), this.db) : null;
   }
 
   public findOperation(
@@ -653,7 +844,7 @@ export class ManagedAutomationRepository {
         WHERE binding_id = ? AND operation_class = ? AND intent_key = ?
         ORDER BY created_at DESC LIMIT 1`,
     ).get(bindingId, operationClass, intentKey) as ManagedAutomationOperationRow | undefined;
-    return row ? parseOperation(row) : null;
+    return row ? parseOperation(row, this.requireBindingForOperation(row), this.db) : null;
   }
 
   public listDueOperations(now: number, limit = 20): ManagedAutomationOperation[] {
@@ -666,7 +857,11 @@ export class ManagedAutomationRepository {
            OR (state = 'leased' AND lease_expires_at <= ?)
         ORDER BY next_attempt_at, created_at LIMIT ?`,
     ).all(now, now, limit) as ManagedAutomationOperationRow[];
-    return rows.map(parseOperation);
+    return rows.map((row) => parseOperation(row, this.requireBindingForOperation(row), this.db));
+  }
+
+  private requireBindingForOperation(row: ManagedAutomationOperationRow): ManagedAutomationBinding {
+    return requireOperationBinding(row, this.get(row.binding_id));
   }
 
   public claimOperation(input: ManagedAutomationExecutorFence & {
@@ -979,9 +1174,8 @@ export class ManagedAutomationRepository {
       }
       if (outcome === "succeeded" && !retiresBinding) {
         const current = this.get(binding.id)!;
-        for (const candidate of [...runs, ...(run ? [run] : [])]) {
-          this.recordRunInTransaction(current, candidate, input.now, operation.id);
-        }
+        for (const candidate of runs) this.recordRunInTransaction(current, candidate, input.now);
+        if (run) this.recordRunInTransaction(current, run, input.now, operation.id);
       }
       return this.get(binding.id);
     }).immediate();
@@ -1415,7 +1609,7 @@ export class ManagedAutomationRepository {
       if (!binding || binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
         throw new Error("managed automation run does not match its active binding");
       }
-      return this.recordRunInTransaction(binding, run, now, binding.lastOperationId ?? binding.id);
+      return this.recordRunInTransaction(binding, run, now);
     }).immediate();
   }
 
@@ -1423,7 +1617,7 @@ export class ManagedAutomationRepository {
     binding: ManagedAutomationBinding,
     run: ManagedAutomationRun,
     now: number,
-    initiatingOperationId: string,
+    initiatingOperationId?: string,
   ): boolean {
     if (binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
       throw new Error("managed automation run does not match its active binding");
@@ -1431,20 +1625,16 @@ export class ManagedAutomationRepository {
     const outputSha256 = run.output === null ? null : managedAutomationDigest(run.output);
     const contract = managedAutomationRunContract(binding, run);
     const errorClass = contract.errorClass ?? (run.error === null ? null : "bb_automation_run_failed");
-    const receipt = isCurrentManagedAutomationAuthority(binding.authority) && binding.capabilityEvidence
+    const receipt = initiatingOperationId && isCurrentManagedAutomationAuthority(binding.authority) && binding.capabilityEvidence
       ? managedAutomationRunReceipt(binding, initiatingOperationId, binding.authority, binding.capabilityEvidence, run, now)
       : null;
     const evidenceJson = canonical({
       automationId: run.automationId,
-      authority: binding.authority,
-      capabilityEvidence: binding.capabilityEvidence,
       contractOutcome: contract.outcome,
-      definitionRevision: binding.definitionRevision,
       errorClass,
       exitCode: run.exitCode,
       finishedAt: run.finishedAt,
       id: run.id,
-      initiatingOperationId,
       output: outputSha256 === null ? null : { screened: true, sha256: outputSha256 },
       receipt,
       runMode: run.runMode,
@@ -1454,6 +1644,14 @@ export class ManagedAutomationRepository {
       status: run.status,
       threadId: run.threadId,
       trigger: run.trigger,
+      ...(receipt
+        ? {
+            authority: receipt.authority,
+            capabilityEvidence: receipt.capabilityEvidence,
+            definitionRevision: receipt.definitionRevision,
+            initiatingOperationId: receipt.initiatingOperationId,
+          }
+        : {}),
     });
     const inserted = this.db.prepare(
       `INSERT OR IGNORE INTO managed_automation_run_evidence (

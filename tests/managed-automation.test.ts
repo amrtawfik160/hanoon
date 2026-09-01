@@ -1,4 +1,5 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type {
   BbAutomation,
@@ -17,9 +18,10 @@ import {
   migrateLegacyClockMonitor,
   type ManagedAutomationAdapter,
 } from "../src/services/managed-automation-service";
-import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
+import { ManagedAutomationRepository, type ManagedAutomationBinding } from "../src/storage/managed-automation-repository";
 import { openStore, type MonitorRecord } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
+import { systemMaintenanceAuthority } from "../src/services/system-monitors";
 import { hashSecret } from "../src/crypto";
 import { registerControllerTools } from "../src/controller/tools";
 import { policyFixture } from "./helpers";
@@ -286,6 +288,51 @@ function versionedOwnerAuthority(turnId = "turn_owner"): Record<string, unknown>
       evidenceRefs: ["capability-profile:profile_owner:1"],
     },
     mayWidenAutomation: false,
+  };
+}
+
+function versionedSystemMaintenanceAuthority(
+  systemKey = "system-stale-jobs",
+): Extract<ManagedAutomationAuthority, { origin: "system-maintenance" }> {
+  return systemMaintenanceAuthority({
+    systemKey,
+    controllerKey: "owner-7-controller",
+    projectId: "proj_owner",
+    hostId: "host_owner",
+  });
+}
+
+async function settledRunNowFixture() {
+  const { bb, store, repository } = fixture();
+  const fake = fakeAdapter();
+  const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+  const binding = await service.create(createInput());
+  const submitted = service.submitLifecycleOperation({
+    id: binding.id,
+    operationClass: "run_now",
+    desiredState: "enabled",
+    authority: versionedOwnerAuthority("turn_run_now") as ManagedAutomationAuthority,
+    controllerFence: {
+      ownerId: "controller-executor",
+      generation: 1,
+      turnId: "turn_run_now",
+    },
+    now: NOW + 1,
+    mutate: (mutation) => mutation(),
+  });
+  const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+  if (!lease.acquired) throw new Error("missing automation executor lease");
+  const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+  const signal = new AbortController().signal;
+  await reconciler.processDue(NOW + 2, signal, {
+    ownerId: "automation-executor",
+    generation: lease.generation,
+    signal,
+  });
+  return {
+    bb,
+    operationId: submitted.lastOperationId!,
+    database: bb.storage.database(),
   };
 }
 
@@ -921,6 +968,102 @@ describe("managed BB automations", () => {
     expect(fake.adapter.delete).toHaveBeenCalledOnce();
   });
 
+  it.each(["before", "after"] as const)(
+    "routes system retirement through the fenced durable path when the executor lease transfers %s delete",
+    async (transferPoint) => {
+      const { bb, store, repository } = fixture();
+      const fake = fakeAdapter();
+      const systemKey = "system-stale-jobs";
+      const authority = versionedSystemMaintenanceAuthority(systemKey);
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
+      const created = await service.create({
+        ...createInput(),
+        sourceKey: systemKey,
+        authority,
+      });
+      const submitted = { value: null as ManagedAutomationBinding | null };
+      const releaseCurrentLease = (now: number): void => {
+        const row = bb.storage.database().prepare(
+          "SELECT owner_id, generation FROM executor_lease WHERE singleton = 1",
+        ).get() as { owner_id: string | null; generation: number } | undefined;
+        if (!row?.owner_id || !store.releaseExecutorLease(row.owner_id, row.generation, now)) {
+          throw new Error("executor lease could not be transferred");
+        }
+      };
+      const originalDelete = fake.adapter.delete;
+      const deleteCall = vi.spyOn(fake.adapter, "delete").mockImplementation(async (input) => {
+        if (transferPoint === "before") releaseCurrentLease(NOW + 3);
+        await originalDelete(input);
+        if (transferPoint === "after") releaseCurrentLease(NOW + 3);
+      });
+      const originalShow = fake.adapter.show;
+      vi.spyOn(fake.adapter, "show").mockImplementation(async (input) => {
+        try {
+          return await originalShow(input);
+        } catch {
+          throw new BbAutomationNotFoundError();
+        }
+      });
+      const systemMonitors = {
+        install: (fence?: { ownerId: string; generation: number }): void => {
+          if (!fence || submitted.value) return;
+          const result = store.runExecutorMutation(
+            { ownerId: fence.ownerId, generation: fence.generation },
+            () => service.submitSystemMaintenanceRetirementOperation({
+              id: created.id,
+              systemKey,
+              authority,
+              now: NOW + 1,
+              mutate: (mutation) => mutation(),
+            }),
+          );
+          if (result.outcome === "stale") throw new Error("system retirement reservation lost its executor fence");
+          submitted.value = result.mutationValue;
+        },
+      };
+      const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+      const firstStop = new AbortController();
+      await runJobExecutorService({
+        store,
+        clock: { now: () => NOW + 2 },
+        automations: reconciler,
+        systemMonitors,
+        releaseOnShutdown: true,
+        sleep: async () => firstStop.abort(),
+      }, firstStop.signal);
+
+      const operationId = submitted.value?.lastOperationId;
+      if (!operationId) throw new Error("system retirement operation was not reserved");
+      expect(repository.getOperation(operationId)).toMatchObject({
+        operationClass: "retire",
+        state: "leased",
+        controllerFence: null,
+      });
+      expect(deleteCall).toHaveBeenCalledOnce();
+
+      const successorStop = new AbortController();
+      await runJobExecutorService({
+        store,
+        clock: { now: () => NOW + 120_003 },
+        automations: reconciler,
+        systemMonitors,
+        releaseOnShutdown: true,
+        sleep: async () => successorStop.abort(),
+      }, successorStop.signal);
+
+      expect(deleteCall).toHaveBeenCalledOnce();
+      expect(repository.get(created.id)).toMatchObject({
+        state: "retired",
+        desiredState: "retired",
+        lastOperationOutcome: "succeeded",
+      });
+      expect(repository.getOperation(operationId)).toMatchObject({
+        state: "succeeded",
+        outcome: { kind: "settled", operationClass: "retire", outcome: "succeeded" },
+      });
+    },
+  );
+
   it("retries an ambiguous retirement by observing absence before deleting again", async () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();
@@ -1033,6 +1176,243 @@ describe("managed BB automations", () => {
       observed: expect.objectContaining({ enabled: true }),
       lastOperationOutcome: "succeeded",
       lastReconciledOperationOutcome: "succeeded",
+    });
+  });
+
+  it("does not give an old scheduled run revision-2 provenance during restart reconciliation", async () => {
+    const { bb, store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const revisionOne = versionedOwnerAuthority("turn_revision_1") as ManagedAutomationAuthority;
+    const created = await service.create({ ...createInput(), authority: revisionOne });
+    fake.runs.set(created.bbAutomationId!, [runEvidence({
+      id: "run_historical",
+      automationId: created.bbAutomationId!,
+      idempotencyKey: null,
+    })]);
+
+    const revisionTwoBase = versionedOwnerAuthority("turn_revision_2") as ManagedAutomationAuthority;
+    const revisionTwo = {
+      ...revisionTwoBase,
+      capabilityEvidence: {
+        ...revisionTwoBase.capabilityEvidence,
+        profileId: "profile_revision_2",
+        descriptorDigest: "b".repeat(64),
+        evidenceRefs: ["capability-profile:profile_revision_2:1"],
+      },
+    } as ManagedAutomationAuthority;
+    const updatedDefinition = {
+      ...definition,
+      prompt: "Check production and report the revised material change.",
+    };
+    const updated = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "update",
+      desiredState: "enabled",
+      authority: revisionTwo,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_revision_2",
+      },
+      definition: updatedDefinition,
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const firstReconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await firstReconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    const reopenedStore = openStore(bb.storage, bb.storage.kv, () => NOW);
+    const reopenedRepository = new ManagedAutomationRepository(bb.storage.database());
+    const reopenedService = new ManagedAutomationService(reopenedRepository, fake.adapter, () => true);
+    const reopenedBinding = reopenedRepository.get(created.id);
+    if (!reopenedBinding) throw new Error("reopened automation binding is missing");
+    const reconciliation = reopenedService.submitReconciliationOperation({
+      binding: reopenedBinding,
+      now: NOW + 60_003,
+      mutate: (mutation) => mutation(),
+    });
+    if (!reconciliation?.lastOperationId) throw new Error("reconciliation operation was not reserved");
+    const restartedReconciler = new ManagedAutomationReconciler({
+      repository: reopenedRepository,
+      service: reopenedService,
+      store: reopenedStore,
+      notify: vi.fn(),
+    });
+    await restartedReconciler.processDue(NOW + 60_004, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(updated.lastOperationId).not.toBe(reconciliation.lastOperationId);
+    expect(reopenedRepository.getOperation(reconciliation.lastOperationId)).toMatchObject({
+      state: "succeeded",
+      definitionRevision: 2,
+      outcome: { kind: "settled", runReceipt: null },
+    });
+    expect(bb.storage.database().prepare(
+      `SELECT initiating_operation_id, definition_revision, authority_json,
+              capability_evidence_json, receipt_version
+         FROM managed_automation_run_evidence WHERE bb_run_id = 'run_historical'`,
+    ).get()).toEqual({
+      initiating_operation_id: null,
+      definition_revision: null,
+      authority_json: null,
+      capability_evidence_json: null,
+      receipt_version: null,
+    });
+  });
+
+  it("keeps the exact authoritative receipt for a correlated run-now", async () => {
+    const { database, operationId } = await settledRunNowFixture();
+    const operation = new ManagedAutomationRepository(database).getOperation(operationId);
+    if (!operation || operation.outcome?.kind !== "settled" || !operation.outcome.runReceipt) {
+      throw new Error("correlated run-now receipt is missing");
+    }
+
+    expect(operation.outcome.runReceipt).toEqual({
+      version: 1,
+      kind: "run-receipt",
+      providerRunId: "run_1",
+      automationBindingId: operation.bindingId,
+      providerAutomationId: "auto_1",
+      definitionRevision: operation.definitionRevision,
+      initiatingOperationId: operation.id,
+      authority: operation.authority,
+      capabilityEvidence: operation.capabilityEvidence,
+      scheduledFor: NOW,
+      startedAt: NOW + 1,
+      finishedAt: NOW + 2,
+      observedAt: NOW + 2,
+      outcomeClass: "succeeded",
+    });
+  });
+
+  it.each([
+    {
+      label: "outcome class",
+      mutateOutcome: (outcome: Record<string, unknown>) => { outcome.operationClass = "disable"; },
+    },
+    {
+      label: "outcome authority",
+      mutateOutcome: (outcome: Record<string, unknown>) => {
+        outcome.authority = versionedOwnerAuthority("turn_other") as ManagedAutomationAuthority;
+      },
+    },
+    {
+      label: "outcome capability evidence",
+      mutateOutcome: (outcome: Record<string, unknown>) => {
+        outcome.capabilityEvidence = {
+          version: 1,
+          profileId: "profile_other",
+          profileRevision: 1,
+          capabilityId: "telegram_agent_watch",
+          descriptorVersion: "1",
+          descriptorDigest: "d".repeat(64),
+          evidenceRefs: ["capability-profile:profile_other:1"],
+        };
+      },
+    },
+    {
+      label: "provider identity",
+      mutateOutcome: (outcome: Record<string, unknown>) => { outcome.providerAutomationId = "auto_other"; },
+    },
+    {
+      label: "binding receipt identity",
+      mutateOutcome: (outcome: Record<string, unknown>) => {
+        const receipt = outcome.runReceipt as Record<string, unknown>;
+        receipt.automationBindingId = "binding_other";
+      },
+    },
+    {
+      label: "receipt definition revision",
+      mutateOutcome: (outcome: Record<string, unknown>) => {
+        const receipt = outcome.runReceipt as Record<string, unknown>;
+        receipt.definitionRevision = 2;
+      },
+    },
+    {
+      label: "nested initiating operation",
+      mutateOutcome: (outcome: Record<string, unknown>) => {
+        const receipt = outcome.runReceipt as Record<string, unknown>;
+        receipt.initiatingOperationId = "operation_other";
+      },
+    },
+    {
+      label: "nested provider run identity",
+      mutateOutcome: (outcome: Record<string, unknown>) => {
+        const receipt = outcome.runReceipt as Record<string, unknown>;
+        receipt.providerRunId = "run_other";
+      },
+    },
+    {
+      label: "missing successful run-now receipt",
+      mutateOutcome: (outcome: Record<string, unknown>) => { outcome.runReceipt = null; },
+    },
+    {
+      label: "row outcome state",
+      mutateRow: (database: Database.Database, operationId: string) => {
+        database.prepare("UPDATE managed_automation_operations SET state = 'failed' WHERE id = ?").run(operationId);
+      },
+    },
+  ] as const)("fails closed on a shape-valid current outcome: $label", async ({ mutateOutcome, mutateRow }) => {
+    const { database, operationId } = await settledRunNowFixture();
+    const row = database.prepare(
+      "SELECT outcome_json FROM managed_automation_operations WHERE id = ?",
+    ).get(operationId) as { outcome_json: string };
+    const outcome = JSON.parse(row.outcome_json) as Record<string, unknown>;
+    mutateOutcome?.(outcome);
+    if (mutateOutcome) {
+      database.prepare("UPDATE managed_automation_operations SET outcome_json = ? WHERE id = ?")
+        .run(JSON.stringify(outcome), operationId);
+    }
+    mutateRow?.(database, operationId);
+    const reopenedRepository = new ManagedAutomationRepository(database);
+    expect(() => reopenedRepository.getOperation(operationId)).toThrow();
+  });
+
+  it("keeps the immediately preceding current create outcome without a run receipt readable", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 1, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({
+      state: "succeeded",
+      operationClass: "create",
+      outcome: { kind: "settled", runReceipt: null },
     });
   });
 
