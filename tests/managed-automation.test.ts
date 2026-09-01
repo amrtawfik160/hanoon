@@ -1666,6 +1666,120 @@ describe("managed BB automations", () => {
     ).get()).toEqual(evidenceBeforeRepeat);
   });
 
+  it("retains unrelated provider history while deferring only the exact retryable run-now candidate (SPEC-61-001)", async () => {
+    const { bb, store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const created = await service.create(createInput());
+    const submitted = service.submitLifecycleOperation({
+      id: created.id,
+      operationClass: "run_now",
+      desiredState: "enabled",
+      authority: versionedOwnerAuthority("turn_history_loss") as ManagedAutomationAuthority,
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_history_loss",
+      },
+      intentKey: "history-loss-run-now",
+      now: NOW + 1,
+      mutate: (mutation) => mutation(),
+    });
+    const originalRunNow = fake.adapter.runNow;
+    const appliedThenAmbiguous = vi.spyOn(fake.adapter, "runNow").mockImplementation(async (input) => {
+      await originalRunNow(input);
+      throw new Error("BB automation command timed out after accepting the run");
+    });
+    const lease = store.acquireExecutorLease("automation-executor", NOW + 1, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 2, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+    appliedThenAmbiguous.mockRestore();
+
+    const exactCandidate = fake.runs.get(created.bbAutomationId!)?.[0];
+    if (!exactCandidate) throw new Error("ambiguous provider run is missing");
+    const unrelatedRuns = Array.from({ length: 21 }, (_, index) => runEvidence({
+      id: `unrelated_${index + 1}`,
+      automationId: created.bbAutomationId!,
+      scheduledFor: NOW + 10 + index,
+      startedAt: NOW + 11 + index,
+      finishedAt: NOW + 12 + index,
+    }));
+    fake.runs.set(created.bbAutomationId!, [...unrelatedRuns, exactCandidate]);
+    const providerWindows = [
+      [...unrelatedRuns.slice(0, 19), exactCandidate],
+      unrelatedRuns.slice(1),
+    ];
+    let reconciliationWindow = 0;
+    vi.mocked(fake.adapter.runs).mockImplementation(async ({ limit }) => {
+      if (limit === 20) {
+        const window = providerWindows[Math.min(reconciliationWindow, providerWindows.length - 1)];
+        reconciliationWindow += 1;
+        return window;
+      }
+      return providerWindows[1];
+    });
+
+    const firstReconciliation = repository.get(created.id);
+    if (!firstReconciliation) throw new Error("ambiguous automation binding is missing");
+    await service.reconcile({ binding: firstReconciliation, scope: SCOPE, now: NOW + 3, signal });
+    const secondReconciliation = repository.get(created.id);
+    if (!secondReconciliation) throw new Error("reconciled automation binding is missing");
+    await service.reconcile({ binding: secondReconciliation, scope: SCOPE, now: NOW + 4, signal });
+
+    const historyRows = bb.storage.database().prepare(
+      `SELECT bb_run_id, initiating_operation_id, idempotency_key
+         FROM managed_automation_run_evidence
+        ORDER BY bb_run_id`,
+    ).all() as Array<{
+      bb_run_id: string;
+      initiating_operation_id: string | null;
+      idempotency_key: string | null;
+    }>;
+    expect(historyRows).toHaveLength(21);
+    expect(historyRows.map((row) => row.bb_run_id).sort()).toEqual(unrelatedRuns.map((run) => run.id).sort());
+    expect(historyRows.every((row) => row.initiating_operation_id === null && row.idempotency_key === null)).toBe(true);
+    expect(bb.storage.database().prepare(
+      "SELECT 1 FROM managed_automation_run_evidence WHERE bb_run_id = ?",
+    ).get(exactCandidate.id)).toBeUndefined();
+
+    await reconciler.processDue(NOW + 60_003, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    openStore(bb.storage, bb.storage.kv, () => NOW + 60_003);
+    const restartedRepository = new ManagedAutomationRepository(bb.storage.database());
+    const operation = restartedRepository.getOperation(submitted.lastOperationId!);
+    if (!operation || operation.state !== "succeeded" || operation.outcome?.kind !== "settled" ||
+      !operation.outcome.runReceipt) {
+      throw new Error("restarted run-now operation is not readable with its authoritative receipt");
+    }
+    expect(operation.outcome.runReceipt).toMatchObject({
+      providerRunId: exactCandidate.id,
+      initiatingOperationId: operation.id,
+    });
+    const exactEvidence = bb.storage.database().prepare(
+      `SELECT initiating_operation_id, idempotency_key, authority_json, capability_evidence_json
+         FROM managed_automation_run_evidence WHERE bb_run_id = ?`,
+    ).get(exactCandidate.id) as {
+      initiating_operation_id: string;
+      idempotency_key: string;
+      authority_json: string;
+      capability_evidence_json: string;
+    };
+    expect(exactEvidence.initiating_operation_id).toBe(operation.id);
+    expect(exactEvidence.idempotency_key).toBe(operation.id);
+    expect(JSON.parse(exactEvidence.authority_json)).toEqual(operation.authority);
+    expect(JSON.parse(exactEvidence.capability_evidence_json)).toEqual(operation.capabilityEvidence);
+  });
+
   it("fails closed when a second operation claims an authoritative provider run", async () => {
     const { store, repository } = fixture();
     const fake = fakeAdapter();

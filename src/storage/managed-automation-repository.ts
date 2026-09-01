@@ -601,12 +601,17 @@ function assertExistingRunProvenance(
   }
 }
 
-function hasRetryableRunNowOperation(db: SqliteDatabase, bindingId: string): boolean {
+function hasRetryableRunNowOperation(
+  db: SqliteDatabase,
+  bindingId: string,
+  idempotencyKey: string | null | undefined,
+): boolean {
+  if (!idempotencyKey) return false;
   const row = db.prepare(
     `SELECT 1 FROM managed_automation_operations
-      WHERE binding_id = ? AND operation_class = 'run_now'
+      WHERE binding_id = ? AND id = ? AND operation_class = 'run_now'
         AND state IN ('pending', 'leased', 'ambiguous') LIMIT 1`,
-  ).get(bindingId) as { 1: number } | undefined;
+  ).get(bindingId, idempotencyKey) as { 1: number } | undefined;
   return row !== undefined;
 }
 
@@ -1706,7 +1711,7 @@ export class ManagedAutomationRepository {
     const receipt = initiatingOperationId && isCurrentManagedAutomationAuthority(binding.authority) && binding.capabilityEvidence
       ? managedAutomationRunReceipt(binding, initiatingOperationId, binding.authority, binding.capabilityEvidence, run, now)
       : null;
-    if (!initiatingOperationId && hasRetryableRunNowOperation(this.db, binding.id)) return false;
+    if (!initiatingOperationId && hasRetryableRunNowOperation(this.db, binding.id, run.idempotencyKey)) return false;
     const evidenceJson = canonical({
       automationId: run.automationId,
       contractOutcome: contract.outcome,
