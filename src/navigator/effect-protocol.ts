@@ -21,6 +21,7 @@ import type {
   NavigatorTicketReceipt,
   NavigatorTicketEffectContext,
   NavigatorTicketAttemptContext,
+  NavigatorTicketWorkerResource,
 } from "./effect-contracts";
 import { navigatorEffectReceiptSchema } from "./effect-contracts";
 
@@ -53,8 +54,13 @@ export type NavigatorEffectOutcome =
     resource?: Readonly<{ kind: "bb_thread"; id: string }>;
   }>;
 
+export type NavigatorEffectPreparation = Readonly<{
+  resource: NavigatorTicketWorkerResource;
+}>;
+
 export type NavigatorEffectAdapter = Readonly<{
   kind: NavigatorEffectKind;
+  prepare?(context: NavigatorEffectContext): Promise<NavigatorEffectPreparation | NavigatorEffectOutcome>;
   execute(context: NavigatorEffectContext): Promise<NavigatorEffectOutcome>;
   reconcile?(context: NavigatorEffectContext): Promise<NavigatorEffectOutcome>;
 }>;
@@ -76,6 +82,7 @@ type NavigatorEffectStore = Pick<
   | "settleNavigatorTicketWorkerAttempt"
   | "settleNavigatorReleaseEffect"
   | "getNavigatorTicketAttemptContext"
+  | "bindNavigatorTicketWorkerResource"
   | "getCurrentWorkArtifactSnapshot"
   | "isWorkArtifactSnapshotValid"
   | "listCurrentHeldResourceClaims"
@@ -118,6 +125,13 @@ export class NavigatorEffectLeaseCancellationError extends Error {
   public constructor(message: string) {
     super(message);
     this.name = "NavigatorEffectLeaseCancellationError";
+  }
+}
+
+export class NavigatorEffectDeadlineError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "NavigatorEffectDeadlineError";
   }
 }
 
@@ -574,19 +588,101 @@ export class NavigatorEffectProtocol {
     context: NavigatorEffectContext,
   ): Promise<boolean> {
     const leaseAbort = new AbortController();
-    const runSignal = AbortSignal.any([context.signal, leaseAbort.signal]);
-    const runningContext = Object.freeze({ ...context, signal: runSignal });
+    const deadlineAbort = context.kind === "run_navigator_ticket_worker" ? new AbortController() : null;
+    const signals = [context.signal, leaseAbort.signal];
+    if (deadlineAbort !== null) signals.push(deadlineAbort.signal);
+    const runSignal = AbortSignal.any(signals);
+    let runningContext = Object.freeze({ ...context, signal: runSignal });
+    const deadline = this.startTicketDeadline(context, deadlineAbort);
     const renewal = setInterval(() => this.renewNavigatorEffect(effect, context, leaseAbort), this.renewalInterval());
     try {
-      const outcome = context.signal.aborted
-        ? { outcome: "lease_cancelled" as const, reason: "Navigator executor signal was cancelled" }
-        : await this.runWithInterruption(adapter.execute(runningContext), runSignal);
+      let outcome: NavigatorEffectOutcome;
+      if (context.signal.aborted) {
+        outcome = { outcome: "lease_cancelled", reason: "Navigator executor signal was cancelled" };
+      } else {
+        const prepared = await this.prepareNavigatorEffect(effect, adapter, runningContext, runSignal);
+        if (prepared === null) return true;
+        if ("outcome" in prepared) {
+          outcome = prepared.outcome;
+        } else {
+          runningContext = prepared.context;
+          outcome = await this.runWithInterruption(adapter.execute(runningContext), runSignal);
+        }
+      }
       return this.settleNavigatorOutcome(effect, adapter, runningContext, outcome);
     } catch (error) {
       return this.settleNavigatorOutcome(effect, adapter, runningContext, this.classify(error, runSignal));
     } finally {
       clearInterval(renewal);
+      if (deadline !== null) clearTimeout(deadline);
     }
+  }
+
+  private startTicketDeadline(
+    context: NavigatorEffectContext,
+    deadlineAbort: AbortController | null,
+  ): ReturnType<typeof setTimeout> | null {
+    if (context.kind !== "run_navigator_ticket_worker" || deadlineAbort === null) return null;
+    return setTimeout(() => {
+      deadlineAbort.abort(new NavigatorEffectDeadlineError("Navigator ticket step deadline expired"));
+    }, context.ticket.attempt.stepContract.timeoutMs);
+  }
+
+  private async prepareNavigatorEffect(
+    effect: StoredEffect,
+    adapter: NavigatorEffectAdapter,
+    context: NavigatorEffectContext,
+    signal: AbortSignal,
+  ): Promise<Readonly<{ context: NavigatorEffectContext }> | Readonly<{ outcome: NavigatorEffectOutcome }> | null> {
+    if (!adapter.prepare) return { context };
+    const preparation = await this.runWithInterruption(adapter.prepare(context), signal);
+    if ("outcome" in preparation) return { outcome: preparation };
+    if (context.kind !== "run_navigator_ticket_worker" || !this.validWorkerResource(preparation.resource)) {
+      return { outcome: { outcome: "permanent", reason: "Navigator effect preparation returned an invalid resource" } };
+    }
+    const now = this.dependencies.clock.now();
+    const bound = this.dependencies.store.bindNavigatorTicketWorkerResource({
+      attemptId: context.ticket.attempt.id,
+      effectIdempotencyKey: effect.idempotencyKey,
+      resource: preparation.resource,
+      ownerId: context.fence.ownerId,
+      generation: context.fence.generation,
+      now,
+    });
+    const current = this.dependencies.store.getEffect(effect.jobId, effect.idempotencyKey);
+    if (!bound) {
+      return current && this.leaseIsCurrent(current, context.fence, now)
+        ? { outcome: { outcome: "transient", reason: "Navigator ticket worker resource binding failed" } }
+        : null;
+    }
+    const refreshed = this.dependencies.store.getNavigatorTicketAttemptContext({
+      attemptId: context.ticket.attempt.id,
+      effectIdempotencyKey: effect.idempotencyKey,
+      ownerId: context.fence.ownerId,
+      generation: context.fence.generation,
+      now,
+    });
+    if (refreshed === null) {
+      return current && this.leaseIsCurrent(current, context.fence, now)
+        ? { outcome: { outcome: "permanent", reason: "Navigator ticket attempt context changed before worker wait" } }
+        : null;
+    }
+    return { context: this.refreshTicketContext(context, refreshed) };
+  }
+
+  private validWorkerResource(resource: unknown): resource is NavigatorTicketWorkerResource {
+    if (typeof resource !== "object" || resource === null) return false;
+    const candidate = resource as Record<string, unknown>;
+    return candidate.kind === "bb_thread" && typeof candidate.id === "string" &&
+      candidate.id.trim().length > 0 && candidate.id.length <= 256;
+  }
+
+  private refreshTicketContext(
+    context: NavigatorEffectContext,
+    ticket: NavigatorTicketAttemptContext,
+  ): NavigatorEffectContext {
+    if (context.kind !== "run_navigator_ticket_worker") return context;
+    return Object.freeze({ ...context, ticket: cloneAndFreezeNavigatorValue(ticket) });
   }
 
   private renewalInterval(): number {
@@ -629,10 +725,10 @@ export class NavigatorEffectProtocol {
     };
   }
 
-  private async runWithInterruption(
-    operation: Promise<NavigatorEffectOutcome>,
+  private async runWithInterruption<T>(
+    operation: Promise<T>,
     signal: AbortSignal,
-  ): Promise<NavigatorEffectOutcome> {
+  ): Promise<T> {
     const interruption = new Promise<never>((_resolve, reject) => {
       if (signal.aborted) {
         reject(signal.reason ?? new NavigatorEffectLeaseCancellationError("Navigator effect was cancelled"));
@@ -646,9 +742,15 @@ export class NavigatorEffectProtocol {
   }
 
   private classify(error: unknown, signal: AbortSignal): NavigatorEffectOutcome {
+    if (error instanceof NavigatorEffectLeaseCancellationError || signal.reason instanceof NavigatorEffectLeaseCancellationError) {
+      return { outcome: "lease_cancelled", reason: safeReason(error ?? signal.reason, "Navigator effect was cancelled") };
+    }
+    if (error instanceof NavigatorEffectDeadlineError || signal.reason instanceof NavigatorEffectDeadlineError) {
+      return { outcome: "transient", reason: safeReason(error ?? signal.reason, "Navigator ticket step deadline expired") };
+    }
     if (error instanceof NavigatorEffectAmbiguousError) return { outcome: "ambiguous", reason: error.message };
     if (error instanceof NavigatorEffectPermanentError) return { outcome: "permanent", reason: error.message };
-    if (error instanceof NavigatorEffectLeaseCancellationError || signal.aborted) {
+    if (signal.aborted) {
       return { outcome: "lease_cancelled", reason: safeReason(error ?? signal.reason, "Navigator effect was cancelled") };
     }
     if (error instanceof NavigatorEffectTransientError) return { outcome: "transient", reason: error.message };
@@ -681,6 +783,8 @@ export class NavigatorEffectProtocol {
         ? { outcome: "transient", reason: `ambiguous outcome: ${reconciled.reason}` }
         : reconciled;
     } catch (error) {
+      if (context.signal.aborted || error instanceof NavigatorEffectLeaseCancellationError ||
+        error instanceof NavigatorEffectDeadlineError) return this.classify(error, context.signal);
       return { outcome: "transient", reason: `ambiguous reconciliation failed: ${safeReason(error, "unknown error")}` };
     }
   }

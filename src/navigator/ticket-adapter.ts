@@ -1,9 +1,12 @@
 import type {
   NavigatorEffectAdapter,
+  NavigatorEffectPreparation,
   NavigatorEffectOutcome,
 } from "./effect-protocol";
 import {
   NavigatorEffectAmbiguousError,
+  NavigatorEffectDeadlineError,
+  NavigatorEffectLeaseCancellationError,
   NavigatorEffectPermanentError,
   NavigatorEffectTransientError,
 } from "./effect-protocol";
@@ -53,6 +56,7 @@ export interface NavigatorGitObserver {
 }
 
 export interface NavigatorTicketWorkerOperation {
+  prepare?(input: NavigatorTicketWorkerInput, signal: AbortSignal): Promise<NavigatorTicketWorkerRun["resource"]>;
   run(input: NavigatorTicketWorkerInput, signal: AbortSignal): Promise<NavigatorTicketWorkerRun>;
   reconcile(input: NavigatorTicketWorkerInput, signal: AbortSignal): Promise<NavigatorTicketWorkerRun>;
   observe(request: NavigatorGitObservationRequest, signal: AbortSignal): Promise<unknown>;
@@ -131,6 +135,36 @@ function expectedChangedPaths(
   return parsed.success && parsed.data.kind === "implementation_result"
     ? parsed.data.changedPaths
     : attempt.workOrder.changedPaths;
+}
+
+async function preflightWorkerGit(
+  operation: NavigatorTicketWorkerOperation,
+  input: NavigatorTicketWorkerInput,
+  signal: AbortSignal,
+): Promise<void> {
+  const request: NavigatorGitObservationRequest = {
+    purpose: input.attempt.kind,
+    worktreeId: input.attempt.workOrder.worktreeId,
+    integrationBranch: input.attempt.workOrder.integrationBranch,
+    expectedHeadSha: input.attempt.workOrder.baseHeadSha,
+    baseHeadSha: input.attempt.workOrder.baseHeadSha,
+    comparisonBaseHeadSha: input.attempt.workOrder.comparisonBaseHeadSha,
+    expectedChangedPaths: input.attempt.workOrder.changedPaths,
+  };
+  let observed: unknown;
+  try {
+    observed = await operation.observe(request, signal);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new NavigatorTicketWorkerPermanentError("Navigator ticket worker Git preflight failed");
+  }
+  if (signal.aborted) throw signal.reason ?? new Error("Navigator ticket worker Git preflight was cancelled");
+  const parsed = navigatorGitObservationSchema.safeParse(observed);
+  if (!parsed.success || parsed.data.worktreeId !== request.worktreeId ||
+    parsed.data.branch !== request.integrationBranch || parsed.data.headSha !== request.expectedHeadSha ||
+    !parsed.data.clean) {
+    throw new NavigatorTicketWorkerPermanentError("Navigator ticket worker Git preflight failed");
+  }
 }
 
 async function observeWorkerGit(
@@ -218,6 +252,9 @@ function workerOperationError(
   error: unknown,
   resource: NavigatorTicketWorkerRun["resource"] | null,
 ): NavigatorEffectOutcome {
+  if (context.signal.aborted || error instanceof NavigatorEffectDeadlineError || error instanceof NavigatorEffectLeaseCancellationError) {
+    throw error;
+  }
   if (error instanceof NavigatorTicketWorkerRetryableError) {
     return failureReceipt(context, error.resource === null && resource !== null
       ? new NavigatorTicketWorkerRetryableError(safeErrorMessage(error), resource)
@@ -233,6 +270,23 @@ function workerOperationError(
     return failureReceipt(context, new NavigatorTicketWorkerRetryableError(errorMessage(error), resource));
   }
   return classifyTicketWorkerError(error);
+}
+
+async function prepareTicketOperation(
+  operation: NavigatorTicketWorkerOperation,
+  context: NavigatorTicketEffectContext,
+): Promise<NavigatorEffectPreparation | NavigatorEffectOutcome> {
+  const input = workerInput(context);
+  try {
+    await preflightWorkerGit(operation, input, context.signal);
+    const resource = input.attempt.resource ?? await operation.prepare!(input, context.signal);
+    return { resource };
+  } catch (error) {
+    if (context.signal.aborted || error instanceof NavigatorEffectDeadlineError || error instanceof NavigatorEffectLeaseCancellationError) {
+      throw error;
+    }
+    return workerOperationError(context, error, null);
+  }
 }
 
 function classifyTicketWorkerError(error: unknown): NavigatorEffectOutcome {
@@ -301,7 +355,7 @@ async function executeTicketOperation(
 export function createNavigatorTicketEffectAdapter(
   operation: NavigatorTicketWorkerOperation,
 ): NavigatorEffectAdapter {
-  return {
+  const adapter: NavigatorEffectAdapter = {
     kind: "run_navigator_ticket_worker",
     execute: async (context) => context.kind === "run_navigator_ticket_worker"
       ? executeTicketOperation(operation, context, "execute")
@@ -310,4 +364,9 @@ export function createNavigatorTicketEffectAdapter(
       ? executeTicketOperation(operation, context, "reconcile")
       : { outcome: "permanent", reason: "Navigator ticket adapter received another effect kind" },
   };
+  return operation.prepare === undefined
+    ? adapter
+    : { ...adapter, prepare: async (context) => context.kind === "run_navigator_ticket_worker"
+      ? prepareTicketOperation(operation, context)
+      : { outcome: "permanent", reason: "Navigator ticket adapter received another effect kind" } };
 }

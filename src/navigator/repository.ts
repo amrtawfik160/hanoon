@@ -20,6 +20,7 @@ import {
   type NavigatorCapabilityOperation,
   type NavigatorSkillReceipt,
   type NavigatorTicketSettlementInput,
+  type NavigatorTicketWorkerResourceBindingInput,
 } from "./effect-contracts";
 import type { NavigatorTicketAttemptContext } from "./effect-contracts";
 import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
@@ -718,6 +719,10 @@ export class NavigatorRepository {
     input: NavigatorTicketSettlementInput,
   ): NavigatorTicketWorkerOutcome | null {
     return this.ticketSettlement.settle(input);
+  }
+
+  public bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
+    return this.ticketSettlement.bindResource(input);
   }
 
   private createNavigatorCapabilityProfile(input: Readonly<{
@@ -1899,7 +1904,8 @@ export class NavigatorRepository {
     if (!ticket || ticket.snapshot_id !== slice.ticket_snapshot_id || ticket.snapshot_digest !== slice.ticket_snapshot_digest ||
       attempt.workOrder.jobId !== row.job_id || attempt.workOrder.ticket.artifactId !== ticket.artifact_id ||
       attempt.workOrder.ticket.snapshotId !== ticket.snapshot_id || attempt.workOrder.ticket.snapshotDigest !== ticket.snapshot_digest ||
-      attempt.workOrder.worktreeId !== integration.worktree_id || attempt.workOrder.integrationBranch !== integration.integration_branch) return null;
+      attempt.workOrder.worktreeId !== integration.worktree_id || attempt.workOrder.integrationBranch !== integration.integration_branch ||
+      attempt.workOrder.baseHeadSha !== integration.current_head_sha) return null;
     const claim = this.artifacts.getClaim(slice.claim_id);
     const ticketSnapshot = this.artifacts.getSnapshot(ticket.snapshot_id);
     const specificationSnapshot = this.artifacts.getSnapshot(attempt.workOrder.specification.snapshotId);
@@ -2214,8 +2220,9 @@ export class NavigatorRepository {
     const ticketClaim = contract.requiresTicketWorkArtifact
       ? this.navigatorTicketClaimForEffect(effect)
       : null;
-    const allowExpiredTransfer = effect.status === "leased" && effect.leaseExpiresAt !== null &&
-      effect.leaseExpiresAt <= input.now;
+    const allowExpiredTransfer =
+      (effect.status === "leased" && effect.leaseExpiresAt !== null && effect.leaseExpiresAt <= input.now) ||
+      (effect.status === "failed" && effect.nextAttemptAt <= input.now);
     if (contract.requiresTicketWorkArtifact && !this.claimCanTransfer(ticketClaim, input, allowExpiredTransfer)) return null;
     if (!claims.every((claim) => this.claimCanTransfer(claim, input, allowExpiredTransfer))) return null;
     return {

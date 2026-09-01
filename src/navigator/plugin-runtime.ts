@@ -152,6 +152,10 @@ function gitIsAncestor(result: CommandResult): boolean {
   return result.outcome === "exited" && result.exitCode === 0;
 }
 
+function throwIfWorkerSignalAborted(signal: AbortSignal, fallback: unknown): void {
+  if (signal.aborted) throw signal.reason ?? fallback ?? new Error("navigator ticket worker was cancelled");
+}
+
 function boundedWorkerErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "Navigator ticket worker failed";
   return message.replace(/[^\x20-\x7E]/gu, " ").trim().slice(0, 500) || "Navigator ticket worker failed";
@@ -273,9 +277,11 @@ async function waitForWorker(
   let current: Awaited<ReturnType<BbSdk["threads"]["get"]>>;
   try {
     current = await sdk.threads.get({ threadId, signal });
-  } catch {
+  } catch (error) {
+    throwIfWorkerSignalAborted(signal, error);
     throw new NavigatorTicketWorkerUnavailableError("missing");
   }
+  throwIfWorkerSignalAborted(signal, new Error("navigator ticket worker was cancelled"));
   if (current.status === "idle") return;
   if (current.status === "error") throw new Error("navigator ticket worker ended in error");
   const settled = new AbortController();
@@ -313,6 +319,7 @@ async function findExistingWorker(
   const matching = threads.filter((thread) =>
     thread.title === workerTitle(input.attempt) && thread.environmentId === input.attempt.workOrder.worktreeId &&
     thread.deletedAt === null && thread.archivedAt === null);
+  throwIfWorkerSignalAborted(signal, new Error("navigator ticket worker preparation was cancelled"));
   if (matching.length > 1) throw new Error("navigator worker recovery found duplicate BB threads");
   return matching.length === 1 ? { kind: "bb_thread", id: matching[0]!.id } : null;
 }
@@ -320,7 +327,9 @@ async function findExistingWorker(
 async function spawnTicketWorker(
   sdk: BbSdk,
   input: NavigatorTicketWorkerInput,
+  signal: AbortSignal,
 ): Promise<TicketWorkerResource> {
+  throwIfWorkerSignalAborted(signal, new Error("navigator ticket worker was cancelled before spawn"));
   const packet = workerPacket(input);
   const uploaded = await sdk.projects.attachments.upload({
     projectId: input.attempt.workOrder.projectPolicy.projectId,
@@ -328,6 +337,7 @@ async function spawnTicketWorker(
     filename: packet.filename,
     mimeType: "application/json",
   });
+  throwIfWorkerSignalAborted(signal, new Error("navigator ticket worker was cancelled before spawn"));
   if (uploaded.type !== "localFile") throw new Error("navigator worker packet upload did not return a local file");
   const route = input.attempt.modelRoute;
   const permissionMode = input.attempt.kind === "implementation"
@@ -358,9 +368,10 @@ async function prepareWorkerResource(
   input: NavigatorTicketWorkerInput,
   signal: AbortSignal,
 ): Promise<TicketWorkerResource> {
+  throwIfWorkerSignalAborted(signal, new Error("navigator ticket worker preparation was cancelled"));
   if (input.attempt.resource !== null) return input.attempt.resource;
   const existing = await findExistingWorker(sdk, input, signal);
-  return existing ?? spawnTicketWorker(sdk, input);
+  return existing ?? spawnTicketWorker(sdk, input, signal);
 }
 
 async function readWorker(
@@ -369,6 +380,7 @@ async function readWorker(
   signal: AbortSignal,
 ): Promise<NavigatorTicketWorkerRun> {
   await waitForWorker(sdk, resource.id, signal);
+  throwIfWorkerSignalAborted(signal, new Error("navigator ticket worker wait was cancelled"));
   const output = await sdk.threads.output({ threadId: resource.id, signal });
   return { resource, result: parseThreadJson(output) };
 }
@@ -428,15 +440,44 @@ class PluginNavigatorSkillRunner implements NavigatorSkillRunner {
 export class PluginNavigatorTicketWorkerRunner {
   public constructor(private readonly sdk: BbSdk) {}
 
+  public async prepare(
+    input: NavigatorTicketWorkerInput,
+    signal: AbortSignal,
+  ): Promise<TicketWorkerResource> {
+    let resource = input.attempt.resource;
+    try {
+      resource = await prepareWorkerResource(this.sdk, input, signal);
+      return resource;
+    } catch (error) {
+      throwIfWorkerSignalAborted(signal, error);
+      throw classifyWorkerError(error, resource);
+    }
+  }
+
+  public async wait(
+    input: NavigatorTicketWorkerInput,
+    signal: AbortSignal,
+  ): Promise<NavigatorTicketWorkerRun> {
+    const resource = input.attempt.resource;
+    if (resource === null) throw new NavigatorTicketWorkerUnavailableError("missing");
+    try {
+      return await readWorker(this.sdk, resource, signal);
+    } catch (error) {
+      throwIfWorkerSignalAborted(signal, error);
+      throw classifyWorkerError(error, resource);
+    }
+  }
+
   public async run(
     input: NavigatorTicketWorkerInput,
     signal: AbortSignal,
   ): Promise<NavigatorTicketWorkerRun> {
     let resource = input.attempt.resource;
     try {
-      resource = await prepareWorkerResource(this.sdk, input, signal);
+      resource = await this.prepare(input, signal);
       return await readWorker(this.sdk, resource, signal);
     } catch (error) {
+      throwIfWorkerSignalAborted(signal, error);
       throw classifyWorkerError(error, resource);
     }
   }
@@ -450,6 +491,7 @@ export class PluginNavigatorTicketWorkerRunner {
     try {
       return await readWorker(this.sdk, resource, signal);
     } catch (error) {
+      throwIfWorkerSignalAborted(signal, error);
       if (!(error instanceof NavigatorTicketWorkerUnavailableError)) {
         throw classifyWorkerError(error, resource);
       }
@@ -691,7 +733,8 @@ export function createNavigatorRuntime(input: Readonly<{
     });
   const ticketWorker = new PluginNavigatorTicketWorkerRunner(input.sdk);
   const ticketOperation: NavigatorTicketWorkerOperation = {
-    run: (workerInput, signal) => ticketWorker.run(workerInput, signal),
+    prepare: (workerInput, signal) => ticketWorker.prepare(workerInput, signal),
+    run: (workerInput, signal) => ticketWorker.wait(workerInput, signal),
     reconcile: (workerInput, signal) => ticketWorker.reconcile(workerInput, signal),
     observe: (request, signal) => new PluginNavigatorGitObserver(input.sdk).observe(request, signal),
   };

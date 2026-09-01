@@ -10,6 +10,7 @@ import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
 import {
   navigatorTicketReceiptSchema,
   type NavigatorTicketReceipt,
+  type NavigatorTicketWorkerResourceBindingInput,
   type NavigatorTicketSettlementInput,
 } from "./effect-contracts";
 import {
@@ -410,6 +411,17 @@ export class NavigatorTicketSettlementRepository {
     })).immediate();
   }
 
+  public bindResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
+    assertIdentifier(input.attemptId, "attemptId");
+    assertIdentifier(input.effectIdempotencyKey, "effectIdempotencyKey");
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    if (input.resource.kind !== "bb_thread") throw new TypeError("navigator ticket worker resource kind is invalid");
+    assertIdentifier(input.resource.id, "resource id");
+    assertNonNegativeInteger(input.now, "now");
+    return this.db.transaction(() => this.bindResourceInTransaction(input)).immediate();
+  }
+
   private settleReceipt(input: NavigatorTicketSettlementInput & Readonly<{ receipt: NavigatorTicketReceipt }>): NavigatorTicketWorkerOutcome | null {
     const effect = this.effect(input.effectIdempotencyKey);
     if (!effect || !this.effectLeaseCurrent(input.effectIdempotencyKey, input.ownerId, input.generation, input.now)) return null;
@@ -420,7 +432,14 @@ export class NavigatorTicketSettlementRepository {
     if (!this.claimFenceIsCurrent(attempt, input.ownerId, input.generation, input.now)) return null;
     const integration = this.integrationRow(attempt.jobId);
     if (!integration) return null;
-    if (!this.bindResource(input.receipt, attempt, input)) return null;
+    if (!this.bindResourceInTransaction({
+      attemptId: input.attemptId,
+      effectIdempotencyKey: input.effectIdempotencyKey,
+      resource: input.receipt.resource,
+      ownerId: input.ownerId,
+      generation: input.generation,
+      now: input.now,
+    })) return null;
     const settlement = this.assessReceipt(attempt, integration, effect, input.receipt, input.now);
     if (settlement.outcome !== null) {
       this.recordReceipt(input.receipt, attempt.jobId, input);
@@ -477,17 +496,24 @@ export class NavigatorTicketSettlementRepository {
       receipt.attemptId === attempt.id && attempt.effectIdempotencyKey === effect.idempotencyKey;
   }
 
-  private bindResource(
-    receipt: NavigatorTicketReceipt,
-    attempt: NavigatorTicketWorkerAttempt,
-    input: Readonly<{ effectIdempotencyKey: string; ownerId: string; generation: number; now: number }>,
-  ): boolean {
-    if (attempt.resource !== null) return attempt.resource.id === receipt.resource.id;
+  private bindResourceInTransaction(input: NavigatorTicketWorkerResourceBindingInput): boolean {
+    const effect = this.effect(input.effectIdempotencyKey);
+    if (!effect || effect.kind !== "run_navigator_ticket_worker" ||
+      !this.effectLeaseCurrent(input.effectIdempotencyKey, input.ownerId, input.generation, input.now)) return false;
+    const attempt = this.ticketAttempt(input.attemptId);
+    if (!attempt || attempt.effectIdempotencyKey !== input.effectIdempotencyKey ||
+      !this.claimFenceIsCurrent(attempt, input.ownerId, input.generation, input.now)) return false;
+    const integration = this.integrationRow(attempt.jobId);
+    if (!integration || integration.state !== "implementing" || integration.active_slice_id !== attempt.sliceId ||
+      integration.current_head_sha !== attempt.workOrder.baseHeadSha) return false;
+    if (attempt.resource !== null) {
+      return attempt.resource.kind === input.resource.kind && attempt.resource.id === input.resource.id;
+    }
     const bound = this.db.prepare(
       `UPDATE navigator_ticket_worker_attempts
           SET resource_kind = 'bb_thread', resource_id = ?, updated_at = ?
-        WHERE id = ? AND effect_idempotency_key = ? AND resource_id IS NULL`,
-    ).run(receipt.resource.id, input.now, attempt.id, input.effectIdempotencyKey).changes === 1;
+        WHERE id = ? AND effect_idempotency_key = ? AND resource_kind IS NULL AND resource_id IS NULL`,
+    ).run(input.resource.id, input.now, input.attemptId, input.effectIdempotencyKey).changes === 1;
     if (!bound) return false;
     this.db.prepare(
       "UPDATE navigator_ticket_slices SET state = ?, updated_at = ? WHERE id = ?",

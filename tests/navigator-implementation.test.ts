@@ -428,6 +428,17 @@ function ticketProtocol(
   });
 }
 
+async function waitForAttemptResource(value: Fixture, attemptId: string, resourceId: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const row = value.database.prepare(
+      "SELECT resource_kind, resource_id FROM navigator_ticket_worker_attempts WHERE id = ?",
+    ).get(attemptId) as { resource_kind: string | null; resource_id: string | null } | undefined;
+    if (row?.resource_kind === "bb_thread" && row.resource_id === resourceId) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("navigator ticket worker resource was not durably bound");
+}
+
 function completedTicketReceipt(context: NavigatorEffectContext): NavigatorEffectOutcome {
   if (context.kind !== "run_navigator_ticket_worker") {
     return { outcome: "permanent", reason: "ticket receipt received another effect kind" };
@@ -832,6 +843,258 @@ describe("navigator ticket integration executor", () => {
     expect(run).toHaveBeenCalledTimes(1);
     expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "done" });
   });
+
+  it("cancels a ticket worker at its immutable step deadline and retries the fenced effect", async () => {
+    const value = fixture();
+    const now = { value: 1_110 };
+    const prepared = prepareTicketEffectForExecutor(value, 1_110);
+    const attemptId = String(prepared.effect.payload.attemptId);
+    const timeoutMs = prepared.executor.snapshot(value.jobId).attempts[0]!.stepContract.timeoutMs;
+    const abort = new AbortController();
+    const gitObserver = validGitObserver();
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput, signal: AbortSignal) => {
+      if (run.mock.calls.length > 1) {
+        return { resource: input.attempt.resource!, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) };
+      }
+      return await new Promise<never>((_resolve, reject) => {
+        const cancel = (): void => reject(signal.reason ?? new Error("worker cancelled"));
+        if (signal.aborted) {
+          cancel();
+          return;
+        }
+        signal.addEventListener("abort", cancel, { once: true });
+      });
+    });
+    const operation = {
+      prepare: vi.fn(async () => ({ kind: "bb_thread" as const, id: "thr_timeout" })),
+      run,
+      reconcile: vi.fn(),
+      observe: gitObserver.observe,
+    };
+    const protocol = ticketProtocol(value, operation, () => now.value, 15_000_000);
+    vi.useFakeTimers();
+    try {
+      const service = runJobExecutorService({
+        store: value.store,
+        clock: { now: () => now.value },
+        leaseMs: 15_000_000,
+        navigatorEffects: protocol,
+        effectRunnerFactory: () => ({ run: async () => undefined }),
+        waitForWork: async () => abort.abort(),
+        releaseOnShutdown: true,
+      }, abort.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(timeoutMs + 1);
+      abort.abort(new Error("test safety stop"));
+      await service;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[1].aborted).toBe(true);
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({
+      status: "failed",
+      lastError: expect.stringContaining("deadline"),
+      nextAttemptAt: expect.any(Number),
+    });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(attemptId)).toEqual({ count: 0 });
+
+    now.value = 20_000_000;
+    const successorAbort = new AbortController();
+    vi.useFakeTimers();
+    try {
+      const successor = runJobExecutorService({
+        store: value.store,
+        clock: { now: () => now.value },
+        leaseMs: 15_000_000,
+        navigatorEffects: protocol,
+        effectRunnerFactory: () => ({ run: async () => undefined }),
+        waitForWork: async () => successorAbort.abort(),
+        releaseOnShutdown: true,
+      }, successorAbort.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      await successor;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(operation.prepare).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1]?.[0].attempt.resource).toEqual({ kind: "bb_thread", id: "thr_timeout" });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_attempts WHERE effect_idempotency_key = ?",
+    ).get(prepared.effect.idempotencyKey)).toEqual({ count: 1 });
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "done" });
+  });
+
+  it("binds a spawned worker before waiting so takeover reuses one exact durable thread", async () => {
+    const value = fixture();
+    const now = { value: 1_110 };
+    const prepared = prepareTicketEffectForExecutor(value, now.value);
+    const attemptId = String(prepared.effect.payload.attemptId);
+    const resource = { kind: "bb_thread" as const, id: "thr_spawned_once" };
+    const firstAbort = new AbortController();
+    const prepare = vi.fn(async () => resource);
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput, signal: AbortSignal) => {
+      if (run.mock.calls.length === 1) {
+        await new Promise<never>((_resolve, reject) => {
+          const cancel = (): void => reject(signal.reason ?? new Error("first worker stopped"));
+          if (signal.aborted) {
+            cancel();
+            return;
+          }
+          signal.addEventListener("abort", cancel, { once: true });
+        });
+      }
+      return { resource: input.attempt.resource!, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) };
+    });
+    const operation = {
+      prepare,
+      run,
+      reconcile: vi.fn(),
+      observe: validGitObserver().observe,
+    };
+    const protocol = ticketProtocol(value, operation, () => now.value, 1_000);
+    const firstService = runJobExecutorService({
+      store: value.store,
+      clock: { now: () => now.value },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => firstAbort.abort(),
+      releaseOnShutdown: true,
+    }, firstAbort.signal);
+    try {
+      await waitForAttemptResource(value, attemptId, resource.id);
+    } finally {
+      firstAbort.abort(new Error("predecessor stopped after spawn"));
+    }
+    await firstService;
+
+    expect(value.store.getNavigatorTicketAttemptContext({
+      attemptId,
+      effectIdempotencyKey: prepared.effect.idempotencyKey,
+      ownerId: "executor-40",
+      generation: 1,
+      now: 1_110,
+    })).toBeNull();
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    now.value = 5_000;
+    const successorAbort = new AbortController();
+    await runJobExecutorService({
+      store: value.store,
+      clock: { now: () => now.value },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => successorAbort.abort(),
+      releaseOnShutdown: true,
+    }, successorAbort.signal);
+
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1]?.[0].attempt.id).toBe(attemptId);
+    expect(run.mock.calls[1]?.[0].attempt.resource).toEqual(resource);
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_attempts WHERE effect_idempotency_key = ?",
+    ).get(prepared.effect.idempotencyKey)).toEqual({ count: 1 });
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "done" });
+  });
+
+  it("rejects persisted integration-head drift before ticket worker preparation", async () => {
+    const value = fixture();
+    const prepared = prepareTicketEffectForExecutor(value, 1_110);
+    const attemptId = String(prepared.effect.payload.attemptId);
+    value.database.prepare(
+      "UPDATE navigator_integrations SET current_head_sha = ? WHERE job_id = ?",
+    ).run(SHA.ticketOne, value.jobId);
+    const prepare = vi.fn(async () => ({ kind: "bb_thread" as const, id: "thr_persisted_drift" }));
+    const run = vi.fn();
+    const observe = vi.fn(validGitObserver().observe);
+    const protocol = ticketProtocol(value, {
+      prepare,
+      run,
+      reconcile: vi.fn(),
+      observe,
+    });
+    const abort = new AbortController();
+    await runJobExecutorService({
+      store: value.store,
+      clock: { now: () => 1_110 },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(prepare).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "dead" });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(prepared.effect.idempotencyKey)).toEqual({ count: 0 });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(attemptId)).toEqual({ count: 0 });
+  });
+
+  it.each(["branch", "head", "dirty"] as const)(
+    "rejects external Git %s drift before ticket worker preparation",
+    async (drift) => {
+      const value = fixture();
+      const prepared = prepareTicketEffectForExecutor(value, 1_110);
+      const attemptId = String(prepared.effect.payload.attemptId);
+      const prepare = vi.fn(async () => ({ kind: "bb_thread" as const, id: "thr_external_drift" }));
+      const run = vi.fn();
+      const observe = vi.fn(async (request: Parameters<NavigatorGitObserver["observe"]>[0]) => ({
+        kind: "navigator_git_observation" as const,
+        worktreeId: request.worktreeId,
+        branch: drift === "branch" ? "hanoon/drift" : request.integrationBranch,
+        headSha: drift === "head" ? SHA.ticketOne : request.expectedHeadSha,
+        baseHeadSha: request.baseHeadSha,
+        baseHeadIsAncestor: true,
+        comparisonBaseHeadSha: request.comparisonBaseHeadSha,
+        comparisonBaseHeadIsAncestor: true,
+        clean: drift !== "dirty",
+        changedPaths: request.expectedChangedPaths,
+        evidenceRef: `git-preflight:${drift}`,
+        observedAt: 2_000,
+      }));
+      const protocol = ticketProtocol(value, {
+        prepare,
+        run,
+        reconcile: vi.fn(),
+        observe,
+      });
+      const abort = new AbortController();
+      await runJobExecutorService({
+        store: value.store,
+        clock: { now: () => 1_110 },
+        leaseMs: 1_000,
+        navigatorEffects: protocol,
+        effectRunnerFactory: () => ({ run: async () => undefined }),
+        waitForWork: async () => abort.abort(),
+        releaseOnShutdown: true,
+      }, abort.signal);
+
+      expect(observe).toHaveBeenCalledTimes(1);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "dead" });
+      expect(value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+      ).get(prepared.effect.idempotencyKey)).toEqual({ count: 0 });
+      expect(value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+      ).get(attemptId)).toEqual({ count: 0 });
+    },
+  );
 
   it("passes an immutable accepted ticket snapshot to the shared executor seam", async () => {
     const value = fixture();

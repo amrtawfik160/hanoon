@@ -335,6 +335,7 @@ import type {
   NavigatorReleaseReceipt,
   NavigatorTicketAttemptContext,
   NavigatorTicketSettlementInput,
+  NavigatorTicketWorkerResourceBindingInput,
   NavigatorSkillReceipt,
 } from "../navigator/effect-contracts";
 import { navigatorReleaseReceiptSchema } from "../navigator/effect-contracts";
@@ -4073,6 +4074,7 @@ export interface TelegramAgentStore {
     generation: number;
     now: number;
   }): NavigatorTicketAttemptContext | null;
+  bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean;
   settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
@@ -12748,6 +12750,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number;
   }): NavigatorTicketAttemptContext | null {
     return this.navigatorRepository.getNavigatorTicketAttemptContext(input);
+  }
+
+  public bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
+    return this.navigatorRepository.bindNavigatorTicketWorkerResource(input);
   }
 
   public settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null {
