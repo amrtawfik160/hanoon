@@ -423,12 +423,70 @@ describe("append-only schema compatibility", () => {
         capability_ids_json, risk, mfa_mode, approval_mode, last_verified_at,
         created_at, updated_at
       ) VALUES ('installation-v1-restart', 'binding-v1-restart', 'Legacy', 'onepassword', 'vault_verified', 1,
-        '[]', 'low', 'none', 'none', ?, ?, ?)
-    `).run(NOW, NOW, NOW);
-    const legacyBindingBefore = db.prepare(
-      "SELECT installation_id, binding_id, state, generation FROM credential_bindings WHERE binding_id = 'binding-v1-restart'",
-    ).get();
+        '["telegram_agent_access_verify"]', 'low', 'none', 'none', ?, ?, ?),
+      ('installation-v1-restart', 'binding-v1-active', 'Legacy active', 'onepassword', 'active', 2,
+        '[]', 'low', 'push', 'owner_confirmation', ?, ?, ?)
+    `).run(NOW, NOW, NOW, NOW, NOW, NOW);
+    db.prepare(`
+      INSERT INTO credential_operations (
+        installation_id, request_id, idempotency_key, nonce, operation,
+        binding_id, binding_generation, turn_id, capability_id, policy_digest,
+        fence_owner, fence_generation, issued_at, deadline_at, envelope_digest,
+        state, response_receipt_id, created_at, updated_at
+      ) VALUES ('installation-v1-restart', 'request-v1-restart', 'idempotency-v1-restart', 'nonce-v1-restart',
+        'vault.binding.verify', 'binding-v1-restart', 1, 'turn-v1-restart', 'telegram_agent_access_verify',
+        ?, 'executor-v1', 1, ?, ?, ?, 'completed', 'receipt-v1-restart', ?, ?)
+    `).run("a".repeat(64), NOW, NOW + 1_000, "b".repeat(64), NOW, NOW);
+    db.prepare(`
+      INSERT INTO credential_operations (
+        installation_id, request_id, idempotency_key, nonce, operation,
+        binding_id, binding_generation, turn_id, capability_id, policy_digest,
+        fence_owner, fence_generation, issued_at, deadline_at, envelope_digest,
+        state, response_receipt_id, created_at, updated_at
+      ) VALUES ('installation-v1-restart', 'request-v1-health', 'idempotency-v1-health', 'nonce-v1-health',
+        'broker.health', NULL, NULL, NULL, 'telegram_agent_health',
+        ?, NULL, NULL, ?, ?, ?, 'completed', 'receipt-v1-health', ?, ?)
+    `).run("c".repeat(64), NOW + 10, NOW + 1_010, "d".repeat(64), NOW + 10, NOW + 10);
+    db.prepare(`
+      INSERT INTO credential_operations (
+        installation_id, request_id, idempotency_key, nonce, operation,
+        binding_id, binding_generation, turn_id, capability_id, policy_digest,
+        fence_owner, fence_generation, issued_at, deadline_at, envelope_digest,
+        state, response_receipt_id, created_at, updated_at
+      ) VALUES ('installation-v1-restart', 'request-v1-ambiguous', 'idempotency-v1-ambiguous', 'nonce-v1-ambiguous',
+        'vault.binding.verify', 'binding-v1-active', 2, 'turn-v1-ambiguous', 'telegram_agent_access_verify',
+        ?, 'executor-v1', 2, ?, ?, ?, 'ambiguous', NULL, ?, ?)
+    `).run("e".repeat(64), NOW + 20, NOW + 1_020, "f".repeat(64), NOW + 20, NOW + 20);
+    db.prepare(`
+      INSERT INTO credential_receipts (
+        receipt_id, installation_id, request_id, idempotency_key, operation,
+        turn_id, binding_id, binding_generation, outcome, result, failure_class,
+        retryable, retry_after_ms, response_sha256, completed_at, created_at
+      ) VALUES ('receipt-v1-restart', 'installation-v1-restart', 'request-v1-restart', 'idempotency-v1-restart',
+        'vault.binding.verify', 'turn-v1-restart', 'binding-v1-restart', 1, 'succeeded', 'valid', NULL,
+        0, NULL, ?, ?, ?)
+    `).run("1".repeat(64), NOW + 2_000, NOW);
+    db.prepare(`
+      INSERT INTO credential_receipts (
+        receipt_id, installation_id, request_id, idempotency_key, operation,
+        turn_id, binding_id, binding_generation, outcome, result, failure_class,
+        retryable, retry_after_ms, response_sha256, completed_at, created_at
+      ) VALUES ('receipt-v1-health', 'installation-v1-restart', 'request-v1-health', 'idempotency-v1-health',
+        'broker.health', NULL, NULL, NULL, 'succeeded', 'ready', NULL,
+        0, NULL, ?, ?, ?)
+    `).run("2".repeat(64), NOW + 2_010, NOW + 10);
+    const legacyRowsBefore = {
+      bindings: db.prepare("SELECT * FROM credential_bindings ORDER BY installation_id, binding_id").all(),
+      operations: db.prepare("SELECT * FROM credential_operations ORDER BY id").all(),
+      receipts: db.prepare("SELECT * FROM credential_receipts ORDER BY receipt_id").all(),
+    };
     const originalMigrate = bb.storage.migrate.bind(bb.storage);
+    let protectedMigrationStarted = false;
+    // A process can stop between committed migration batches. Apply the real
+    // first protected batch before installing the interruption at the next
+    // batch boundary, leaving a durable partial schema for the restart.
+    originalMigrate(db, ALL_MIGRATIONS.slice(0, -1));
+    protectedMigrationStarted = true;
     let interrupted = false;
     bb.storage.migrate = (database, statements) => {
       if (!interrupted && statements.length === ALL_MIGRATIONS.length) {
@@ -442,20 +500,26 @@ describe("append-only schema compatibility", () => {
     } finally {
       bb.storage.migrate = originalMigrate;
     }
-    expect(db.prepare(
-      "SELECT installation_id, binding_id, state, generation FROM credential_bindings WHERE binding_id = 'binding-v1-restart'",
-    ).get()).toEqual(legacyBindingBefore);
-    expect(db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_connector_bindings'",
-    ).get()).toBeUndefined();
+    expect(interrupted).toBe(true);
+    expect(protectedMigrationStarted).toBe(true);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_connector_bindings'").get())
+      .toEqual({ name: "credential_connector_bindings" });
+    expect(db.prepare("PRAGMA table_info(credential_connector_operations)").all())
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ name: "capability_profile_id" })]));
+    expect({
+      bindings: db.prepare("SELECT * FROM credential_bindings ORDER BY installation_id, binding_id").all(),
+      operations: db.prepare("SELECT * FROM credential_operations ORDER BY id").all(),
+      receipts: db.prepare("SELECT * FROM credential_receipts ORDER BY receipt_id").all(),
+    }).toEqual(legacyRowsBefore);
 
     openStore(bb.storage, bb.storage.kv, () => NOW);
-    expect(db.prepare(
-      "SELECT installation_id, binding_id, state, generation FROM credential_bindings WHERE binding_id = 'binding-v1-restart'",
-    ).get()).toEqual(legacyBindingBefore);
-    expect(db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_connector_bindings'",
-    ).get()).toEqual({ name: "credential_connector_bindings" });
+    expect({
+      bindings: db.prepare("SELECT * FROM credential_bindings ORDER BY installation_id, binding_id").all(),
+      operations: db.prepare("SELECT * FROM credential_operations ORDER BY id").all(),
+      receipts: db.prepare("SELECT * FROM credential_receipts ORDER BY receipt_id").all(),
+    }).toEqual(legacyRowsBefore);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_connector_bindings'").get())
+      .toEqual({ name: "credential_connector_bindings" });
     expect(db.prepare("PRAGMA table_info(credential_connector_operations)").all()).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "capability_profile_id" })]),
     );

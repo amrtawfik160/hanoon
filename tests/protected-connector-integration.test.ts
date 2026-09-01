@@ -11,6 +11,11 @@ import {
 import { ProtectedConnectorAuthorityService } from "../broker/src/connector-authority-service";
 import { PROTECTED_CONNECTOR_POLICY_DIGEST } from "../src/credentials/connector-policy";
 import { protectedConnectorRequestDigest } from "../src/credentials/connector-protocol";
+import {
+  buildVercelBrowserJourney,
+  VERCEL_BROWSER_JOURNEY_PURPOSE,
+  VERCEL_BROWSER_JOURNEY_TIMEOUT_MS,
+} from "../broker/src/browser-journey";
 import { assertCanaryAbsent, sqliteCanarySurfaces } from "./support/credential-broker-fixtures";
 
 afterAll(() => cleanupProtectedConnectorIntegrationFixtures());
@@ -70,6 +75,11 @@ describe("protected connector synthetic production composition", () => {
       expect(first.receiptId).toBeTruthy();
       expect(harness.providerCalls).toEqual(["GET /v1/teams/team-slug/projects/hanoon"]);
 
+      const storeBeforeRestart = harness.hanoon;
+      const hostBeforeRestart = harness.hostHarness;
+      await harness.restartHanoon();
+      expect(harness.hanoon).not.toBe(storeBeforeRestart);
+      expect(harness.hostHarness).not.toBe(hostBeforeRestart);
       const secondRaw = await inspect(harness, new AbortController().signal);
       const second = (typeof secondRaw === "string" ? JSON.parse(secondRaw) : secondRaw) as {
         outcome: string;
@@ -121,7 +131,7 @@ describe("protected connector synthetic production composition", () => {
     }
   });
 
-  it("crosses the selected controller receipt, broker TLS, browser adapter, durable receipt, and same-profile restart replay", async () => {
+  it("recreates the browser instance with the same profile, runs a fresh journey, and separately replays the old receipt", async () => {
     const harness = await createProtectedConnectorIntegrationHarness({
       operation: "browser.vercel_project.inspect.v1",
       browserAdministrationIsolated: true,
@@ -141,16 +151,31 @@ describe("protected connector synthetic production composition", () => {
         },
       });
       expect(first.receiptId).toBeTruthy();
-      expect(harness.browserCalls.map((argv) => argv.slice(0, 2))).toEqual([
-        ["browser", "status"],
-        ["browser", "grants"],
-        ["browser", "open"],
-        ["browser", "script"],
+      const journey = buildVercelBrowserJourney({
+        operation: "browser.vercel_project.inspect.v1",
+        hostId: "host-integration",
+        profileId: "profile-integration",
+        origin: "https://vercel.com",
+        journeyId: "vercel-project-identity",
+        journeyVersion: 1,
+        teamSlug: "team-slug",
+        projectName: "hanoon",
+      });
+      expect(harness.browserCalls).toEqual([
+        ["browser", "status", "--host", "host-integration", "--profile", "profile-integration", "--json"],
+        ["browser", "grants", "--host", "host-integration", "--profile", "profile-integration", "--json"],
+        [
+          "browser", "open", "https://vercel.com/team-slug/hanoon",
+          "--host", "host-integration", "--profile", "profile-integration",
+          "--timeout", String(VERCEL_BROWSER_JOURNEY_TIMEOUT_MS), "--json",
+        ],
+        [
+          "browser", "script", "--purpose", VERCEL_BROWSER_JOURNEY_PURPOSE,
+          "--code", journey.script, "--origin", "https://vercel.com",
+          "--host", "host-integration", "--profile", "profile-integration",
+          "--tab", "tab-integration", "--timeout", String(VERCEL_BROWSER_JOURNEY_TIMEOUT_MS), "--json",
+        ],
       ]);
-      expect(harness.browserCalls[2]).toContain("https://vercel.com/team-slug/hanoon");
-      expect(harness.browserCalls[3]).toContain("--origin");
-      expect(harness.browserCalls[3]).toContain("https://vercel.com");
-      expect(harness.browserCalls[3]).not.toContain("--screenshot");
       expect(harness.hanoon.getProtectedConnectorBinding(
         "installation-integration",
         "binding-browser",
@@ -160,9 +185,57 @@ describe("protected connector synthetic production composition", () => {
       ).get()).toEqual({ count: 1 });
 
       await harness.restartBrowserInstance();
+      const fresh = parsed(await harness.inspectFreshBrowserJourney()) as {
+        outcome: string;
+        receiptId?: string;
+        identity?: { profileId?: string; origin?: string; projectName?: string };
+      };
+      expect(fresh).toMatchObject({
+        outcome: "succeeded",
+        identity: {
+          profileId: "profile-integration",
+          origin: "https://vercel.com",
+          projectName: "hanoon",
+        },
+      });
+      expect(fresh.receiptId).toBeTruthy();
+      expect(fresh.receiptId).not.toBe(first.receiptId);
+      expect(harness.browserCalls).toHaveLength(8);
+      expect(harness.browserInstanceIds.slice(0, 4)).toEqual([1, 1, 1, 1]);
+      expect(harness.browserInstanceIds.slice(4)).toEqual([2, 2, 2, 2]);
+      expect(harness.browserProfileIds).toEqual([
+        "profile-integration", "profile-integration", "profile-integration", "profile-integration",
+        "profile-integration", "profile-integration", "profile-integration", "profile-integration",
+      ]);
+      expect(harness.browserInstanceLifecycle).toEqual([
+        "created:1:profile-integration",
+        "closed:1:profile-integration",
+        "created:2:profile-integration",
+      ]);
       const replay = parsed(await inspect(harness, new AbortController().signal));
       expect(replay).toMatchObject({ outcome: "succeeded", receiptId: first.receiptId });
-      expect(harness.browserCalls).toHaveLength(4);
+      expect(harness.browserCalls).toHaveLength(8);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects wrong-target and unknown browser invocations at the integrated fake boundary", async () => {
+    const harness = await createProtectedConnectorIntegrationHarness({
+      operation: "browser.vercel_project.inspect.v1",
+      browserAdministrationIsolated: true,
+    });
+    try {
+      await expect(harness.invokeBrowser([
+        "browser", "status", "--host", "host-wrong", "--profile", "profile-integration", "--json",
+      ])).rejects.toThrow(/browser_invocation_rejected/);
+      await expect(harness.invokeBrowser([
+        "browser", "unknown", "--host", "host-integration", "--profile", "profile-integration", "--json",
+      ])).rejects.toThrow(/browser_invocation_rejected/);
+      expect(harness.browserCalls).toEqual([
+        ["browser", "status", "--host", "host-wrong", "--profile", "profile-integration", "--json"],
+        ["browser", "unknown", "--host", "host-integration", "--profile", "profile-integration", "--json"],
+      ]);
     } finally {
       await harness.close();
     }
@@ -418,29 +491,69 @@ describe("protected connector synthetic production composition", () => {
       browserAdministrationIsolated: true,
       browserCanary: canary,
     });
+    const rawResponseHarness = await createProtectedConnectorIntegrationHarness({
+      operation: "browser.vercel_project.inspect.v1",
+      browserAdministrationIsolated: true,
+      browserCanary: canary,
+      browserCanaryMode: "raw-response",
+    });
+    const thrownErrorHarness = await createProtectedConnectorIntegrationHarness({
+      operation: "browser.vercel_project.inspect.v1",
+      browserAdministrationIsolated: true,
+      browserCanary: canary,
+      browserCanaryMode: "thrown-error",
+    });
     const artifactDirectory = mkdtempSync(join(tmpdir(), "protected-browser-canary-"));
     try {
       const result = await inspect(harness, new AbortController().signal);
+      const rawResponseResult = await inspect(rawResponseHarness, new AbortController().signal);
+      const thrownErrorResult = await inspect(thrownErrorHarness, new AbortController().signal);
       const artifactPath = join(artifactDirectory, "browser-canary-evidence.json");
       writeFileSync(artifactPath, JSON.stringify({
         argv: process.argv,
         result,
         browserCalls: harness.browserCalls,
         logs: harness.hostHarness.inspection.logEntries,
-        errors: [],
-        threadOutput: [result],
+        rawResponseBrowserCalls: rawResponseHarness.browserCalls,
+        rawResponseLogs: rawResponseHarness.hostHarness.inspection.logEntries,
+        thrownErrorBrowserCalls: thrownErrorHarness.browserCalls,
+        thrownErrorLogs: thrownErrorHarness.hostHarness.inspection.logEntries,
+        rawResponseResult,
+        thrownErrorResult,
+        rawResponseKinds: rawResponseHarness.browserRawResponseKinds,
+        thrownErrorKinds: thrownErrorHarness.browserThrownErrorKinds,
+        errors: [rawResponseResult, thrownErrorResult],
+        threadOutput: [result, rawResponseResult, thrownErrorResult],
         receipts: {
           broker: harness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
           hanoon: harness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
         },
+        failureReceipts: {
+          rawResponse: {
+            broker: rawResponseHarness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
+            hanoon: rawResponseHarness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
+          },
+          thrownError: {
+            broker: thrownErrorHarness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
+            hanoon: thrownErrorHarness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
+          },
+        },
       }));
       assertCanaryAbsent([
         { name: "controller-result", value: typeof result === "string" ? result : JSON.stringify(result) },
+        { name: "raw-response-result", value: typeof rawResponseResult === "string" ? rawResponseResult : JSON.stringify(rawResponseResult) },
+        { name: "thrown-error-result", value: typeof thrownErrorResult === "string" ? thrownErrorResult : JSON.stringify(thrownErrorResult) },
         { name: "argv", value: JSON.stringify(process.argv) },
         { name: "browser-argv", value: JSON.stringify(harness.browserCalls) },
         { name: "logs", value: JSON.stringify(harness.hostHarness.inspection.logEntries) },
-        { name: "errors", value: "[]" },
-        { name: "thread-output", value: JSON.stringify([result]) },
+        { name: "raw-response-browser-argv", value: JSON.stringify(rawResponseHarness.browserCalls) },
+        { name: "raw-response-logs", value: JSON.stringify(rawResponseHarness.hostHarness.inspection.logEntries) },
+        { name: "thrown-error-browser-argv", value: JSON.stringify(thrownErrorHarness.browserCalls) },
+        { name: "thrown-error-logs", value: JSON.stringify(thrownErrorHarness.hostHarness.inspection.logEntries) },
+        { name: "raw-response-kinds", value: JSON.stringify(rawResponseHarness.browserRawResponseKinds) },
+        { name: "thrown-error-kinds", value: JSON.stringify(thrownErrorHarness.browserThrownErrorKinds) },
+        { name: "errors", value: JSON.stringify([rawResponseResult, thrownErrorResult]) },
+        { name: "thread-output", value: JSON.stringify([result, rawResponseResult, thrownErrorResult]) },
         { name: "receipts", value: JSON.stringify({
           broker: harness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
           hanoon: harness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
@@ -448,11 +561,21 @@ describe("protected connector synthetic production composition", () => {
         { name: "test-artifact", path: artifactPath },
         ...sqliteCanarySurfaces(harness.brokerDatabase.databasePath, "broker"),
         ...sqliteCanarySurfaces(harness.bb.storage.database().name, "hanoon"),
+        ...sqliteCanarySurfaces(rawResponseHarness.brokerDatabase.databasePath, "raw-response-broker"),
+        ...sqliteCanarySurfaces(rawResponseHarness.bb.storage.database().name, "raw-response-hanoon"),
+        ...sqliteCanarySurfaces(thrownErrorHarness.brokerDatabase.databasePath, "thrown-error-broker"),
+        ...sqliteCanarySurfaces(thrownErrorHarness.bb.storage.database().name, "thrown-error-hanoon"),
       ], [canary]);
       expect(parsed(result)).toMatchObject({ outcome: "succeeded" });
+      expect(parsed(rawResponseResult)).toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+      expect(parsed(thrownErrorResult)).toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
       expect(harness.browserCalls).toHaveLength(4);
+      expect(rawResponseHarness.browserRawResponseKinds).toEqual(["secret-bearing-raw-response"]);
+      expect(thrownErrorHarness.browserThrownErrorKinds).toEqual(["secret-bearing-browser-error"]);
     } finally {
       await harness.close();
+      await rawResponseHarness.close();
+      await thrownErrorHarness.close();
       rmSync(artifactDirectory, { recursive: true, force: true });
     }
   });

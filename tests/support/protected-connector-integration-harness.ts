@@ -31,8 +31,11 @@ import { createDurableProtectedConnectorAuthority } from "../../broker/src/main"
 import {
   BROWSER_REQUIRED_CAPABILITIES,
   attestBrowserTopologyEvidence,
+  buildVercelBrowserJourney,
   createBbBrowserJourneyBrowserPort,
   createVercelBrowserJourneyExecutor,
+  VERCEL_BROWSER_JOURNEY_PURPOSE,
+  VERCEL_BROWSER_JOURNEY_TIMEOUT_MS,
   type BrowserTopologyEvidence,
 } from "../../broker/src/browser-journey";
 import { createOnePasswordAdapter, type VaultAdapter } from "../../broker/src/onepassword-adapter";
@@ -212,9 +215,17 @@ export type ProtectedConnectorIntegrationHarness = Readonly<{
   bindingId: string;
   providerCalls: string[];
   browserCalls: string[][];
+  browserInstanceIds: number[];
+  browserProfileIds: string[];
+  browserInstanceLifecycle: string[];
+  browserRawResponseKinds: string[];
+  browserThrownErrorKinds: string[];
+  invokeBrowser(argv: readonly string[]): Promise<unknown>;
   releaseStalledProvider(): void;
   restartBrokerAuthority(): Promise<void>;
+  restartHanoon(): Promise<void>;
   restartBrowserInstance(): Promise<void>;
+  inspectFreshBrowserJourney(): Promise<unknown>;
   provider: https.Server;
   brokerServer: RunningServer;
   client: CredentialBrokerClient;
@@ -232,6 +243,7 @@ export type ProtectedConnectorIntegrationHarnessOptions = Readonly<{
   capabilityEvidence?: "current" | "missing" | "stale";
   browserAdministrationIsolated?: boolean;
   browserCanary?: string;
+  browserCanaryMode?: "success" | "raw-response" | "thrown-error";
 }>;
 
 export function cleanupProtectedConnectorIntegrationFixtures(): void {
@@ -254,11 +266,13 @@ export async function createProtectedConnectorIntegrationHarness(
   const projection = integrationProjectionFor(operation);
   const target = integrationTargetFor(operation);
   const brokerDatabase = temporaryBrokerDatabase();
-  const { bb, harness: hostHarness } = createFakePluginHost({
+  const initialHost = createFakePluginHost({
     pluginId: "protected-connector-production-composition",
     agentSkillIds: [...BUNDLED_SKILL_IDS],
   });
-  const hanoon = openStore(bb.storage, bb.storage.kv, () => INTEGRATION_NOW);
+  let bb = initialHost.bb;
+  let hostHarness = initialHost.harness;
+  let hanoon = openStore(bb.storage, bb.storage.kv, () => INTEGRATION_NOW);
   const pairingSecret = `integration-pairing-${INTEGRATION_NOW}`;
   hanoon.createPairingCode(hashSecret(pairingSecret), INTEGRATION_NOW - 1_000, INTEGRATION_NOW + 60_000);
   if (hanoon.pairOwnerWithCode(hashSecret(pairingSecret), "7", "7", INTEGRATION_NOW).ok !== true) {
@@ -266,6 +280,12 @@ export async function createProtectedConnectorIntegrationHarness(
   }
   const providerCalls: string[] = [];
   const browserCalls: string[][] = [];
+  const browserInstanceIds: number[] = [];
+  const browserProfileIds: string[] = [];
+  const browserInstanceLifecycle: string[] = [];
+  const browserRawResponseKinds: string[] = [];
+  const browserThrownErrorKinds: string[] = [];
+  let nextBrowserInstanceId = 1;
   const browserTopologyKey = new Uint8Array(32).fill(0x33);
   const browserTopology: BrowserTopologyEvidence = attestBrowserTopologyEvidence({
     schemaVersion: 1,
@@ -395,58 +415,126 @@ export async function createProtectedConnectorIntegrationHarness(
       credentials: { resolve: adapter.resolveCredential },
       clock: () => INTEGRATION_NOW,
     });
-    // Synthetic BB Browser boundary: it records the fixed argv and returns
-    // bounded fixtures; it never launches a browser or contacts Vercel.
-    const browserInvoker = async (argv: readonly string[]): Promise<unknown> => {
-      browserCalls.push([...argv]);
-      const secretFields = options.browserCanary === undefined ? {} : {
-        cookie: options.browserCanary,
-        storage: { session: options.browserCanary },
-        dom: options.browserCanary,
-        screenshot: options.browserCanary,
-        rawBody: options.browserCanary,
+    // Synthetic BB Browser boundary: each instance owns one fixed profile and
+    // records the exact argv. It never launches a browser or contacts Vercel,
+    // but it rejects every command outside the enrolled journey contract.
+    const browserTarget = integrationTargetFor("browser.vercel_project.inspect.v1") as Extract<
+      ProtectedConnectorTarget,
+      { operation: "browser.vercel_project.inspect.v1" }
+    >;
+    const journey = buildVercelBrowserJourney(browserTarget);
+    const createBrowserInstance = () => {
+      const instanceId = nextBrowserInstanceId++;
+      const profileId = "profile-integration";
+      browserInstanceLifecycle.push(`created:${instanceId}:${profileId}`);
+      let closed = false;
+      const invoke = async (argv: readonly string[]): Promise<unknown> => {
+        browserCalls.push([...argv]);
+        browserInstanceIds.push(instanceId);
+        browserProfileIds.push(profileId);
+        if (closed) throw new Error("browser_instance_closed");
+        const expected = (command: readonly string[]): void => {
+          if (argv.length !== command.length || argv.some((value, index) => value !== command[index])) {
+            throw new Error("browser_invocation_rejected");
+          }
+        };
+        if (argv[1] === "status") {
+          expected(["browser", "status", "--host", browserTarget.hostId, "--profile", profileId, "--json"]);
+          return {
+            ...(options.browserCanary === undefined ? {} : {
+              cookie: options.browserCanary,
+              storage: { session: options.browserCanary },
+              dom: options.browserCanary,
+              screenshot: options.browserCanary,
+              rawBody: options.browserCanary,
+            }),
+            hostId: browserTarget.hostId,
+            profileId,
+            state: "ready",
+            capabilities: BROWSER_REQUIRED_CAPABILITIES.map((id) => ({ id, status: "ready" })),
+          };
+        }
+        if (argv[1] === "grants") {
+          expected(["browser", "grants", "--host", browserTarget.hostId, "--profile", profileId, "--json"]);
+          return { grants: [{
+            id: "grant-integration",
+            hostId: browserTarget.hostId,
+            profileId,
+            origin: browserTarget.origin,
+            state: "active",
+            expiresAt: INTEGRATION_NOW + 60_000,
+          }] };
+        }
+        if (argv[1] === "open") {
+          expected([
+            "browser", "open", journey.url,
+            "--host", browserTarget.hostId, "--profile", profileId,
+            "--timeout", String(VERCEL_BROWSER_JOURNEY_TIMEOUT_MS), "--json",
+          ]);
+          return { tabId: "tab-integration", url: journey.url };
+        }
+        if (argv[1] !== "script") throw new Error("browser_invocation_rejected");
+        expected([
+          "browser", "script", "--purpose", VERCEL_BROWSER_JOURNEY_PURPOSE,
+          "--code", journey.script, "--origin", browserTarget.origin,
+          "--host", browserTarget.hostId, "--profile", profileId,
+          "--tab", "tab-integration", "--timeout", String(VERCEL_BROWSER_JOURNEY_TIMEOUT_MS), "--json",
+        ]);
+        const canaryFields = options.browserCanary === undefined ? {} : {
+          cookie: options.browserCanary,
+          storage: { session: options.browserCanary },
+          dom: options.browserCanary,
+          screenshot: options.browserCanary,
+          rawBody: options.browserCanary,
+        };
+        if (options.browserCanaryMode === "raw-response") {
+          browserRawResponseKinds.push("secret-bearing-raw-response");
+          return { rawBody: options.browserCanary, headers: { "x-browser-canary": options.browserCanary } };
+        }
+        if (options.browserCanaryMode === "thrown-error") {
+          browserThrownErrorKinds.push("secret-bearing-browser-error");
+          throw new Error(options.browserCanary);
+        }
+        return { result: {
+          ...canaryFields,
+          ok: true,
+          origin: browserTarget.origin,
+          frameOrigins: [browserTarget.origin],
+          teamSlug: browserTarget.teamSlug,
+          projectName: browserTarget.projectName,
+          sessionStatus: "authenticated",
+          observedAt: INTEGRATION_NOW,
+        } };
       };
-      if (argv[1] === "status") return {
-        ...secretFields,
-        hostId: target.operation === "browser.vercel_project.inspect.v1" ? target.hostId : "host-integration",
-        profileId: target.operation === "browser.vercel_project.inspect.v1" ? target.profileId : "profile-integration",
-        state: "ready",
-        capabilities: BROWSER_REQUIRED_CAPABILITIES.map((id) => ({ id, status: "ready" })),
+      return {
+        instanceId,
+        profileId,
+        close: () => {
+          if (closed) return;
+          closed = true;
+          browserInstanceLifecycle.push(`closed:${instanceId}:${profileId}`);
+        },
+        invoke,
       };
-      if (argv[1] === "grants") return { ...secretFields, grants: [{
-        id: "grant-integration",
-        hostId: "host-integration",
-        profileId: "profile-integration",
-        origin: "https://vercel.com",
-        state: "active",
-        expiresAt: INTEGRATION_NOW + 60_000,
-      }] };
-      if (argv[1] === "open") return { ...secretFields, tabId: "tab-integration", url: argv[2] };
-      return { result: {
-        ...secretFields,
-        ok: true,
-        origin: "https://vercel.com",
-        frameOrigins: ["https://vercel.com"],
-        teamSlug: "team-slug",
-        projectName: "hanoon",
-        sessionStatus: "authenticated",
-        observedAt: INTEGRATION_NOW,
-      } };
     };
-    const createBrowserExecutor = () => createVercelBrowserJourneyExecutor({
-      browser: createBbBrowserJourneyBrowserPort({ invoke: browserInvoker }),
-      topology: () => browserTopology,
-      topologyKey: browserTopologyKey,
-      lease: {
-        isCurrent: (input) => connectors.isBrowserProfileLeaseCurrentForTarget({
-          leaseId: input.leaseId,
-          hostId: input.hostId,
-          profileId: input.profileId,
-          now: INTEGRATION_NOW,
-        }),
-      },
-      clock: () => INTEGRATION_NOW,
-    });
+    let browserInstance = createBrowserInstance();
+    const createBrowserExecutor = () => {
+      const instance = browserInstance;
+      return createVercelBrowserJourneyExecutor({
+        browser: createBbBrowserJourneyBrowserPort({ invoke: instance.invoke }),
+        topology: () => browserTopology,
+        topologyKey: browserTopologyKey,
+        lease: {
+          isCurrent: (input) => connectors.isBrowserProfileLeaseCurrentForTarget({
+            leaseId: input.leaseId,
+            hostId: input.hostId,
+            profileId: input.profileId,
+            now: INTEGRATION_NOW,
+          }),
+        },
+        clock: () => INTEGRATION_NOW,
+      });
+    };
     let browserExecutor = createBrowserExecutor();
     const createAuthority = (): void => {
       const durableAuthority = createDurableProtectedConnectorAuthority(broker, connectors, () => INTEGRATION_NOW);
@@ -530,14 +618,15 @@ export async function createProtectedConnectorIntegrationHarness(
       clock: () => INTEGRATION_NOW,
       lookup: loopbackLookup,
     });
-    const credentialAccess = new CredentialAccessService({
-      store: hanoon,
+    const createCredentialAccess = (store: TelegramAgentStore): CredentialAccessService => new CredentialAccessService({
+      store,
       client,
       config: () => ({ state: "isolated", value: clientConfig }),
       trustKernelReady: () => true,
       controllerPermissionMode: () => "auto",
       now: () => INTEGRATION_NOW,
     });
+    let credentialAccess = createCredentialAccess(hanoon);
 
     hanoon.upsertProjectPolicy(policyFixture({ projectId: INTEGRATION_PROJECT_ID }), INTEGRATION_NOW);
     const turn = hanoon.enqueueControllerTurn({
@@ -573,36 +662,39 @@ export async function createProtectedConnectorIntegrationHarness(
     const authorized = { controller, turn: submittedTurn, fence };
     const brokerBinding = connectors.getBinding(INTEGRATION_INSTALLATION_ID, bindingId);
     if (!brokerBinding) throw new Error("integration_broker_binding_missing");
-    const protectedAccessStore = new Proxy(hanoon, {
-      get(target, property) {
-        if (property === "listCapabilityReceipts" && options.capabilityEvidence !== undefined && options.capabilityEvidence !== "current") {
-          return (profileId: string, limit: number): ReturnType<TelegramAgentStore["listCapabilityReceipts"]> => {
-            const receipts = target.listCapabilityReceipts(profileId, limit);
-            const capabilityId = protectedConnectorCapabilityFor(operation);
-            if (options.capabilityEvidence === "missing") {
-              return receipts.filter((receipt) => receipt.capabilityId !== capabilityId || receipt.eventType !== "selected");
-            }
-            return receipts.map((receipt) => receipt.capabilityId === capabilityId && receipt.eventType === "selected"
-              ? { ...receipt, profileRevision: receipt.profileRevision + 1 }
-              : receipt);
-          };
-        }
-        const value = Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    }) as unknown as ProtectedConnectorAccessStore;
-    const protectedAccess = new ProtectedConnectorAccessService({
-      store: protectedAccessStore,
-      client: () => client,
-      config: () => ({ state: "isolated", value: clientConfig }),
-      trustKernelReady: () => true,
-      topologyReady: () => true,
-      browserAdministrationIsolated: () => options.browserAdministrationIsolated === true,
-      auditWritable: () => true,
-      fullReadiness: async () => (await credentialAccess.status({})).readiness,
-      projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
-      now: () => INTEGRATION_NOW,
-    });
+    const createProtectedAccess = (store: TelegramAgentStore): ProtectedConnectorAccessService => {
+      const protectedAccessStore = new Proxy(store, {
+        get(target, property) {
+          if (property === "listCapabilityReceipts" && options.capabilityEvidence !== undefined && options.capabilityEvidence !== "current") {
+            return (profileId: string, limit: number): ReturnType<TelegramAgentStore["listCapabilityReceipts"]> => {
+              const receipts = target.listCapabilityReceipts(profileId, limit);
+              const capabilityId = protectedConnectorCapabilityFor(operation);
+              if (options.capabilityEvidence === "missing") {
+                return receipts.filter((receipt) => receipt.capabilityId !== capabilityId || receipt.eventType !== "selected");
+              }
+              return receipts.map((receipt) => receipt.capabilityId === capabilityId && receipt.eventType === "selected"
+                ? { ...receipt, profileRevision: receipt.profileRevision + 1 }
+                : receipt);
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as unknown as ProtectedConnectorAccessStore;
+      return new ProtectedConnectorAccessService({
+        store: protectedAccessStore,
+        client: () => client,
+        config: () => ({ state: "isolated", value: clientConfig }),
+        trustKernelReady: () => true,
+        topologyReady: () => true,
+        browserAdministrationIsolated: () => options.browserAdministrationIsolated === true,
+        auditWritable: () => true,
+        fullReadiness: async () => (await credentialAccess.status({})).readiness,
+        projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
+        now: () => INTEGRATION_NOW,
+      });
+    };
+    let protectedAccess = createProtectedAccess(hanoon);
     const imported = protectedAccess.reconcileEnrollment({
       projectId: INTEGRATION_PROJECT_ID,
       projection: brokerBinding.projection,
@@ -610,24 +702,31 @@ export async function createProtectedConnectorIntegrationHarness(
     });
     if (imported.outcome !== "reconciled") throw new Error(`integration_projection_reconciliation_failed:${imported.outcome}`);
 
-    registerControllerTools(bb, {
-      store: hanoon,
-      sdk: bb.sdk,
-      threadOperations: { request: async () => { throw new Error("unused"); } },
-      health: () => ({ ok: true }),
-      notify: () => undefined,
-      now: () => INTEGRATION_NOW,
-      protectedConnectorAccess: protectedAccess,
-      controllerProviderId: () => "codex",
-    });
+    const registerHanoonSurface = (
+      pluginApi: typeof bb,
+      store: TelegramAgentStore,
+      access: ProtectedConnectorAccessService,
+    ): void => {
+      registerControllerTools(pluginApi, {
+        store,
+        sdk: pluginApi.sdk,
+        threadOperations: { request: async () => { throw new Error("unused"); } },
+        health: () => ({ ok: true }),
+        notify: () => undefined,
+        now: () => INTEGRATION_NOW,
+        protectedConnectorAccess: access,
+        controllerProviderId: () => "codex",
+      });
+    };
+    registerHanoonSurface(bb, hanoon, protectedAccess);
 
     return {
-      bb,
-      hostHarness,
-      hanoon,
-      broker,
-      connectors,
-      protectedAccess,
+      get bb() { return bb; },
+      get hostHarness() { return hostHarness; },
+      get hanoon() { return hanoon; },
+      get broker() { return broker; },
+      get connectors() { return connectors; },
+      get protectedAccess() { return protectedAccess; },
       controllerThreadId: "thread-integration",
       controllerProjectId: INTEGRATION_PROJECT_ID,
       turnId: turn.id,
@@ -635,8 +734,14 @@ export async function createProtectedConnectorIntegrationHarness(
       bindingId,
       providerCalls,
       browserCalls,
+      browserInstanceIds,
+      browserProfileIds,
+      browserInstanceLifecycle,
+      browserRawResponseKinds,
+      browserThrownErrorKinds,
+      invokeBrowser: (argv) => browserInstance.invoke(argv),
       provider,
-      brokerServer,
+      get brokerServer() { return brokerServer!; },
       client,
       fixture,
       brokerDatabase,
@@ -670,14 +775,77 @@ export async function createProtectedConnectorIntegrationHarness(
         });
         await adminServer.start();
       },
+      restartHanoon: async () => {
+        let reopenedStore: TelegramAgentStore | undefined;
+        let reopenedCredentialAccess: CredentialAccessService | undefined;
+        let reopenedProtectedAccess: ProtectedConnectorAccessService | undefined;
+        const reloadedHost = await hostHarness.lifecycle.reload(async (restartedBb) => {
+          const store = openStore(restartedBb.storage, restartedBb.storage.kv, () => INTEGRATION_NOW);
+          const access = createCredentialAccess(store);
+          const protectedAccessForReload = createProtectedAccess(store);
+          registerHanoonSurface(restartedBb, store, protectedAccessForReload);
+          reopenedStore = store;
+          reopenedCredentialAccess = access;
+          reopenedProtectedAccess = protectedAccessForReload;
+        });
+        if (!reopenedStore || !reopenedCredentialAccess || !reopenedProtectedAccess) {
+          throw new Error("integration_hanoon_restart_failed");
+        }
+        bb = reloadedHost.bb;
+        hostHarness = reloadedHost.harness;
+        hanoon = reopenedStore;
+        credentialAccess = reopenedCredentialAccess;
+        protectedAccess = reopenedProtectedAccess;
+      },
       restartBrowserInstance: async () => {
+        browserInstance.close();
+        browserInstance = createBrowserInstance();
         browserExecutor = createBrowserExecutor();
         createAuthority();
+      },
+      inspectFreshBrowserJourney: async () => {
+        if (operation !== "browser.vercel_project.inspect.v1") throw new Error("integration_browser_journey_required");
+        const freshControllerKey = "owner-7-browser-restart";
+        const freshThreadId = "thread-browser-restart";
+        const freshTurn = hanoon.enqueueControllerTurn({
+          controllerKey: freshControllerKey,
+          telegramUserId: "7",
+          telegramChatId: "7",
+          updateId: 68002,
+          inputText: integrationInputFor(operation),
+          now: INTEGRATION_NOW,
+        });
+        if (!hanoon.claimNextControllerTurn(fence) || !hanoon.reserveControllerSpawn({
+          controllerKey: freshControllerKey,
+          turnId: freshTurn.id,
+          projectId: INTEGRATION_PROJECT_ID,
+          hostId: "host-integration",
+          now: INTEGRATION_NOW,
+        }) || !hanoon.markControllerSpawned({
+          ...fence,
+          turnId: freshTurn.id,
+          projectId: INTEGRATION_PROJECT_ID,
+          hostId: "host-integration",
+          threadId: freshThreadId,
+          spawnToken: freshTurn.id,
+        }) || !hanoon.markControllerTurnSubmitted({ ...fence, turnId: freshTurn.id })) {
+          throw new Error("integration_fresh_controller_submission_failed");
+        }
+        return hostHarness.behavior.callAgentTool(
+          "telegram_agent_connector_inspect",
+          {
+            projectId: INTEGRATION_PROJECT_ID,
+            operation,
+            bindingId,
+          },
+          { threadId: freshThreadId, projectId: INTEGRATION_PROJECT_ID, signal: new AbortController().signal },
+        );
       },
       close: async () => {
         stalledProviderResponse?.destroy();
         stalledProviderResponse = undefined;
         client.close();
+        browserInstance.close();
         await closeServer(brokerServer!);
         await closeServer(provider!);
         await adminServer?.close();
