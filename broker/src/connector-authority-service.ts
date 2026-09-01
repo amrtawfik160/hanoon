@@ -36,6 +36,7 @@ export type ProtectedConnectorExecutionFailure = Readonly<{
     ProtectedConnectorFailureClass,
     | "scope_insufficient"
     | "destination_denied"
+    | "unsafe_topology"
     | "human_presence_required"
     | "credential_invalid"
     | "credential_expired"
@@ -74,6 +75,7 @@ export type ProtectedConnectorExecutor = Readonly<{
   }>): Promise<ProtectedConnectorExecutionSuccess<VercelProjectIdentity> | ProtectedConnectorExecutionFailure>;
   inspectBrowserVercel(input: Readonly<{
     target: BrowserVercelProjectTarget;
+    leaseId: string;
     signal?: AbortSignal;
   }>): Promise<ProtectedConnectorExecutionSuccess<BrowserVercelProjectIdentity> | ProtectedConnectorExecutionFailure>;
 }>;
@@ -108,6 +110,7 @@ type ConnectorAuthorization =
       binding: BrokerConnectorBinding;
       target: ProtectedConnectorTarget;
       credentialReference: string | null;
+      browserLeaseId: string | null;
     }>
   | Readonly<{ outcome: "denied"; response: ProtectedConnectorResponseEnvelope }>;
 
@@ -235,7 +238,56 @@ export class ProtectedConnectorAuthorityService {
     if (authorityDenial) return { outcome: "denied", response: authorityDenial };
     const bindingAuthorization = this.authorizeBinding(request, now);
     if (bindingAuthorization.outcome === "denied") return bindingAuthorization;
-    return this.resolveBindingTarget(request, bindingAuthorization.binding, now);
+    const targetAuthorization = this.resolveBindingTarget(request, bindingAuthorization.binding, now);
+    if (targetAuthorization.outcome === "denied") return targetAuthorization;
+    return this.claimBrowserProfile(request, targetAuthorization, now);
+  }
+
+  private claimBrowserProfile(
+    request: ProtectedConnectorRequestEnvelope,
+    authorization: Extract<ConnectorAuthorization, { outcome: "authorized" }>,
+    now: number,
+  ): ConnectorAuthorization {
+    if (authorization.target.operation !== "browser.vercel_project.inspect.v1") {
+      return authorization;
+    }
+    try {
+      const claim = this.connectorStore.claimBrowserProfile({
+        installationId: request.installationId,
+        requestId: request.requestId,
+        idempotencyKey: request.idempotencyKey,
+        hostId: authorization.target.hostId,
+        profileId: authorization.target.profileId,
+        bindingGeneration: request.bindingGeneration,
+        fenceOwner: request.fenceOwner,
+        fenceGeneration: request.fenceGeneration,
+        leaseId: `browser_lease_${randomUUID()}`,
+        leaseExpiresAt: request.deadlineAt,
+        now,
+      });
+      if (claim.outcome === "busy") {
+        return {
+          outcome: "denied",
+          response: this.completeFailure({
+            request,
+            binding: authorization.binding,
+            failureClass: "reconciliation_required",
+            completedAt: now,
+          }),
+        };
+      }
+      return { ...authorization, browserLeaseId: claim.leaseId };
+    } catch {
+      return {
+        outcome: "denied",
+        response: this.completeFailure({
+          request,
+          binding: authorization.binding,
+          failureClass: "reconciliation_required",
+          completedAt: now,
+        }),
+      };
+    }
   }
 
   private claimedAuthorityDenial(
@@ -305,6 +357,7 @@ export class ProtectedConnectorAuthorityService {
         binding,
         target,
         credentialReference: this.connectorStore.resolveCredentialReference(binding),
+        browserLeaseId: null,
       };
     } catch {
       return {
@@ -319,7 +372,12 @@ export class ProtectedConnectorAuthorityService {
     signal?: AbortSignal,
   ): Promise<ConnectorExecution> {
     try {
-      return await this.dispatch(authorization.target, authorization.credentialReference, signal);
+      return await this.dispatch(
+        authorization.target,
+        authorization.credentialReference,
+        authorization.browserLeaseId,
+        signal,
+      );
     } catch {
       return {
         outcome: "failed",
@@ -339,7 +397,12 @@ export class ProtectedConnectorAuthorityService {
   }>): ProtectedConnectorResponseEnvelope {
     const completedAt = this.clock();
     const { binding, target } = input.authorization;
-    if (!this.completionAuthorityCurrent(input.certificateFingerprint, input.request, binding, completedAt)) {
+    if (!this.completionAuthorityCurrent(
+      input.certificateFingerprint,
+      input.request,
+      input.authorization,
+      completedAt,
+    )) {
       return this.completeFailure({
         request: input.request,
         binding,
@@ -368,7 +431,7 @@ export class ProtectedConnectorAuthorityService {
   private completionAuthorityCurrent(
     certificateFingerprint: string,
     request: ProtectedConnectorRequestEnvelope,
-    binding: BrokerConnectorBinding,
+    authorization: Extract<ConnectorAuthorization, { outcome: "authorized" }>,
     completedAt: number,
   ): boolean {
     return !temporalFailure(request, completedAt) &&
@@ -376,7 +439,27 @@ export class ProtectedConnectorAuthorityService {
       this.policyStillCurrent(request) &&
       this.authority.topologyReady(request.operation) &&
       this.fenceCurrent(request) &&
-      this.bindingStillCurrent(request, binding, completedAt);
+      this.bindingStillCurrent(request, authorization.binding, completedAt) &&
+      this.browserLeaseStillCurrent(request, authorization, completedAt);
+  }
+
+  private browserLeaseStillCurrent(
+    request: ProtectedConnectorRequestEnvelope,
+    authorization: Extract<ConnectorAuthorization, { outcome: "authorized" }>,
+    now: number,
+  ): boolean {
+    if (authorization.target.operation !== "browser.vercel_project.inspect.v1") return true;
+    return authorization.browserLeaseId !== null && this.connectorStore.isBrowserProfileLeaseCurrent({
+      leaseId: authorization.browserLeaseId,
+      installationId: request.installationId,
+      requestId: request.requestId,
+      hostId: authorization.target.hostId,
+      profileId: authorization.target.profileId,
+      bindingGeneration: request.bindingGeneration,
+      fenceOwner: request.fenceOwner,
+      fenceGeneration: request.fenceGeneration,
+      now,
+    });
   }
 
   private completeExecutionFailure(
@@ -465,6 +548,7 @@ export class ProtectedConnectorAuthorityService {
   private async dispatch(
     target: ProtectedConnectorTarget,
     credentialReference: string | null,
+    browserLeaseId: string | null,
     signal?: AbortSignal,
   ): Promise<ProtectedConnectorExecutionSuccess<ProtectedConnectorIdentity> | ProtectedConnectorExecutionFailure> {
     if (target.operation === "convex.project.inspect.v1") {
@@ -475,8 +559,8 @@ export class ProtectedConnectorAuthorityService {
       if (!credentialReference) return this.missingCredentialFailure();
       return this.executor.inspectVercel({ target, credentialReference, signal });
     }
-    if (credentialReference !== null) return this.missingCredentialFailure();
-    return this.executor.inspectBrowserVercel({ target, signal });
+    if (credentialReference !== null || browserLeaseId === null) return this.missingCredentialFailure();
+    return this.executor.inspectBrowserVercel({ target, leaseId: browserLeaseId, signal });
   }
 
   private missingCredentialFailure(): ProtectedConnectorExecutionFailure {

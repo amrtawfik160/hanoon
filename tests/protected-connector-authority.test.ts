@@ -534,6 +534,27 @@ describe("protected connector audit and idempotency", () => {
     }
   });
 
+  it("replays a completed browser receipt without rerunning the journey", async () => {
+    const harness = createHarness();
+    try {
+      const browserRequest = request("browser.vercel_project.inspect.v1");
+      const first = await harness.service.execute({
+        certificateFingerprint: CERTIFICATE,
+        request: browserRequest,
+        now: NOW,
+      });
+      const replay = await harness.service.execute({
+        certificateFingerprint: CERTIFICATE,
+        request: browserRequest,
+        now: NOW,
+      });
+      expect(replay).toEqual(first);
+      expect(harness.calls.browser).toBe(1);
+    } finally {
+      harness.close();
+    }
+  });
+
   it("reconciles an interrupted claim after restart without a second connector observation", async () => {
     const harness = createHarness();
     try {
@@ -551,6 +572,162 @@ describe("protected connector audit and idempotency", () => {
       expect(response).toMatchObject({ outcome: "failed", failureClass: "result_ambiguous" });
       expect(response.receiptId).not.toBeNull();
       expect(totalCalls(harness)).toBe(0);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("serializes browser profile use and releases the lease only after a receipt", async () => {
+    const harness = createHarness();
+    let releaseObservation!: () => void;
+    const observationReleased = new Promise<void>((resolve) => {
+      releaseObservation = resolve;
+    });
+    try {
+      vi.mocked(harness.executor.inspectBrowserVercel).mockImplementationOnce(async () => {
+        await observationReleased;
+        return {
+          outcome: "succeeded",
+          connectorVersion: "journey-1",
+          identity: {
+            profileId: "profile-1",
+            journeyId: VERCEL_PROJECT_IDENTITY_JOURNEY_ID,
+            journeyVersion: 1,
+            origin: VERCEL_BROWSER_ORIGIN,
+            teamSlug: "vercel-team",
+            projectName: "hanoon",
+            sessionStatus: "authenticated",
+            observedAt: NOW,
+          },
+        };
+      });
+      const firstRequest = request("browser.vercel_project.inspect.v1");
+      const first = harness.service.execute({ certificateFingerprint: CERTIFICATE, request: firstRequest, now: NOW });
+      await Promise.resolve();
+      const second = await harness.service.execute({
+        certificateFingerprint: CERTIFICATE,
+        request: request("browser.vercel_project.inspect.v1", {
+          requestId: "browser-request-2",
+          idempotencyKey: "browser-idempotency-2",
+          nonce: "browser-nonce-2",
+        }),
+        now: NOW,
+      });
+      expect(second).toMatchObject({ outcome: "failed", failureClass: "reconciliation_required" });
+      expect(harness.executor.inspectBrowserVercel).toHaveBeenCalledOnce();
+      expect(harness.fixture.db.prepare(
+        "SELECT state FROM broker_browser_profile_leases WHERE request_id = ?",
+      ).get(firstRequest.requestId)).toEqual({ state: "held" });
+      releaseObservation();
+      await expect(first).resolves.toMatchObject({ outcome: "succeeded" });
+      expect(harness.fixture.db.prepare(
+        "SELECT state FROM broker_browser_profile_leases WHERE request_id = ?",
+      ).get(firstRequest.requestId)).toEqual({ state: "released" });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("does not settle a browser observation after fence loss", async () => {
+    const harness = createHarness();
+    try {
+      vi.mocked(harness.executor.inspectBrowserVercel).mockImplementationOnce(async () => {
+        harness.authorityState.fenceCurrent = false;
+        return {
+          outcome: "succeeded",
+          connectorVersion: "journey-1",
+          identity: {
+            profileId: "profile-1",
+            journeyId: VERCEL_PROJECT_IDENTITY_JOURNEY_ID,
+            journeyVersion: 1,
+            origin: VERCEL_BROWSER_ORIGIN,
+            teamSlug: "vercel-team",
+            projectName: "hanoon",
+            sessionStatus: "authenticated",
+            observedAt: NOW,
+          },
+        };
+      });
+      const browserRequest = request("browser.vercel_project.inspect.v1");
+      const response = await harness.service.execute({
+        certificateFingerprint: CERTIFICATE,
+        request: browserRequest,
+        now: NOW,
+      });
+      expect(response).toMatchObject({ outcome: "failed", failureClass: "reconciliation_required" });
+      expect(harness.fixture.db.prepare(
+        "SELECT state FROM broker_browser_profile_leases WHERE request_id = ?",
+      ).get(browserRequest.requestId)).toEqual({ state: "released" });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("keeps a browser lease held when receipt persistence fails", async () => {
+    const harness = createHarness();
+    try {
+      harness.fixture.db.exec(`
+        CREATE TRIGGER fail_browser_receipt BEFORE INSERT ON broker_connector_receipts
+        BEGIN SELECT RAISE(ABORT, 'browser receipt canary'); END
+      `);
+      const browserRequest = request("browser.vercel_project.inspect.v1");
+      const response = await harness.service.execute({
+        certificateFingerprint: CERTIFICATE,
+        request: browserRequest,
+        now: NOW,
+      });
+      expect(response).toMatchObject({
+        outcome: "failed",
+        failureClass: "receipt_persistence_failed",
+        receiptId: null,
+      });
+      expect(harness.fixture.db.prepare(
+        "SELECT state FROM broker_browser_profile_leases WHERE request_id = ?",
+      ).get(browserRequest.requestId)).toEqual({ state: "held" });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it("reconciles an interrupted browser lease on restart and never reruns the journey", async () => {
+    const harness = createHarness();
+    try {
+      const browserRequest = request("browser.vercel_project.inspect.v1");
+      expect(harness.connectorStore.claimRequest({
+        request: browserRequest,
+        certificateFingerprint: CERTIFICATE,
+        now: NOW,
+      })).toEqual({ outcome: "claimed" });
+      expect(harness.connectorStore.claimBrowserProfile({
+        installationId: browserRequest.installationId,
+        requestId: browserRequest.requestId,
+        idempotencyKey: browserRequest.idempotencyKey,
+        hostId: "host-1",
+        profileId: "profile-1",
+        bindingGeneration: browserRequest.bindingGeneration,
+        fenceOwner: browserRequest.fenceOwner,
+        fenceGeneration: browserRequest.fenceGeneration,
+        leaseId: "browser-lease-restart",
+        leaseExpiresAt: browserRequest.deadlineAt,
+        now: NOW,
+      })).toMatchObject({ outcome: "claimed" });
+      const restarted = new ProtectedConnectorAuthorityService({
+        foundationStore: harness.foundationStore,
+        connectorStore: harness.connectorStore,
+        executor: harness.executor,
+        authority: harness.authority,
+        clock: () => NOW + 1,
+      });
+      const response = await restarted.execute({
+        certificateFingerprint: CERTIFICATE,
+        request: browserRequest,
+        now: NOW + 1,
+      });
+      expect(response).toMatchObject({ outcome: "failed", failureClass: "result_ambiguous" });
+      expect(harness.calls.browser).toBe(0);
+      expect(harness.fixture.db.prepare(
+        "SELECT state FROM broker_browser_profile_leases WHERE request_id = ?",
+      ).get(browserRequest.requestId)).toEqual({ state: "released" });
     } finally {
       harness.close();
     }

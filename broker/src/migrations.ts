@@ -1,7 +1,7 @@
 import { chmodSync } from "node:fs";
 import type Database from "better-sqlite3";
 
-const MIGRATION_VERSIONS = [1, 2] as const;
+const MIGRATION_VERSIONS = [1, 2, 3] as const;
 
 export const BROKER_FOUNDATION_SCHEMA = String.raw`
 CREATE TABLE IF NOT EXISTS broker_schema_migrations (
@@ -198,6 +198,31 @@ CREATE TABLE IF NOT EXISTS broker_connector_requests (
 
 CREATE INDEX IF NOT EXISTS broker_connector_requests_task
   ON broker_connector_requests (installation_id, task_id, state);
+
+CREATE TABLE IF NOT EXISTS broker_browser_profile_leases (
+  lease_id TEXT PRIMARY KEY,
+  installation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation >= 1),
+  fence_owner TEXT NOT NULL,
+  fence_generation INTEGER NOT NULL CHECK (fence_generation >= 1),
+  state TEXT NOT NULL CHECK (state IN ('held', 'released', 'expired')),
+  lease_expires_at INTEGER NOT NULL CHECK (lease_expires_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  FOREIGN KEY (installation_id) REFERENCES broker_installations (installation_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS broker_browser_profile_leases_held_profile
+  ON broker_browser_profile_leases (installation_id, host_id, profile_id)
+  WHERE state = 'held';
+CREATE UNIQUE INDEX IF NOT EXISTS broker_browser_profile_leases_request
+  ON broker_browser_profile_leases (installation_id, request_id);
+CREATE INDEX IF NOT EXISTS broker_browser_profile_leases_expiry
+  ON broker_browser_profile_leases (state, lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS broker_connector_receipts (
   receipt_id TEXT PRIMARY KEY,

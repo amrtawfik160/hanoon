@@ -69,6 +69,22 @@ type ConnectorRequestRow = {
   completed_at: number | null;
 };
 
+type BrowserProfileLeaseRow = {
+  lease_id: string;
+  installation_id: string;
+  request_id: string;
+  idempotency_key: string;
+  host_id: string;
+  profile_id: string;
+  binding_generation: number;
+  fence_owner: string;
+  fence_generation: number;
+  state: "held" | "released" | "expired";
+  lease_expires_at: number;
+  created_at: number;
+  updated_at: number;
+};
+
 export type BrokerConnectorPolicy = Readonly<{
   installationId: string;
   projectId: string;
@@ -97,6 +113,10 @@ export type BrokerConnectorRequestClaim =
   | { outcome: "completed"; response: ProtectedConnectorResponseEnvelope }
   | { outcome: "ambiguous" }
   | { outcome: "digest_mismatch" };
+
+export type BrokerBrowserProfileLeaseClaim =
+  | Readonly<{ outcome: "claimed" | "already_held"; leaseId: string; leaseExpiresAt: number }>
+  | Readonly<{ outcome: "busy" }>;
 
 export type BrokerConnectorStoreOptions = Readonly<{
   dataKey: Uint8Array;
@@ -415,6 +435,109 @@ export class BrokerProtectedConnectorStore {
     return { outcome: "claimed" };
   }
 
+  /** Atomically reserves one enrolled browser profile for one request/fence. */
+  public claimBrowserProfile(input: Readonly<{
+    installationId: string;
+    requestId: string;
+    idempotencyKey: string;
+    hostId: string;
+    profileId: string;
+    bindingGeneration: number;
+    fenceOwner: string;
+    fenceGeneration: number;
+    leaseId: string;
+    leaseExpiresAt: number;
+    now: number;
+  }>): BrokerBrowserProfileLeaseClaim {
+    if (
+      !input.installationId || !input.requestId || !input.idempotencyKey || !input.hostId || !input.profileId ||
+      !input.leaseId || input.leaseExpiresAt <= input.now
+    ) throw stableError("browser_profile_lease_invalid");
+    this.assertActiveInstallation(input.installationId);
+    try {
+      return this.db.transaction((): BrokerBrowserProfileLeaseClaim => {
+        const existing = this.db.prepare(`
+          SELECT * FROM broker_browser_profile_leases
+           WHERE installation_id = ? AND host_id = ? AND profile_id = ? AND state = 'held'
+        `).get(input.installationId, input.hostId, input.profileId) as BrowserProfileLeaseRow | undefined;
+        if (existing) {
+          if (existing.lease_expires_at <= input.now) {
+            this.db.prepare(`
+              UPDATE broker_browser_profile_leases
+                 SET state = 'expired', updated_at = ?
+               WHERE lease_id = ? AND state = 'held'
+            `).run(input.now, existing.lease_id);
+          } else if (
+            existing.request_id === input.requestId &&
+            existing.idempotency_key === input.idempotencyKey &&
+            existing.binding_generation === input.bindingGeneration &&
+            existing.fence_owner === input.fenceOwner &&
+            existing.fence_generation === input.fenceGeneration
+          ) {
+            return {
+              outcome: "already_held",
+              leaseId: existing.lease_id,
+              leaseExpiresAt: existing.lease_expires_at,
+            };
+          } else {
+            return { outcome: "busy" };
+          }
+        }
+        this.db.prepare(`
+          INSERT INTO broker_browser_profile_leases (
+            lease_id, installation_id, request_id, idempotency_key, host_id, profile_id,
+            binding_generation, fence_owner, fence_generation, state,
+            lease_expires_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?)
+        `).run(
+          input.leaseId,
+          input.installationId,
+          input.requestId,
+          input.idempotencyKey,
+          input.hostId,
+          input.profileId,
+          input.bindingGeneration,
+          input.fenceOwner,
+          input.fenceGeneration,
+          input.leaseExpiresAt,
+          input.now,
+          input.now,
+        );
+        return { outcome: "claimed", leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+      }).immediate();
+    } catch (error) {
+      if (error instanceof Error && "code" in error && String(error.code).startsWith("SQLITE_CONSTRAINT")) {
+        return { outcome: "busy" };
+      }
+      throw error;
+    }
+  }
+
+  public isBrowserProfileLeaseCurrent(input: Readonly<{
+    leaseId: string;
+    installationId: string;
+    requestId: string;
+    hostId: string;
+    profileId: string;
+    bindingGeneration: number;
+    fenceOwner: string;
+    fenceGeneration: number;
+    now: number;
+  }>): boolean {
+    const row = this.db.prepare(`
+      SELECT * FROM broker_browser_profile_leases
+       WHERE lease_id = ? AND installation_id = ? AND request_id = ?
+    `).get(input.leaseId, input.installationId, input.requestId) as BrowserProfileLeaseRow | undefined;
+    return row !== undefined &&
+      row.host_id === input.hostId &&
+      row.profile_id === input.profileId &&
+      row.binding_generation === input.bindingGeneration &&
+      row.fence_owner === input.fenceOwner &&
+      row.fence_generation === input.fenceGeneration &&
+      row.state === "held" &&
+      row.lease_expires_at > input.now;
+  }
+
   public completeRequest(input: Readonly<{
     request: ProtectedConnectorRequestEnvelope;
     response: ProtectedConnectorResponseEnvelope;
@@ -499,6 +622,11 @@ export class BrokerProtectedConnectorStore {
         row.installation_id,
         row.idempotency_key,
       );
+      this.db.prepare(`
+        UPDATE broker_browser_profile_leases
+           SET state = 'released', updated_at = ?
+         WHERE installation_id = ? AND request_id = ? AND state = 'held'
+      `).run(input.now, row.installation_id, row.request_id);
       return parsed.value;
     }).immediate();
   }

@@ -437,7 +437,7 @@ describe("append-only schema compatibility", () => {
       expect(fixture.db.prepare("SELECT result, protocol_version FROM broker_receipts WHERE receipt_id = 'receipt-v1'").get())
         .toEqual({ result: "valid", protocol_version: 1 });
       expect(fixture.db.prepare("SELECT version FROM broker_schema_migrations ORDER BY version").all())
-        .toEqual([{ version: 1 }, { version: 2 }]);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
 
       const reopened = new Database(fixture.databasePath);
       applyBrokerMigrations(reopened);
