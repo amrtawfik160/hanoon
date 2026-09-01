@@ -1,7 +1,24 @@
+import * as onePassword from "@1password/sdk";
 import { AuthExpiredError, RateLimitExceededError } from "@1password/sdk";
 import { describe, expect, it, vi } from "vitest";
+import { ProtectedConnectorAuthorityService } from "../broker/src/connector-authority-service";
+import { BrokerProtectedConnectorStore } from "../broker/src/connector-store";
+import { createProtectedConnectorExecutor } from "../broker/src/provider-connectors";
+import { BrokerStore } from "../broker/src/store";
 import { createOnePasswordAdapter, type VaultAdapter } from "../broker/src/onepassword-adapter";
-import { fakeOnePasswordPort, type FakeResolveResult } from "./support/credential-broker-fixtures";
+import {
+  PROTECTED_CONNECTOR_POLICY_DIGEST,
+  type ProtectedConnectorBindingProjection,
+  type ProtectedConnectorTarget,
+} from "../src/credentials/connector-policy";
+import type { ProtectedConnectorRequestEnvelope } from "../src/credentials/connector-protocol";
+import { fakeOnePasswordPort, temporaryBrokerDatabase, type FakeResolveResult } from "./support/credential-broker-fixtures";
+import { certificateFingerprint, createMtlsFixture } from "./support/mtls-fixtures";
+
+vi.mock("@1password/sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@1password/sdk")>();
+  return { ...actual, createClient: vi.fn() };
+});
 
 const EXPECTED_VAULT_ID = "vault-canary-id";
 const ITEM_ID = "item-canary-id";
@@ -10,6 +27,34 @@ const REFERENCE = `op://${EXPECTED_VAULT_ID}/${ITEM_ID}/${FIELD_ID}`;
 const SECRET = "resolved-secret-canary-value-7f31a2";
 const SDK_MESSAGE = "provider diagnostic canary must not escape";
 const AUDIT_KEY = new Uint8Array(32).fill(0x44);
+const DEADLINE_INSTALLATION_ID = "installation-sdk-deadline";
+const DEADLINE_PROJECT_ID = "project-sdk-deadline";
+const deadlineProjection: ProtectedConnectorBindingProjection = {
+  schemaVersion: 2,
+  installationId: DEADLINE_INSTALLATION_ID,
+  bindingId: "binding-sdk-deadline",
+  operation: "convex.project.inspect.v1",
+  bindingKind: "workload_identity",
+  authorityProvider: "convex",
+  secretProvider: "provider_native",
+  principalLabel: "SDK deadline test workload",
+  capabilityIds: ["telegram_agent_convex_project_inspect"],
+  audiences: ["api.convex.dev"],
+  origins: [],
+  scopes: ["project:read"],
+  riskClass: "low",
+  mfaMode: "workload_identity",
+  approvalMode: "standing_policy",
+  state: "vault_verified",
+  generation: 1,
+  verifiedAt: null,
+  expiresAt: null,
+};
+const deadlineTarget: ProtectedConnectorTarget = {
+  operation: "convex.project.inspect.v1",
+  teamIdOrSlug: "team-sdk-deadline",
+  projectSlug: "hanoon",
+};
 
 async function adapterFor(
   vaults: readonly { id: string }[],
@@ -143,7 +188,7 @@ describe("isolated onepassword adapter", () => {
     }
   });
 
-  it("stops waiting on an aborted credential resolution and exposes lifecycle cleanup", async () => {
+  it("stops waiting on an aborted injected credential port and exposes lifecycle cleanup", async () => {
     const controller = new AbortController();
     let receivedSignal: AbortSignal | undefined;
     let closeCalls = 0;
@@ -170,5 +215,132 @@ describe("isolated onepassword adapter", () => {
     });
     await adapter.close();
     expect(closeCalls).toBe(1);
+  });
+
+  it("fails closed before starting installed SDK credential resolution", async () => {
+    const resolveAll = vi.fn(() => new Promise<never>(() => undefined));
+    vi.mocked(onePassword.createClient).mockResolvedValue({
+      vaults: { list: vi.fn() },
+      secrets: { resolveAll },
+    } as unknown as Awaited<ReturnType<typeof onePassword.createClient>>);
+    try {
+      const adapter = await createOnePasswordAdapter({ serviceToken: "service-token-is-test-only" });
+      const deadline = new AbortController();
+      const persistedDeadline = setTimeout(() => deadline.abort(), 1);
+      const result = await adapter.resolveCredential(REFERENCE, deadline.signal);
+      clearTimeout(persistedDeadline);
+
+      expect(result).toEqual({
+        outcome: "failed",
+        failureClass: "provider_unavailable",
+        retryable: true,
+        retryAfterMs: 30_000,
+      });
+      expect(resolveAll).not.toHaveBeenCalled();
+      await adapter.close();
+    } finally {
+      vi.mocked(onePassword.createClient).mockReset();
+    }
+  });
+
+  it("does not leave an in-flight installed SDK effect after the persisted deadline", async () => {
+    const now = 1_800_000_000_000;
+    const fixture = createMtlsFixture();
+    const brokerDatabase = temporaryBrokerDatabase();
+    const dataKey = new Uint8Array(32).fill(0x11);
+    const broker = new BrokerStore(brokerDatabase.db, { dataKey, auditKey: new Uint8Array(32).fill(0x22), clock: () => now });
+    const certificate = certificateFingerprint(fixture.clientCertificatePem);
+    broker.addInstallation({
+      installationId: DEADLINE_INSTALLATION_ID,
+      clientCertificateFingerprint: certificate,
+      policyDigest: "b".repeat(64),
+      topologyReceiptDigest: "c".repeat(64),
+      topologyReceiptExpiresAt: now + 60_000,
+      expectedVaultId: EXPECTED_VAULT_ID,
+      now,
+    });
+    const connectors = new BrokerProtectedConnectorStore(brokerDatabase.db, { dataKey, clock: () => now });
+    connectors.enrollProtectedBinding({
+      projectId: DEADLINE_PROJECT_ID,
+      policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+      enabledOperations: ["convex.project.inspect.v1"],
+      projection: deadlineProjection,
+      target: deadlineTarget,
+      credentialReference: REFERENCE,
+      now,
+    });
+    expect(broker.attestExecutorFence({
+      installationId: DEADLINE_INSTALLATION_ID,
+      taskId: "task-sdk-deadline",
+      projectId: DEADLINE_PROJECT_ID,
+      fenceOwner: "executor-sdk-deadline",
+      fenceGeneration: 1,
+      expiresAt: now + 60_000,
+      now,
+    })).toBe(true);
+
+    let inFlight = 0;
+    const resolveAll = vi.fn(() => {
+      inFlight += 1;
+      return new Promise<never>(() => undefined);
+    });
+    vi.mocked(onePassword.createClient).mockResolvedValue({
+      vaults: { list: vi.fn() },
+      secrets: { resolveAll },
+    } as unknown as Awaited<ReturnType<typeof onePassword.createClient>>);
+    try {
+      const adapter = await createOnePasswordAdapter({ serviceToken: "service-token-is-test-only" });
+      const getConvexProject = vi.fn();
+      const authority = new ProtectedConnectorAuthorityService({
+        foundationStore: broker,
+        connectorStore: connectors,
+        executor: createProtectedConnectorExecutor({
+          http: {
+            getConvexProject,
+            getVercelProject: vi.fn(),
+          },
+          credentials: { resolve: adapter.resolveCredential },
+          clock: () => now,
+        }),
+        authority: {
+          topologyReady: () => true,
+          auditWritable: () => true,
+          fenceCurrent: (input) => broker.isExecutorFenceCurrent({ ...input, now }),
+        },
+        clock: () => now,
+      });
+      const request = {
+        schemaVersion: 2,
+        operation: "convex.project.inspect.v1",
+        installationId: DEADLINE_INSTALLATION_ID,
+        requestId: "request-sdk-deadline",
+        idempotencyKey: "idempotency-sdk-deadline",
+        nonce: "nonce-sdk-deadline",
+        bindingId: deadlineProjection.bindingId,
+        bindingGeneration: 1,
+        taskId: "task-sdk-deadline",
+        projectId: DEADLINE_PROJECT_ID,
+        capabilityId: "telegram_agent_convex_project_inspect",
+        policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        fenceOwner: "executor-sdk-deadline",
+        fenceGeneration: 1,
+        issuedAt: now,
+        deadlineAt: now + 1,
+      } satisfies ProtectedConnectorRequestEnvelope;
+
+      const response = await authority.execute({ certificateFingerprint: certificate, request, now });
+      expect(response).toMatchObject({ outcome: "failed", failureClass: "provider_unavailable" });
+      expect(brokerDatabase.db.prepare(
+        "SELECT state FROM broker_connector_requests WHERE request_id = ?",
+      ).get(request.requestId)).toEqual({ state: "completed" });
+      expect(resolveAll).not.toHaveBeenCalled();
+      expect(getConvexProject).not.toHaveBeenCalled();
+      expect(inFlight).toBe(0);
+      await adapter.close();
+    } finally {
+      vi.mocked(onePassword.createClient).mockReset();
+      fixture.cleanup();
+      brokerDatabase.close();
+    }
   });
 });

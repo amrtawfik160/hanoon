@@ -24,16 +24,7 @@ type AdapterFailure = Readonly<{
   retryAfterMs: number | null;
 }>;
 
-const INVALID_REFERENCE_ERROR_TYPES = new Set([
-  "fieldNotFound",
-  "vaultNotFound",
-  "itemNotFound",
-  "tooManyVaults",
-  "tooManyItems",
-  "tooManyMatchingFields",
-  "noMatchingSections",
-  "parsing",
-]);
+const SDK_CREDENTIAL_RESOLUTION_UNAVAILABLE = "onepassword_sdk_credential_resolution_unavailable";
 
 export type VaultVerification =
   | { outcome: "valid"; versionHmac: string }
@@ -103,35 +94,16 @@ async function createSdkPort(serviceToken: string): Promise<OnePasswordPort> {
       const vaults = await client.vaults.list({ decryptDetails: false });
       return vaults.map((vault) => ({ id: vault.id }));
     },
-    resolveOne: async (reference, signal) => abortable(resolveSdkReference(client, reference), signal),
-    // The SDK owns its transport and exposes no public close operation. Keep a
-    // lifecycle seam here so a future SDK can release it without changing the
-    // broker composition; request cancellation still stops this adapter's
-    // caller from waiting on the SDK promise.
+    // @1password/sdk 0.5.0 exposes no AbortSignal on Secrets.resolveAll and no
+    // public Client close/dispose method. Do not start an SDK request that can
+    // outlive the broker's persisted deadline; injected ports may provide a
+    // genuinely abortable transport through the test/embedding seam.
+    resolveOne: async () => {
+      throw new Error(SDK_CREDENTIAL_RESOLUTION_UNAVAILABLE);
+    },
+    // Keep the lifecycle seam so a future SDK can release its transport.
     close: () => undefined,
   };
-}
-
-async function resolveSdkReference(
-  client: Awaited<ReturnType<typeof onePassword.createClient>>,
-  reference: string,
-): Promise<ResolvedSecret | { outcome: "invalid" }> {
-  const response = await client.secrets.resolveAll([reference]);
-  const keys = Object.keys(response.individualResponses);
-  if (keys.length !== 1 || keys[0] !== reference) return { outcome: "invalid" };
-  const entry = response.individualResponses[reference];
-  if (entry.content !== undefined) {
-    if (typeof entry.content.secret !== "string" || typeof entry.content.vaultId !== "string" ||
-        typeof entry.content.itemId !== "string") return { outcome: "invalid" };
-    return {
-      outcome: "resolved",
-      secret: entry.content.secret,
-      vaultId: entry.content.vaultId,
-      itemId: entry.content.itemId,
-    };
-  }
-  if (entry.error && isInvalidReferenceError(entry.error.type)) return { outcome: "invalid" };
-  throw new Error("unsupported_onepassword_response");
 }
 
 async function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -151,10 +123,6 @@ async function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> 
       },
     );
   });
-}
-
-function isInvalidReferenceError(errorType: string): boolean {
-  return INVALID_REFERENCE_ERROR_TYPES.has(errorType);
 }
 
 async function checkHealth(port: OnePasswordPort, expectedVaultId: string): Promise<{ outcome: "ready" } | AdapterFailure> {

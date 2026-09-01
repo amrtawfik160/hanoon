@@ -21,8 +21,8 @@ describe("protected connector production composition", () => {
       "telegram_agent_connector_inspect",
       {
         projectId: INTEGRATION_PROJECT_ID,
-        operation: "convex.project.inspect.v1",
-        bindingId: INTEGRATION_BINDING_ID,
+        operation: harness.operation,
+        bindingId: harness.bindingId,
       },
       { threadId: harness.controllerThreadId, projectId: INTEGRATION_PROJECT_ID, signal },
     );
@@ -44,8 +44,12 @@ describe("protected connector production composition", () => {
       ]));
       expect(harness.hanoon.listCapabilityReceipts(turn.capabilityProfileId, 64)).toEqual(expect.arrayContaining([
         expect.objectContaining({
+          profileRevision: turn.capabilityProfileRevision,
+          subjectKind: "controller_turn",
+          subjectId: turn.id,
           capabilityId: "telegram_agent_convex_project_inspect",
           eventType: "selected",
+          reasonCode: "profile_selected",
         }),
       ]));
       expect(harness.hanoon.getProtectedConnectorBinding(
@@ -80,6 +84,119 @@ describe("protected connector production composition", () => {
       expect(harness.brokerDatabase.db.prepare(
         "SELECT count(*) AS count FROM broker_connector_receipts WHERE installation_id = ?",
       ).get("installation-integration")).toEqual({ count: 1 });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("crosses the selected controller receipt and real Vercel provider path", async () => {
+    const harness = await createProtectedConnectorIntegrationHarness({ operation: "vercel.project.inspect.v1" });
+    try {
+      const turn = harness.hanoon.getControllerTurn(harness.turnId);
+      if (!turn?.capabilityProfileId) throw new Error("integration_profile_missing");
+      const profile = harness.hanoon.getCapabilityProfileById(turn.capabilityProfileId);
+      expect(profile?.assignments).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          capabilityId: "telegram_agent_vercel_project_inspect",
+          mandatory: true,
+        }),
+      ]));
+      expect(harness.hanoon.listCapabilityReceipts(turn.capabilityProfileId, 64)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          profileRevision: turn.capabilityProfileRevision,
+          subjectKind: "controller_turn",
+          subjectId: turn.id,
+          capabilityId: "telegram_agent_vercel_project_inspect",
+          eventType: "selected",
+          reasonCode: "profile_selected",
+        }),
+      ]));
+
+      const result = parsed(await inspect(harness, new AbortController().signal));
+      expect(result).toMatchObject({ outcome: "succeeded" });
+      expect((result as { identity?: { projectId?: string } }).identity?.projectId).toBe("vercel-project-id");
+      expect(harness.providerCalls).toEqual(["GET /v9/projects/hanoon?teamId=team-id"]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("selects the browser capability but denies the unisolated browser path before provider I/O", async () => {
+    const harness = await createProtectedConnectorIntegrationHarness({ operation: "browser.vercel_project.inspect.v1" });
+    try {
+      const turn = harness.hanoon.getControllerTurn(harness.turnId);
+      if (!turn?.capabilityProfileId) throw new Error("integration_profile_missing");
+      const profile = harness.hanoon.getCapabilityProfileById(turn.capabilityProfileId);
+      expect(profile?.assignments).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          capabilityId: "telegram_agent_browser_vercel_project_inspect",
+          mandatory: true,
+        }),
+      ]));
+      expect(harness.hanoon.listCapabilityReceipts(turn.capabilityProfileId, 64)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          profileRevision: turn.capabilityProfileRevision,
+          subjectKind: "controller_turn",
+          subjectId: turn.id,
+          capabilityId: "telegram_agent_browser_vercel_project_inspect",
+          eventType: "selected",
+          reasonCode: "profile_selected",
+        }),
+      ]));
+
+      expect(parsed(await inspect(harness, new AbortController().signal))).toMatchObject({
+        outcome: "denied",
+        reason: "unsafe_topology",
+      });
+      expect(harness.providerCalls).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    ["convex.project.inspect.v1", "telegram_agent_convex_project_inspect"],
+    ["vercel.project.inspect.v1", "telegram_agent_vercel_project_inspect"],
+  ] as const)("denies %s when its selected receipt is missing before provider I/O", async (operation, capabilityId) => {
+    const harness = await createProtectedConnectorIntegrationHarness({ operation, capabilityEvidence: "missing" });
+    try {
+      const turn = harness.hanoon.getControllerTurn(harness.turnId);
+      if (!turn?.capabilityProfileId) throw new Error("integration_profile_missing");
+      expect(harness.hanoon.listCapabilityReceipts(turn.capabilityProfileId, 64)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ capabilityId, eventType: "selected" }),
+      ]));
+
+      expect(parsed(await inspect(harness, new AbortController().signal))).toMatchObject({
+        outcome: "denied",
+        reason: "capability_evidence_missing",
+      });
+      expect(harness.providerCalls).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    ["convex.project.inspect.v1", "telegram_agent_convex_project_inspect"],
+    ["vercel.project.inspect.v1", "telegram_agent_vercel_project_inspect"],
+  ] as const)("denies %s when its selected receipt is stale before provider I/O", async (operation, capabilityId) => {
+    const harness = await createProtectedConnectorIntegrationHarness({ operation, capabilityEvidence: "stale" });
+    try {
+      const turn = harness.hanoon.getControllerTurn(harness.turnId);
+      if (!turn?.capabilityProfileId) throw new Error("integration_profile_missing");
+      expect(harness.hanoon.listCapabilityReceipts(turn.capabilityProfileId, 64)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          capabilityId,
+          eventType: "selected",
+          profileRevision: turn.capabilityProfileRevision,
+        }),
+      ]));
+
+      expect(parsed(await inspect(harness, new AbortController().signal))).toMatchObject({
+        outcome: "denied",
+        reason: "capability_evidence_missing",
+      });
+      expect(harness.providerCalls).toHaveLength(0);
     } finally {
       await harness.close();
     }

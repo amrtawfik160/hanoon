@@ -13,6 +13,11 @@ import { CredentialBrokerClient } from "../../src/credentials/broker-client";
 import type { IsolatedCredentialBrokerConfig } from "../../src/credentials/config";
 import { CredentialAccessService } from "../../src/credentials/service";
 import { ProtectedConnectorAccessService } from "../../src/credentials/protected-connector-service";
+import type { ProtectedConnectorAccessStore } from "../../src/credentials/protected-connector-service";
+import {
+  protectedConnectorCapabilityFor,
+  type ProtectedConnectorOperation,
+} from "../../src/credentials/connector-protocol";
 import type { BrokerResponseEnvelope } from "../../src/credentials/protocol";
 import { openStore, type TelegramAgentStore } from "../../src/storage/store";
 import { hashSecret } from "../../src/crypto";
@@ -40,33 +45,109 @@ export const INTEGRATION_PROJECT_ID = "proj_1";
 export const INTEGRATION_BINDING_ID = "binding-convex";
 export const INTEGRATION_TOKEN = "synthetic-provider-token";
 
-export const integrationProjection: ProtectedConnectorBindingProjection = {
-  schemaVersion: 2,
-  installationId: INTEGRATION_INSTALLATION_ID,
-  bindingId: INTEGRATION_BINDING_ID,
-  operation: "convex.project.inspect.v1",
-  bindingKind: "workload_identity",
-  authorityProvider: "convex",
-  secretProvider: "provider_native",
-  principalLabel: "controlled integration workload",
-  capabilityIds: ["telegram_agent_convex_project_inspect"],
-  audiences: ["api.convex.dev"],
-  origins: [],
-  scopes: ["project:read"],
-  riskClass: "low",
-  mfaMode: "workload_identity",
-  approvalMode: "standing_policy",
-  state: "vault_verified",
-  generation: 1,
-  verifiedAt: null,
-  expiresAt: null,
-};
+export function integrationBindingIdFor(operation: ProtectedConnectorOperation): string {
+  if (operation === "convex.project.inspect.v1") return "binding-convex";
+  if (operation === "vercel.project.inspect.v1") return "binding-vercel";
+  return "binding-browser";
+}
 
-export const integrationTarget: ProtectedConnectorTarget = {
-  operation: "convex.project.inspect.v1",
-  teamIdOrSlug: "team-slug",
-  projectSlug: "hanoon",
-};
+export function integrationProjectionFor(operation: ProtectedConnectorOperation): ProtectedConnectorBindingProjection {
+  if (operation === "convex.project.inspect.v1") return {
+    schemaVersion: 2,
+    installationId: INTEGRATION_INSTALLATION_ID,
+    bindingId: integrationBindingIdFor(operation),
+    operation,
+    bindingKind: "workload_identity",
+    authorityProvider: "convex",
+    secretProvider: "provider_native",
+    principalLabel: "controlled integration workload",
+    capabilityIds: ["telegram_agent_convex_project_inspect"],
+    audiences: ["api.convex.dev"],
+    origins: [],
+    scopes: ["project:read"],
+    riskClass: "low",
+    mfaMode: "workload_identity",
+    approvalMode: "standing_policy",
+    state: "vault_verified",
+    generation: 1,
+    verifiedAt: null,
+    expiresAt: null,
+  };
+  if (operation === "vercel.project.inspect.v1") return {
+    schemaVersion: 2,
+    installationId: INTEGRATION_INSTALLATION_ID,
+    bindingId: integrationBindingIdFor(operation),
+    operation,
+    bindingKind: "workload_identity",
+    authorityProvider: "vercel",
+    secretProvider: "provider_native",
+    principalLabel: "controlled integration workload",
+    capabilityIds: ["telegram_agent_vercel_project_inspect"],
+    audiences: ["api.vercel.com"],
+    origins: [],
+    scopes: ["project:read"],
+    riskClass: "low",
+    mfaMode: "workload_identity",
+    approvalMode: "standing_policy",
+    state: "vault_verified",
+    generation: 1,
+    verifiedAt: null,
+    expiresAt: null,
+  };
+  return {
+    schemaVersion: 2,
+    installationId: INTEGRATION_INSTALLATION_ID,
+    bindingId: integrationBindingIdFor(operation),
+    operation,
+    bindingKind: "browser_session",
+    authorityProvider: "bb_browser",
+    secretProvider: "broker_session",
+    principalLabel: "controlled integration browser session",
+    capabilityIds: ["telegram_agent_browser_vercel_project_inspect"],
+    audiences: [],
+    origins: ["https://vercel.com"],
+    scopes: [],
+    riskClass: "low",
+    mfaMode: "human_presence",
+    approvalMode: "standing_policy",
+    state: "pending",
+    generation: 1,
+    verifiedAt: null,
+    expiresAt: null,
+  };
+}
+
+export function integrationTargetFor(operation: ProtectedConnectorOperation): ProtectedConnectorTarget {
+  if (operation === "convex.project.inspect.v1") return {
+    operation,
+    teamIdOrSlug: "team-slug",
+    projectSlug: "hanoon",
+  };
+  if (operation === "vercel.project.inspect.v1") return {
+    operation,
+    teamId: "team-id",
+    projectIdOrName: "hanoon",
+  };
+  return {
+    operation,
+    hostId: "host-integration",
+    profileId: "profile-integration",
+    origin: "https://vercel.com",
+    journeyId: "vercel-project-identity",
+    journeyVersion: 1,
+    teamSlug: "team-slug",
+    projectName: "hanoon",
+  };
+}
+
+export function integrationInputFor(operation: ProtectedConnectorOperation): string {
+  if (operation === "convex.project.inspect.v1") return "Inspect the current Convex project identity.";
+  if (operation === "vercel.project.inspect.v1") return "Inspect the current Vercel project identity.";
+  return "Inspect the current Vercel project identity in the browser session.";
+}
+
+export const integrationProjection = integrationProjectionFor("convex.project.inspect.v1");
+export const integrationTarget = integrationTargetFor("convex.project.inspect.v1");
 
 type RunningServer = ReturnType<typeof createBrokerServer>;
 
@@ -120,6 +201,8 @@ export type ProtectedConnectorIntegrationHarness = Readonly<{
   controllerThreadId: string;
   controllerProjectId: string;
   turnId: string;
+  operation: ProtectedConnectorOperation;
+  bindingId: string;
   providerCalls: string[];
   releaseStalledProvider(): void;
   restartBrokerAuthority(): Promise<void>;
@@ -136,6 +219,8 @@ export type ProtectedConnectorIntegrationHarnessOptions = Readonly<{
   credentialError?: string;
   providerMode?: "success" | "failure" | "stall";
   auditWritable?: boolean;
+  operation?: ProtectedConnectorOperation;
+  capabilityEvidence?: "current" | "missing" | "stale";
 }>;
 
 export function cleanupProtectedConnectorIntegrationFixtures(): void {
@@ -153,6 +238,10 @@ export async function createProtectedConnectorIntegrationHarness(
   options: ProtectedConnectorIntegrationHarnessOptions = {},
 ): Promise<ProtectedConnectorIntegrationHarness> {
   const fixture = SHARED_FIXTURE;
+  const operation = options.operation ?? "convex.project.inspect.v1";
+  const bindingId = integrationBindingIdFor(operation);
+  const projection = integrationProjectionFor(operation);
+  const target = integrationTargetFor(operation);
   const brokerDatabase = temporaryBrokerDatabase();
   const { bb, harness: hostHarness } = createFakePluginHost({
     pluginId: "protected-connector-production-composition",
@@ -173,7 +262,12 @@ export async function createProtectedConnectorIntegrationHarness(
   try {
     provider = https.createServer({ key: fixture.serverPrivateKeyPem, cert: fixture.serverCertificatePem }, (request, response) => {
       providerCalls.push(`${request.method ?? ""} ${request.url ?? ""}`);
-      if (request.url !== "/v1/teams/team-slug/projects/hanoon") {
+      const expectedPath = operation === "convex.project.inspect.v1"
+        ? "/v1/teams/team-slug/projects/hanoon"
+        : operation === "vercel.project.inspect.v1"
+          ? "/v9/projects/hanoon?teamId=team-id"
+          : null;
+      if (request.url !== expectedPath) {
         response.writeHead(404).end();
         return;
       }
@@ -185,13 +279,23 @@ export async function createProtectedConnectorIntegrationHarness(
         response.writeHead(503, { "content-type": "application/json" }).end("{}");
         return;
       }
-      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
-        id: "convex-project-id",
-        slug: "hanoon",
-        teamId: "team-id",
-        teamSlug: "team-slug",
-        status: "active",
-      }));
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(
+        operation === "convex.project.inspect.v1"
+          ? {
+              id: "convex-project-id",
+              slug: "hanoon",
+              teamId: "team-id",
+              teamSlug: "team-slug",
+              status: "active",
+            }
+          : {
+              id: "vercel-project-id",
+              name: "hanoon",
+              accountId: "team-id",
+              framework: "nextjs",
+              status: "ready",
+            },
+      ));
     });
     const providerPort = await listen(provider);
 
@@ -232,12 +336,14 @@ export async function createProtectedConnectorIntegrationHarness(
       installationId: INTEGRATION_INSTALLATION_ID,
       projectId: INTEGRATION_PROJECT_ID,
       policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
-      enabledOperations: ["convex.project.inspect.v1"],
-      projection: integrationProjection,
-      target: integrationTarget,
-      credentialReference: "op://vault-integration/item-integration/token",
+      enabledOperations: [operation],
+      projection,
+      target,
+      credentialReference: operation === "browser.vercel_project.inspect.v1"
+        ? null
+        : "op://vault-integration/item-integration/token",
     });
-    if (enrollment.ok !== true || enrollment.bindingId !== INTEGRATION_BINDING_ID) {
+    if (enrollment.ok !== true || enrollment.bindingId !== bindingId) {
       throw new Error("integration_admin_enrollment_failed");
     }
 
@@ -358,7 +464,7 @@ export async function createProtectedConnectorIntegrationHarness(
       telegramUserId: "7",
       telegramChatId: "7",
       updateId: 68001,
-      inputText: "Inspect the current Convex project identity.",
+      inputText: integrationInputFor(operation),
       now: INTEGRATION_NOW,
     });
     const lease = hanoon.acquireExecutorLease("executor-integration", INTEGRATION_NOW, 60_000);
@@ -384,10 +490,28 @@ export async function createProtectedConnectorIntegrationHarness(
     const submittedTurn = hanoon.getPendingControllerTurn(turn.controllerKey);
     if (!controller || !submittedTurn) throw new Error("integration_authorized_controller_missing");
     const authorized = { controller, turn: submittedTurn, fence };
-    const brokerBinding = connectors.getBinding(INTEGRATION_INSTALLATION_ID, INTEGRATION_BINDING_ID);
+    const brokerBinding = connectors.getBinding(INTEGRATION_INSTALLATION_ID, bindingId);
     if (!brokerBinding) throw new Error("integration_broker_binding_missing");
+    const protectedAccessStore = new Proxy(hanoon, {
+      get(target, property) {
+        if (property === "listCapabilityReceipts" && options.capabilityEvidence !== undefined && options.capabilityEvidence !== "current") {
+          return (profileId: string, limit: number): ReturnType<TelegramAgentStore["listCapabilityReceipts"]> => {
+            const receipts = target.listCapabilityReceipts(profileId, limit);
+            const capabilityId = protectedConnectorCapabilityFor(operation);
+            if (options.capabilityEvidence === "missing") {
+              return receipts.filter((receipt) => receipt.capabilityId !== capabilityId || receipt.eventType !== "selected");
+            }
+            return receipts.map((receipt) => receipt.capabilityId === capabilityId && receipt.eventType === "selected"
+              ? { ...receipt, profileRevision: receipt.profileRevision + 1 }
+              : receipt);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as unknown as ProtectedConnectorAccessStore;
     const protectedAccess = new ProtectedConnectorAccessService({
-      store: hanoon,
+      store: protectedAccessStore,
       client: () => client,
       config: () => ({ state: "isolated", value: clientConfig }),
       trustKernelReady: () => true,
@@ -426,6 +550,8 @@ export async function createProtectedConnectorIntegrationHarness(
       controllerThreadId: "thread-integration",
       controllerProjectId: INTEGRATION_PROJECT_ID,
       turnId: turn.id,
+      operation,
+      bindingId,
       providerCalls,
       provider,
       brokerServer,
