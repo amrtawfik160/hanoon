@@ -538,6 +538,25 @@ export class BrokerProtectedConnectorStore {
       row.lease_expires_at > input.now;
   }
 
+  /** Checks the opaque lease fence used while the browser adapter is active. */
+  public isBrowserProfileLeaseCurrentForTarget(input: Readonly<{
+    leaseId: string;
+    hostId: string;
+    profileId: string;
+    now: number;
+  }>): boolean {
+    const row = this.db.prepare(`
+      SELECT host_id, profile_id, state, lease_expires_at
+        FROM broker_browser_profile_leases
+       WHERE lease_id = ?
+    `).get(input.leaseId) as Pick<BrowserProfileLeaseRow, "host_id" | "profile_id" | "state" | "lease_expires_at"> | undefined;
+    return row !== undefined &&
+      row.host_id === input.hostId &&
+      row.profile_id === input.profileId &&
+      row.state === "held" &&
+      row.lease_expires_at > input.now;
+  }
+
   public completeRequest(input: Readonly<{
     request: ProtectedConnectorRequestEnvelope;
     response: ProtectedConnectorResponseEnvelope;

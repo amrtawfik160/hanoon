@@ -11,6 +11,20 @@ import { BrokerOperationService } from "./operation-service.js";
 import { BrokerStore } from "./store.js";
 import { createBrokerServer } from "./server.js";
 import { createAdminServer } from "./admin-server.js";
+import {
+  attestBrowserTopologyEvidence,
+  createBbBrowserJourneyBrowserPort,
+  createVercelBrowserJourneyExecutor,
+  type BrowserCliInvoker,
+  type BrowserTopologyEvidence,
+} from "./browser-journey.js";
+import { BrokerProtectedConnectorStore } from "./connector-store.js";
+import {
+  ProtectedConnectorAuthorityService,
+  type ProtectedConnectorAuthorityPort,
+  type ProtectedConnectorExecutionFailure,
+  type ProtectedConnectorExecutor,
+} from "./connector-authority-service.js";
 
 const BROKER_VERSION = "0.1.0";
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -29,7 +43,65 @@ export type RunningBroker = Readonly<{
 
 export type BrokerStartupOptions = Readonly<{
   adminServer?: BrokerAdminLifecycle;
+  protectedBrowser?: Readonly<{
+    topology?: () => BrowserTopologyEvidence;
+    authority?: ProtectedConnectorAuthorityPort;
+    invoke?: BrowserCliInvoker;
+  }>;
 }>;
+
+export type ProtectedBrowserConnectorServiceDependencies = Readonly<{
+  foundationStore: BrokerStore;
+  connectorStore: BrokerProtectedConnectorStore;
+  topology: () => BrowserTopologyEvidence;
+  topologyKey: Uint8Array;
+  authority: ProtectedConnectorAuthorityPort;
+  clock: () => number;
+  invoke?: BrowserCliInvoker;
+}>;
+
+function unsupportedProtectedConnectorFailure(): ProtectedConnectorExecutionFailure {
+  return {
+    outcome: "failed",
+    failureClass: "reconciliation_required",
+    retryable: false,
+    retryAfterMs: null,
+    connectorVersion: "protected-runtime-1",
+  };
+}
+
+/** Composes the protected authority with the fixed browser journey at startup. */
+export function createProtectedBrowserConnectorService(
+  dependencies: ProtectedBrowserConnectorServiceDependencies,
+): ProtectedConnectorAuthorityService {
+  const browser = createBbBrowserJourneyBrowserPort({ invoke: dependencies.invoke });
+  const browserExecutor = createVercelBrowserJourneyExecutor({
+    browser,
+    topology: dependencies.topology,
+    topologyKey: dependencies.topologyKey,
+    lease: {
+      isCurrent: (input) => dependencies.connectorStore.isBrowserProfileLeaseCurrentForTarget({
+        leaseId: input.leaseId,
+        hostId: input.hostId,
+        profileId: input.profileId,
+        now: dependencies.clock(),
+      }),
+    },
+    clock: dependencies.clock,
+  });
+  const executor: ProtectedConnectorExecutor = {
+    inspectConvex: async () => unsupportedProtectedConnectorFailure(),
+    inspectVercel: async () => unsupportedProtectedConnectorFailure(),
+    inspectBrowserVercel: browserExecutor.inspectBrowserVercel,
+  };
+  return new ProtectedConnectorAuthorityService({
+    foundationStore: dependencies.foundationStore,
+    connectorStore: dependencies.connectorStore,
+    executor,
+    authority: dependencies.authority,
+    clock: dependencies.clock,
+  });
+}
 
 function parseConfigPath(argv: readonly string[]): string {
   if (argv.length !== 2 || argv[0] !== "--config" || !isAbsolute(argv[1])) {
@@ -88,6 +160,35 @@ export async function startBroker(
       clock: Date.now,
       retentionDays: config.retentionDays,
     });
+    const connectorStore = new BrokerProtectedConnectorStore(database, {
+      dataKey: credentials.brokerDataKey,
+      clock: Date.now,
+    });
+    const defaultTopology = attestBrowserTopologyEvidence({
+      schemaVersion: 1,
+      evidenceId: "unconfigured-browser-topology",
+      observedAt: 0,
+      expiresAt: 0,
+      controllerMayAdminProfiles: true,
+      controllerMayAdminGrants: true,
+      workerMayAdminProfiles: true,
+      workerMayAdminGrants: true,
+    }, credentials.brokerAuditKey);
+    const topology = options.protectedBrowser?.topology ?? (() => defaultTopology);
+    const authority = options.protectedBrowser?.authority ?? {
+      topologyReady: () => false,
+      auditWritable: () => true,
+      fenceCurrent: () => false,
+    } satisfies ProtectedConnectorAuthorityPort;
+    const protectedService = createProtectedBrowserConnectorService({
+      foundationStore: store,
+      connectorStore,
+      topology,
+      topologyKey: credentials.brokerAuditKey,
+      authority,
+      clock: Date.now,
+      invoke: options.protectedBrowser?.invoke,
+    });
     const adapter = await createOnePasswordAdapter({ serviceToken: credentials.onepasswordServiceToken });
     const service = new BrokerOperationService({
       store,
@@ -102,6 +203,7 @@ export async function startBroker(
       serverPrivateKeyPem: credentials.serverPrivateKeyPem,
       clientCaCertificatePem: credentials.clientCaCertificatePem,
       service,
+      protectedService,
       clock: Date.now,
       requestBodyLimitBytes: config.requestBodyLimitBytes,
       responseBodyLimitBytes: config.responseBodyLimitBytes,

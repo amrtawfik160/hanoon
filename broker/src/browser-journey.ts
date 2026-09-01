@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import {
   parseProtectedConnectorTarget,
@@ -7,6 +8,7 @@ import {
   VERCEL_PROJECT_IDENTITY_JOURNEY_VERSION,
   type BrowserVercelProjectTarget,
 } from "../../src/credentials/connector-policy.js";
+import { canonicalBrokerJson } from "../../src/credentials/protocol.js";
 import type { BrowserVercelProjectIdentity } from "../../src/credentials/connector-protocol.js";
 import type {
   ProtectedConnectorExecutionFailure,
@@ -68,7 +70,7 @@ export type BrowserJourneyDeniedObservation = Readonly<{
 
 export type BrowserJourneyRun = BrowserJourneyObservation | BrowserJourneyDeniedObservation;
 
-export type BrowserTopologyEvidence = Readonly<{
+export type BrowserTopologyEvidencePayload = Readonly<{
   schemaVersion: 1;
   evidenceId: string;
   observedAt: number;
@@ -77,6 +79,10 @@ export type BrowserTopologyEvidence = Readonly<{
   controllerMayAdminGrants: boolean;
   workerMayAdminProfiles: boolean;
   workerMayAdminGrants: boolean;
+}>;
+
+export type BrowserTopologyEvidence = BrowserTopologyEvidencePayload & Readonly<{
+  attestation: string;
 }>;
 
 export type BrowserProfileLeasePort = Readonly<{
@@ -115,6 +121,7 @@ export type ProtectedVercelBrowserExecutor = Readonly<{
 export type BrowserJourneyDependencies = Readonly<{
   browser: BrowserJourneyBrowserPort;
   topology: () => BrowserTopologyEvidence;
+  topologyKey: Uint8Array;
   lease: BrowserProfileLeasePort;
   clock: () => number;
 }>;
@@ -151,17 +158,80 @@ function browserTarget(candidateTarget: unknown): BrowserVercelProjectTarget | n
   return parsed.ok && parsed.value.operation === "browser.vercel_project.inspect.v1" ? parsed.value : null;
 }
 
-export function browserTopologyIsProtected(evidence: BrowserTopologyEvidence, now: number): boolean {
-  return evidence.schemaVersion === 1 &&
-    safeId(evidence.evidenceId) &&
-    safeTimestamp(evidence.observedAt) &&
-    safeTimestamp(evidence.expiresAt) &&
-    evidence.observedAt <= now &&
-    now < evidence.expiresAt &&
-    evidence.controllerMayAdminProfiles === false &&
-    evidence.controllerMayAdminGrants === false &&
-    evidence.workerMayAdminProfiles === false &&
-    evidence.workerMayAdminGrants === false;
+const TOPOLOGY_EVIDENCE_KEYS = Object.freeze([
+  "schemaVersion",
+  "evidenceId",
+  "observedAt",
+  "expiresAt",
+  "controllerMayAdminProfiles",
+  "controllerMayAdminGrants",
+  "workerMayAdminProfiles",
+  "workerMayAdminGrants",
+] as const);
+
+function topologyEvidencePayload(evidence: BrowserTopologyEvidencePayload): BrowserTopologyEvidencePayload {
+  return {
+    schemaVersion: evidence.schemaVersion,
+    evidenceId: evidence.evidenceId,
+    observedAt: evidence.observedAt,
+    expiresAt: evidence.expiresAt,
+    controllerMayAdminProfiles: evidence.controllerMayAdminProfiles,
+    controllerMayAdminGrants: evidence.controllerMayAdminGrants,
+    workerMayAdminProfiles: evidence.workerMayAdminProfiles,
+    workerMayAdminGrants: evidence.workerMayAdminGrants,
+  };
+}
+
+function topologyAttestation(evidence: BrowserTopologyEvidencePayload, key: Uint8Array): string {
+  if (key.byteLength !== 32) throw new Error("browser_topology_key_invalid");
+  return createHmac("sha256", Buffer.from(key))
+    .update(canonicalBrokerJson(topologyEvidencePayload(evidence)), "utf8")
+    .digest("hex");
+}
+
+export function attestBrowserTopologyEvidence(
+  evidence: BrowserTopologyEvidencePayload,
+  key: Uint8Array,
+): BrowserTopologyEvidence {
+  return Object.freeze({
+    ...topologyEvidencePayload(evidence),
+    attestation: topologyAttestation(evidence, key),
+  });
+}
+
+function hasExactTopologyEvidenceKeys(candidateEvidence: object): boolean {
+  const keys = Object.keys(candidateEvidence);
+  return keys.length === TOPOLOGY_EVIDENCE_KEYS.length + 1 &&
+    [...TOPOLOGY_EVIDENCE_KEYS, "attestation"].every((key) => keys.includes(key));
+}
+
+export function browserTopologyIsProtected(
+  evidence: BrowserTopologyEvidence,
+  now: number,
+  key: Uint8Array,
+): boolean {
+  try {
+    if (!evidence || typeof evidence !== "object" || !hasExactTopologyEvidenceKeys(evidence)) return false;
+    if (
+      evidence.schemaVersion !== 1 ||
+      !safeId(evidence.evidenceId) ||
+      !safeTimestamp(evidence.observedAt) ||
+      !safeTimestamp(evidence.expiresAt) ||
+      evidence.observedAt > now ||
+      now >= evidence.expiresAt ||
+      evidence.controllerMayAdminProfiles !== false ||
+      evidence.controllerMayAdminGrants !== false ||
+      evidence.workerMayAdminProfiles !== false ||
+      evidence.workerMayAdminGrants !== false ||
+      typeof evidence.attestation !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(evidence.attestation)
+    ) return false;
+    const expected = Buffer.from(topologyAttestation(evidence, key), "hex");
+    const supplied = Buffer.from(evidence.attestation, "hex");
+    return expected.length === supplied.length && timingSafeEqual(expected, supplied);
+  } catch {
+    return false;
+  }
 }
 
 function journeyPath(target: BrowserVercelProjectTarget): string {
@@ -188,30 +258,51 @@ const deny = (reason) => ({ ok: false, reason });
 try {
   const initial = new URL(page.url());
   if (initial.origin !== EXPECTED_ORIGIN) return deny("stale_tab");
-  await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded" });
-  const finalUrl = new URL(page.url());
-  if (finalUrl.origin !== EXPECTED_ORIGIN) return deny("login_redirect");
-  if (finalUrl.pathname !== EXPECTED_PATH) return deny("wrong_project");
-  const frameOrigins = page.frames().map((frame) => new URL(frame.url()).origin);
-  if (frameOrigins.some((frameOrigin) => frameOrigin !== EXPECTED_ORIGIN)) return deny("cross_origin_frame");
-  if (await page.locator('input[type="password"]').count() > 0) return deny("login_redirect");
-  const projectHeading = page.getByRole("heading", { name: EXPECTED_PROJECT, exact: true });
-  if (await projectHeading.count() !== 1) return deny("wrong_project");
-  const teamLinks = page.locator('a[href^="/"]');
-  let teamMatches = false;
-  for (let index = 0; index < await teamLinks.count(); index += 1) {
-    if (await teamLinks.nth(index).getAttribute("href") === "/" + EXPECTED_TEAM) teamMatches = true;
-  }
-  if (!teamMatches) return deny("wrong_team");
-  return {
-    ok: true,
-    origin: EXPECTED_ORIGIN,
-    frameOrigins,
-    teamSlug: EXPECTED_TEAM,
-    projectName: EXPECTED_PROJECT,
-    sessionStatus: "authenticated",
-    observedAt: Date.now()
+  let crossOriginNavigation = false;
+  const trackNavigation = (request) => {
+    if (!request.isNavigationRequest()) return;
+    let current = request;
+    while (current) {
+      try {
+        if (new URL(current.url()).origin !== EXPECTED_ORIGIN) crossOriginNavigation = true;
+      } catch {
+        crossOriginNavigation = true;
+      }
+      current = current.redirectedFrom();
+    }
   };
+  page.on("request", trackNavigation);
+  try {
+    await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded" });
+    if (crossOriginNavigation) return deny("login_redirect");
+    const finalUrl = new URL(page.url());
+    if (finalUrl.origin !== EXPECTED_ORIGIN) return deny("login_redirect");
+    if (finalUrl.pathname !== EXPECTED_PATH) return deny("wrong_project");
+    const frameOrigins = page.frames().map((frame) => new URL(frame.url()).origin);
+    if (frameOrigins.some((frameOrigin) => frameOrigin !== EXPECTED_ORIGIN)) return deny("cross_origin_frame");
+    if (await page.locator('input[type="password"]').count() > 0) return deny("login_redirect");
+    const projectHeading = page.getByRole("heading", { name: EXPECTED_PROJECT, exact: true });
+    if (await projectHeading.count() !== 1) return deny("wrong_project");
+    const teamLinks = page.locator('a[href^="/"]');
+    let teamMatches = false;
+    for (let index = 0; index < await teamLinks.count(); index += 1) {
+      if (await teamLinks.nth(index).getAttribute("href") === "/" + EXPECTED_TEAM) teamMatches = true;
+    }
+    if (!teamMatches) return deny("wrong_team");
+    return {
+      ok: true,
+      origin: EXPECTED_ORIGIN,
+      frameOrigins,
+      teamSlug: EXPECTED_TEAM,
+      projectName: EXPECTED_PROJECT,
+      sessionStatus: "authenticated",
+      observedAt: Date.now()
+    };
+  } catch {
+    return deny(crossOriginNavigation ? "login_redirect" : "ambiguous");
+  } finally {
+    page.off("request", trackNavigation);
+  }
 } catch {
   return deny("ambiguous");
 }`.trim();
@@ -275,7 +366,7 @@ export function createVercelBrowserJourneyExecutor(
       } catch {
         return browserJourneyFailure("unsafe_topology");
       }
-      if (!browserTopologyIsProtected(topology, now)) return browserJourneyFailure("unsafe_topology");
+      if (!browserTopologyIsProtected(topology, now, dependencies.topologyKey)) return browserJourneyFailure("unsafe_topology");
       if (input.signal?.aborted || !currentLease(dependencies.lease, target, input.leaseId)) {
         return browserJourneyFailure("reconciliation_required");
       }
@@ -320,7 +411,7 @@ export function createVercelBrowserJourneyExecutor(
       } catch {
         return browserJourneyFailure("unsafe_topology");
       }
-      if (!browserTopologyIsProtected(topologyAfter, dependencies.clock()) || topologyAfter.evidenceId !== topology.evidenceId) {
+      if (!browserTopologyIsProtected(topologyAfter, dependencies.clock(), dependencies.topologyKey) || topologyAfter.evidenceId !== topology.evidenceId) {
         return browserJourneyFailure("unsafe_topology");
       }
       if (
@@ -490,14 +581,14 @@ export function createBbBrowserJourneyBrowserPort(options: Readonly<{ invoke?: B
     async runVercelProjectJourney(target) {
       const journey = buildVercelBrowserJourney(target);
       const opened = parseOpenTab(await run([
-        "browser", "open", journey.url, "--profile", target.profileId,
+        "browser", "open", journey.url, "--host", target.hostId, "--profile", target.profileId,
         "--timeout", String(VERCEL_BROWSER_JOURNEY_TIMEOUT_MS), "--json",
       ]));
       if (opened.origin !== journey.origin) throw new Error("browser_origin_denied");
       const observation = parseJourneyObservation(await run([
         "browser", "script", "--purpose", VERCEL_BROWSER_JOURNEY_PURPOSE,
         "--code", journey.script, "--origin", journey.origin,
-        "--profile", target.profileId, "--tab", opened.tabId,
+        "--host", target.hostId, "--profile", target.profileId, "--tab", opened.tabId,
         "--timeout", String(VERCEL_BROWSER_JOURNEY_TIMEOUT_MS), "--json",
       ]), opened.tabId);
       return observation;

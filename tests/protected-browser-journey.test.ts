@@ -3,6 +3,7 @@ import {
   BROWSER_REQUIRED_CAPABILITIES,
   VERCEL_BROWSER_JOURNEY_CONNECTOR_VERSION,
   VERCEL_BROWSER_JOURNEY_PURPOSE,
+  attestBrowserTopologyEvidence,
   buildVercelBrowserJourney,
   browserTopologyIsProtected,
   createBbBrowserJourneyBrowserPort,
@@ -24,6 +25,7 @@ import { FOUNDATION_BROKER_POLICY_DIGEST } from "../src/credentials/protocol";
 import { assertCanaryAbsent, temporaryBrokerDatabase } from "./support/credential-broker-fixtures";
 
 const NOW = 1_800_000_000_000;
+const TOPOLOGY_KEY = new Uint8Array(32).fill(0x41);
 
 const target: BrowserVercelProjectTarget = {
   operation: "browser.vercel_project.inspect.v1",
@@ -36,7 +38,7 @@ const target: BrowserVercelProjectTarget = {
   projectName: "hanoon",
 };
 
-const topology: BrowserTopologyEvidence = {
+const topology = attestBrowserTopologyEvidence({
   schemaVersion: 1,
   evidenceId: "topology-1",
   observedAt: NOW,
@@ -45,7 +47,7 @@ const topology: BrowserTopologyEvidence = {
   controllerMayAdminGrants: false,
   workerMayAdminProfiles: false,
   workerMayAdminGrants: false,
-};
+}, TOPOLOGY_KEY);
 
 const status: BrowserStatusObservation = {
   hostId: target.hostId,
@@ -93,6 +95,8 @@ describe("protected Vercel browser journey contract", () => {
     });
     expect(journey.script).toContain(VERCEL_BROWSER_ORIGIN);
     expect(journey.script).toContain("getByRole");
+    expect(journey.script).toContain("redirectedFrom");
+    expect(journey.script).toContain('page.on("request"');
     expect(journey.script).not.toContain("page.content");
     expect(journey.script).not.toContain("document.cookie");
     expect(journey.script).not.toContain("localStorage");
@@ -100,10 +104,51 @@ describe("protected Vercel browser journey contract", () => {
     expect(VERCEL_BROWSER_JOURNEY_CONNECTOR_VERSION).toBe("browser-journey-1");
   });
 
+  it("rejects an intermediate cross-origin redirect even when navigation returns home", async () => {
+    const journey = buildVercelBrowserJourney(target);
+    type FakeRequest = {
+      isNavigationRequest(): boolean;
+      url(): string;
+      redirectedFrom(): FakeRequest | null;
+    };
+    const listeners = new Map<string, (request: FakeRequest) => void>();
+    let currentUrl = journey.url;
+    const initialRequest: FakeRequest = {
+      isNavigationRequest: () => true,
+      url: () => journey.url,
+      redirectedFrom: () => null,
+    };
+    const crossOriginRequest: FakeRequest = {
+      isNavigationRequest: () => true,
+      url: () => "https://evil.example/login",
+      redirectedFrom: () => initialRequest,
+    };
+    const page = {
+      url: () => currentUrl,
+      on: (event: string, listener: (request: FakeRequest) => void) => listeners.set(event, listener),
+      off: (event: string) => listeners.delete(event),
+      goto: async () => {
+        listeners.get("request")?.(initialRequest);
+        listeners.get("request")?.(crossOriginRequest);
+        currentUrl = journey.url;
+      },
+      frames: () => [{ url: () => journey.origin }],
+      locator: (selector: string) => selector.includes("password")
+        ? { count: async () => 0 }
+        : { count: async () => 1, nth: () => ({ getAttribute: async () => "/" + target.teamSlug }) },
+      getByRole: () => ({ count: async () => 1 }),
+    };
+    const execute = new Function("page", `return (async () => { ${journey.script} })();`) as (value: typeof page) => Promise<unknown>;
+
+    await expect(execute(page)).resolves.toEqual({ ok: false, reason: "login_redirect" });
+    expect(listeners.size).toBe(0);
+  });
+
   it("admits only explicit protected-topology evidence", () => {
-    expect(browserTopologyIsProtected(topology, NOW)).toBe(true);
-    expect(browserTopologyIsProtected({ ...topology, workerMayAdminGrants: true }, NOW)).toBe(false);
-    expect(browserTopologyIsProtected({ ...topology, expiresAt: NOW }, NOW)).toBe(false);
+    expect(browserTopologyIsProtected(topology, NOW, TOPOLOGY_KEY)).toBe(true);
+    expect(browserTopologyIsProtected({ ...topology, workerMayAdminGrants: true }, NOW, TOPOLOGY_KEY)).toBe(false);
+    expect(browserTopologyIsProtected({ ...topology, expiresAt: NOW }, NOW, TOPOLOGY_KEY)).toBe(false);
+    expect(browserTopologyIsProtected({ ...topology, attestation: "0".repeat(64) }, NOW, TOPOLOGY_KEY)).toBe(false);
   });
 
   it("rejects arbitrary journey controls instead of forwarding them", () => {
@@ -120,6 +165,7 @@ describe("protected Vercel browser journey contract", () => {
     const executor = createVercelBrowserJourneyExecutor({
       browser: port,
       topology: () => topology,
+      topologyKey: TOPOLOGY_KEY,
       lease: { isCurrent: () => true },
       clock: () => NOW,
     });
@@ -191,6 +237,7 @@ describe("protected Vercel browser journey contract", () => {
     const executor = createVercelBrowserJourneyExecutor({
       browser: port,
       topology: "topology" in overrides ? overrides.topology : (() => topology),
+      topologyKey: TOPOLOGY_KEY,
       lease: { isCurrent: () => true },
       clock: () => NOW,
     });
@@ -208,6 +255,7 @@ describe("protected Vercel browser journey contract", () => {
     const executor = createVercelBrowserJourneyExecutor({
       browser: port,
       topology: () => topology,
+      topologyKey: TOPOLOGY_KEY,
       lease: { isCurrent: () => {
         checks += 1;
         return checks === 1;
@@ -231,6 +279,7 @@ describe("protected Vercel browser journey contract", () => {
     const executor = createVercelBrowserJourneyExecutor({
       browser: port,
       topology: () => topology,
+      topologyKey: TOPOLOGY_KEY,
       lease: { isCurrent: () => true },
       clock: () => NOW,
     });
@@ -269,12 +318,15 @@ describe("protected Vercel browser journey contract", () => {
     expect(calls[0]).toEqual(["browser", "status", "--host", target.hostId, "--profile", target.profileId, "--json"]);
     expect(calls[1]).toEqual(["browser", "grants", "--host", target.hostId, "--profile", target.profileId, "--json"]);
     expect(calls[2]).toEqual([
-      "browser", "open", "https://vercel.com/vercel-team/hanoon", "--profile", target.profileId,
+      "browser", "open", "https://vercel.com/vercel-team/hanoon", "--host", target.hostId,
+      "--profile", target.profileId,
       "--timeout", "15000", "--json",
     ]);
     expect(calls[3]?.slice(0, 2)).toEqual(["browser", "script"]);
     expect(calls[3]).toContain("--origin");
     expect(calls[3]).toContain(target.origin);
+    expect(calls[3]).toContain("--host");
+    expect(calls[3]).toContain(target.hostId);
     expect(calls[3]).toContain("--profile");
     expect(calls[3]).toContain(target.profileId);
     expect(calls[3]).toContain("--tab");
