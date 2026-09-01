@@ -28,6 +28,13 @@ import { BrokerProtectedConnectorStore } from "../../broker/src/connector-store"
 import { ProtectedConnectorAuthorityService } from "../../broker/src/connector-authority-service";
 import { createAdminServer, type RunningAdminServer } from "../../broker/src/admin-server";
 import { createDurableProtectedConnectorAuthority } from "../../broker/src/main";
+import {
+  BROWSER_REQUIRED_CAPABILITIES,
+  attestBrowserTopologyEvidence,
+  createBbBrowserJourneyBrowserPort,
+  createVercelBrowserJourneyExecutor,
+  type BrowserTopologyEvidence,
+} from "../../broker/src/browser-journey";
 import { createOnePasswordAdapter, type VaultAdapter } from "../../broker/src/onepassword-adapter";
 import {
   createProtectedConnectorExecutor,
@@ -204,8 +211,10 @@ export type ProtectedConnectorIntegrationHarness = Readonly<{
   operation: ProtectedConnectorOperation;
   bindingId: string;
   providerCalls: string[];
+  browserCalls: string[][];
   releaseStalledProvider(): void;
   restartBrokerAuthority(): Promise<void>;
+  restartBrowserInstance(): Promise<void>;
   provider: https.Server;
   brokerServer: RunningServer;
   client: CredentialBrokerClient;
@@ -221,6 +230,8 @@ export type ProtectedConnectorIntegrationHarnessOptions = Readonly<{
   auditWritable?: boolean;
   operation?: ProtectedConnectorOperation;
   capabilityEvidence?: "current" | "missing" | "stale";
+  browserAdministrationIsolated?: boolean;
+  browserCanary?: string;
 }>;
 
 export function cleanupProtectedConnectorIntegrationFixtures(): void {
@@ -254,6 +265,18 @@ export async function createProtectedConnectorIntegrationHarness(
     throw new Error("integration_owner_pairing_failed");
   }
   const providerCalls: string[] = [];
+  const browserCalls: string[][] = [];
+  const browserTopologyKey = new Uint8Array(32).fill(0x33);
+  const browserTopology: BrowserTopologyEvidence = attestBrowserTopologyEvidence({
+    schemaVersion: 1,
+    evidenceId: "integration-browser-topology",
+    observedAt: INTEGRATION_NOW - 1_000,
+    expiresAt: INTEGRATION_NOW + 60_000,
+    controllerMayAdminProfiles: false,
+    controllerMayAdminGrants: false,
+    workerMayAdminProfiles: false,
+    workerMayAdminGrants: false,
+  }, browserTopologyKey);
   let brokerServer: RunningServer | undefined;
   let provider: https.Server | undefined;
   let adminServer: RunningAdminServer | undefined;
@@ -372,12 +395,68 @@ export async function createProtectedConnectorIntegrationHarness(
       credentials: { resolve: adapter.resolveCredential },
       clock: () => INTEGRATION_NOW,
     });
+    // Synthetic BB Browser boundary: it records the fixed argv and returns
+    // bounded fixtures; it never launches a browser or contacts Vercel.
+    const browserInvoker = async (argv: readonly string[]): Promise<unknown> => {
+      browserCalls.push([...argv]);
+      const secretFields = options.browserCanary === undefined ? {} : {
+        cookie: options.browserCanary,
+        storage: { session: options.browserCanary },
+        dom: options.browserCanary,
+        screenshot: options.browserCanary,
+        rawBody: options.browserCanary,
+      };
+      if (argv[1] === "status") return {
+        ...secretFields,
+        hostId: target.operation === "browser.vercel_project.inspect.v1" ? target.hostId : "host-integration",
+        profileId: target.operation === "browser.vercel_project.inspect.v1" ? target.profileId : "profile-integration",
+        state: "ready",
+        capabilities: BROWSER_REQUIRED_CAPABILITIES.map((id) => ({ id, status: "ready" })),
+      };
+      if (argv[1] === "grants") return { ...secretFields, grants: [{
+        id: "grant-integration",
+        hostId: "host-integration",
+        profileId: "profile-integration",
+        origin: "https://vercel.com",
+        state: "active",
+        expiresAt: INTEGRATION_NOW + 60_000,
+      }] };
+      if (argv[1] === "open") return { ...secretFields, tabId: "tab-integration", url: argv[2] };
+      return { result: {
+        ...secretFields,
+        ok: true,
+        origin: "https://vercel.com",
+        frameOrigins: ["https://vercel.com"],
+        teamSlug: "team-slug",
+        projectName: "hanoon",
+        sessionStatus: "authenticated",
+        observedAt: INTEGRATION_NOW,
+      } };
+    };
+    const createBrowserExecutor = () => createVercelBrowserJourneyExecutor({
+      browser: createBbBrowserJourneyBrowserPort({ invoke: browserInvoker }),
+      topology: () => browserTopology,
+      topologyKey: browserTopologyKey,
+      lease: {
+        isCurrent: (input) => connectors.isBrowserProfileLeaseCurrentForTarget({
+          leaseId: input.leaseId,
+          hostId: input.hostId,
+          profileId: input.profileId,
+          now: INTEGRATION_NOW,
+        }),
+      },
+      clock: () => INTEGRATION_NOW,
+    });
+    let browserExecutor = createBrowserExecutor();
     const createAuthority = (): void => {
       const durableAuthority = createDurableProtectedConnectorAuthority(broker, connectors, () => INTEGRATION_NOW);
       authority = new ProtectedConnectorAuthorityService({
         foundationStore: broker,
         connectorStore: connectors,
-        executor: providerExecutor,
+        executor: {
+          ...providerExecutor,
+          inspectBrowserVercel: browserExecutor.inspectBrowserVercel,
+        },
         authority: options.auditWritable === undefined
           ? durableAuthority
           : { ...durableAuthority, auditWritable: () => options.auditWritable === true },
@@ -417,18 +496,20 @@ export async function createProtectedConnectorIntegrationHarness(
               completedAt: INTEGRATION_NOW,
             } satisfies BrokerResponseEnvelope);
           }
-          if (input.request.schemaVersion !== 2) throw new Error("integration_protocol_version_mismatch");
-          return authority!.execute({
-            certificateFingerprint: input.certificateFingerprint,
-            request: input.request,
-            now: input.now,
-          });
+          throw new Error("integration_protected_service_required");
         },
-        attestExecutorFence: ({ certificateFingerprint, now, attestation }) => {
-          const installation = broker.getInstallationByCertificate(certificateFingerprint);
-          return installation?.installationId === attestation.installationId &&
-            broker.attestExecutorFence({ ...attestation, now });
-        },
+      attestExecutorFence: ({ certificateFingerprint, now, attestation }) => {
+        const installation = broker.getInstallationByCertificate(certificateFingerprint);
+        return installation?.installationId === attestation.installationId &&
+          broker.attestExecutorFence({ ...attestation, now });
+      },
+      },
+      protectedService: {
+        execute: (input) => authority!.execute({
+          certificateFingerprint: input.certificateFingerprint,
+          request: input.request,
+          now: input.now,
+        }),
       },
       clock: () => INTEGRATION_NOW,
     });
@@ -516,7 +597,7 @@ export async function createProtectedConnectorIntegrationHarness(
       config: () => ({ state: "isolated", value: clientConfig }),
       trustKernelReady: () => true,
       topologyReady: () => true,
-      browserAdministrationIsolated: () => false,
+      browserAdministrationIsolated: () => options.browserAdministrationIsolated === true,
       auditWritable: () => true,
       fullReadiness: async () => (await credentialAccess.status({})).readiness,
       projectPolicyDigest: () => PROTECTED_CONNECTOR_POLICY_DIGEST,
@@ -553,6 +634,7 @@ export async function createProtectedConnectorIntegrationHarness(
       operation,
       bindingId,
       providerCalls,
+      browserCalls,
       provider,
       brokerServer,
       client,
@@ -587,6 +669,10 @@ export async function createProtectedConnectorIntegrationHarness(
           brokerVersion: "0.1.0",
         });
         await adminServer.start();
+      },
+      restartBrowserInstance: async () => {
+        browserExecutor = createBrowserExecutor();
+        createAuthority();
       },
       close: async () => {
         stalledProviderResponse?.destroy();

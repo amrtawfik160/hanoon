@@ -15,7 +15,7 @@ import { assertCanaryAbsent, sqliteCanarySurfaces } from "./support/credential-b
 
 afterAll(() => cleanupProtectedConnectorIntegrationFixtures());
 
-describe("protected connector production composition", () => {
+describe("protected connector synthetic production composition", () => {
   const inspect = (harness: Awaited<ReturnType<typeof createProtectedConnectorIntegrationHarness>>, signal: AbortSignal) =>
     harness.hostHarness.behavior.callAgentTool(
       "telegram_agent_connector_inspect",
@@ -89,7 +89,7 @@ describe("protected connector production composition", () => {
     }
   });
 
-  it("crosses the selected controller receipt and real Vercel provider path", async () => {
+  it("crosses the selected controller receipt and fixed Vercel provider path", async () => {
     const harness = await createProtectedConnectorIntegrationHarness({ operation: "vercel.project.inspect.v1" });
     try {
       const turn = harness.hanoon.getControllerTurn(harness.turnId);
@@ -116,6 +116,53 @@ describe("protected connector production composition", () => {
       expect(result).toMatchObject({ outcome: "succeeded" });
       expect((result as { identity?: { projectId?: string } }).identity?.projectId).toBe("vercel-project-id");
       expect(harness.providerCalls).toEqual(["GET /v9/projects/hanoon?teamId=team-id"]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("crosses the selected controller receipt, broker TLS, browser adapter, durable receipt, and same-profile restart replay", async () => {
+    const harness = await createProtectedConnectorIntegrationHarness({
+      operation: "browser.vercel_project.inspect.v1",
+      browserAdministrationIsolated: true,
+    });
+    try {
+      const first = parsed(await inspect(harness, new AbortController().signal)) as {
+        outcome: string;
+        identity?: { profileId?: string; origin?: string; projectName?: string };
+        receiptId?: string;
+      };
+      expect(first).toMatchObject({
+        outcome: "succeeded",
+        identity: {
+          profileId: "profile-integration",
+          origin: "https://vercel.com",
+          projectName: "hanoon",
+        },
+      });
+      expect(first.receiptId).toBeTruthy();
+      expect(harness.browserCalls.map((argv) => argv.slice(0, 2))).toEqual([
+        ["browser", "status"],
+        ["browser", "grants"],
+        ["browser", "open"],
+        ["browser", "script"],
+      ]);
+      expect(harness.browserCalls[2]).toContain("https://vercel.com/team-slug/hanoon");
+      expect(harness.browserCalls[3]).toContain("--origin");
+      expect(harness.browserCalls[3]).toContain("https://vercel.com");
+      expect(harness.browserCalls[3]).not.toContain("--screenshot");
+      expect(harness.hanoon.getProtectedConnectorBinding(
+        "installation-integration",
+        "binding-browser",
+      )).toMatchObject({ state: "active" });
+      expect(harness.brokerDatabase.db.prepare(
+        "SELECT count(*) AS count FROM broker_connector_receipts WHERE operation = 'browser.vercel_project.inspect.v1'",
+      ).get()).toEqual({ count: 1 });
+
+      await harness.restartBrowserInstance();
+      const replay = parsed(await inspect(harness, new AbortController().signal));
+      expect(replay).toMatchObject({ outcome: "succeeded", receiptId: first.receiptId });
+      expect(harness.browserCalls).toHaveLength(4);
     } finally {
       await harness.close();
     }
@@ -364,7 +411,53 @@ describe("protected connector production composition", () => {
     }
   });
 
-  it("closes the real composed path on audit failure before provider I/O and on receipt persistence failure", async () => {
+  it("keeps synthetic browser cookie, storage, DOM, screenshot, and raw-response canaries out of evidence", async () => {
+    const canary = "BROWSER-INTEGRATION-CANARY-70";
+    const harness = await createProtectedConnectorIntegrationHarness({
+      operation: "browser.vercel_project.inspect.v1",
+      browserAdministrationIsolated: true,
+      browserCanary: canary,
+    });
+    const artifactDirectory = mkdtempSync(join(tmpdir(), "protected-browser-canary-"));
+    try {
+      const result = await inspect(harness, new AbortController().signal);
+      const artifactPath = join(artifactDirectory, "browser-canary-evidence.json");
+      writeFileSync(artifactPath, JSON.stringify({
+        argv: process.argv,
+        result,
+        browserCalls: harness.browserCalls,
+        logs: harness.hostHarness.inspection.logEntries,
+        errors: [],
+        threadOutput: [result],
+        receipts: {
+          broker: harness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
+          hanoon: harness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
+        },
+      }));
+      assertCanaryAbsent([
+        { name: "controller-result", value: typeof result === "string" ? result : JSON.stringify(result) },
+        { name: "argv", value: JSON.stringify(process.argv) },
+        { name: "browser-argv", value: JSON.stringify(harness.browserCalls) },
+        { name: "logs", value: JSON.stringify(harness.hostHarness.inspection.logEntries) },
+        { name: "errors", value: "[]" },
+        { name: "thread-output", value: JSON.stringify([result]) },
+        { name: "receipts", value: JSON.stringify({
+          broker: harness.brokerDatabase.db.prepare("SELECT * FROM broker_connector_receipts").all(),
+          hanoon: harness.bb.storage.database().prepare("SELECT * FROM credential_connector_receipts").all(),
+        }) },
+        { name: "test-artifact", path: artifactPath },
+        ...sqliteCanarySurfaces(harness.brokerDatabase.databasePath, "broker"),
+        ...sqliteCanarySurfaces(harness.bb.storage.database().name, "hanoon"),
+      ], [canary]);
+      expect(parsed(result)).toMatchObject({ outcome: "succeeded" });
+      expect(harness.browserCalls).toHaveLength(4);
+    } finally {
+      await harness.close();
+      rmSync(artifactDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("closes the composed path on audit failure before provider I/O and on receipt persistence failure", async () => {
     const auditHarness = await createProtectedConnectorIntegrationHarness({ auditWritable: false });
     try {
       const denied = parsed(await inspect(auditHarness, new AbortController().signal));

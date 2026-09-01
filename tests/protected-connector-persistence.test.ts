@@ -411,6 +411,56 @@ describe("append-only schema compatibility", () => {
       .toEqual({ name: "credential_connector_bindings" });
   });
 
+  it("restarts an interrupted protected connector migration without losing version-1 rows", () => {
+    const { bb } = createFakePluginHost({ pluginId: "protected-connector-hanoon-migration-restart" });
+    const db = bb.storage.database();
+    registerWorkArtifactRelationshipValidation(db);
+    const foundationMigrations = ALL_MIGRATIONS.slice(0, -PROTECTED_CONNECTOR_MIGRATIONS.length);
+    bb.storage.migrate(db, foundationMigrations);
+    db.prepare(`
+      INSERT INTO credential_bindings (
+        installation_id, binding_id, label, provider, state, generation,
+        capability_ids_json, risk, mfa_mode, approval_mode, last_verified_at,
+        created_at, updated_at
+      ) VALUES ('installation-v1-restart', 'binding-v1-restart', 'Legacy', 'onepassword', 'vault_verified', 1,
+        '[]', 'low', 'none', 'none', ?, ?, ?)
+    `).run(NOW, NOW, NOW);
+    const legacyBindingBefore = db.prepare(
+      "SELECT installation_id, binding_id, state, generation FROM credential_bindings WHERE binding_id = 'binding-v1-restart'",
+    ).get();
+    const originalMigrate = bb.storage.migrate.bind(bb.storage);
+    let interrupted = false;
+    bb.storage.migrate = (database, statements) => {
+      if (!interrupted && statements.length === ALL_MIGRATIONS.length) {
+        interrupted = true;
+        throw new Error("interrupt-protected-connector-migration");
+      }
+      originalMigrate(database, statements);
+    };
+    try {
+      expect(() => openStore(bb.storage, bb.storage.kv, () => NOW)).toThrow(/interrupt-protected-connector-migration/);
+    } finally {
+      bb.storage.migrate = originalMigrate;
+    }
+    expect(db.prepare(
+      "SELECT installation_id, binding_id, state, generation FROM credential_bindings WHERE binding_id = 'binding-v1-restart'",
+    ).get()).toEqual(legacyBindingBefore);
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_connector_bindings'",
+    ).get()).toBeUndefined();
+
+    openStore(bb.storage, bb.storage.kv, () => NOW);
+    expect(db.prepare(
+      "SELECT installation_id, binding_id, state, generation FROM credential_bindings WHERE binding_id = 'binding-v1-restart'",
+    ).get()).toEqual(legacyBindingBefore);
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_connector_bindings'",
+    ).get()).toEqual({ name: "credential_connector_bindings" });
+    expect(db.prepare("PRAGMA table_info(credential_connector_operations)").all()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "capability_profile_id" })]),
+    );
+  });
+
   it("migrates and restarts a shipped broker foundation without changing version-1 rows", async () => {
     const fixture = temporaryBrokerDatabase();
     try {
