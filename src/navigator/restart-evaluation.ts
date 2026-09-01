@@ -11,8 +11,13 @@ import { navigatorAcceptanceCriteria } from "./implementation-contracts";
 import {
   NavigatorImplementationExecutor,
   type NavigatorGitObservationRequest,
-  type NavigatorTicketWorkerAttempt,
 } from "./implementation-executor";
+import {
+  createNavigatorTicketEffectAdapter,
+  type NavigatorTicketWorkerInput,
+  type NavigatorTicketWorkerOperation,
+} from "./ticket-adapter";
+import { NavigatorEffectProtocol } from "./effect-protocol";
 import type { NavigatorEvaluationCase } from "./evaluation-corpus";
 import type { DualEngineRestartPoint } from "./promotion";
 
@@ -108,9 +113,9 @@ function gitObservation(request: NavigatorGitObservationRequest) {
   };
 }
 
-function workerResult(attempt: NavigatorTicketWorkerAttempt, store: TelegramAgentStore) {
+function workerResult(input: NavigatorTicketWorkerInput) {
+  const { attempt, ticket: ticketSnapshot } = input;
   if (attempt.kind === "implementation") {
-    const ticketSnapshot = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
     return {
       kind: "implementation_result" as const,
       baseHeadSha: attempt.workOrder.baseHeadSha,
@@ -221,6 +226,12 @@ function openRestartJob(
     .run("shipped_change", JSON.stringify([]), selected.id);
   const lease = store.acquireExecutorLease(`restart-exec-${sequence}`, now(), 120_000);
   if (!lease.acquired) throw new Error("restart evaluation lease was unavailable");
+  database.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+     ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+  ).run(selected.id, projectResourceKey(projectId), `restart-exec-${sequence}`, lease.generation, now() + 100_000, now(), now());
   return { jobId: selected.id, specificationId, ticketId, leaseGeneration: lease.generation };
 }
 
@@ -268,19 +279,6 @@ function implementationExecutor(
   return new NavigatorImplementationExecutor({
     store,
     database,
-    workerRunner: {
-      run: async (attempt, hooks) => {
-        const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
-        await hooks.bindResource(resource);
-        return { resource, result: workerResult(attempt, store) };
-      },
-      reconcileUnavailableResource: async (resource) => ({
-        resource,
-        state: "missing" as const,
-        evidenceRef: "unavailable",
-        observedAt: 0,
-      }),
-    },
     gitObserver: { observe: async (request) => gitObservation(request) },
     pullRequests: {
       createOrRefresh: async (request) => ({
@@ -293,6 +291,36 @@ function implementationExecutor(
     },
     modelRoute: () => workerModelRoute(),
     clock: { now },
+  });
+}
+
+function ticketOperation(): NavigatorTicketWorkerOperation {
+  return {
+    run: async (input) => ({
+      resource: input.attempt.resource ?? { kind: "bb_thread", id: `thr_${input.attempt.id}` },
+      result: workerResult(input),
+    }),
+    reconcile: async (input) => ({
+      resource: input.attempt.resource ?? { kind: "bb_thread", id: `thr_${input.attempt.id}` },
+      result: workerResult(input),
+    }),
+    observe: async (request) => gitObservation(request),
+  };
+}
+
+function navigatorEffects(
+  store: TelegramAgentStore,
+  now: () => number,
+): NavigatorEffectProtocol {
+  const unused = async () => ({ outcome: "permanent" as const, reason: "unused restart evaluation adapter" });
+  return new NavigatorEffectProtocol({
+    store,
+    clock: { now },
+    adapters: [
+      { kind: "run_navigator_skill", execute: unused },
+      createNavigatorTicketEffectAdapter(ticketOperation()),
+      { kind: "run_navigator_release", execute: unused },
+    ],
   });
 }
 
@@ -475,6 +503,7 @@ async function measureWorkerSeamOnJob(
   point: Extract<DualEngineRestartPoint, "worker_dispatch" | "result_storage" | "head_change">,
 ): Promise<NavigatorRestartPointResult> {
   const executor = implementationExecutor(store, database, now);
+  const effects = navigatorEffects(store, now);
   executor.startIntegration({
     jobId: opened.jobId,
     specificationArtifactId: opened.specificationId,
@@ -513,8 +542,8 @@ async function measureWorkerSeamOnJob(
     generation: opened.leaseGeneration,
     signal: new AbortController().signal,
   };
-  await executor.processOne(fence, new AbortController().signal);
-  await executor.processOne(fence, new AbortController().signal);
+  await effects.processOne(fence, new AbortController().signal);
+  await effects.processOne(fence, new AbortController().signal);
   const workerEffects = store.listEffectsForJob(opened.jobId)
     .filter((effect) => effect.kind === "run_navigator_ticket_worker");
   const duplicateEffects = workerEffects.length - new Set(workerEffects.map((effect) => effect.idempotencyKey)).size;

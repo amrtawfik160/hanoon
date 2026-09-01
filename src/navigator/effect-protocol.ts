@@ -47,7 +47,11 @@ export type NavigatorEffectOutcome =
   | Readonly<{ outcome: "transient"; reason: string }>
   | Readonly<{ outcome: "permanent"; reason: string }>
   | Readonly<{ outcome: "lease_cancelled"; reason: string }>
-  | Readonly<{ outcome: "ambiguous"; reason: string }>;
+  | Readonly<{
+    outcome: "ambiguous";
+    reason: string;
+    resource?: Readonly<{ kind: "bb_thread"; id: string }>;
+  }>;
 
 export type NavigatorEffectAdapter = Readonly<{
   kind: NavigatorEffectKind;
@@ -670,14 +674,29 @@ export class NavigatorEffectProtocol {
     if (outcome.outcome !== "ambiguous" || !adapter.reconcile) return outcome;
     const current = this.dependencies.store.getEffect(effect.jobId, effect.idempotencyKey);
     if (!current || !this.leaseIsCurrent(current, context.fence, this.dependencies.clock.now())) return outcome;
+    const reconciliationContext = this.reconciliationContext(context, outcome);
     try {
-      const reconciled = await this.runWithInterruption(adapter.reconcile(context), context.signal);
+      const reconciled = await this.runWithInterruption(adapter.reconcile(reconciliationContext), context.signal);
       return reconciled.outcome === "ambiguous"
         ? { outcome: "transient", reason: `ambiguous outcome: ${reconciled.reason}` }
         : reconciled;
     } catch (error) {
       return { outcome: "transient", reason: `ambiguous reconciliation failed: ${safeReason(error, "unknown error")}` };
     }
+  }
+
+  private reconciliationContext(
+    context: NavigatorEffectContext,
+    outcome: Readonly<{ outcome: "ambiguous"; resource?: Readonly<{ kind: "bb_thread"; id: string }> }>,
+  ): NavigatorEffectContext {
+    if (context.kind !== "run_navigator_ticket_worker" || outcome.resource === undefined) return context;
+    return Object.freeze({
+      ...context,
+      ticket: cloneAndFreezeNavigatorValue({
+        ...context.ticket,
+        attempt: { ...context.ticket.attempt, resource: outcome.resource },
+      }),
+    });
   }
 
   private settleCurrent(
