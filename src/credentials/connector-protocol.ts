@@ -124,7 +124,6 @@ export type VercelProjectIdentity = Readonly<{
   projectId: string;
   projectName: string;
   teamId: string;
-  teamSlug: string;
   framework: (typeof VERCEL_PROJECT_FRAMEWORKS)[number];
   status: (typeof VERCEL_PROJECT_STATUSES)[number];
   connectorVersion: string;
@@ -247,7 +246,6 @@ const VERCEL_RESULT_KEYS = [
   "projectId",
   "projectName",
   "teamId",
-  "teamSlug",
   "framework",
   "status",
   "connectorVersion",
@@ -478,7 +476,6 @@ function parseIdentity(
       !isBoundedIdentity(value.projectId) ||
       !isBoundedIdentity(value.projectName) ||
       !isBoundedIdentity(value.teamId) ||
-      !isBoundedIdentity(value.teamSlug) ||
       !VERCEL_PROJECT_FRAMEWORKS.includes(value.framework as VercelProjectIdentity["framework"]) ||
       !VERCEL_PROJECT_STATUSES.includes(value.status as VercelProjectIdentity["status"]) ||
       typeof value.connectorVersion !== "string" ||

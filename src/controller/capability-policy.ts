@@ -39,6 +39,7 @@ export const CONTROLLER_TOOL_NAMES = Object.freeze([
   "telegram_agent_resume_project",
   "telegram_agent_add_reference",
   "telegram_agent_search_reference",
+  "telegram_agent_connector_inspect",
 ] as const);
 
 export const CONTROLLER_DATA_CLASSES = Object.freeze([
@@ -717,6 +718,23 @@ export const CONTROLLER_CAPABILITIES: Readonly<
     proof_kinds: ["retrieved_content"],
     receipt_kind: "observation",
     result_limit: 8_000,
+  }),
+  telegram_agent_connector_inspect: capability({
+    capability_id: "telegram_agent_connector_inspect",
+    schema_version: 1,
+    effect_class: "read",
+    risk_class: "low",
+    data_class: ["credential_metadata"],
+    reversibility: "not_applicable",
+    idempotency: "read",
+    approval: "none",
+    allowed_roles: ["controller"],
+    project_scope: "exact_entity",
+    credential_scope: { credential: "credential_broker", audience: "hanoon-credential-broker:v2" },
+    egress: ["credential_broker"],
+    proof_kinds: ["health_snapshot"],
+    receipt_kind: "observation",
+    result_limit: 4_000,
   }),
 });
 

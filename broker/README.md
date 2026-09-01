@@ -1,6 +1,6 @@
 # Hanoon Credential Broker
 
-This package runs the protected broker service on a Linux control-plane host. It exposes one private HTTPS route, `POST /v1/operations`, authenticated with TLS 1.3 client certificates. Installation and binding administration are available only through the local Unix socket used by `hanoon-credential-broker-admin`.
+This package runs the protected broker service on a Linux control-plane host. It exposes private HTTPS routes, `POST /v1/operations` and the executor-fence attestation route `POST /v1/fences`, authenticated with TLS 1.3 client certificates. Installation and binding administration are available only through the local Unix socket used by `hanoon-credential-broker-admin`.
 
 The broker returns binding metadata, health states, and audit receipt references. It never returns a resolved value, a vault reference, a vault id, a field value, a certificate private key, or a provider diagnostic.
 
@@ -90,6 +90,14 @@ sudo -u hanoon-broker /usr/bin/node /opt/hanoon-credential-broker/current/dist/b
 ```
 
 `installation add` accepts the public client certificate, a topology receipt digest and expiry, and the expected vault id. It returns only a generated installation id and state. `binding add` accepts one exact `op://<26-character-vault>/<26-character-item>/<field>` reference and returns only an opaque binding id, state, and generation. It does not make a binding active; a later provider-authoritative connector is required for application use.
+
+Typed connector enrollment is separate from the legacy vault binding command. Submit bounded JSON on protected standard input; the target and credential reference remain broker-private:
+
+```bash
+sudo -u hanoon-broker /usr/bin/node /opt/hanoon-credential-broker/current/dist/broker/src/admin-cli.js connector binding enroll --stdin
+```
+
+The request contains the project policy digest, one fixed Convex/Vercel/browser operation, its typed target, and (for workload identities) an opaque vault reference. The broker atomically records policy, encrypted target/reference, and audit events. The response contains only ids, state, generation, and the secret-free projection; it does not create credentials or provider resources. On Hanoon, from the active controller project context, run `bb telegram-agent access reconcile <project-id> --projection-json '<secret-free projection JSON>' --json`; this is a mutating local projection import, not a read-only inspection, and it accepts only the returned projection after the controller fence, active executor lease, and installation scope are checked. It does not contact the broker or verify a credential. Then use the owner-only guarded inspection tool. Current installation topology, audit, independent executor fence, and policy evidence is required before provider I/O, and the exact request envelope is persisted for restart/ambiguity recovery. The installed `@1password/sdk` 0.5.0 exposes no `AbortSignal` for `Secrets.resolveAll` and no public client close/dispose operation, so SDK-backed credential resolution fails closed before starting that operation; the repository's injected-port cancellation proof does not claim SDK transport cancellation. The repository's executable acceptance path uses synthetic local vault/TLS fixtures only.
 
 The HTTPS client certificate fingerprint, expected vault reference, encrypted external reference, and all resolved values remain broker-side. The local CLI output contains only stable states, opaque ids, counts, and failure classes.
 

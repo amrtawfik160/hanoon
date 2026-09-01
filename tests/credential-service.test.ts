@@ -337,14 +337,48 @@ describe("CredentialAccessService.status", () => {
     expect(result.binding).toBeNull();
   });
 
-  it("marks the operation ambiguous and keeps prior health on a client failure", async () => {
+  it("invalidates prior readiness when the current health observation fails", async () => {
     const fixture = serviceFixture();
     fixture.setConfig(isolatedConfig());
+    seedReconciledBinding(fixture.store);
     fixture.client.call.mockResolvedValue({ outcome: "ambiguous" } satisfies CredentialBrokerCallOutcome);
 
     const result = await fixture.service.status({});
     expect(result.readiness.state).toBe("unavailable");
-    expect(fixture.store.getCredentialHealth(INSTALLATION_ID)).toBeNull();
+    expect(fixture.store.getCredentialHealth(INSTALLATION_ID)).toMatchObject({
+      adapterState: "unavailable",
+      auditWritable: false,
+      lastSuccessAt: 2_000,
+      lastFailureClass: "result_ambiguous",
+    });
+  });
+
+  it("invalidates prior readiness when a schema-valid failed health response is receipted", async () => {
+    const fixture = serviceFixture();
+    fixture.setConfig(isolatedConfig());
+    seedReconciledBinding(fixture.store);
+    fixture.client.call.mockImplementation(async (envelope: BrokerRequestEnvelope) => ({
+      outcome: "succeeded",
+      response: healthResponse(envelope, {
+        outcome: "failed",
+        result: null,
+        failureClass: "provider_unavailable",
+        retryable: true,
+        retryAfterMs: 30_000,
+        health: null,
+        bindings: [],
+      }),
+    } satisfies CredentialBrokerCallOutcome));
+
+    const result = await fixture.service.status({});
+
+    expect(result.readiness.state).toBe("unavailable");
+    expect(fixture.store.getCredentialHealth(INSTALLATION_ID)).toMatchObject({
+      adapterState: "unavailable",
+      auditWritable: false,
+      lastSuccessAt: 2_000,
+      lastFailureClass: "provider_unavailable",
+    });
   });
 });
 

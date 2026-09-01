@@ -286,6 +286,58 @@ BEFORE DELETE ON broker_connector_admin_events
 BEGIN SELECT RAISE(ABORT, 'broker connector admin events are append-only'); END;
 `;
 
+/**
+ * Version three is deliberately separate from the shipped foundation schema.
+ * The v1 body is part of the on-disk compatibility contract; this migration
+ * widens its audit operation check without dropping any historical events.
+ */
+const BROKER_AUDIT_REBUILD_MIGRATION = String.raw`
+CREATE TABLE broker_admin_events_v3 (
+  event_id TEXT PRIMARY KEY,
+  operation TEXT NOT NULL CHECK (operation IN ('installation.add', 'installation.attest', 'installation.revoke', 'binding.add', 'binding.revoke', 'connector.binding.enroll')),
+  installation_id TEXT NOT NULL,
+  binding_id TEXT,
+  before_topology_digest TEXT,
+  after_topology_digest TEXT,
+  before_topology_expires_at INTEGER,
+  after_topology_expires_at INTEGER,
+  before_generation INTEGER,
+  after_generation INTEGER,
+  before_state TEXT,
+  after_state TEXT,
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed')),
+  occurred_at INTEGER NOT NULL CHECK (occurred_at >= 0)
+);
+INSERT INTO broker_admin_events_v3 (
+  event_id, operation, installation_id, binding_id,
+  before_topology_digest, after_topology_digest,
+  before_topology_expires_at, after_topology_expires_at,
+  before_generation, after_generation, before_state, after_state,
+  outcome, occurred_at
+)
+SELECT
+  event_id, operation, installation_id, binding_id,
+  before_topology_digest, after_topology_digest,
+  before_topology_expires_at, after_topology_expires_at,
+  before_generation, after_generation, before_state, after_state,
+  outcome, occurred_at
+FROM broker_admin_events;
+DROP TABLE broker_admin_events;
+ALTER TABLE broker_admin_events_v3 RENAME TO broker_admin_events;
+
+CREATE TABLE IF NOT EXISTS broker_connector_executor_fences (
+  installation_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  fence_owner TEXT NOT NULL CHECK (length(trim(fence_owner)) BETWEEN 1 AND 200),
+  fence_generation INTEGER NOT NULL CHECK (fence_generation >= 1),
+  expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (installation_id, task_id, project_id),
+  FOREIGN KEY (installation_id) REFERENCES broker_installations (installation_id)
+);
+`;
+
 export function applyBrokerMigrations(db: Database.Database): void {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
@@ -295,8 +347,16 @@ export function applyBrokerMigrations(db: Database.Database): void {
   for (const version of MIGRATION_VERSIONS) {
     const applied = db.prepare("SELECT 1 FROM broker_schema_migrations WHERE version = ?").get(version);
     if (!applied) {
-      db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (?, ?)")
-        .run(version, Date.now());
+      if (version === 3) {
+        db.transaction(() => {
+          db.exec(BROKER_AUDIT_REBUILD_MIGRATION);
+          db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (?, ?)")
+            .run(version, Date.now());
+        }).immediate();
+      } else {
+        db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (?, ?)")
+          .run(version, Date.now());
+      }
     }
   }
   if (db.name !== ":memory:") {

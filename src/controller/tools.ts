@@ -119,6 +119,13 @@ import {
 } from "./outbound-media";
 import { BROKER_BINDING_STATES, OPAQUE_ID_PATTERN } from "../credentials/protocol";
 import type { CredentialAccessService } from "../credentials/service";
+import type { ProtectedConnectorAccessService } from "../credentials/protected-connector-service";
+
+const PROTECTED_PROVIDER_OPERATIONS = [
+  "convex.project.inspect.v1",
+  "vercel.project.inspect.v1",
+  "browser.vercel_project.inspect.v1",
+] as const;
 
 export { CONTROLLER_TOOL_NAMES } from "./capability-policy";
 export const CONTROLLER_METADATA_TOOL_NAMES = CONTROLLER_METADATA_TOOL_IDS;
@@ -151,6 +158,7 @@ type ToolDependencies = {
   now(): number;
   /** Absent exactly when credential mode is disabled; the three access tools fail closed. */
   credentialAccess?: CredentialAccessService;
+  protectedConnectorAccess?: ProtectedConnectorAccessService;
   /** Current persisted controller provider; undefined means configuration is invalid. */
   controllerProviderId?: () => string | undefined;
   /** Current controller execution tuple, used when this turn opens a child thread. */
@@ -1069,6 +1077,10 @@ async function resolveTrustedScope(
       // denial, not an authorization boundary: an unknown binding id carries
       // no cross-tenant information the scope check needs to protect.
       return exactScope([`credential-binding:${String(params.bindingId)}`], true);
+    case "telegram_agent_connector_inspect": {
+      const projectId = String(params.projectId);
+      return exactScope([`project:${projectId}`], enabledProject(dependencies.store, projectId));
+    }
     case "telegram_agent_turn_evidence":
     case "telegram_agent_respond":
       throw new Error("telegram_agent_turn_evidence and telegram_agent_respond register directly and have no capability scope");
@@ -1741,6 +1753,17 @@ async function projectTrustedEvidence(
         ].slice(0, 16),
       };
     }
+    case "telegram_agent_connector_inspect": {
+      const receiptId = typeof domain.receiptId === "string" ? domain.receiptId : null;
+      return {
+        outcome: domain.outcome === "succeeded" ? "succeeded" : "observed",
+        proofKinds: ["health_snapshot"],
+        subjectRefs: [
+          ...resolution.scope.entityRefs,
+          ...(receiptId ? [`credential-connector-receipt:${receiptId}`] : []),
+        ].slice(0, 16),
+      };
+    }
     case "telegram_agent_turn_evidence":
     case "telegram_agent_respond":
       throw new Error("telegram_agent_turn_evidence and telegram_agent_respond register directly and have no domain capability scope");
@@ -1771,7 +1794,10 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         credential: descriptor.credential_scope.credential === "bb"
           ? { credential: "bb", audience: "bb-plugin-sdk" }
           : descriptor.credential_scope.credential === "credential_broker"
-            ? { credential: "credential_broker", audience: "hanoon-credential-broker:v1" }
+            ? {
+                credential: "credential_broker",
+                audience: descriptor.credential_scope.audience as "hanoon-credential-broker:v1" | "hanoon-credential-broker:v2",
+              }
             : { credential: "none", audience: "none" },
       }, {
         ...registration,
@@ -2805,6 +2831,26 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         limit: params.limit ?? 3,
       });
       return boundedReferenceSearchResult(hits);
+    },
+  });
+
+  registerTool({
+    name: CONTROLLER_TOOL_NAMES[34],
+    description: "Inspect one exact enrolled Convex, Vercel, or governed Vercel browser target through the protected broker. The broker selects the enrolled target and resolves any credential privately; this returns only bounded identity, readiness, stable failure class, and receipt metadata.",
+    parameters: z.object({
+      projectId: z.string().min(1).max(256),
+      operation: z.enum(PROTECTED_PROVIDER_OPERATIONS),
+      bindingId: z.string().regex(OPAQUE_ID_PATTERN).max(128),
+    }).strict(),
+    execute: async (params, context, _resolution, authorized) => {
+      if (!dependencies.protectedConnectorAccess) return { outcome: "denied", reason: "disabled" };
+      return dependencies.protectedConnectorAccess.inspect({
+        operation: params.operation,
+        projectId: params.projectId,
+        bindingId: params.bindingId,
+        authorized,
+        signal: context.signal,
+      });
     },
   });
 

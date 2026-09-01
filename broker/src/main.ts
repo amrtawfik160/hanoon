@@ -3,13 +3,22 @@ import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Server } from "node:https";
 
-import { BROKER_SCHEMA_VERSION } from "../../src/credentials/protocol.js";
+import {
+  BROKER_MAX_TOPOLOGY_RECEIPT_AGE_MS,
+  BROKER_SCHEMA_VERSION,
+  type BrokerRequestEnvelope,
+  type BrokerResponseEnvelope,
+} from "../../src/credentials/protocol.js";
+import type {
+  CredentialProtocolRequestEnvelope,
+  CredentialProtocolResponseEnvelope,
+} from "../../src/credentials/connector-protocol.js";
 import { loadBrokerConfig } from "./config.js";
 import { readSystemdCredentials } from "./credentials.js";
 import { createOnePasswordAdapter } from "./onepassword-adapter.js";
 import { BrokerOperationService } from "./operation-service.js";
 import { BrokerStore } from "./store.js";
-import { createBrokerServer } from "./server.js";
+import { createBrokerServer, type BrokerFenceAttestation } from "./server.js";
 import { createAdminServer } from "./admin-server.js";
 import {
   attestBrowserTopologyEvidence,
@@ -25,6 +34,10 @@ import {
   type ProtectedConnectorExecutionFailure,
   type ProtectedConnectorExecutor,
 } from "./connector-authority-service.js";
+import {
+  createProtectedConnectorExecutor,
+  createProtectedConnectorProviderHttpPort,
+} from "./provider-connectors.js";
 
 const BROKER_VERSION = "0.1.0";
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -43,6 +56,7 @@ export type RunningBroker = Readonly<{
 
 export type BrokerStartupOptions = Readonly<{
   adminServer?: BrokerAdminLifecycle;
+  protectedAuthority?: ProtectedConnectorAuthorityPort;
   protectedBrowser?: Readonly<{
     topology?: () => BrowserTopologyEvidence;
     authority?: ProtectedConnectorAuthorityPort;
@@ -58,6 +72,7 @@ export type ProtectedBrowserConnectorServiceDependencies = Readonly<{
   authority: ProtectedConnectorAuthorityPort;
   clock: () => number;
   invoke?: BrowserCliInvoker;
+  providerExecutor?: Pick<ProtectedConnectorExecutor, "inspectConvex" | "inspectVercel">;
 }>;
 
 function unsupportedProtectedConnectorFailure(): ProtectedConnectorExecutionFailure {
@@ -90,8 +105,8 @@ export function createProtectedBrowserConnectorService(
     clock: dependencies.clock,
   });
   const executor: ProtectedConnectorExecutor = {
-    inspectConvex: async () => unsupportedProtectedConnectorFailure(),
-    inspectVercel: async () => unsupportedProtectedConnectorFailure(),
+    inspectConvex: dependencies.providerExecutor?.inspectConvex ?? (async () => unsupportedProtectedConnectorFailure()),
+    inspectVercel: dependencies.providerExecutor?.inspectVercel ?? (async () => unsupportedProtectedConnectorFailure()),
     inspectBrowserVercel: browserExecutor.inspectBrowserVercel,
   };
   return new ProtectedConnectorAuthorityService({
@@ -101,6 +116,27 @@ export function createProtectedBrowserConnectorService(
     authority: dependencies.authority,
     clock: dependencies.clock,
   });
+}
+
+export function createDurableProtectedConnectorAuthority(
+  foundationStore: BrokerStore,
+  _connectorStore: BrokerProtectedConnectorStore,
+  clock: () => number,
+): ProtectedConnectorAuthorityPort {
+  return {
+    topologyReady: (operation, context) => {
+      if (!context) return false;
+      const installation = foundationStore.getInstallation(context.installationId);
+      const policy = _connectorStore.getPolicy(context.installationId, context.projectId);
+      const now = clock();
+      return installation?.state === "active" &&
+        installation.topologyReceiptExpiresAt > now &&
+        installation.topologyReceiptExpiresAt - now <= BROKER_MAX_TOPOLOGY_RECEIPT_AGE_MS &&
+        policy?.enabledOperations.includes(operation) === true;
+    },
+    auditWritable: () => foundationStore.auditWritable(),
+    fenceCurrent: (input) => foundationStore.isExecutorFenceCurrent({ ...input, now: clock() }),
+  };
 }
 
 function parseConfigPath(argv: readonly string[]): string {
@@ -153,6 +189,7 @@ export async function startBroker(
   const database = new Database(config.databasePath);
   let server: Server | null = null;
   let adminServer: BrokerAdminLifecycle | null = null;
+  let adapter: Awaited<ReturnType<typeof createOnePasswordAdapter>> | null = null;
   try {
     const store = new BrokerStore(database, {
       dataKey: credentials.brokerDataKey,
@@ -160,6 +197,7 @@ export async function startBroker(
       clock: Date.now,
       retentionDays: config.retentionDays,
     });
+    adapter = await createOnePasswordAdapter({ serviceToken: credentials.onepasswordServiceToken });
     const connectorStore = new BrokerProtectedConnectorStore(database, {
       dataKey: credentials.brokerDataKey,
       clock: Date.now,
@@ -175,11 +213,13 @@ export async function startBroker(
       workerMayAdminGrants: true,
     }, credentials.brokerAuditKey);
     const topology = options.protectedBrowser?.topology ?? (() => defaultTopology);
-    const authority = options.protectedBrowser?.authority ?? {
-      topologyReady: () => false,
-      auditWritable: () => true,
-      fenceCurrent: () => false,
-    } satisfies ProtectedConnectorAuthorityPort;
+    const providerExecutor = createProtectedConnectorExecutor({
+      http: createProtectedConnectorProviderHttpPort(),
+      credentials: { resolve: adapter.resolveCredential },
+    });
+    const authority = options.protectedBrowser?.authority ??
+      options.protectedAuthority ??
+      createDurableProtectedConnectorAuthority(store, connectorStore, Date.now);
     const protectedService = createProtectedBrowserConnectorService({
       foundationStore: store,
       connectorStore,
@@ -188,9 +228,9 @@ export async function startBroker(
       authority,
       clock: Date.now,
       invoke: options.protectedBrowser?.invoke,
+      providerExecutor,
     });
-    const adapter = await createOnePasswordAdapter({ serviceToken: credentials.onepasswordServiceToken });
-    const service = new BrokerOperationService({
+    const legacyService = new BrokerOperationService({
       store,
       adapter,
       dataKey: credentials.brokerDataKey,
@@ -198,6 +238,32 @@ export async function startBroker(
       clock: Date.now,
       brokerVersion: BROKER_VERSION,
     });
+    const service = {
+      execute: (input: {
+        certificateFingerprint: string;
+        now: number;
+        request: CredentialProtocolRequestEnvelope;
+      }): Promise<CredentialProtocolResponseEnvelope> => input.request.schemaVersion === 1
+        ? legacyService.execute({
+            ...input,
+            request: input.request as BrokerRequestEnvelope,
+          }) as Promise<BrokerResponseEnvelope>
+        : protectedService.execute({
+            certificateFingerprint: input.certificateFingerprint,
+            now: input.now,
+            request: input.request,
+          }),
+      attestExecutorFence: (input: {
+        certificateFingerprint: string;
+        now: number;
+        attestation: BrokerFenceAttestation;
+      }) => {
+        const { certificateFingerprint, now, attestation } = input;
+        const installation = store.getInstallationByCertificate(certificateFingerprint);
+        return installation?.installationId === attestation.installationId &&
+          store.attestExecutorFence({ ...attestation, now });
+      },
+    };
     const httpsServer = createBrokerServer({
       serverCertificatePem: credentials.serverCertificatePem,
       serverPrivateKeyPem: credentials.serverPrivateKeyPem,
@@ -213,6 +279,7 @@ export async function startBroker(
       socketPath: config.adminSocketPath,
       store,
       adapter,
+      connectorStore,
       clock: Date.now,
       brokerVersion: BROKER_VERSION,
     });
@@ -227,7 +294,11 @@ export async function startBroker(
           try {
             await closeServer(httpsServer);
           } finally {
-            database.close();
+            try {
+              await adapter?.close();
+            } finally {
+              database.close();
+            }
           }
         }
       },
@@ -238,6 +309,7 @@ export async function startBroker(
   } catch (error) {
     await adminServer?.close().catch(() => undefined);
     if (server) await closeServer(server).catch(() => undefined);
+    await adapter?.close().catch(() => undefined);
     database.close();
     throw error;
   }

@@ -73,7 +73,7 @@ export type ProtectedConnectorExecutor = Readonly<{
     credentialReference: string;
     signal?: AbortSignal;
   }>): Promise<ProtectedConnectorExecutionSuccess<VercelProjectIdentity> | ProtectedConnectorExecutionFailure>;
-  inspectBrowserVercel(input: Readonly<{
+  inspectBrowserVercel?(input: Readonly<{
     target: BrowserVercelProjectTarget;
     leaseId: string;
     signal?: AbortSignal;
@@ -81,7 +81,10 @@ export type ProtectedConnectorExecutor = Readonly<{
 }>;
 
 export type ProtectedConnectorAuthorityPort = Readonly<{
-  topologyReady(operation: ProtectedConnectorRequestEnvelope["operation"]): boolean;
+  topologyReady(
+    operation: ProtectedConnectorRequestEnvelope["operation"],
+    context?: Readonly<{ installationId: string; projectId: string }>,
+  ): boolean;
   auditWritable(): boolean;
   fenceCurrent(input: Readonly<{
     installationId: string;
@@ -191,7 +194,7 @@ export class ProtectedConnectorAuthorityService {
     if (claimedResponse) return claimedResponse;
     const authorization = this.authorizeClaimedRequest(request, now);
     if (authorization.outcome === "denied") return authorization.response;
-    const execution = await this.executeTarget(authorization, input.signal);
+    const execution = await this.executeTarget(authorization, request, input.signal);
     return this.completeExecution({
       certificateFingerprint: input.certificateFingerprint,
       request,
@@ -297,7 +300,7 @@ export class ProtectedConnectorAuthorityService {
     if (temporalFailure(request, now)) {
       return this.completeFailure({ request, binding: null, failureClass: "request_rejected", completedAt: now });
     }
-    if (!this.authority.topologyReady(request.operation)) {
+    if (!this.authority.topologyReady(request.operation, request)) {
       return this.completeFailure({ request, binding: null, failureClass: "unsafe_topology", completedAt: now });
     }
     if (!this.authority.auditWritable()) {
@@ -369,14 +372,21 @@ export class ProtectedConnectorAuthorityService {
 
   private async executeTarget(
     authorization: Extract<ConnectorAuthorization, { outcome: "authorized" }>,
+    request: ProtectedConnectorRequestEnvelope,
     signal?: AbortSignal,
   ): Promise<ConnectorExecution> {
+    const deadlineController = new AbortController();
+    const remaining = Math.max(1, request.deadlineAt - this.clock());
+    const deadlineTimer = setTimeout(() => deadlineController.abort(), remaining);
+    const abort = (): void => deadlineController.abort();
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
     try {
       return await this.dispatch(
         authorization.target,
         authorization.credentialReference,
         authorization.browserLeaseId,
-        signal,
+        deadlineController.signal,
       );
     } catch {
       return {
@@ -386,6 +396,9 @@ export class ProtectedConnectorAuthorityService {
         retryAfterMs: 30_000,
         connectorVersion: "connector-1",
       };
+    } finally {
+      clearTimeout(deadlineTimer);
+      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -437,7 +450,7 @@ export class ProtectedConnectorAuthorityService {
     return !temporalFailure(request, completedAt) &&
       this.installationStillActive(certificateFingerprint, request.installationId) &&
       this.policyStillCurrent(request) &&
-      this.authority.topologyReady(request.operation) &&
+      this.authority.topologyReady(request.operation, request) &&
       this.fenceCurrent(request) &&
       this.bindingStillCurrent(request, authorization.binding, completedAt) &&
       this.browserLeaseStillCurrent(request, authorization, completedAt);
@@ -560,7 +573,9 @@ export class ProtectedConnectorAuthorityService {
       return this.executor.inspectVercel({ target, credentialReference, signal });
     }
     if (credentialReference !== null || browserLeaseId === null) return this.missingCredentialFailure();
-    return this.executor.inspectBrowserVercel({ target, leaseId: browserLeaseId, signal });
+    return this.executor.inspectBrowserVercel
+      ? this.executor.inspectBrowserVercel({ target, leaseId: browserLeaseId, signal })
+      : Promise.resolve(this.missingCredentialFailure());
   }
 
   private missingCredentialFailure(): ProtectedConnectorExecutionFailure {

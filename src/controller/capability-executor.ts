@@ -22,7 +22,7 @@ import type {
 import type { TelegramAgentStore, ToolReceiptClaim } from "../storage/store";
 
 const MAX_SAFE_SUBJECTS = 16;
-const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller|credential-binding|credential-receipt|reference|reference-passage):[^\s:]{1,248}$/;
+const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller|credential-binding|credential-receipt|credential-connector-receipt|reference|reference-passage):[^\s:]{1,248}$/;
 const INTERRUPTED_DOMAIN_RESULT = Object.freeze({
   outcome: "uncertain",
   detail: "An identical call was already started and its outcome is unknown. Check current state before acting again.",
@@ -43,7 +43,7 @@ export type ControllerCapabilityDependencies = Readonly<{
   now(): number;
   credential: Readonly<{
     credential: "none" | "bb" | "credential_broker";
-    audience: "none" | "bb-plugin-sdk" | "hanoon-credential-broker:v1";
+    audience: "none" | "bb-plugin-sdk" | "hanoon-credential-broker:v1" | "hanoon-credential-broker:v2";
   }>;
   sdk?: BbPluginApi["sdk"];
 }>;

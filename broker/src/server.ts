@@ -6,8 +6,7 @@ import type { TLSSocket } from "node:tls";
 import {
   BROKER_MAX_REQUEST_BYTES,
   BROKER_MAX_RESPONSE_BYTES,
-  type BrokerRequestEnvelope,
-  type BrokerResponseEnvelope,
+  OPAQUE_ID_PATTERN,
 } from "../../src/credentials/protocol.js";
 import {
   parseCredentialProtocolRequest,
@@ -22,8 +21,22 @@ export type BrokerRequestService = Readonly<{
   execute(input: {
     certificateFingerprint: string;
     now: number;
-    request: BrokerRequestEnvelope;
-  }): Promise<BrokerResponseEnvelope>;
+    request: CredentialProtocolRequestEnvelope;
+  }): Promise<CredentialProtocolResponseEnvelope>;
+  attestExecutorFence?(input: {
+    certificateFingerprint: string;
+    now: number;
+    attestation: BrokerFenceAttestation;
+  }): boolean;
+}>;
+
+export type BrokerFenceAttestation = Readonly<{
+  installationId: string;
+  taskId: string;
+  projectId: string;
+  fenceOwner: string;
+  fenceGeneration: number;
+  expiresAt: number;
 }>;
 
 export type ProtectedBrokerRequestService = Readonly<{
@@ -139,22 +152,6 @@ function sendBrokerResponse(
   response.end(body);
 }
 
-function rejectUnsupportedHttpRequest(request: IncomingMessage, response: ServerResponse): boolean {
-  if (request.method !== "POST") {
-    sendHttpError(response, 400, "invalid_request");
-    return true;
-  }
-  if (request.url !== "/v1/operations") {
-    sendHttpError(response, 404, "not_found");
-    return true;
-  }
-  if (request.headers["content-type"] !== "application/json") {
-    sendHttpError(response, 400, "invalid_request");
-    return true;
-  }
-  return false;
-}
-
 function parseRequestEnvelope(body: Buffer): CredentialProtocolRequestEnvelope | null {
   try {
     const parsedJson: unknown = JSON.parse(body.toString("utf8"));
@@ -163,6 +160,56 @@ function parseRequestEnvelope(body: Buffer): CredentialProtocolRequestEnvelope |
   } catch {
     return null;
   }
+}
+
+function isFenceAttestation(value: unknown): value is BrokerFenceAttestation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  const keys = Object.keys(input).sort();
+  if (keys.join(",") !== "expiresAt,fenceGeneration,fenceOwner,installationId,projectId,taskId") return false;
+  return typeof input.installationId === "string" && OPAQUE_ID_PATTERN.test(input.installationId) &&
+    typeof input.taskId === "string" && OPAQUE_ID_PATTERN.test(input.taskId) &&
+    typeof input.projectId === "string" && OPAQUE_ID_PATTERN.test(input.projectId) &&
+    typeof input.fenceOwner === "string" && OPAQUE_ID_PATTERN.test(input.fenceOwner) &&
+    typeof input.fenceGeneration === "number" && Number.isSafeInteger(input.fenceGeneration) && input.fenceGeneration >= 1 &&
+    typeof input.expiresAt === "number" && Number.isSafeInteger(input.expiresAt) && input.expiresAt >= 1;
+}
+
+function parseFenceAttestation(body: Buffer): BrokerFenceAttestation | null {
+  try {
+    const value: unknown = JSON.parse(body.toString("utf8"));
+    return isFenceAttestation(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function sendFenceResult(response: ServerResponse, accepted: boolean): void {
+  response.statusCode = accepted ? 204 : 403;
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.removeHeader("Server");
+  response.end();
+}
+
+async function executeFenceAttestation(
+  request: IncomingMessage,
+  response: ServerResponse,
+  dependencies: BrokerServerDependencies,
+  body: Buffer,
+): Promise<void> {
+  const fingerprint = certificateFingerprint(request);
+  const attestation = parseFenceAttestation(body);
+  if (!fingerprint || !attestation || !dependencies.service.attestExecutorFence) {
+    sendFenceResult(response, false);
+    return;
+  }
+  const accepted = dependencies.service.attestExecutorFence({
+    certificateFingerprint: fingerprint,
+    now: dependencies.clock?.() ?? Date.now(),
+    attestation,
+  });
+  sendFenceResult(response, accepted);
 }
 
 async function executeBrokerRequest(
@@ -209,12 +256,24 @@ async function handleBrokerRequest(
   requestLimit: number,
   responseLimit: number,
 ): Promise<void> {
-  if (rejectUnsupportedHttpRequest(request, response)) return;
+  if (request.method !== "POST" ||
+      (request.url !== "/v1/operations" && request.url !== "/v1/fences") ||
+      request.headers["content-type"] !== "application/json") {
+    if (request.method !== "POST") sendHttpError(response, 400, "invalid_request");
+    else if (request.url === "/v1/fences" && request.headers["content-type"] !== "application/json") sendHttpError(response, 400, "invalid_request");
+    else if (request.url !== "/v1/operations" && request.url !== "/v1/fences") sendHttpError(response, 404, "not_found");
+    else sendHttpError(response, 400, "invalid_request");
+    return;
+  }
 
   const body = await readRequestBody(request, requestLimit);
   if (body.outcome === "aborted") return;
   if (body.outcome === "oversized") {
     sendHttpError(response, 413, "invalid_request");
+    return;
+  }
+  if (request.url === "/v1/fences") {
+    await executeFenceAttestation(request, response, dependencies, body.body);
     return;
   }
   const parsedRequest = parseRequestEnvelope(body.body);

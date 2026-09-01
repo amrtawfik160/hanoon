@@ -121,6 +121,7 @@ const EXPECTED_CONTROLLER_TOOL_NAMES = [
   "telegram_agent_resume_project",
   "telegram_agent_add_reference",
   "telegram_agent_search_reference",
+  "telegram_agent_connector_inspect",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;
@@ -138,6 +139,7 @@ const EXPECTED_CONTROLLER_PROFILE_TOOL_NAMES = [
   // Reachable from every turn now: showing the owner a picture is not a
   // subject the opening message has to name.
   "telegram_agent_send_media",
+  "telegram_agent_connector_inspect",
   "telegram_agent_capabilities",
   "telegram_agent_request_capability",
 ] as const;

@@ -55,6 +55,9 @@ function requestFromArguments(argv: readonly string[], io: AdminCliIo): AdminReq
   if (argv[0] === "binding" && argv[1] === "revoke" && argv.length === 4) {
     return parseRequest({ operation: "binding.revoke", installationId: argv[2], bindingId: argv[3] });
   }
+  if (argv[0] === "connector" && argv[1] === "binding" && argv[2] === "enroll" && argv.length === 4 && argv[3] === "--stdin") {
+    return parseRequest({ operation: "connector.binding.enroll", ...readBoundedStdin(io) });
+  }
   if (argv[0] === "installation" && argv[1] === "doctor" && (argv.length === 3 || (argv.length === 4 && argv[3] === "--json"))) {
     return parseRequest({ operation: "installation.doctor", installationId: argv[2] });
   }
@@ -127,6 +130,17 @@ function safeResponseProjection(response: AdminResponse): Record<string, unknown
         bindingId: response.bindingId,
         state: response.state,
         generation: response.generation,
+      };
+    case "connector.binding.enroll":
+      return {
+        ok: true,
+        operation: response.operation,
+        installationId: response.installationId,
+        projectId: response.projectId,
+        bindingId: response.bindingId,
+        state: response.state,
+        generation: response.generation,
+        projection: response.projection,
       };
     case "installation.doctor":
       return {
