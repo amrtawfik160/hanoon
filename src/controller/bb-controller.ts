@@ -25,6 +25,7 @@ export type ControllerLocation = {
 export type ControllerStatus =
   | "idle"
   | "active"
+  | "pending"
   | "starting"
   | "stopping"
   | "error"

@@ -16,9 +16,9 @@ const ENROL_BATCH = 10;
 // never compete with the owner's actual work for provider capacity.
 const MAX_IN_FLIGHT = 1;
 const MAX_ATTEMPTS = 2;
-// A thread that hangs `active`, or whose host disappears so every status poll
-// throws, would otherwise hold the single in-flight slot forever and silently
-// stop the agent ever learning again.
+// A thread that stays in an in-flight state, or whose host disappears so every
+// status poll throws, would otherwise hold the single in-flight slot forever
+// and silently stop the agent ever learning again.
 export const EXTRACTION_TIMEOUT_MS = 30 * 60_000;
 const MAX_MEMORIES_PER_JOB = 3;
 const MAX_EXTRACTION_OUTPUT = 64 * 1024;
@@ -233,7 +233,7 @@ export class JobMemoryService {
         now: this.dependencies.clock.now(),
       });
     }
-    if (status === "active" || status === "starting" || status === "stopping") {
+    if (status === "pending" || status === "active" || status === "starting" || status === "stopping") {
       return expired && this.dependencies.store.failJobMemoryExtraction({
         jobId: extraction.jobId,
         error: "Memory extraction outlived its deadline",

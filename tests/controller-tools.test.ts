@@ -36,6 +36,7 @@ function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntr
     titleFallback: null,
     sectionId: null,
     status: "active",
+    queuedWork: "none",
     parentThreadId: null,
     sourceThreadId: null,
     originKind: null,

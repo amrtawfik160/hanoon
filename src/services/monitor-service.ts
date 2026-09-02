@@ -16,7 +16,7 @@ import type {
   TelegramAgentStore,
 } from "../storage/store";
 
-export type MonitorThreadStatus = "idle" | "active" | "starting" | "stopping" | "error" | "missing";
+export type MonitorThreadStatus = "idle" | "active" | "pending" | "starting" | "stopping" | "error" | "missing";
 
 export type MonitorThreads = {
   status(threadId: string): Promise<MonitorThreadStatus>;

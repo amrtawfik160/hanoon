@@ -2454,7 +2454,7 @@ it("adopts an uncertain spawn after restart without spawning the owner input twi
   ).get(turn.updateId, turn.inputText)).toEqual({ count: 1 });
 });
 
-it("requeues a turn while the controller thread is still busy instead of failing it", async () => {
+it("requeues a turn while the controller thread is pending instead of failing it", async () => {
   const { store, fence } = serviceFixture();
   const turn = store.enqueueControllerTurn({
     ...turnRecord({ updateId: 61, inputText: "answer me" }),
@@ -2488,7 +2488,7 @@ it("requeues a turn while the controller thread is still busy instead of failing
     telegramChatId: "7",
     now: 2_001,
   });
-  let status: "active" | "idle" = "active";
+  let status: "pending" | "idle" = "pending";
   const adapter: ControllerAdapter = {
     spawn: vi.fn(async (spawnTurn: { id: string }) => ({ threadId: "unused", projectId: "proj_personal", hostId: "host_personal", spawnToken: spawnTurn.id })),
     send: vi.fn(async () => undefined),
