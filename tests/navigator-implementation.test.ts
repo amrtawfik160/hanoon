@@ -817,6 +817,101 @@ describe("navigator ticket integration executor", () => {
     expect(executor.snapshot(value.jobId).findingLedger[0]).toMatchObject({ state: "stale" });
   });
 
+  it.each([
+    {
+      name: "advisory-only confirmation",
+      verificationOutcome: "findings" as const,
+      verificationFindings: "source" as const,
+      expectedEvent: "opened",
+      expectedState: "open",
+      expectedDisposition: "advisory",
+      expectedReason: "accepted_advisories",
+    },
+    {
+      name: "disputed proposal",
+      verificationOutcome: "passed" as const,
+      verificationFindings: "none" as const,
+      expectedEvent: "disputed",
+      expectedState: "disputed",
+      expectedDisposition: "advisory",
+      expectedReason: "findings_disputed",
+    },
+  ] as const)("settles the $name at the ledger decision boundary", async ({
+    verificationOutcome,
+    verificationFindings,
+    expectedEvent,
+    expectedState,
+    expectedDisposition,
+    expectedReason,
+  }) => {
+    const value = fixture();
+    const { executor } = prepareTicketEffectForProtocol(value, 1_110);
+    const finding: NavigatorReviewFinding = {
+      rootCauseId: "advisory-boundary-root",
+      capabilityId: "code-review",
+      ruleId: "requirement.behavior",
+      severity: "low",
+      subject: "src/app.ts",
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: "The finding remains advisory or disputed at settlement.",
+      evidenceRefs: ["review:boundary"],
+    };
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
+      if (input.attempt.kind === "implementation") {
+        return { resource, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) };
+      }
+      if (input.attempt.workOrder.verificationOf === undefined) {
+        return { resource, result: reviewResult(input.attempt, "findings", finding) };
+      }
+      const verification = reviewResult(input.attempt, verificationOutcome);
+      return {
+        resource,
+        result: verificationFindings === "source"
+          ? { ...verification, findings: [finding] }
+          : verification,
+      };
+    });
+    const protocol = ticketProtocol(value, {
+      run,
+      reconcile: run,
+      observe: validGitObserver().observe,
+    }, value.now);
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+
+    const snapshot = executor.snapshot(value.jobId);
+    expect(snapshot.integration.state).toBe("implementing");
+    expect(snapshot.activeSlice?.state).toBe("accepted");
+    expect(snapshot.findingLedger).toEqual([
+      expect.objectContaining({
+        rootCauseId: finding.rootCauseId,
+        state: expectedState,
+        disposition: expectedDisposition,
+        blockingBurden: 0,
+      }),
+    ]);
+    expect(snapshot.findingLedgerDecision).toMatchObject({
+      outcome: "accepted",
+      allowedNextAction: "accept",
+      blockingBurden: 0,
+      reasonCode: null,
+    });
+    expect(snapshot.outcomes.at(-1)).toMatchObject({ outcome: "succeeded", reasonCode: expectedReason });
+    expect(value.database.prepare(
+      "SELECT event, disposition, root_cause_confirmed FROM navigator_review_finding_events WHERE slice_id = ?",
+    ).get(snapshot.activeSlice?.id)).toEqual({
+      event: expectedEvent,
+      disposition: expectedDisposition,
+      root_cause_confirmed: expectedEvent === "opened" ? 1 : 0,
+    });
+  });
+
   it("appends a checked root-cause correction without rewriting the prior finding fact", async () => {
     const value = fixture();
     const { executor } = prepareTicketEffectForProtocol(value, 1_110);
