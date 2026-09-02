@@ -473,7 +473,7 @@ it("scopes evidence reads to the requested turn", () => {
     inputText: "Inspect another project.",
     now: 2_001,
   });
-  expect(store.claimNextControllerTurn({ ...fence, now: 2_001 })?.id).toBe(other.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: 5001 })?.id).toBe(other.id);
   expect(store.reserveControllerSpawn({
     controllerKey: other.controllerKey,
     turnId: other.id,

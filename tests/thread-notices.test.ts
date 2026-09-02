@@ -128,7 +128,7 @@ async function submittedEngagedFollowUp() {
   const lease = store.acquireExecutorLease("executor", 5_000, 30_000);
   if (!lease.acquired) throw new Error("executor lease was not acquired");
   const fence = { ownerId: "executor", generation: lease.generation, now: 5_000 };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(followUp.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(followUp.id);
   expect(store.reserveControllerSpawn({
     ...fence,
     controllerKey: CONTROLLER_KEY,
@@ -346,7 +346,7 @@ it("sends the bare notice when the engaged-thread follow-up turn fails", async (
   expect(store.claimNextControllerTurn({
     ownerId: "executor",
     generation: lease.generation,
-    now: 5_000,
+    now: 8000,
   })?.id).toBe(followUp.id);
 
   expect(store.failControllerTurn({

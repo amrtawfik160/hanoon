@@ -178,7 +178,7 @@ function confirmNavigatorAdmission(
   const turn = store.claimNextControllerTurn({
     ownerId: "executor",
     generation: lease.generation,
-    now: now(),
+    now: now() + 3_000,
   });
   if (!turn) throw new Error("missing controller turn");
   if (!store.markControllerSpawned({

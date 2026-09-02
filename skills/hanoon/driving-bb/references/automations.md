@@ -35,8 +35,10 @@ bb automation create --project <id> --name "..." \
 
 Use `--at <ISO-8601>` or `--in 30m` instead of `--cron` for one-shot work.
 Agent targets are mutually exclusive: `--target-thread`, `--environment`, or
-`--new-environment worktree`. Automation-created threads cannot create or
-widen another automation.
+`--new-environment worktree`. A scheduled run must not create or widen another
+automation. Hanoon refuses a managed schedule from any turn the owner did not
+send; inside an automation run this rule is an instruction, not a mechanical
+block, so obey it.
 
 ## Manage and reconcile
 

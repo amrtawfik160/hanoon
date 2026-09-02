@@ -32,7 +32,7 @@ function credentialFixture() {
   const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
   if (!lease.acquired) throw new Error("executor lease was not acquired");
   const fence = { ownerId: "executor", generation: lease.generation, now: 2_000 };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(queued.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(queued.id);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: queued.id,

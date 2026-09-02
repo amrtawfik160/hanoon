@@ -3,8 +3,10 @@ import {
   assertAutomationMatches,
   buildAutomationRunsCommand,
   buildCreateAutomationCommand,
+  buildListAutomationsCommand,
   buildUpdateAutomationCommand,
   BbAutomationNotFoundError,
+  BbAutomationProjectUnavailableError,
   TerminalBbAutomationAdapter,
   type BbAgentAutomationDefinition,
   type BbAutomation,
@@ -72,11 +74,8 @@ describe("BB automation adapter", () => {
     expect(command.endsWith("--json")).toBe(true);
     expect(buildAutomationRunsCommand("proj_owner", "auto_1", 20))
       .toBe("bb automation runs 'auto_1' --project 'proj_owner' --limit '20' --json");
-    expect(new TerminalBbAutomationAdapter({ run: vi.fn() }).agentAutomationCapabilities).toEqual({
-      executionTimeout: false,
-      resultContract: false,
-      preRunAuthority: false,
-    });
+    expect(buildListAutomationsCommand("proj_owner"))
+      .toBe("bb automation list --project 'proj_owner' --json");
   });
 
   it("builds a complete project-bound definition update", () => {
@@ -93,11 +92,14 @@ describe("BB automation adapter", () => {
     expect(command.endsWith("--json")).toBe(true);
   });
 
-  it("returns the provider create acknowledgement before read-back", async () => {
-    const results: CommandResult[] = [
-      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
-    ];
-    const run = vi.fn(async (_input: unknown) => results.shift()!);
+  it("returns BB's create acknowledgement and leaves acceptance to the service", async () => {
+    // The service persists the returned id before the exact read-back, so the
+    // adapter must not hide a second command inside create.
+    const run = vi.fn(async (_input: unknown): Promise<CommandResult> => ({
+      outcome: "exited",
+      exitCode: 0,
+      output: JSON.stringify(observed()),
+    }));
     const adapter = new TerminalBbAutomationAdapter({ run });
 
     await expect(adapter.create({
@@ -107,6 +109,8 @@ describe("BB automation adapter", () => {
     })).resolves.toMatchObject({ version: 1, operationId: "managed-operation-1", providerAutomationId: "auto_1" });
 
     expect(run).toHaveBeenCalledTimes(1);
+    expect((run.mock.calls[0]?.[0] as { command: string } | undefined)?.command)
+      .toContain("bb automation create");
   });
 
   it("translates a BB response into provider-neutral Hanoon observation values", async () => {
@@ -134,25 +138,24 @@ describe("BB automation adapter", () => {
     expect(result).not.toHaveProperty("origin");
   });
 
-  it("returns an acknowledged create receipt without compensating for read-back", async () => {
-    const run = vi.fn(async () => ({
-      outcome: "exited" as const,
-      exitCode: 0,
-      output: JSON.stringify(observed()),
-    }));
-    const adapter = new TerminalBbAutomationAdapter({ run });
+  it("never adopts a record it cannot read exactly, so a damaged row is skipped", async () => {
+    // BB keeps damaged records visible under a `problem` discriminator; only an
+    // exact definition match may close an ambiguous create.
+    const adapter = new TerminalBbAutomationAdapter({
+      run: async () => ({
+        outcome: "exited",
+        exitCode: 0,
+        output: JSON.stringify([
+          { id: "auto_broken", projectId: "proj_owner", name: definition.name, problem: "invalid-stored-data" },
+        ]),
+      }),
+    });
 
-    await expect(adapter.create({
+    await expect(adapter.findByDefinition({
       scope: { kind: "environment", environmentId: "env_owner" },
       definition,
       identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
-    })).resolves.toMatchObject({
-      version: 1,
-      operationId: "managed-operation-1",
-      ownershipMarker: "hanoon:marker-1",
-      providerAutomationId: "auto_1",
-    });
-    expect(run).toHaveBeenCalledTimes(1);
+    })).resolves.toBeNull();
   });
 
   it("fails closed when BB reads back a different schedule", async () => {
@@ -264,5 +267,25 @@ describe("BB automation adapter", () => {
 
     await expect(adapter.delete(input)).rejects.toBeInstanceOf(BbAutomationNotFoundError);
     await expect(adapter.delete(input)).rejects.toThrow("command exited 1");
+  });
+
+  it("classifies BB refusing the project as a standing condition, not a command failure", async () => {
+    // Production, 2026-09-02: BB's personal project answers exactly this.
+    const adapter = new TerminalBbAutomationAdapter({
+      run: async () => ({
+        outcome: "exited",
+        exitCode: 1,
+        output: "Project proj_personal is not available: HTTP 404: Project not found\n",
+      }),
+    });
+
+    const failure = await adapter.create({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      definition: { ...definition, projectId: "proj_personal" },
+      identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BbAutomationProjectUnavailableError);
+    expect((failure as BbAutomationProjectUnavailableError).projectId).toBe("proj_personal");
   });
 });

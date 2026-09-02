@@ -24,7 +24,7 @@ function fixture(options?: { threadStatus?: "active" | "error"; omitRateLimitRec
   });
   const lease = store.acquireExecutorLease("executor", 1_000, 30_000);
   if (!lease.acquired) throw new Error("controller lease unavailable");
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 1_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 4000 });
   if (!turn) throw new Error("controller turn unavailable");
   expect(store.markControllerSpawned({
     turnId: turn.id,

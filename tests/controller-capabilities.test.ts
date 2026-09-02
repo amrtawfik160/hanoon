@@ -209,7 +209,7 @@ it("persists one additive bundle expansion and denies a second request", () => {
   expect(store.claimNextControllerTurn({
     ownerId: "controller-capability-test",
     generation: lease.generation,
-    now: 2_002,
+    now: 5002,
   })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     ownerId: "controller-capability-test",
