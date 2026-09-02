@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { admittedCapabilityFindingPolicy, type CapabilityFindingPolicy } from "../capabilities/catalog";
-import { normalizeGuardSubject } from "../capabilities/guards";
+import { evaluateFindingDisposition, normalizeGuardSubject } from "../capabilities/guards";
 import {
   navigatorReviewFindingSchema,
   type NavigatorReviewFinding,
@@ -228,17 +228,6 @@ export function navigatorFindingFingerprint(
   return createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex");
 }
 
-function dispositionFor(
-  finding: NavigatorReviewFinding,
-  policy: CapabilityFindingPolicy,
-): NavigatorFindingDisposition {
-  if (finding.severity === "critical" || finding.severity === "high") return "must_fix";
-  if (finding.requirementId !== null || finding.evidenceClass === "public-contract") return "must_fix";
-  if (policy.mustFixRuleIds.includes(finding.ruleId)) return "must_fix";
-  if (policy.advisoryRuleIds.includes(finding.ruleId)) return "advisory";
-  return policy.defaultDisposition;
-}
-
 function validateAssessmentInput(input: NavigatorFindingAssessmentInput): string | null {
   assertAssessmentIdentity(input);
   return validateSelectedGuards(input) ?? validateRequirementIds(input) ?? validateEvidenceRefs(input);
@@ -305,14 +294,16 @@ function findingFacts(
 ): NavigatorFindingAssessmentFact[] {
   return [...proposed.values()].map(({ finding, policy, fingerprint }) => {
     const observed = confirmed.get(fingerprint) ?? finding;
+    const disposition = evaluateFindingDisposition(observed, policy);
+    if (disposition === null) throw new TypeError("finding disposition policy rejected observation");
     return {
       proposed: finding,
       observed,
       confirmed: confirmed.has(fingerprint),
       fingerprint,
-      normalizedSubject: finding.subject,
-      requirementClass: requirementClass(finding),
-      disposition: dispositionFor(finding, policy),
+      normalizedSubject: observed.subject,
+      requirementClass: requirementClass(observed),
+      disposition,
       policy,
     };
   });

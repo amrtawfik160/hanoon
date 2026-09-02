@@ -6,6 +6,7 @@ import {
   type CapabilityDescriptor,
   type CapabilityRoute,
 } from "./contracts";
+import { evaluateFindingDisposition, isBoundedPolicyKey, type FindingDispositionInput } from "./guards";
 
 export const TASK_RECIPES = [
   "direct",
@@ -884,7 +885,7 @@ const FINDING_POLICY_DEFAULTS: Readonly<Record<string, Readonly<{
   mustFixRuleIds: readonly string[];
   advisoryRuleIds: readonly string[];
 }>>> = Object.freeze({
-  "code-review": Object.freeze({ defaultDisposition: "must_fix", mustFixRuleIds: [], advisoryRuleIds: [] }),
+  "code-review": Object.freeze({ defaultDisposition: "advisory", mustFixRuleIds: [], advisoryRuleIds: [] }),
   "blast-radius": Object.freeze({ defaultDisposition: "advisory", mustFixRuleIds: [], advisoryRuleIds: [] }),
   "clean-code-guard": Object.freeze({
     defaultDisposition: "advisory",
@@ -951,20 +952,60 @@ export function admittedCapabilityFindingPolicy(input: Readonly<{
  * Navigator assessment uses the versioned ledger policy, including evidence and
  * requirement inputs, through `NavigatorFindingLedger.assess`.
  */
-export function compatibilityCapabilityFindingDisposition(input: Readonly<{
+type CompatibilityFindingInput = Readonly<{
   capabilityId: string;
   ruleId: string;
-} & Partial<Record<string, unknown>>>): "must_fix" | "advisory" | null {
+} & Partial<Record<string, unknown>>>;
+
+function isFindingSeverity(value: unknown): value is FindingDispositionInput["severity"] {
+  return value === "critical" || value === "high" || value === "medium" || value === "low";
+}
+
+function compatibilityFindingObservation(input: CompatibilityFindingInput): FindingDispositionInput | null {
+  const severity = input.severity === undefined ? "low" : input.severity;
+  const requirementId = input.requirementId === undefined ? null : input.requirementId;
+  const evidenceClass = input.evidenceClass === undefined ? "review" : input.evidenceClass;
+  return isBoundedPolicyKey(input.ruleId) && isFindingSeverity(severity) &&
+    (requirementId === null || isBoundedPolicyKey(requirementId)) && isBoundedPolicyKey(evidenceClass)
+    ? { ruleId: input.ruleId, severity, requirementId, evidenceClass }
+    : null;
+}
+
+function compatibilityRequirementIds(input: CompatibilityFindingInput): readonly string[] | null {
+  const requirementIds = input.requirementIds;
+  if (requirementIds === undefined) return [];
+  return Array.isArray(requirementIds) && requirementIds.length <= 100 && requirementIds.every(isBoundedPolicyKey)
+    ? requirementIds
+    : null;
+}
+
+function compatibilityDescriptorDigest(
+  input: CompatibilityFindingInput,
+  admission: SkillAdmissionEvidence | undefined,
+  descriptor: CapabilityDescriptor,
+): string | null {
+  if (input.descriptorDigest === undefined) return admission?.bundleDescriptorDigest ?? descriptor.digest;
+  return typeof input.descriptorDigest === "string" ? input.descriptorDigest : null;
+}
+
+export function compatibilityCapabilityFindingDisposition(
+  input: CompatibilityFindingInput,
+): "must_fix" | "advisory" | null {
+  if (!isBoundedPolicyKey(input.capabilityId)) return null;
   const descriptor = CAPABILITY_BY_ID.get(input.capabilityId);
   if (!descriptor) return null;
   const admission = SKILL_ADMISSION_BY_ID.get(input.capabilityId as AdmittedCapabilitySkillId);
+  const finding = compatibilityFindingObservation(input);
+  const requirementIds = compatibilityRequirementIds(input);
+  const descriptorDigest = compatibilityDescriptorDigest(input, admission, descriptor);
+  if (!finding || requirementIds === null || descriptorDigest === null) return null;
   const policy = admittedCapabilityFindingPolicy({
     capabilityId: input.capabilityId,
-    descriptorDigest: admission?.bundleDescriptorDigest ?? descriptor.digest,
-    requirementIds: [],
+    descriptorDigest,
+    requirementIds,
   });
   if (!policy) return null;
-  return policy.mustFixRuleIds.includes(input.ruleId) ? "must_fix" : policy.defaultDisposition;
+  return evaluateFindingDisposition(finding, policy);
 }
 
 export function capabilityCatalogView(engine: "recipe-v1" | "navigator-v1"): Readonly<{

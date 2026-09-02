@@ -3,7 +3,11 @@ import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { SKILL_ADMISSION_CATALOG } from "../src/capabilities/catalog";
-import { guardRequirementBindings } from "../src/capabilities/guards";
+import {
+  assessGuardEnvelope,
+  guardRequirementBindings,
+  type GuardAssessmentPolicy,
+} from "../src/capabilities/guards";
 import {
   navigatorAcceptanceCriteria,
   navigatorAcceptanceCriteriaAreSatisfied,
@@ -24,6 +28,7 @@ import {
   type NavigatorFindingLedgerDecision,
   type NavigatorFindingLedgerPersistence,
 } from "../src/navigator/finding-ledger";
+import { NavigatorFindingLedgerRepository } from "../src/navigator/finding-ledger-repository";
 import {
   NavigatorTicketWorkerRetryableError,
   NavigatorTicketWorkerUnavailableError,
@@ -40,6 +45,7 @@ import { createNavigatorTicketEffectAdapter } from "../src/navigator/plugin-runt
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import {
   ALL_MIGRATIONS,
+  NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
   NAVIGATOR_IMPLEMENTATION_MIGRATIONS,
   NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS,
 } from "../src/storage/migrations";
@@ -288,6 +294,135 @@ function fixture(
   };
 }
 
+function seedPreFindingLedgerSchema(database: Database.Database): void {
+  const jobId = "legacy-ledger-job";
+  const sliceId = "legacy-ledger-slice";
+  const specificationArtifactId = "legacy-ledger-specification";
+  const specificationSnapshotId = "legacy-ledger-specification-snapshot";
+  const ticketArtifactId = "legacy-ledger-ticket";
+  const ticketSnapshotId = "legacy-ledger-ticket-snapshot";
+  const sourceAttemptId = "legacy-ledger-source-attempt";
+  const resolutionAttemptId = "legacy-ledger-resolution-attempt";
+  const sourceEffectKey = "legacy-ledger-source-effect";
+  const resolutionEffectKey = "legacy-ledger-resolution-effect";
+  const digest = "a".repeat(64);
+  const finding = {
+    rootCauseId: "legacy-open-root",
+    capabilityId: "code-review",
+    ruleId: "code-review.legacy-rule",
+    severity: "high" as const,
+    subject: "src/legacy.ts",
+    line: 3,
+    requirementId: null,
+    evidenceClass: "review",
+    summary: "A legacy open finding survives the schema upgrade.",
+    evidenceRefs: ["legacy:open"],
+  };
+
+  database.pragma("foreign_keys = OFF");
+  database.prepare(
+    `INSERT INTO jobs (id, source_update_id, request_text, state, created_at, updated_at)
+     VALUES (?, ?, ?, 'merged', ?, ?)`,
+  ).run(jobId, -63, "Legacy finding ledger migration fixture", 1_000, 1_000);
+  const insertArtifact = database.prepare(
+    `INSERT INTO work_artifacts (
+       id, project_id, effort_id, operation_id, kind, initial_status, status,
+       tracker_kind, tracker_namespace, external_id, external_url, external_revision,
+       external_status, assignees_json, title, tracker_order, current_revision,
+       current_snapshot_id, remote_closed_at, created_at, updated_at
+     ) VALUES (?, 'proj_legacy', ?, ?, ?, 'ready', 'ready', 'github',
+       'github:legacy/widgets', ?, NULL, '1', 'open', '[]', ?, ?, 1, ?, NULL, 1_000, 1_000)`,
+  );
+  insertArtifact.run(
+    specificationArtifactId, jobId, "legacy-specification", "specification", "legacy-specification",
+    "Legacy specification", 0, specificationSnapshotId,
+  );
+  insertArtifact.run(
+    ticketArtifactId, jobId, "legacy-ticket", "implementation_ticket", "legacy-ticket",
+    "Legacy ticket", 1, ticketSnapshotId,
+  );
+  const insertSnapshot = database.prepare(
+    `INSERT INTO work_artifact_snapshots (
+       id, artifact_id, revision, title, content, content_digest, snapshot_digest,
+       acceptance_criteria_json, relationships_json, external_revision, captured_at
+     ) VALUES (?, ?, 1, ?, ?, ?, ?, '[]', '[]', '1', 1_000)`,
+  );
+  insertSnapshot.run(
+    specificationSnapshotId, specificationArtifactId, "Legacy specification", "# Legacy specification", digest, digest,
+  );
+  insertSnapshot.run(
+    ticketSnapshotId, ticketArtifactId, "Legacy ticket", "# Legacy ticket", digest, digest,
+  );
+  database.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, 'run_navigator_ticket_worker', ?, 'done', 1, 1_000, 1_000, 1_000)`,
+  ).run(sourceEffectKey, jobId, JSON.stringify({ attemptId: sourceAttemptId }));
+  database.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, 'run_navigator_ticket_worker', ?, 'done', 1, 1_000, 1_000, 1_000)`,
+  ).run(resolutionEffectKey, jobId, JSON.stringify({ attemptId: resolutionAttemptId }));
+  database.prepare(
+    `INSERT INTO navigator_integrations (
+       job_id, specification_artifact_id, specification_snapshot_id, specification_snapshot_digest,
+       base_branch, integration_branch, worktree_id, project_policy_version, project_policy_json,
+       project_policy_digest, base_head_sha, current_head_sha, state, active_slice_id,
+       pull_request_number, pull_request_url, evidence_refs_json, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, 'main', 'legacy/integration', 'legacy-worktree', 1, ?, ?, ?, ?,
+       'implementing', ?, NULL, NULL, '[]', 1_000, 1_000)`,
+  ).run(
+    jobId, specificationArtifactId, specificationSnapshotId, digest,
+    JSON.stringify({ projectId: "proj_legacy", maxReviewCycles: 3 }), digest, SHA.base, SHA.base, sliceId,
+  );
+  database.prepare(
+    `INSERT INTO navigator_integration_tickets (
+       job_id, artifact_id, snapshot_id, snapshot_digest, ticket_order, state,
+       accepted_head_sha, resolved_at
+     ) VALUES (?, ?, ?, ?, 0, 'active', NULL, NULL)`,
+  ).run(jobId, ticketArtifactId, ticketSnapshotId, digest);
+  database.prepare(
+    `INSERT INTO work_artifact_claims (
+       id, artifact_id, workflow_step_id, job_id, snapshot_id, external_assignee,
+       state, owner_id, generation, lease_expires_at, acquired_at, renewed_at,
+       released_at, release_reason
+     ) VALUES (1, ?, 'legacy:workflow', ?, ?, 'legacy-owner', 'held',
+       'legacy-owner', 1, 2_000, 1_000, 1_000, NULL, NULL)`,
+  ).run(ticketArtifactId, jobId, ticketSnapshotId);
+  database.prepare(
+    `INSERT INTO navigator_ticket_slices (
+       id, job_id, ticket_artifact_id, ticket_snapshot_id, ticket_snapshot_digest,
+       claim_id, integration_base_head_sha, state, accepted_head_sha, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 1, ?, 'review_pending', NULL, 1_000, 1_000)`,
+  ).run(sliceId, jobId, ticketArtifactId, ticketSnapshotId, digest, SHA.base);
+  const insertAttempt = database.prepare(
+    `INSERT INTO navigator_ticket_worker_attempts (
+       id, job_id, slice_id, kind, ordinal, effect_idempotency_key,
+       work_order_json, work_order_digest, step_contract_id, step_contract_revision,
+       step_contract_digest, profile_json, profile_digest, model_route_json,
+       resource_kind, resource_id, created_at, updated_at
+     ) VALUES (?, ?, ?, 'review', ?, ?, '{}', ?, 'navigator-ticket-code-review', 2,
+       'b32624e6c687619ad840747a023b9f918108b8a409308f935723eb99de5f2f3c',
+       '{}', ?, '{}', NULL, NULL, 1_000, 1_000)`,
+  );
+  insertAttempt.run(sourceAttemptId, jobId, sliceId, 1, sourceEffectKey, digest, digest);
+  insertAttempt.run(resolutionAttemptId, jobId, sliceId, 2, resolutionEffectKey, digest, digest);
+  database.prepare(
+    `INSERT INTO navigator_review_finding_events (
+       id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
+       root_cause_id, capability_id, rule_id, disposition, event, head_sha,
+       finding_json, evidence_refs_json, occurrence, blocking_burden, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'must_fix', 'opened', ?, ?, ?, 1, 1, 1_000)`,
+  ).run(
+    "legacy-ledger-open-event", jobId, sliceId, sourceAttemptId, sourceAttemptId,
+    finding.rootCauseId, finding.capabilityId, finding.ruleId, SHA.base,
+    JSON.stringify(finding), JSON.stringify(finding.evidenceRefs),
+  );
+  database.pragma("foreign_keys = ON");
+}
+
 function implementationResult(
   attempt: NavigatorTicketWorkerAttempt,
   headSha: string,
@@ -419,6 +554,20 @@ function prepareTicketEffectForExecutor(value: Fixture, now: number) {
     throw new Error("navigator ticket predecessor lease was not released");
   }
   return { executor, claimId, effect };
+}
+
+function prepareTicketEffectForProtocol(value: Fixture, now: number) {
+  const prepared = prepareTicketEffectForExecutor(value, now);
+  value.database.prepare("UPDATE effects SET lease_expires_at = ? WHERE job_id = ? AND status = 'leased'")
+    .run(now - 1, value.jobId);
+  value.database.prepare("UPDATE job_resource_claims SET lease_expires_at = ? WHERE job_id = ? AND state = 'held'")
+    .run(now + 1_000, value.jobId);
+  value.database.prepare("UPDATE work_artifact_claims SET lease_expires_at = ? WHERE state = 'held'")
+    .run(now + 1_000);
+  value.database.prepare(
+    "UPDATE executor_lease SET owner_id = 'executor-40', generation = 1, heartbeat_at = ?, lease_expires_at = ? WHERE singleton = 1",
+  ).run(now, now + 1_000);
+  return prepared;
 }
 
 function ticketProtocol(
@@ -563,35 +712,36 @@ describe("navigator ticket integration executor", () => {
     );
   });
 
-  it("records registry policy facts atomically and marks older-head proof stale", async () => {
+  it("derives confirmed disposition from the observed finding and marks older-head proof stale", async () => {
     const value = fixture();
-    const { executor } = prepareTicketEffectForExecutor(value, 1_110);
-    value.database.prepare("UPDATE effects SET lease_expires_at = 1_109 WHERE job_id = ? AND status = 'leased'")
-      .run(value.jobId);
-    value.database.prepare("UPDATE job_resource_claims SET lease_expires_at = 2_000 WHERE job_id = ? AND state = 'held'")
-      .run(value.jobId);
-    value.database.prepare("UPDATE work_artifact_claims SET lease_expires_at = 2_000 WHERE state = 'held'")
-      .run();
-    value.database.prepare(
-      "UPDATE executor_lease SET owner_id = 'executor-40', generation = 1, heartbeat_at = 1_110, lease_expires_at = 2_000 WHERE singleton = 1",
-    ).run();
-    const finding: NavigatorReviewFinding = {
+    const { executor } = prepareTicketEffectForProtocol(value, 1_110);
+    const proposedFinding: NavigatorReviewFinding = {
       rootCauseId: "critical-advisory-rule",
       capabilityId: "clean-code-guard",
       ruleId: "clean.rule-10",
-      severity: "critical",
+      severity: "low",
       subject: ".\\src/app.ts",
       line: 1,
       requirementId: null,
       evidenceClass: "review",
-      summary: "The severity is model-supplied but cannot lower policy.",
-      evidenceRefs: ["review:critical"],
+      summary: "The initial review proposed an advisory finding.",
+      evidenceRefs: ["review:proposal"],
+    };
+    const confirmedFinding: NavigatorReviewFinding = {
+      ...proposedFinding,
+      severity: "critical",
+      summary: "An independent confirmation found a critical issue.",
+      evidenceRefs: ["review:critical-confirmation"],
     };
     const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
       const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
-      return input.attempt.kind === "implementation"
-        ? { resource, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) }
-        : { resource, result: reviewResult(input.attempt, "findings", finding) };
+      if (input.attempt.kind === "implementation") {
+        return { resource, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) };
+      }
+      const result = reviewResult(input.attempt, "findings", proposedFinding);
+      return input.attempt.workOrder.verificationOf === undefined
+        ? { resource, result }
+        : { resource, result: { ...result, findings: [confirmedFinding] } };
     });
     const protocol = ticketProtocol(value, { run, reconcile: run, observe: validGitObserver().observe }, () => 1_110);
     const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
@@ -610,6 +760,7 @@ describe("navigator ticket integration executor", () => {
     expect(entry).toMatchObject({
       disposition: "must_fix",
       state: "open",
+      finding: expect.objectContaining({ severity: "critical" }),
       normalizedSubject: "src/app.ts",
       requirementClass: "evidence:review",
       descriptorDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
@@ -624,13 +775,14 @@ describe("navigator ticket integration executor", () => {
       verificationAttemptDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
     });
     const event = value.database.prepare(
-      `SELECT root_cause_id, head_sha, normalized_subject, evidence_class, fingerprint,
+      `SELECT root_cause_id, head_sha, severity, normalized_subject, evidence_class, fingerprint,
               disposition, policy_revision, requirement_ids_json, root_cause_confirmed
          FROM navigator_review_finding_events ORDER BY sequence DESC LIMIT 1`,
     ).get();
     expect(event).toMatchObject({
       root_cause_id: "critical-advisory-rule",
       head_sha: SHA.ticketOne,
+      severity: "critical",
       normalized_subject: "src/app.ts",
       evidence_class: "review",
       fingerprint: entry.fingerprint,
@@ -652,7 +804,7 @@ describe("navigator ticket integration executor", () => {
     expect(executor.snapshot(value.jobId).findingLedger[0]).toMatchObject({ state: "stale" });
   });
 
-  it("classifies findings from the trusted capability registry, not reviewer-supplied severity", () => {
+  it("fails closed on unadmitted context and uses the registry default for unknown rules", () => {
     const finding = {
       rootCauseId: "spoofed-priority",
       capabilityId: "clean-code-guard",
@@ -666,7 +818,7 @@ describe("navigator ticket integration executor", () => {
       evidenceRefs: ["review:spoofed"],
     };
 
-    expect(navigatorFindingDisposition(finding)).toBe("advisory");
+    expect(navigatorFindingDisposition(finding)).toBeNull();
     expect(navigatorFindingDisposition({
       ...finding,
       capabilityId: "code-review",
@@ -674,27 +826,35 @@ describe("navigator ticket integration executor", () => {
       severity: "low",
       requirementId: null,
       evidenceClass: "review",
-    })).toBe("must_fix");
+    })).toBe("advisory");
   });
 
   it.each([
-    { name: "critical", overrides: { severity: "critical" as const }, expected: "must_fix" as const },
-    { name: "high", overrides: { severity: "high" as const }, expected: "must_fix" as const },
+    { name: "critical", capabilityId: "clean-code-guard", overrides: { severity: "critical" as const }, expected: "must_fix" as const },
+    { name: "high", capabilityId: "clean-code-guard", overrides: { severity: "high" as const }, expected: "must_fix" as const },
     {
       name: "requirement-linked",
-      overrides: { requirementId: guardRequirementBindings(["test"])[0]!.id },
+      capabilityId: "clean-code-guard",
+      overrides: { ruleId: "clean.rule-unknown", requirementId: guardRequirementBindings(["test"])[0]!.id },
       expected: "must_fix" as const,
     },
-    { name: "public-contract", overrides: { evidenceClass: "public-contract" }, expected: "must_fix" as const },
-    { name: "explicit must-fix rule", overrides: { ruleId: "clean.rule-1" }, expected: "must_fix" as const },
-    { name: "explicit advisory rule", overrides: { ruleId: "clean.rule-10" }, expected: "advisory" as const },
-    { name: "unknown rule uses registry default", overrides: { ruleId: "clean.rule-unknown" }, expected: "advisory" as const },
-  ] as const)("derives the $name disposition from the admitted policy", ({ overrides, expected }) => {
-    const descriptorDigest = SKILL_ADMISSION_CATALOG.find((entry) => entry.id === "clean-code-guard")?.bundleDescriptorDigest;
-    if (!descriptorDigest) throw new Error("clean-code-guard admission is unavailable");
-    const finding: NavigatorReviewFinding = {
-      rootCauseId: "policy-case",
+    {
+      name: "public-contract",
       capabilityId: "clean-code-guard",
+      overrides: { ruleId: "clean.rule-unknown", evidenceClass: "public-contract" },
+      expected: "must_fix" as const,
+    },
+    { name: "explicit must-fix rule", capabilityId: "clean-code-guard", overrides: { ruleId: "clean.rule-1" }, expected: "must_fix" as const },
+    { name: "explicit advisory rule", capabilityId: "clean-code-guard", overrides: { ruleId: "clean.rule-10" }, expected: "advisory" as const },
+    { name: "unknown clean-code rule", capabilityId: "clean-code-guard", overrides: { ruleId: "clean.rule-unknown" }, expected: "advisory" as const },
+    { name: "unknown code-review rule", capabilityId: "code-review", overrides: { ruleId: "code-review.rule-unknown" }, expected: "advisory" as const },
+  ] as const)("derives $name the same way at every finding policy seam", ({ capabilityId, overrides, expected }) => {
+    const descriptorDigest = SKILL_ADMISSION_CATALOG.find((entry) => entry.id === capabilityId)?.bundleDescriptorDigest;
+    if (!descriptorDigest) throw new Error(`${capabilityId} admission is unavailable`);
+    const requirementId = guardRequirementBindings(["test"])[0]!.id;
+    const finding: NavigatorReviewFinding = {
+      rootCauseId: "policy-matrix",
+      capabilityId,
       ruleId: "clean.rule-10",
       severity: "low",
       subject: "src/app.ts",
@@ -702,9 +862,41 @@ describe("navigator ticket integration executor", () => {
       requirementId: null,
       evidenceClass: "review",
       summary: "Mutable review prose does not choose disposition.",
-      evidenceRefs: ["finding:policy-case"],
+      evidenceRefs: ["finding:policy-matrix"],
       ...overrides,
     };
+    const guardFinding = {
+      ruleId: finding.ruleId,
+      severity: finding.severity,
+      subject: finding.subject,
+      line: finding.line,
+      evidence: finding.summary,
+      evidenceClass: finding.evidenceClass,
+      requirementId: finding.requirementId,
+    };
+    const guardPolicy: GuardAssessmentPolicy = {
+      profileId: "cap_profile:policy-matrix",
+      profileRevision: 1,
+      reviewedHeadSha: SHA.base,
+      diffDigest: "f".repeat(64),
+      selectedGuards: [{ capabilityId: finding.capabilityId, descriptorDigest, mandatory: true, substitutes: [] }],
+      requirementIds: [requirementId],
+      mustFixRuleIds: capabilityId === "clean-code-guard" ? ["clean.rule-1"] : [],
+      advisoryRuleIds: capabilityId === "clean-code-guard" ? ["clean.rule-10"] : [],
+    };
+    const guardAssessment = assessGuardEnvelope({
+      schemaVersion: 1,
+      profileId: guardPolicy.profileId,
+      profileRevision: guardPolicy.profileRevision,
+      reviewedHeadSha: SHA.base,
+      diffDigest: guardPolicy.diffDigest,
+      guards: [{
+        capabilityId: finding.capabilityId,
+        descriptorDigest,
+        outcome: "findings",
+        findings: [guardFinding],
+      }],
+    }, guardPolicy);
     const recorded: { facts: NavigatorFindingAssessmentFacts | null } = { facts: null };
     const emptyDecision = (): NavigatorFindingLedgerDecision => ({
       outcome: "accepted",
@@ -717,19 +909,18 @@ describe("navigator ticket integration executor", () => {
       staleEvidence: [],
       reasons: [],
     });
-    const persistence: NavigatorFindingLedgerPersistence = {
+    new NavigatorFindingLedger({
       assess: (facts) => {
         recorded.facts = facts;
         return emptyDecision();
       },
       resolvePassingReview: emptyDecision,
       currentDecision: emptyDecision,
-    };
-    new NavigatorFindingLedger(persistence).assess({
-      jobId: "job_policy",
-      sliceId: "slice_policy",
-      sourceReviewAttemptId: "attempt_source",
-      verificationAttemptId: "attempt_verification",
+    }).assess({
+      jobId: "job_policy_matrix",
+      sliceId: "slice_policy_matrix",
+      sourceReviewAttemptId: "attempt_policy_source",
+      verificationAttemptId: "attempt_policy_confirmation",
       sourceAttemptDigest: "a".repeat(64),
       verificationAttemptDigest: "b".repeat(64),
       exactHeadSha: SHA.base,
@@ -737,15 +928,23 @@ describe("navigator ticket integration executor", () => {
       artifactSnapshotDigest: null,
       specificationSnapshotId: null,
       specificationSnapshotDigest: null,
-      selectedGuards: [{ capabilityId: "clean-code-guard", descriptorDigest }],
-      requirementIds: [guardRequirementBindings(["test"])[0]!.id],
+      selectedGuards: [{ capabilityId: finding.capabilityId, descriptorDigest }],
+      requirementIds: [requirementId],
       proposedFindings: [finding],
       confirmedFindings: [finding],
-      evidenceRefs: ["review:policy-case"],
+      evidenceRefs: ["review:policy-matrix"],
       now: 1,
       maxReviewCycles: 3,
     });
+
+    expect(guardAssessment).toMatchObject({ outcome: expected === "must_fix" ? "changes_requested" : "pass_with_advisories" });
+    expect(guardAssessment.findings[0]?.disposition).toBe(expected);
     expect(recorded.facts?.findings[0]?.disposition).toBe(expected);
+    expect(navigatorFindingDisposition({
+      ...finding,
+      descriptorDigest,
+      requirementIds: [requirementId],
+    })).toBe(expected);
   });
 
   it.each([
@@ -906,6 +1105,70 @@ describe("navigator ticket integration executor", () => {
       "navigator_ticket_repair_proposals",
       "navigator_ticket_repair_dispatches",
     )).toHaveLength(3);
+  });
+
+  it("upgrades a preceding-schema open finding ledger and resolves it in SQLite", () => {
+    const findingUpgradeId = ALL_MIGRATIONS.indexOf(NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS[0]);
+    expect(findingUpgradeId).toBeGreaterThan(0);
+    const value = fixture(findingUpgradeId, seedPreFindingLedgerSchema);
+
+    const readable = value.store.getNavigatorFindingLedgerDecision("legacy-ledger-job");
+    expect(readable).toMatchObject({
+      outcome: "accepted",
+      allowedNextAction: "repair",
+      blockingBurden: 1,
+      entries: [{
+        rootCauseId: "legacy-open-root",
+        state: "open",
+        disposition: "must_fix",
+        normalizedSubject: "src/legacy.ts",
+        requirementClass: "evidence:legacy",
+      }],
+    });
+
+    const ledger = new NavigatorFindingLedger(new NavigatorFindingLedgerRepository(value.database));
+    const resolved = ledger.resolvePassingReview({
+      jobId: "legacy-ledger-job",
+      sliceId: "legacy-ledger-slice",
+      verificationAttemptId: "legacy-ledger-resolution-attempt",
+      verificationAttemptDigest: "c".repeat(64),
+      exactHeadSha: SHA.base,
+      artifactSnapshotId: null,
+      artifactSnapshotDigest: null,
+      specificationSnapshotId: null,
+      specificationSnapshotDigest: null,
+      evidenceRefs: ["legacy:resolution"],
+      now: 2_000,
+      maxReviewCycles: 3,
+    });
+
+    expect(resolved).toMatchObject({
+      outcome: "accepted",
+      allowedNextAction: "accept",
+      blockingBurden: 0,
+      entries: [{ rootCauseId: "legacy-open-root", state: "resolved", blockingBurden: 0 }],
+      currentRoots: [],
+    });
+    expect(value.database.prepare(
+      `SELECT event, root_cause_id, fingerprint, normalized_subject, evidence_class
+         FROM navigator_review_finding_events
+        WHERE job_id = ? ORDER BY sequence`,
+    ).all("legacy-ledger-job")).toEqual([
+      {
+        event: "opened",
+        root_cause_id: "legacy-open-root",
+        fingerprint: "",
+        normalized_subject: "",
+        evidence_class: "legacy",
+      },
+      {
+        event: "resolved",
+        root_cause_id: "legacy-open-root",
+        fingerprint: "legacy:legacy-open-root",
+        normalized_subject: "src/legacy.ts",
+        evidence_class: "review",
+      },
+    ]);
   });
 
   it("rejects worker-reported Git evidence that disagrees with the executor observation", async () => {
@@ -1594,6 +1857,143 @@ describe("navigator ticket integration executor", () => {
     expect(value.database.prepare(
       "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
     ).get(prepared.effect.payload.attemptId)).toEqual({ count: 0 });
+  });
+
+  it("rolls back verified finding settlement after ledger insertion", async () => {
+    const value = fixture();
+    const prepared = prepareTicketEffectForProtocol(value, 1_110);
+    const proposedFinding: NavigatorReviewFinding = {
+      rootCauseId: "post-ledger-settlement-fault",
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-10",
+      severity: "low",
+      subject: "src/app.ts",
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: "The initial review proposed an advisory finding.",
+      evidenceRefs: ["review:proposal"],
+    };
+    const confirmedFinding: NavigatorReviewFinding = {
+      ...proposedFinding,
+      severity: "critical",
+      summary: "The independent confirmation found a critical issue.",
+      evidenceRefs: ["review:confirmation"],
+    };
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
+      if (input.attempt.kind === "implementation") {
+        return { resource, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) };
+      }
+      const result = reviewResult(input.attempt, "findings", proposedFinding);
+      return input.attempt.workOrder.verificationOf === undefined
+        ? { resource, result }
+        : { resource, result: { ...result, findings: [confirmedFinding] } };
+    });
+    const protocol = ticketProtocol(value, {
+      run,
+      reconcile: run,
+      observe: validGitObserver().observe,
+    }, () => 1_110);
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+
+    const verificationAttempt = value.database.prepare(
+      `SELECT id FROM navigator_ticket_worker_attempts
+        WHERE slice_id = ? AND kind = 'review' ORDER BY ordinal DESC LIMIT 1`,
+    ).get(prepared.effect.payload.sliceId) as { id: string } | undefined;
+    if (!verificationAttempt) throw new Error("finding verification attempt was not created");
+    const verificationEffect = value.store.listEffectsForJob(value.jobId).find((effect) =>
+      effect.payload.attemptId === verificationAttempt.id);
+    if (!verificationEffect) throw new Error("finding verification effect was not created");
+
+    const before = {
+      findingEvents: value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_review_finding_events WHERE slice_id = ?",
+      ).get(prepared.effect.payload.sliceId) as { count: number },
+      convergence: value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_review_convergence WHERE slice_id = ?",
+      ).get(prepared.effect.payload.sliceId) as { count: number },
+      receipt: value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+      ).get(verificationEffect.idempotencyKey) as { count: number },
+      outcome: value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+      ).get(verificationAttempt.id) as { count: number },
+      attemptCount: value.database.prepare(
+        "SELECT COUNT(*) AS count FROM navigator_ticket_worker_attempts WHERE slice_id = ?",
+      ).get(prepared.effect.payload.sliceId) as { count: number },
+      job: value.database.prepare("SELECT state, version FROM jobs WHERE id = ?")
+        .get(value.jobId) as { state: string; version: number },
+      integration: value.database.prepare(
+        "SELECT state, current_head_sha, active_slice_id FROM navigator_integrations WHERE job_id = ?",
+      ).get(value.jobId) as { state: string; current_head_sha: string; active_slice_id: string | null },
+      ticket: value.database.prepare(
+        "SELECT state, accepted_head_sha FROM navigator_integration_tickets WHERE job_id = ? AND artifact_id = ?",
+      ).get(value.jobId, value.ticketIds[0]) as { state: string; accepted_head_sha: string | null },
+      slice: value.database.prepare("SELECT state, accepted_head_sha FROM navigator_ticket_slices WHERE id = ?")
+        .get(prepared.effect.payload.sliceId) as { state: string; accepted_head_sha: string | null },
+    };
+    expect(before.findingEvents).toEqual({ count: 0 });
+    expect(before.convergence).toEqual({ count: 0 });
+    expect(before.receipt).toEqual({ count: 0 });
+    expect(before.outcome).toEqual({ count: 0 });
+    expect(before.slice.state).toBe("review_pending");
+    expect(value.store.getEffect(value.jobId, verificationEffect.idempotencyKey)).toMatchObject({ status: "pending" });
+
+    value.database.exec(
+      `CREATE TRIGGER navigator_test_fail_after_finding_ledger
+       BEFORE UPDATE ON navigator_ticket_slices
+       WHEN NEW.id = '${prepared.effect.payload.sliceId}' AND NEW.state = 'repair_pending'
+       BEGIN
+         SELECT RAISE(ABORT, 'finding settlement fault')
+           WHERE EXISTS (
+             SELECT 1 FROM navigator_review_finding_events
+              WHERE slice_id = '${prepared.effect.payload.sliceId}' AND event = 'opened'
+           );
+       END`,
+    );
+
+    await expect(protocol.processOne(fence, new AbortController().signal)).resolves.toBe(true);
+
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_review_finding_events WHERE slice_id = ?",
+    ).get(prepared.effect.payload.sliceId)).toEqual(before.findingEvents);
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_review_convergence WHERE slice_id = ?",
+    ).get(prepared.effect.payload.sliceId)).toEqual(before.convergence);
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(verificationEffect.idempotencyKey)).toEqual(before.receipt);
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(verificationAttempt.id)).toEqual(before.outcome);
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_attempts WHERE slice_id = ?",
+    ).get(prepared.effect.payload.sliceId)).toEqual(before.attemptCount);
+    expect(value.database.prepare("SELECT state, version FROM jobs WHERE id = ?").get(value.jobId)).toEqual(before.job);
+    expect(value.database.prepare(
+      "SELECT state, current_head_sha, active_slice_id FROM navigator_integrations WHERE job_id = ?",
+    ).get(value.jobId)).toEqual(before.integration);
+    expect(value.database.prepare(
+      "SELECT state, accepted_head_sha FROM navigator_integration_tickets WHERE job_id = ? AND artifact_id = ?",
+    ).get(value.jobId, value.ticketIds[0])).toEqual(before.ticket);
+    expect(value.database.prepare("SELECT state, accepted_head_sha FROM navigator_ticket_slices WHERE id = ?")
+      .get(prepared.effect.payload.sliceId)).toEqual(before.slice);
+    expect(value.store.getNavigatorFindingLedgerDecision(value.jobId)).toMatchObject({
+      blockingBurden: 0,
+      entries: [],
+      allowedNextAction: "accept",
+    });
+    expect(value.store.getEffect(value.jobId, verificationEffect.idempotencyKey)).toMatchObject({
+      status: "failed",
+      leaseOwner: null,
+      leaseGeneration: null,
+      leaseExpiresAt: null,
+      lastError: expect.stringContaining("finding settlement fault"),
+    });
   });
 
   it("reconciles an ambiguous ticket outcome with a typed receipt", async () => {
