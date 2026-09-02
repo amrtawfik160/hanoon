@@ -185,7 +185,7 @@ export function normalizeGuardSubject(rawSubject: string): string {
     .replace(/\/$/u, "");
   if (normalized.length < 1 || normalized.length > 512 || normalized.startsWith("/") ||
     /^[A-Za-z]:\//u.test(normalized) || normalized.includes("\0") ||
-    normalized.split("/").some((segment) => segment === ".." || segment.length === 0)) {
+    normalized.split("/").some((segment) => segment === "." || segment === ".." || segment.length === 0)) {
     throw new TypeError("Guard finding subject must be a normalized project-relative identity");
   }
   return normalized;

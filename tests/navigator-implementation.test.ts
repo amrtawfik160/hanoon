@@ -2,18 +2,28 @@ import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
+import { SKILL_ADMISSION_CATALOG } from "../src/capabilities/catalog";
+import { guardRequirementBindings } from "../src/capabilities/guards";
 import {
   navigatorAcceptanceCriteria,
   navigatorAcceptanceCriteriaAreSatisfied,
   navigatorCodeReviewResultSchema,
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
+  type NavigatorReviewFinding,
 } from "../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
   navigatorFindingDisposition,
   type NavigatorTicketWorkerAttempt,
 } from "../src/navigator/implementation-executor";
+import {
+  NavigatorFindingLedger,
+  navigatorFindingFingerprint,
+  type NavigatorFindingAssessmentFacts,
+  type NavigatorFindingLedgerDecision,
+  type NavigatorFindingLedgerPersistence,
+} from "../src/navigator/finding-ledger";
 import {
   NavigatorTicketWorkerRetryableError,
   NavigatorTicketWorkerUnavailableError,
@@ -307,16 +317,18 @@ function implementationResult(
 function reviewResult(
   attempt: NavigatorTicketWorkerAttempt,
   outcome: "passed" | "findings",
+  findingOverride?: NavigatorReviewFinding,
 ) {
   const findings = outcome === "findings"
-    ? attempt.workOrder.verificationOf?.findings ?? [{
+    ? attempt.workOrder.verificationOf?.findings ?? [findingOverride ?? {
       rootCauseId: "restart-durability",
       capabilityId: "code-review",
       ruleId: "SPEC-40-RESTART",
       severity: "high" as const,
       subject: "src/navigator/implementation-executor.ts",
       line: 1,
-      requirementId: "SPEC-40-RESTART",
+      requirementId: guardRequirementBindings(["test"])[0]!.id,
+      evidenceClass: "review",
       summary: "The interrupted worker path is not yet durable.",
       evidenceRefs: [`head:${attempt.workOrder.baseHeadSha}`],
     }]
@@ -517,6 +529,129 @@ function configureTicketClaimCase(
 }
 
 describe("navigator ticket integration executor", () => {
+  it("keeps finding identity stable across mutable review wording and formatting", () => {
+    const finding = {
+      rootCauseId: "wording-change",
+      capabilityId: "code-review",
+      ruleId: "requirement.behavior",
+      severity: "high" as const,
+      subject: "./src\\app.ts",
+      line: 7,
+      requirementId: "required-check:behavior",
+      evidenceClass: "review",
+      summary: "The first wording.",
+      evidenceRefs: ["review:first"],
+    };
+
+    const descriptorDigest = "a".repeat(64);
+    expect(navigatorFindingFingerprint(descriptorDigest, finding)).toBe(
+      navigatorFindingFingerprint(descriptorDigest, {
+        ...finding,
+        severity: "low",
+        line: 99,
+        summary: "The revised wording.",
+        evidenceRefs: ["review:second"],
+        subject: "src/app.ts",
+      }),
+    );
+    expect(navigatorFindingFingerprint(descriptorDigest, { ...finding, requirementId: null })).not.toBe(
+      navigatorFindingFingerprint(descriptorDigest, {
+        ...finding,
+        requirementId: null,
+        evidenceClass: "public-contract",
+      }),
+    );
+  });
+
+  it("records registry policy facts atomically and marks older-head proof stale", async () => {
+    const value = fixture();
+    const { executor } = prepareTicketEffectForExecutor(value, 1_110);
+    value.database.prepare("UPDATE effects SET lease_expires_at = 1_109 WHERE job_id = ? AND status = 'leased'")
+      .run(value.jobId);
+    value.database.prepare("UPDATE job_resource_claims SET lease_expires_at = 2_000 WHERE job_id = ? AND state = 'held'")
+      .run(value.jobId);
+    value.database.prepare("UPDATE work_artifact_claims SET lease_expires_at = 2_000 WHERE state = 'held'")
+      .run();
+    value.database.prepare(
+      "UPDATE executor_lease SET owner_id = 'executor-40', generation = 1, heartbeat_at = 1_110, lease_expires_at = 2_000 WHERE singleton = 1",
+    ).run();
+    const finding: NavigatorReviewFinding = {
+      rootCauseId: "critical-advisory-rule",
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-10",
+      severity: "critical",
+      subject: ".\\src/app.ts",
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: "The severity is model-supplied but cannot lower policy.",
+      evidenceRefs: ["review:critical"],
+    };
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
+      return input.attempt.kind === "implementation"
+        ? { resource, result: implementationResult(input.attempt, SHA.ticketOne, input.ticket) }
+        : { resource, result: reviewResult(input.attempt, "findings", finding) };
+    });
+    const protocol = ticketProtocol(value, { run, reconcile: run, observe: validGitObserver().observe }, () => 1_110);
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+
+    const decision = value.store.getNavigatorFindingLedgerDecision(value.jobId);
+    const entry = decision.entries[0]!;
+    expect(decision).toMatchObject({
+      outcome: "accepted",
+      allowedNextAction: "repair",
+      blockingBurden: 1,
+      burdenDelta: 0,
+    });
+    expect(entry).toMatchObject({
+      disposition: "must_fix",
+      state: "open",
+      normalizedSubject: "src/app.ts",
+      requirementClass: "evidence:review",
+      descriptorDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      descriptorVersion: expect.any(String),
+      policyRevision: 1,
+      policyDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      artifactSnapshotId: expect.any(String),
+      artifactSnapshotDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      specificationSnapshotId: expect.any(String),
+      specificationSnapshotDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      sourceAttemptDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      verificationAttemptDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    });
+    const event = value.database.prepare(
+      `SELECT root_cause_id, head_sha, normalized_subject, evidence_class, fingerprint,
+              disposition, policy_revision, requirement_ids_json, root_cause_confirmed
+         FROM navigator_review_finding_events ORDER BY sequence DESC LIMIT 1`,
+    ).get();
+    expect(event).toMatchObject({
+      root_cause_id: "critical-advisory-rule",
+      head_sha: SHA.ticketOne,
+      normalized_subject: "src/app.ts",
+      evidence_class: "review",
+      fingerprint: entry.fingerprint,
+      disposition: "must_fix",
+      policy_revision: 1,
+      root_cause_confirmed: 1,
+    });
+
+    value.database.prepare("UPDATE navigator_integrations SET current_head_sha = ? WHERE job_id = ?")
+      .run(SHA.repair, value.jobId);
+    const stale = value.store.getNavigatorFindingLedgerDecision(value.jobId);
+    expect(stale).toMatchObject({ allowedNextAction: "recheck", blockingBurden: 0, reasonCode: "stale_evidence" });
+    expect(stale.entries[0]).toMatchObject({ state: "stale", headSha: SHA.ticketOne });
+    expect(stale.staleEvidence).toEqual([{
+      fingerprint: entry.fingerprint,
+      assessedHeadSha: SHA.ticketOne,
+      currentHeadSha: SHA.repair,
+    }]);
+    expect(executor.snapshot(value.jobId).findingLedger[0]).toMatchObject({ state: "stale" });
+  });
+
   it("classifies findings from the trusted capability registry, not reviewer-supplied severity", () => {
     const finding = {
       rootCauseId: "spoofed-priority",
@@ -526,6 +661,7 @@ describe("navigator ticket integration executor", () => {
       subject: "src/app.ts",
       line: 1,
       requirementId: "SPOOFED-REQUIREMENT",
+      evidenceClass: "review",
       summary: "A reviewer tried to promote an advisory finding.",
       evidenceRefs: ["review:spoofed"],
     };
@@ -537,7 +673,139 @@ describe("navigator ticket integration executor", () => {
       ruleId: "requirement.behavior",
       severity: "low",
       requirementId: null,
+      evidenceClass: "review",
     })).toBe("must_fix");
+  });
+
+  it.each([
+    { name: "critical", overrides: { severity: "critical" as const }, expected: "must_fix" as const },
+    { name: "high", overrides: { severity: "high" as const }, expected: "must_fix" as const },
+    {
+      name: "requirement-linked",
+      overrides: { requirementId: guardRequirementBindings(["test"])[0]!.id },
+      expected: "must_fix" as const,
+    },
+    { name: "public-contract", overrides: { evidenceClass: "public-contract" }, expected: "must_fix" as const },
+    { name: "explicit must-fix rule", overrides: { ruleId: "clean.rule-1" }, expected: "must_fix" as const },
+    { name: "explicit advisory rule", overrides: { ruleId: "clean.rule-10" }, expected: "advisory" as const },
+    { name: "unknown rule uses registry default", overrides: { ruleId: "clean.rule-unknown" }, expected: "advisory" as const },
+  ] as const)("derives the $name disposition from the admitted policy", ({ overrides, expected }) => {
+    const descriptorDigest = SKILL_ADMISSION_CATALOG.find((entry) => entry.id === "clean-code-guard")?.bundleDescriptorDigest;
+    if (!descriptorDigest) throw new Error("clean-code-guard admission is unavailable");
+    const finding: NavigatorReviewFinding = {
+      rootCauseId: "policy-case",
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-10",
+      severity: "low",
+      subject: "src/app.ts",
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: "Mutable review prose does not choose disposition.",
+      evidenceRefs: ["finding:policy-case"],
+      ...overrides,
+    };
+    const recorded: { facts: NavigatorFindingAssessmentFacts | null } = { facts: null };
+    const emptyDecision = (): NavigatorFindingLedgerDecision => ({
+      outcome: "accepted",
+      allowedNextAction: "accept",
+      reasonCode: null,
+      entries: [],
+      currentRoots: [],
+      blockingBurden: 0,
+      burdenDelta: 0,
+      staleEvidence: [],
+      reasons: [],
+    });
+    const persistence: NavigatorFindingLedgerPersistence = {
+      assess: (facts) => {
+        recorded.facts = facts;
+        return emptyDecision();
+      },
+      resolvePassingReview: emptyDecision,
+      currentDecision: emptyDecision,
+    };
+    new NavigatorFindingLedger(persistence).assess({
+      jobId: "job_policy",
+      sliceId: "slice_policy",
+      sourceReviewAttemptId: "attempt_source",
+      verificationAttemptId: "attempt_verification",
+      sourceAttemptDigest: "a".repeat(64),
+      verificationAttemptDigest: "b".repeat(64),
+      exactHeadSha: SHA.base,
+      artifactSnapshotId: null,
+      artifactSnapshotDigest: null,
+      specificationSnapshotId: null,
+      specificationSnapshotDigest: null,
+      selectedGuards: [{ capabilityId: "clean-code-guard", descriptorDigest }],
+      requirementIds: [guardRequirementBindings(["test"])[0]!.id],
+      proposedFindings: [finding],
+      confirmedFindings: [finding],
+      evidenceRefs: ["review:policy-case"],
+      now: 1,
+      maxReviewCycles: 3,
+    });
+    expect(recorded.facts?.findings[0]?.disposition).toBe(expected);
+  });
+
+  it.each([
+    { name: "unknown capability", capabilityId: "not-admitted", requirementId: null, requirementIds: [] },
+    { name: "unselected capability", capabilityId: "docs-guard", requirementId: null, requirementIds: [] },
+    {
+      name: "unknown requirement",
+      capabilityId: "clean-code-guard",
+      requirementId: "requirement:not-admitted",
+      requirementIds: [guardRequirementBindings(["test"])[0]!.id],
+    },
+  ] as const)("fails closed for an $name", ({ capabilityId, requirementId, requirementIds }) => {
+    const descriptorDigest = SKILL_ADMISSION_CATALOG.find((entry) => entry.id === "clean-code-guard")?.bundleDescriptorDigest;
+    if (!descriptorDigest) throw new Error("clean-code-guard admission is unavailable");
+    const finding: NavigatorReviewFinding = {
+      rootCauseId: "policy-rejection",
+      capabilityId,
+      ruleId: "clean.rule-10",
+      severity: "low",
+      subject: "src/app.ts",
+      line: 1,
+      requirementId,
+      evidenceClass: "review",
+      summary: "Unadmitted policy input cannot reach persistence.",
+      evidenceRefs: ["finding:policy-rejection"],
+    };
+    let called = false;
+    const decision = new NavigatorFindingLedger({
+      assess: () => {
+        called = true;
+        throw new Error("untrusted finding reached persistence");
+      },
+      resolvePassingReview: () => {
+        throw new Error("unused");
+      },
+      currentDecision: () => {
+        throw new Error("unused");
+      },
+    }).assess({
+      jobId: "job_policy",
+      sliceId: "slice_policy",
+      sourceReviewAttemptId: "attempt_source",
+      verificationAttemptId: "attempt_verification",
+      sourceAttemptDigest: "a".repeat(64),
+      verificationAttemptDigest: "b".repeat(64),
+      exactHeadSha: SHA.base,
+      artifactSnapshotId: null,
+      artifactSnapshotDigest: null,
+      specificationSnapshotId: null,
+      specificationSnapshotDigest: null,
+      selectedGuards: [{ capabilityId: "clean-code-guard", descriptorDigest }],
+      requirementIds,
+      proposedFindings: [finding],
+      confirmedFindings: [finding],
+      evidenceRefs: ["review:policy-rejection"],
+      now: 1,
+      maxReviewCycles: 3,
+    });
+    expect(decision).toMatchObject({ outcome: "blocked", allowedNextAction: "stop" });
+    expect(called).toBe(false);
   });
 
   it("requires every stable acceptance criterion and both review axes", () => {

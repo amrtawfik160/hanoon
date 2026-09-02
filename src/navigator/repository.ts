@@ -28,6 +28,11 @@ import {
   NavigatorTicketSettlementRepository,
   type NavigatorTicketWorkerOutcome,
 } from "./ticket-settlement-repository";
+import {
+  NavigatorFindingLedger,
+  type NavigatorFindingLedgerDecision,
+} from "./finding-ledger";
+import { NavigatorFindingLedgerRepository } from "./finding-ledger-repository";
 import { navigatorClaimContract, type NavigatorClaimedEffectKind } from "./claim-contracts";
 import {
   navigatorJsonDigest,
@@ -705,6 +710,7 @@ export class NavigatorRepository {
   private readonly releaseAuthorities: ReleaseAuthorityRepository;
   private readonly ownerBoundaries: OwnerBoundaryRepository;
   private readonly ticketSettlement: NavigatorTicketSettlementRepository;
+  private readonly findingLedger: NavigatorFindingLedger;
 
   public constructor(private readonly db: SqliteDatabase) {
     this.artifacts = new WorkArtifactRepository(db);
@@ -712,7 +718,8 @@ export class NavigatorRepository {
     this.taskAuthorities = new TaskAuthorityRepository(db);
     this.releaseAuthorities = new ReleaseAuthorityRepository(db);
     this.ownerBoundaries = new OwnerBoundaryRepository(db);
-    this.ticketSettlement = new NavigatorTicketSettlementRepository(db);
+    this.findingLedger = new NavigatorFindingLedger(new NavigatorFindingLedgerRepository(db));
+    this.ticketSettlement = new NavigatorTicketSettlementRepository(db, this.findingLedger);
   }
 
   public settleNavigatorTicketWorkerAttempt(
@@ -723,6 +730,10 @@ export class NavigatorRepository {
 
   public bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
     return this.ticketSettlement.bindResource(input);
+  }
+
+  public getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision {
+    return this.findingLedger.currentDecision({ jobId });
   }
 
   private createNavigatorCapabilityProfile(input: Readonly<{

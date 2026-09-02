@@ -8,6 +8,7 @@ import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes"
 import {
   CAPABILITY_GRAPH_DIGEST,
   CAPABILITY_REGISTRY_DIGEST,
+  admittedCapabilityFindingPolicy,
   capabilityDescriptorById,
 } from "./capabilities/catalog";
 import { isCurrentManagedAutomationAuthority } from "./domain/managed-automation";
@@ -168,6 +169,23 @@ import {
   parseOpenSelfDiagnosisPullRequests,
   publishSelfDiagnosisPullRequest,
 } from "./bb/pr-publish";
+
+function registryGuardRuleIds(
+  assignments: readonly Readonly<{ capabilityId: string; descriptorDigest: string }>[],
+  requirementIds: readonly string[],
+): Readonly<{ mustFixRuleIds: readonly string[]; advisoryRuleIds: readonly string[] }> | null {
+  const policies = assignments.map((assignment) => admittedCapabilityFindingPolicy({
+    capabilityId: assignment.capabilityId,
+    descriptorDigest: assignment.descriptorDigest,
+    requirementIds,
+  }));
+  const admitted = policies.filter((policy): policy is NonNullable<typeof policy> => policy !== null);
+  if (admitted.length !== policies.length) return null;
+  return {
+    mustFixRuleIds: [...new Set(admitted.flatMap((policy) => policy.mustFixRuleIds))].sort(),
+    advisoryRuleIds: [...new Set(admitted.flatMap((policy) => policy.advisoryRuleIds))].sort(),
+  };
+}
 
 function clock(): number {
   return Date.now();
@@ -2069,6 +2087,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         return;
       }
       if (guardAssignments.length > 0) {
+        const requirementIds = guardRequirementBindings(current.policy.requiredChecks).map((requirement) => requirement.id);
+        const findingRuleIds = registryGuardRuleIds(guardAssignments, requirementIds);
+        if (!findingRuleIds) {
+          if (!fenceCurrent()) return;
+          applyExecutorEvent(job.id, current.version, { type: "REVIEW_BLOCKED", reason: "configuration" });
+          return;
+        }
         guardPolicy = {
           profileId: profile.id,
           profileRevision: profile.revision,
@@ -2084,9 +2109,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
               substitutes: descriptor.composition.substitutes,
             };
           }),
-          requirementIds: guardRequirementBindings(current.policy.requiredChecks).map((requirement) => requirement.id),
-          mustFixRuleIds: ["clean.rule-1", "docs.rule-1", "tests.rule-1"],
-          advisoryRuleIds: ["clean.rule-10", "docs.rule-10", "tests.rule-10"],
+          requirementIds,
+          mustFixRuleIds: findingRuleIds.mustFixRuleIds,
+          advisoryRuleIds: findingRuleIds.advisoryRuleIds,
         };
       }
     }

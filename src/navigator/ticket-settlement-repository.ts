@@ -6,6 +6,9 @@ import { CAPABILITY_GRAPH_DIGEST, CAPABILITY_REGISTRY_DIGEST } from "../capabili
 import { DEFAULT_MODEL_POOL_REGISTRY, modelRouteSchema, type ModelRoute } from "../capabilities/models";
 import { CapabilityRepository } from "../storage/capability-repository";
 import { WorkArtifactRepository } from "../work-artifacts/repository";
+import { guardRequirementBindings } from "../capabilities/guards";
+import { NavigatorFindingLedger } from "./finding-ledger";
+import type { NavigatorFindingLedgerEntry } from "./finding-ledger";
 import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
 import {
   navigatorTicketReceiptSchema,
@@ -14,6 +17,7 @@ import {
   type NavigatorTicketSettlementInput,
 } from "./effect-contracts";
 import {
+  navigatorAcceptanceCriteria,
   navigatorAcceptanceCriteriaAreSatisfied,
   NAVIGATOR_TICKET_STEP_CONTRACTS,
   navigatorCodeReviewResultSchema,
@@ -21,7 +25,6 @@ import {
   navigatorImplementationResultSchema,
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
-  navigatorReviewFindingSchema,
   navigatorTicketWorkerProfileSchema,
   navigatorTicketWorkerProfile,
   navigatorTicketWorkerFailureResultSchema,
@@ -37,6 +40,9 @@ import {
   type NavigatorTicketWorkerUnavailableResult,
 } from "./implementation-contracts";
 
+export type { NavigatorFindingLedgerEntry } from "./finding-ledger";
+export { compatibilityCapabilityFindingDisposition as navigatorFindingDisposition } from "../capabilities/catalog";
+
 export type NavigatorTicketWorkerOutcome = Readonly<{
   attemptId: string;
   sliceId: string;
@@ -47,19 +53,6 @@ export type NavigatorTicketWorkerOutcome = Readonly<{
   resultDigest: string;
   gitObservation: NavigatorGitObservation | null;
   recordedAt: number;
-}>;
-
-export type NavigatorFindingLedgerEntry = Readonly<{
-  rootCauseId: string;
-  sliceId: string;
-  sourceReviewAttemptId: string;
-  verificationAttemptId: string;
-  disposition: "must_fix" | "advisory";
-  state: "open" | "resolved" | "disputed";
-  occurrence: number;
-  blockingBurden: number;
-  headSha: string;
-  finding: NavigatorReviewFinding;
 }>;
 
 type SqliteDatabase = Database.Database;
@@ -158,50 +151,6 @@ type OutcomeRow = Readonly<{
   recorded_at: number;
 }>;
 
-type FindingEventRow = Readonly<{
-  sequence: number;
-  id: string;
-  job_id: string;
-  slice_id: string;
-  source_review_attempt_id: string;
-  verification_attempt_id: string;
-  root_cause_id: string;
-  capability_id: string;
-  rule_id: string;
-  disposition: "must_fix" | "advisory";
-  event: "opened" | "reobserved" | "resolved" | "disputed";
-  head_sha: string;
-  finding_json: string;
-  evidence_refs_json: string;
-  occurrence: number;
-  blocking_burden: number;
-  created_at: number;
-}>;
-
-type ConvergenceRow = Readonly<{
-  slice_id: string;
-  last_blocking_burden: number;
-  plateau_recoveries: number;
-  review_cycles: number;
-  updated_at: number;
-}>;
-
-const NAVIGATOR_FINDING_POLICY = Object.freeze({
-  "code-review": Object.freeze({ defaultDisposition: "must_fix" as const, mustFixRuleIds: Object.freeze([]) }),
-  "clean-code-guard": Object.freeze({
-    defaultDisposition: "advisory" as const,
-    mustFixRuleIds: Object.freeze(["clean.rule-1"]),
-  }),
-  "docs-guard": Object.freeze({
-    defaultDisposition: "advisory" as const,
-    mustFixRuleIds: Object.freeze(["docs.rule-1"]),
-  }),
-  "test-guard": Object.freeze({
-    defaultDisposition: "advisory" as const,
-    mustFixRuleIds: Object.freeze(["tests.rule-1"]),
-  }),
-});
-
 function assertIdentifier(value: string, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0 || value.length > 256) {
     throw new TypeError(`${field} is invalid`);
@@ -246,27 +195,6 @@ function retryDelay(contract: NavigatorTicketWorkerAttempt["stepContract"], atte
     "backoffMaximumMs" in contract && contract.backoffMaximumMs !== undefined
   ) return Math.min(contract.backoffMaximumMs, contract.backoffBaseMs * 2 ** Math.max(0, attempts - 1));
   return 1;
-}
-
-function findingState(event: FindingEventRow["event"]): NavigatorFindingLedgerEntry["state"] {
-  if (event === "opened" || event === "reobserved") return "open";
-  return event === "resolved" ? "resolved" : "disputed";
-}
-
-function sameRootCause(left: NavigatorReviewFinding, right: NavigatorReviewFinding): boolean {
-  return left.rootCauseId === right.rootCauseId && left.capabilityId === right.capabilityId &&
-    left.ruleId === right.ruleId && left.subject === right.subject && left.line === right.line &&
-    left.requirementId === right.requirementId;
-}
-
-export function navigatorFindingDisposition(
-  finding: NavigatorReviewFinding,
-): "must_fix" | "advisory" | null {
-  const policy = NAVIGATOR_FINDING_POLICY[finding.capabilityId as keyof typeof NAVIGATOR_FINDING_POLICY];
-  if (!policy) return null;
-  return policy.mustFixRuleIds.some((ruleId) => ruleId === finding.ruleId)
-    ? "must_fix"
-    : policy.defaultDisposition;
 }
 
 function parseTicketAttempt(row: AttemptRow): NavigatorTicketWorkerAttempt {
@@ -388,7 +316,10 @@ export class NavigatorTicketSettlementRepository {
   private readonly artifacts: WorkArtifactRepository;
   private readonly capabilities: CapabilityRepository;
 
-  public constructor(private readonly db: SqliteDatabase) {
+  public constructor(
+    private readonly db: SqliteDatabase,
+    private readonly findingLedger: NavigatorFindingLedger,
+  ) {
     this.artifacts = new WorkArtifactRepository(db);
     this.capabilities = new CapabilityRepository(db);
   }
@@ -420,6 +351,10 @@ export class NavigatorTicketSettlementRepository {
     assertIdentifier(input.resource.id, "resource id");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction(() => this.bindResourceInTransaction(input)).immediate();
+  }
+
+  public currentFindingLedger(jobId: string): NavigatorFindingLedgerEntry[] {
+    return [...this.findingLedger.currentDecision({ jobId }).entries];
   }
 
   private settleReceipt(input: NavigatorTicketSettlementInput & Readonly<{ receipt: NavigatorTicketReceipt }>): NavigatorTicketWorkerOutcome | null {
@@ -966,108 +901,30 @@ export class NavigatorTicketSettlementRepository {
     }, "review");
   }
 
-  private currentFindingRows(jobId: string, sliceId?: string): FindingEventRow[] {
-    return this.db.prepare(
-      `SELECT event.*
-         FROM navigator_review_finding_events AS event
-        WHERE event.job_id = ? AND (? IS NULL OR event.slice_id = ?)
-          AND event.sequence = (
-            SELECT MAX(newest.sequence) FROM navigator_review_finding_events AS newest
-             WHERE newest.slice_id = event.slice_id AND newest.root_cause_id = event.root_cause_id
-          )
-        ORDER BY event.slice_id, event.root_cause_id`,
-    ).all(jobId, sliceId ?? null, sliceId ?? null) as FindingEventRow[];
-  }
-
-  public currentFindingLedger(jobId: string): NavigatorFindingLedgerEntry[] {
-    return this.currentFindingRows(jobId).map((row) => ({
-      rootCauseId: row.root_cause_id,
-      sliceId: row.slice_id,
-      sourceReviewAttemptId: row.source_review_attempt_id,
-      verificationAttemptId: row.verification_attempt_id,
-      disposition: row.disposition,
-      state: findingState(row.event),
-      occurrence: row.occurrence,
-      blockingBurden: row.blocking_burden,
-      headSha: row.head_sha,
-      finding: navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json)),
-    }));
-  }
-
-  private appendFindingEvent(input: Readonly<{
-    attempt: NavigatorTicketWorkerAttempt;
-    sourceReviewAttemptId: string;
-    finding: NavigatorReviewFinding;
-    disposition: "must_fix" | "advisory";
-    event: FindingEventRow["event"];
-    occurrence: number;
-    blockingBurden: number;
-    evidenceRefs: readonly string[];
-    now: number;
-  }>): void {
-    const eventId = stableId("navfinding", input.attempt.id, input.finding.rootCauseId, input.event);
-    this.db.prepare(
-      `INSERT INTO navigator_review_finding_events (
-         id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
-         root_cause_id, capability_id, rule_id, disposition, event, head_sha,
-         finding_json, evidence_refs_json, occurrence, blocking_burden, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      eventId,
-      input.attempt.jobId,
-      input.attempt.sliceId,
-      input.sourceReviewAttemptId,
-      input.attempt.id,
-      input.finding.rootCauseId,
-      input.finding.capabilityId,
-      input.finding.ruleId,
-      input.disposition,
-      input.event,
-      input.attempt.workOrder.baseHeadSha,
-      JSON.stringify(input.finding),
-      JSON.stringify(boundedRefs(input.evidenceRefs)),
-      input.occurrence,
-      input.blockingBurden,
-      input.now,
-    );
-  }
-
   private recordPassingReview(
     attempt: NavigatorTicketWorkerAttempt,
     reviewResult: Readonly<{ axes: { requirements: { evidenceRefs: readonly string[] }; standards: { evidenceRefs: readonly string[] } } }>,
     now: number,
   ): string | null {
-    const current = this.currentFindingRows(attempt.jobId, attempt.sliceId);
-    const convergence = this.db.prepare("SELECT * FROM navigator_review_convergence WHERE slice_id = ?")
-      .get(attempt.sliceId) as ConvergenceRow | undefined;
-    const reviewCycles = (convergence?.review_cycles ?? 0) + 1;
-    if (reviewCycles > attempt.workOrder.projectPolicy.maxReviewCycles) return "review_cycle_limit";
-    for (const row of current) {
-      if (findingState(row.event) !== "open") continue;
-      this.appendFindingEvent({
-        attempt,
-        sourceReviewAttemptId: attempt.id,
-        finding: navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json)),
-        disposition: row.disposition,
-        event: "resolved",
-        occurrence: row.occurrence,
-        blockingBurden: 0,
-        evidenceRefs: mergeEvidenceRefs(
-          reviewResult.axes.requirements.evidenceRefs,
-          reviewResult.axes.standards.evidenceRefs,
-          [`navigator-result:${attempt.id}`],
-        ),
-        now,
-      });
-    }
-    this.db.prepare(
-      `INSERT INTO navigator_review_convergence (
-         slice_id, last_blocking_burden, plateau_recoveries, review_cycles, updated_at
-       ) VALUES (?, 0, ?, ?, ?)
-       ON CONFLICT(slice_id) DO UPDATE SET last_blocking_burden = 0,
-         review_cycles = excluded.review_cycles, updated_at = excluded.updated_at`,
-    ).run(attempt.sliceId, convergence?.plateau_recoveries ?? 0, reviewCycles, now);
-    return null;
+    const decision = this.findingLedger.resolvePassingReview({
+      jobId: attempt.jobId,
+      sliceId: attempt.sliceId,
+      verificationAttemptId: attempt.id,
+      verificationAttemptDigest: navigatorJsonDigest(reviewResult),
+      exactHeadSha: attempt.workOrder.baseHeadSha,
+      artifactSnapshotId: attempt.workOrder.ticket.snapshotId,
+      artifactSnapshotDigest: attempt.workOrder.ticket.snapshotDigest,
+      specificationSnapshotId: attempt.workOrder.specification.snapshotId,
+      specificationSnapshotDigest: attempt.workOrder.specification.snapshotDigest,
+      evidenceRefs: mergeEvidenceRefs(
+        reviewResult.axes.requirements.evidenceRefs,
+        reviewResult.axes.standards.evidenceRefs,
+        [`navigator-result:${attempt.id}`],
+      ),
+      now,
+      maxReviewCycles: attempt.workOrder.projectPolicy.maxReviewCycles,
+    });
+    return decision.outcome === "blocked" ? decision.reasonCode ?? "finding_assessment_blocked" : null;
   }
 
   private recordFindingVerification(
@@ -1077,129 +934,47 @@ export class NavigatorTicketSettlementRepository {
   ): Readonly<{ blockingBurden: number; policyFailureReason: string | null }> {
     const verification = attempt.workOrder.verificationOf;
     if (verification === undefined) return { blockingBurden: 0, policyFailureReason: "finding_verification_source_missing" };
-    const source = new Map(verification.findings.map((finding) => [finding.rootCauseId, finding]));
-    const selectedCapabilities = new Set(attempt.profile.assignments.map(({ capabilityId }) => capabilityId));
-    const dispositions = new Map<string, "must_fix" | "advisory">();
-    for (const finding of verification.findings) {
-      const disposition = navigatorFindingDisposition(finding);
-      if (disposition === null || !selectedCapabilities.has(finding.capabilityId)) {
-        return { blockingBurden: 0, policyFailureReason: "finding_policy_unregistered" };
-      }
-      dispositions.set(finding.rootCauseId, disposition);
-    }
-    const confirmed = new Map<string, NavigatorReviewFinding>();
-    for (const finding of reviewResult.findings) {
-      const reported = source.get(finding.rootCauseId);
-      if (reported === undefined || confirmed.has(finding.rootCauseId) || !sameRootCause(reported, finding)) {
-        return { blockingBurden: 0, policyFailureReason: "finding_verification_mismatch" };
-      }
-      confirmed.set(finding.rootCauseId, finding);
-    }
-    return this.persistFindingVerification({ attempt, verification, reviewResult, source, confirmed, dispositions, now });
+    const requirementIds = this.reviewRequirementIds(attempt);
+    if (requirementIds === null) return { blockingBurden: 0, policyFailureReason: "finding_requirement_context_missing" };
+    const decision = this.findingLedger.assess({
+      jobId: attempt.jobId,
+      sliceId: attempt.sliceId,
+      sourceReviewAttemptId: verification.attemptId,
+      verificationAttemptId: attempt.id,
+      sourceAttemptDigest: verification.resultDigest,
+      verificationAttemptDigest: navigatorJsonDigest(reviewResult),
+      exactHeadSha: attempt.workOrder.baseHeadSha,
+      artifactSnapshotId: attempt.workOrder.ticket.snapshotId,
+      artifactSnapshotDigest: attempt.workOrder.ticket.snapshotDigest,
+      specificationSnapshotId: attempt.workOrder.specification.snapshotId,
+      specificationSnapshotDigest: attempt.workOrder.specification.snapshotDigest,
+      selectedGuards: attempt.profile.assignments.map(({ capabilityId, descriptorDigest }) => ({ capabilityId, descriptorDigest })),
+      requirementIds,
+      proposedFindings: verification.findings,
+      confirmedFindings: reviewResult.findings,
+      evidenceRefs: mergeEvidenceRefs(
+        reviewResult.findings.flatMap((finding) => finding.evidenceRefs),
+        [`navigator-result:${attempt.id}`],
+        [`navigator-result:${verification.attemptId}`],
+      ),
+      now,
+      maxReviewCycles: attempt.workOrder.projectPolicy.maxReviewCycles,
+    });
+    return {
+      blockingBurden: decision.blockingBurden,
+      policyFailureReason: decision.outcome === "blocked" ? decision.reasonCode ?? "finding_assessment_blocked" : null,
+    };
   }
 
-  private persistFindingVerification(input: Readonly<{
-    attempt: NavigatorTicketWorkerAttempt;
-    verification: NonNullable<NavigatorTicketWorkerAttempt["workOrder"]["verificationOf"]>;
-    reviewResult: Readonly<{ findings: readonly NavigatorReviewFinding[] }>;
-    source: ReadonlyMap<string, NavigatorReviewFinding>;
-    confirmed: ReadonlyMap<string, NavigatorReviewFinding>;
-    dispositions: ReadonlyMap<string, "must_fix" | "advisory">;
-    now: number;
-  }>): Readonly<{ blockingBurden: number; policyFailureReason: string | null }> {
-    const currentRows = this.currentFindingRows(input.attempt.jobId, input.attempt.sliceId);
-    const current = new Map(currentRows.map((row) => [row.root_cause_id, row]));
-    const next = new Map(currentRows.map((row) => [row.root_cause_id, {
-      disposition: row.disposition,
-      state: findingState(row.event),
-      occurrence: row.occurrence,
-    }]));
-    for (const finding of input.verification.findings) {
-      const prior = current.get(finding.rootCauseId);
-      const isConfirmed = input.confirmed.has(finding.rootCauseId);
-      next.set(finding.rootCauseId, {
-        disposition: input.dispositions.get(finding.rootCauseId)!,
-        state: isConfirmed ? "open" : "disputed",
-        occurrence: isConfirmed ? Math.min(3, (prior?.occurrence ?? 0) + 1) : prior?.occurrence ?? 0,
-      });
-    }
-    for (const row of currentRows) {
-      if (findingState(row.event) === "open" && !input.source.has(row.root_cause_id)) {
-        next.set(row.root_cause_id, { disposition: row.disposition, state: "resolved", occurrence: row.occurrence });
-      }
-    }
-    const blockingBurden = [...next.values()].filter((entry) => entry.state === "open" && entry.disposition === "must_fix").length;
-    const evidenceRefs = mergeEvidenceRefs(
-      input.reviewResult.findings.flatMap((finding) => finding.evidenceRefs),
-      [`navigator-result:${input.attempt.id}`],
-      [`navigator-result:${input.verification.attemptId}`],
-    );
-    this.appendFindingVerificationEvents({ ...input, currentRows, current, next, evidenceRefs, blockingBurden });
-    const convergence = this.db.prepare("SELECT * FROM navigator_review_convergence WHERE slice_id = ?")
-      .get(input.attempt.sliceId) as ConvergenceRow | undefined;
-    const reviewCycles = (convergence?.review_cycles ?? 0) + 1;
-    let plateauRecoveries = convergence?.plateau_recoveries ?? 0;
-    let policyFailureReason: string | null = null;
-    if ([...next.values()].some((entry) => entry.state === "open" && entry.occurrence >= 3)) policyFailureReason = "finding_recurrence_limit";
-    else if (reviewCycles > input.attempt.workOrder.projectPolicy.maxReviewCycles) policyFailureReason = "review_cycle_limit";
-    else if (convergence !== undefined && convergence.last_blocking_burden > 0 && blockingBurden >= convergence.last_blocking_burden) {
-      if (plateauRecoveries === 0) plateauRecoveries = 1;
-      else policyFailureReason = "review_burden_plateau";
-    }
-    this.db.prepare(
-      `INSERT INTO navigator_review_convergence (
-         slice_id, last_blocking_burden, plateau_recoveries, review_cycles, updated_at
-       ) VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(slice_id) DO UPDATE SET last_blocking_burden = excluded.last_blocking_burden,
-         plateau_recoveries = excluded.plateau_recoveries, review_cycles = excluded.review_cycles,
-         updated_at = excluded.updated_at`,
-    ).run(input.attempt.sliceId, blockingBurden, plateauRecoveries, reviewCycles, input.now);
-    return { blockingBurden, policyFailureReason };
-  }
-
-  private appendFindingVerificationEvents(input: Readonly<{
-    attempt: NavigatorTicketWorkerAttempt;
-    verification: NonNullable<NavigatorTicketWorkerAttempt["workOrder"]["verificationOf"]>;
-    currentRows: readonly FindingEventRow[];
-    current: ReadonlyMap<string, FindingEventRow>;
-    next: ReadonlyMap<string, Readonly<{ disposition: "must_fix" | "advisory"; state: string; occurrence: number }>>;
-    confirmed: ReadonlyMap<string, NavigatorReviewFinding>;
-    dispositions: ReadonlyMap<string, "must_fix" | "advisory">;
-    evidenceRefs: readonly string[];
-    blockingBurden: number;
-    now: number;
-    reviewResult: Readonly<{ findings: readonly NavigatorReviewFinding[] }>;
-    source: ReadonlyMap<string, NavigatorReviewFinding>;
-  }>): void {
-    for (const finding of input.verification.findings) {
-      const prior = input.current.get(finding.rootCauseId);
-      const isConfirmed = input.confirmed.has(finding.rootCauseId);
-      this.appendFindingEvent({
-        attempt: input.attempt,
-        sourceReviewAttemptId: input.verification.attemptId,
-        finding: isConfirmed ? input.confirmed.get(finding.rootCauseId)! : finding,
-        disposition: input.dispositions.get(finding.rootCauseId)!,
-        event: isConfirmed ? (prior && findingState(prior.event) === "open" ? "reobserved" : "opened") : "disputed",
-        occurrence: input.next.get(finding.rootCauseId)!.occurrence,
-        blockingBurden: input.blockingBurden,
-        evidenceRefs: input.evidenceRefs,
-        now: input.now,
-      });
-    }
-    for (const row of input.currentRows) {
-      if (findingState(row.event) !== "open" || input.source.has(row.root_cause_id)) continue;
-      this.appendFindingEvent({
-        attempt: input.attempt,
-        sourceReviewAttemptId: input.verification.attemptId,
-        finding: navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json)),
-        disposition: row.disposition,
-        event: "resolved",
-        occurrence: row.occurrence,
-        blockingBurden: input.blockingBurden,
-        evidenceRefs: input.evidenceRefs,
-        now: input.now,
-      });
-    }
+  private reviewRequirementIds(attempt: NavigatorTicketWorkerAttempt): readonly string[] | null {
+    const ticket = this.artifacts.getSnapshot(attempt.workOrder.ticket.snapshotId);
+    const specification = this.artifacts.getSnapshot(attempt.workOrder.specification.snapshotId);
+    if (!ticket || !specification) return null;
+    return [...new Set([
+      ...guardRequirementBindings(attempt.workOrder.projectPolicy.requiredChecks).map(({ id }) => id),
+      ...navigatorAcceptanceCriteria(ticket).map(({ id }) => id),
+      ...navigatorAcceptanceCriteria(specification).map(({ id }) => id),
+    ])];
   }
 
   private ticketRows(jobId: string): TicketRow[] {

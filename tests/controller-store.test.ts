@@ -21,6 +21,7 @@ import {
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
+  NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -229,7 +230,7 @@ it("keeps every shipped migration at its original position and appends new ones"
       MANAGED_AUTOMATION_MIGRATIONS.length +
       NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length +
       MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length +
-      NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length,
+      NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length,
   );
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");
