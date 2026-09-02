@@ -32,6 +32,7 @@ export type NavigatorFindingLedgerEntry = Readonly<{
   specificationSnapshotDigest: string | null;
   sourceAttemptDigest: string;
   verificationAttemptDigest: string;
+  supersedesRootCauseId: string | null;
   finding: NavigatorReviewFinding;
 }>;
 
@@ -151,19 +152,34 @@ function assertDigest(value: string | null, field: string): void {
   if (value !== null && !SHA256.test(value)) throw new TypeError(`${field} is invalid`);
 }
 
+function assertSnapshotBinding(
+  snapshotId: string | null,
+  snapshotDigest: string | null,
+  field: string,
+): void {
+  if ((snapshotId === null) !== (snapshotDigest === null)) throw new TypeError(`${field} snapshot identity is incomplete`);
+  if (snapshotId !== null) assertBoundedIdentifier(snapshotId, `${field} snapshot id`);
+  assertDigest(snapshotDigest, `${field} snapshot digest`);
+}
+
+function assertTiming(now: number, maxReviewCycles: number, field: string): void {
+  if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(maxReviewCycles) || maxReviewCycles < 1) {
+    throw new TypeError(`${field} timing is invalid`);
+  }
+}
+
 function assertAssessmentIdentity(input: NavigatorFindingAssessmentInput): void {
   for (const [value, field] of [
     [input.jobId, "jobId"], [input.sliceId, "sliceId"],
     [input.sourceReviewAttemptId, "sourceReviewAttemptId"], [input.verificationAttemptId, "verificationAttemptId"],
   ] as const) assertBoundedIdentifier(value, field);
+  if (input.sourceReviewAttemptId === input.verificationAttemptId) throw new TypeError("finding attempts must be independent");
   assertDigest(input.sourceAttemptDigest, "sourceAttemptDigest");
   assertDigest(input.verificationAttemptDigest, "verificationAttemptDigest");
   assertSha(input.exactHeadSha, "exactHeadSha");
-  assertDigest(input.artifactSnapshotDigest, "artifactSnapshotDigest");
-  assertDigest(input.specificationSnapshotDigest, "specificationSnapshotDigest");
-  if (!Number.isSafeInteger(input.now) || input.now < 0 || input.maxReviewCycles < 1) {
-    throw new TypeError("assessment timing is invalid");
-  }
+  assertSnapshotBinding(input.artifactSnapshotId, input.artifactSnapshotDigest, "artifact");
+  assertSnapshotBinding(input.specificationSnapshotId, input.specificationSnapshotDigest, "specification");
+  assertTiming(input.now, input.maxReviewCycles, "assessment");
 }
 
 function validateSelectedGuards(input: NavigatorFindingAssessmentInput): string | null {
@@ -185,11 +201,15 @@ function validateRequirementIds(input: NavigatorFindingAssessmentInput): string 
   return null;
 }
 
-function validateEvidenceRefs(input: NavigatorFindingAssessmentInput): string | null {
-  const invalid = input.evidenceRefs.length === 0 || input.evidenceRefs.length > 128 ||
-    new Set(input.evidenceRefs).size !== input.evidenceRefs.length ||
-    input.evidenceRefs.some((ref) => typeof ref !== "string" || ref.trim().length === 0 || ref.length > 1_024);
+function evidenceRefsError(evidenceRefs: readonly string[]): string | null {
+  const invalid = evidenceRefs.length === 0 || evidenceRefs.length > 128 ||
+    new Set(evidenceRefs).size !== evidenceRefs.length ||
+    evidenceRefs.some((ref) => typeof ref !== "string" || ref.trim().length === 0 || ref.length > 1_024);
   return invalid ? "invalid_evidence_refs" : null;
+}
+
+function validateEvidenceRefs(input: NavigatorFindingAssessmentInput): string | null {
+  return evidenceRefsError(input.evidenceRefs);
 }
 
 function findingRequirementIsAdmitted(
@@ -231,6 +251,18 @@ export function navigatorFindingFingerprint(
 function validateAssessmentInput(input: NavigatorFindingAssessmentInput): string | null {
   assertAssessmentIdentity(input);
   return validateSelectedGuards(input) ?? validateRequirementIds(input) ?? validateEvidenceRefs(input);
+}
+
+function validatePassingReviewInput(input: NavigatorFindingPassingReviewInput): void {
+  for (const [value, field] of [
+    [input.jobId, "jobId"], [input.sliceId, "sliceId"], [input.verificationAttemptId, "verificationAttemptId"],
+  ] as const) assertBoundedIdentifier(value, field);
+  assertDigest(input.verificationAttemptDigest, "verificationAttemptDigest");
+  assertSha(input.exactHeadSha, "exactHeadSha");
+  assertSnapshotBinding(input.artifactSnapshotId, input.artifactSnapshotDigest, "artifact");
+  assertSnapshotBinding(input.specificationSnapshotId, input.specificationSnapshotDigest, "specification");
+  if (evidenceRefsError(input.evidenceRefs) !== null) throw new TypeError("passing review evidence is invalid");
+  assertTiming(input.now, input.maxReviewCycles, "passing review");
 }
 
 function policiesFor(
@@ -340,6 +372,12 @@ export class NavigatorFindingLedger {
   }
 
   public resolvePassingReview(input: NavigatorFindingPassingReviewInput): NavigatorFindingLedgerDecision {
+    try {
+      validatePassingReviewInput(input);
+    } catch (error) {
+      if (error instanceof TypeError) return rejected("finding_resolution_invalid");
+      throw error;
+    }
     return this.persistence.resolvePassingReview(input);
   }
 

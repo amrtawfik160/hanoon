@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
+  navigatorTicketWorkOrderSchema,
   navigatorReviewFindingSchema,
   type NavigatorReviewFinding,
 } from "./implementation-contracts";
@@ -18,7 +19,7 @@ import type {
 } from "./finding-ledger";
 
 type SqliteDatabase = Database.Database;
-type FindingEvent = "opened" | "reobserved" | "resolved" | "disputed";
+type FindingEvent = "opened" | "reobserved" | "resolved" | "disputed" | "corrected";
 
 type FindingEventRow = Readonly<{
   sequence: number;
@@ -55,9 +56,28 @@ type FindingEventRow = Readonly<{
   source_attempt_digest?: string;
   verification_attempt_digest?: string;
   root_cause_confirmed?: number;
+  supersedes_root_cause_id?: string | null;
 }>;
 
 type IntegrationHeadRow = Readonly<{ current_head_sha: string }>;
+type CurrentEvidenceRow = Readonly<{
+  current_head_sha: string;
+  ticket_snapshot_id: string;
+  ticket_snapshot_digest: string;
+  specification_snapshot_id: string;
+  specification_snapshot_digest: string;
+}>;
+type SourceEvidenceRow = Readonly<{
+  job_id: string;
+  slice_id: string;
+  kind: string;
+  work_order_json: string;
+  outcome: string;
+  exact_head_sha: string;
+  result_digest: string;
+  ticket_artifact_id: string;
+  specification_artifact_id: string;
+}>;
 type ConvergenceRow = Readonly<{
   slice_id: string;
   last_blocking_burden: number;
@@ -86,6 +106,7 @@ type FindingEventInput = Readonly<{
   occurrence: number;
   blockingBurden: number;
   rootCauseConfirmed: boolean;
+  supersedesRootCauseId?: string | null;
 }>;
 
 const ZERO_DIGEST = "0".repeat(64);
@@ -97,15 +118,17 @@ const FINDING_EVENT_INSERT = `INSERT INTO navigator_review_finding_events (
   descriptor_digest, descriptor_version, policy_revision, policy_digest,
   requirement_ids_json, artifact_snapshot_id, artifact_snapshot_digest,
   specification_snapshot_id, specification_snapshot_digest,
-  source_attempt_digest, verification_attempt_digest, root_cause_confirmed
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  source_attempt_digest, verification_attempt_digest, root_cause_confirmed,
+  supersedes_root_cause_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 function findingEventId(...parts: readonly string[]): string {
   return `navfinding_${createHash("sha256").update(parts.join("\0"), "utf8").digest("base64url").slice(0, 24)}`;
 }
 
-function stateFor(event: FindingEvent): NavigatorFindingLedgerState {
+function stateFor(event: FindingEvent, rootCauseConfirmed = true): NavigatorFindingLedgerState {
   if (event === "opened" || event === "reobserved") return "open";
+  if (event === "corrected") return rootCauseConfirmed ? "open" : "disputed";
   return event === "resolved" ? "resolved" : "disputed";
 }
 
@@ -161,6 +184,7 @@ function findingEventPolicyFields(input: FindingEventInput): readonly unknown[] 
     fact.policy.policyRevision, fact.policy.policyDigest, JSON.stringify(fact.policy.requirementIds),
     ...artifactSnapshotFields(assessment), sourceAttemptDigest, assessment.verificationAttemptDigest,
     input.rootCauseConfirmed ? 1 : 0,
+    input.supersedesRootCauseId ?? null,
   ];
 }
 
@@ -172,8 +196,8 @@ function entryState(row: FindingEventRow, currentHeadSha: string): Readonly<{
   state: NavigatorFindingLedgerState;
   blockingBurden: number;
 }> {
-  const state = stateFor(row.event);
-  const stale = state !== "resolved" && currentHeadSha.length === 40 && row.head_sha !== currentHeadSha;
+  const state = stateFor(row.event, row.root_cause_confirmed !== 0);
+  const stale = currentHeadSha.length === 40 && row.head_sha !== currentHeadSha;
   return { state: stale ? "stale" : state, blockingBurden: stale ? 0 : row.blocking_burden };
 }
 
@@ -212,7 +236,7 @@ function legacyPolicy(row: FindingEventRow) {
 function entryIdentityFields(
   row: FindingEventRow,
   currentHeadSha: string,
-): Pick<NavigatorFindingLedgerEntry, "rootCauseId" | "sliceId" | "sourceReviewAttemptId" | "verificationAttemptId" | "state" | "blockingBurden" | "headSha" | "fingerprint" | "occurrence"> {
+): Pick<NavigatorFindingLedgerEntry, "rootCauseId" | "sliceId" | "sourceReviewAttemptId" | "verificationAttemptId" | "state" | "blockingBurden" | "headSha" | "fingerprint" | "occurrence" | "supersedesRootCauseId"> {
   const status = entryState(row, currentHeadSha);
   return {
     rootCauseId: row.root_cause_id,
@@ -224,6 +248,7 @@ function entryIdentityFields(
     headSha: row.head_sha,
     fingerprint: identityFor(row),
     occurrence: row.occurrence,
+    supersedesRootCauseId: row.supersedes_root_cause_id ?? null,
   };
 }
 
@@ -246,16 +271,6 @@ function entryPolicyFields(
     sourceAttemptDigest: row.source_attempt_digest || ZERO_DIGEST,
     verificationAttemptDigest: row.verification_attempt_digest || ZERO_DIGEST,
   };
-}
-
-function rootCauseChanged(
-  facts: readonly NavigatorFindingAssessmentFact[],
-  priorByKey: ReadonlyMap<string, FindingEventRow>,
-): boolean {
-  return facts.some((fact) => {
-    const prior = priorByKey.get(fact.fingerprint);
-    return prior !== undefined && prior.root_cause_id !== fact.proposed.rootCauseId;
-  });
 }
 
 export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerPersistence {
@@ -282,26 +297,35 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
   private assessInTransaction(input: NavigatorFindingAssessmentFacts): NavigatorFindingLedgerDecision {
     const priorRows = this.currentRows(input.input.jobId, input.input.sliceId);
     const priorDecision = this.decisionFromRows(priorRows, input.input.exactHeadSha);
+    const convergence = this.convergence(input.input.sliceId);
+    const priorBurden = convergence?.last_blocking_burden ?? priorDecision.blockingBurden;
+    const currentHeadSha = this.integrationHead(input.input.jobId);
+    if (currentHeadSha !== null && currentHeadSha !== input.input.exactHeadSha) {
+      return this.blockedDecision("stale_evidence", priorRows, currentHeadSha);
+    }
+    if (!this.snapshotsAreCurrent(input.input)) {
+      return this.blockedDecision("stale_evidence", priorRows, currentHeadSha ?? input.input.exactHeadSha);
+    }
     if (this.attemptAlreadyRecorded(input.input.verificationAttemptId)) return this.withDelta(priorDecision, 0);
+    if (!this.sourceEvidenceIsCurrent(input.input)) {
+      return this.blockedDecision("finding_verification_source_mismatch", priorRows, currentHeadSha ?? input.input.exactHeadSha);
+    }
     const sourceKeys = new Set(input.findings.map(({ fingerprint }) => fingerprint));
     const priorByKey = new Map(priorRows.map((row) => [identityFor(row), row]));
-    if (rootCauseChanged(input.findings, priorByKey)) {
-      return this.blockedDecision("finding_root_cause_changed", priorRows, input.input.exactHeadSha);
-    }
     const burden = new Set(input.findings
       .filter(({ confirmed, disposition }) => confirmed && disposition === "must_fix")
       .map(({ proposed }) => proposed.rootCauseId)).size;
     this.writeAssessmentEvents(input, priorByKey, burden);
     this.resolveMissingRoots(input, priorRows, sourceKeys, burden);
-    const reasonCode = this.updateConvergence(input.input, burden);
-    return this.assessmentDecision(input, priorDecision, burden, reasonCode);
+    const reasonCode = this.updateConvergence(input.input, burden, convergence);
+    return this.assessmentDecision(input, burden, reasonCode, burden - priorBurden);
   }
 
   private assessmentDecision(
     input: NavigatorFindingAssessmentFacts,
-    priorDecision: NavigatorFindingLedgerDecision,
     burden: number,
     reasonCode: string | null,
+    burdenDelta: number,
   ): NavigatorFindingLedgerDecision {
     const decision = this.decisionFromRows(this.currentRows(input.input.jobId, input.input.sliceId), input.input.exactHeadSha);
     const constrained = reasonCode === null ? decision : {
@@ -311,15 +335,24 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
       reasonCode,
       reasons: [reasonCode],
     };
-    return this.withDelta(constrained, burden - priorDecision.blockingBurden);
+    return this.withDelta(constrained, burdenDelta);
   }
 
   private resolvePassingReviewInTransaction(input: NavigatorFindingPassingReviewInput): NavigatorFindingLedgerDecision {
     const current = this.currentRows(input.jobId, input.sliceId);
+    const currentHeadSha = this.integrationHead(input.jobId);
+    if (currentHeadSha !== null && currentHeadSha !== input.exactHeadSha) {
+      return this.blockedDecision("stale_evidence", current, currentHeadSha);
+    }
+    if (!this.snapshotsAreCurrent(input)) {
+      return this.blockedDecision("stale_evidence", current, currentHeadSha ?? input.exactHeadSha);
+    }
     if (this.attemptAlreadyRecorded(input.verificationAttemptId)) {
       return this.decisionFromRows(current, input.exactHeadSha);
     }
     const convergence = this.convergence(input.sliceId);
+    const priorDecision = this.decisionFromRows(current, input.exactHeadSha);
+    const priorBurden = convergence?.last_blocking_burden ?? priorDecision.blockingBurden;
     const reviewCycles = (convergence?.review_cycles ?? 0) + 1;
     if (reviewCycles > input.maxReviewCycles) return this.blockedDecision("review_cycle_limit", current, input.exactHeadSha);
     this.resolveOpenRows(input, current);
@@ -331,12 +364,15 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
       verificationAttemptId: input.verificationAttemptId,
       now: input.now,
     });
-    return this.decisionFromRows(this.currentRows(input.jobId, input.sliceId), input.exactHeadSha);
+    return this.withDelta(
+      this.decisionFromRows(this.currentRows(input.jobId, input.sliceId), input.exactHeadSha),
+      -priorBurden,
+    );
   }
 
   private resolveOpenRows(input: NavigatorFindingPassingReviewInput, rows: readonly FindingEventRow[]): void {
     for (const row of rows) {
-      if (stateFor(row.event) !== "open") continue;
+      if (stateFor(row.event, row.root_cause_confirmed !== 0) !== "open") continue;
       this.insertEvent({
         input,
         sourceReviewAttemptId: input.verificationAttemptId,
@@ -369,8 +405,11 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     for (const fact of facts.findings) {
       const prior = priorByKey.get(fact.fingerprint);
       const occurrence = fact.confirmed ? Math.min(3, (prior?.occurrence ?? 0) + 1) : (prior?.occurrence ?? 0);
-      const event: FindingEvent = fact.confirmed && prior !== undefined && stateFor(prior.event) === "open"
-        ? "reobserved"
+      const corrected = prior !== undefined && prior.root_cause_id !== fact.proposed.rootCauseId;
+      const priorState = prior === undefined ? null : stateFor(prior.event, prior.root_cause_confirmed !== 0);
+      const event: FindingEvent = corrected
+        ? "corrected"
+        : fact.confirmed && priorState === "open" ? "reobserved"
         : fact.confirmed ? "opened" : "disputed";
       this.insertEvent({
         input: facts.input,
@@ -382,6 +421,7 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
         occurrence,
         blockingBurden,
         rootCauseConfirmed: fact.confirmed,
+        supersedesRootCauseId: corrected ? prior.root_cause_id : null,
       });
     }
   }
@@ -393,7 +433,7 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     blockingBurden: number,
   ): void {
     for (const row of priorRows) {
-      if (stateFor(row.event) !== "open" || sourceKeys.has(identityFor(row))) continue;
+      if (stateFor(row.event, row.root_cause_confirmed !== 0) !== "open" || sourceKeys.has(identityFor(row))) continue;
       this.insertEvent({
         input: facts.input,
         sourceReviewAttemptId: facts.input.sourceReviewAttemptId,
@@ -419,7 +459,7 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     return {
       proposed: finding,
       observed: finding,
-      confirmed: row.root_cause_confirmed !== 0 || stateFor(row.event) === "open",
+      confirmed: row.root_cause_confirmed !== 0 || stateFor(row.event, row.root_cause_confirmed !== 0) === "open",
       fingerprint: identityFor(row),
       normalizedSubject: row.normalized_subject || finding.subject,
       requirementClass: requirementClassForRow(row, finding),
@@ -428,8 +468,11 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     };
   }
 
-  private updateConvergence(input: NavigatorFindingAssessmentInput, burden: number): string | null {
-    const previous = this.convergence(input.sliceId);
+  private updateConvergence(
+    input: NavigatorFindingAssessmentInput,
+    burden: number,
+    previous: ConvergenceRow | undefined,
+  ): string | null {
     const reviewCycles = (previous?.review_cycles ?? 0) + 1;
     let plateauRecoveries = previous?.plateau_recoveries ?? 0;
     let reasonCode: string | null = null;
@@ -453,7 +496,7 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
   private hasRecurrence(sliceId: string): boolean {
     const row = this.db.prepare(
       `SELECT 1 AS present FROM navigator_review_finding_events
-        WHERE slice_id = ? AND event IN ('opened', 'reobserved') AND occurrence >= 3 LIMIT 1`,
+        WHERE slice_id = ? AND event IN ('opened', 'reobserved', 'corrected') AND occurrence >= 3 LIMIT 1`,
     ).get(sliceId) as { present: number } | undefined;
     return row !== undefined;
   }
@@ -501,6 +544,71 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     const row = this.db.prepare("SELECT current_head_sha FROM navigator_integrations WHERE job_id = ?")
       .get(jobId) as IntegrationHeadRow | undefined;
     return row?.current_head_sha ?? null;
+  }
+
+  private snapshotsAreCurrent(
+    input: NavigatorFindingAssessmentInput | NavigatorFindingPassingReviewInput,
+  ): boolean {
+    const row = this.db.prepare(
+      `SELECT integration.current_head_sha, slice.ticket_snapshot_id, slice.ticket_snapshot_digest,
+              integration.specification_snapshot_id, integration.specification_snapshot_digest
+         FROM navigator_integrations AS integration
+         JOIN navigator_ticket_slices AS slice ON slice.id = ? AND slice.job_id = integration.job_id
+        WHERE integration.job_id = ?`,
+    ).get(input.sliceId, input.jobId) as CurrentEvidenceRow | undefined;
+    if (!row) return false;
+    return this.snapshotMatches(input.artifactSnapshotId, input.artifactSnapshotDigest, row.ticket_snapshot_id, row.ticket_snapshot_digest) &&
+      this.snapshotMatches(input.specificationSnapshotId, input.specificationSnapshotDigest, row.specification_snapshot_id, row.specification_snapshot_digest);
+  }
+
+  private snapshotMatches(
+    suppliedId: string | null,
+    suppliedDigest: string | null,
+    currentId: string,
+    currentDigest: string,
+  ): boolean {
+    return suppliedId === null && suppliedDigest === null ||
+      (suppliedId === currentId && suppliedDigest === currentDigest);
+  }
+
+  private sourceEvidenceIsCurrent(input: NavigatorFindingAssessmentInput): boolean {
+    const row = this.db.prepare(
+      `SELECT attempt.job_id, attempt.slice_id, attempt.kind, attempt.work_order_json,
+              outcome.outcome, outcome.exact_head_sha, outcome.result_digest,
+              slice.ticket_artifact_id, integration.specification_artifact_id
+         FROM navigator_ticket_worker_attempts AS attempt
+         JOIN navigator_ticket_worker_outcomes AS outcome ON outcome.attempt_id = attempt.id
+         JOIN navigator_ticket_slices AS slice ON slice.id = attempt.slice_id
+         JOIN navigator_integrations AS integration ON integration.job_id = attempt.job_id
+        WHERE attempt.id = ?`,
+    ).get(input.sourceReviewAttemptId) as SourceEvidenceRow | undefined;
+    if (!row || row.job_id !== input.jobId || row.slice_id !== input.sliceId || row.kind !== "review" ||
+      row.outcome !== "findings" || row.result_digest !== input.sourceAttemptDigest ||
+      row.exact_head_sha !== input.exactHeadSha) return false;
+    let rawWorkOrder: unknown;
+    try {
+      rawWorkOrder = JSON.parse(row.work_order_json) as unknown;
+    } catch (error) {
+      if (error instanceof SyntaxError) return false;
+      throw error;
+    }
+    const parsed = navigatorTicketWorkOrderSchema.safeParse(rawWorkOrder);
+    if (!parsed.success || parsed.data.verificationOf !== undefined || parsed.data.jobId !== input.jobId ||
+      parsed.data.baseHeadSha !== input.exactHeadSha || parsed.data.ticket.artifactId !== row.ticket_artifact_id ||
+      parsed.data.specification.artifactId !== row.specification_artifact_id) return false;
+    return this.exactSnapshotMatches(parsed.data.ticket.snapshotId, parsed.data.ticket.snapshotDigest,
+      input.artifactSnapshotId, input.artifactSnapshotDigest) &&
+      this.exactSnapshotMatches(parsed.data.specification.snapshotId, parsed.data.specification.snapshotDigest,
+        input.specificationSnapshotId, input.specificationSnapshotDigest);
+  }
+
+  private exactSnapshotMatches(
+    sourceId: string,
+    sourceDigest: string,
+    suppliedId: string | null,
+    suppliedDigest: string | null,
+  ): boolean {
+    return suppliedId !== null && suppliedDigest !== null && sourceId === suppliedId && sourceDigest === suppliedDigest;
   }
 
   private decisionFromRows(rows: readonly FindingEventRow[], currentHeadSha: string): NavigatorFindingLedgerDecision {

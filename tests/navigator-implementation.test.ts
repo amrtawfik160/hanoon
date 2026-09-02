@@ -65,6 +65,20 @@ const SHA = {
   ticketTwo: "4".repeat(40),
 } as const;
 
+function emptyFindingDecision(): NavigatorFindingLedgerDecision {
+  return {
+    outcome: "accepted",
+    allowedNextAction: "accept",
+    reasonCode: null,
+    entries: [],
+    currentRoots: [],
+    blockingBurden: 0,
+    burdenDelta: 0,
+    staleEvidence: [],
+    reasons: [],
+  };
+}
+
 let fixtureSequence = 0;
 
 type Fixture = Readonly<{
@@ -508,7 +522,6 @@ function validGitObserver(): NavigatorGitObserver {
 function prepareTicketEffectForExecutor(value: Fixture, now: number) {
   const executor = new NavigatorImplementationExecutor({
     store: value.store,
-    database: value.database,
     gitObserver: validGitObserver(),
     pullRequests: { createOrRefresh: vi.fn() },
     modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -804,6 +817,243 @@ describe("navigator ticket integration executor", () => {
     expect(executor.snapshot(value.jobId).findingLedger[0]).toMatchObject({ state: "stale" });
   });
 
+  it("appends a checked root-cause correction without rewriting the prior finding fact", async () => {
+    const value = fixture();
+    const { executor } = prepareTicketEffectForProtocol(value, 1_110);
+    const proposedRoot = {
+      rootCauseId: "root-cause-a",
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-1",
+      severity: "low" as const,
+      subject: "src/app.ts",
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: "The first review identified one root cause.",
+      evidenceRefs: ["review:root-a"],
+    } satisfies NavigatorReviewFinding;
+    const confirmedRoot = {
+      ...proposedRoot,
+      severity: "critical" as const,
+      summary: "Independent evidence confirmed the first root cause.",
+      evidenceRefs: ["review:root-a-confirmed"],
+    } satisfies NavigatorReviewFinding;
+    const correctedRoot = {
+      ...proposedRoot,
+      rootCauseId: "root-cause-b",
+      summary: "A later review corrected the root-cause relationship.",
+      evidenceRefs: ["review:root-b"],
+    } satisfies NavigatorReviewFinding;
+    const confirmedCorrection = {
+      ...correctedRoot,
+      severity: "critical" as const,
+      summary: "Independent evidence confirmed the corrected relationship.",
+      evidenceRefs: ["review:root-b-confirmed"],
+    } satisfies NavigatorReviewFinding;
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
+      if (input.attempt.kind === "implementation") {
+        const head = input.attempt.ordinal === 1 ? SHA.ticketOne : SHA.repair;
+        return { resource, result: implementationResult(input.attempt, head, input.ticket) };
+      }
+      const source = input.attempt.workOrder.verificationOf;
+      if (source !== undefined) {
+        const finding = source.findings[0]?.rootCauseId === "root-cause-a"
+          ? confirmedRoot
+          : confirmedCorrection;
+        return { resource, result: { ...reviewResult(input.attempt, "findings"), findings: [finding] } };
+      }
+      const finding = input.attempt.ordinal === 1 ? proposedRoot : correctedRoot;
+      return { resource, result: reviewResult(input.attempt, "findings", finding) };
+    });
+    const protocol = ticketProtocol(value, {
+      run,
+      reconcile: run,
+      observe: validGitObserver().observe,
+    }, value.now);
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    expect(executor.snapshot(value.jobId).findingLedger).toEqual([
+      expect.objectContaining({ rootCauseId: "root-cause-a", state: "open", occurrence: 1 }),
+    ]);
+
+    const repairSnapshot = executor.prepareRepairNavigation({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      evidenceRefs: ["review:root-a"],
+    });
+    const repairProposal = executor.recordRepairProposal({
+      snapshotId: repairSnapshot.snapshotId,
+      rawProposal: {
+        kind: "implementation",
+        basedOn: { snapshotId: repairSnapshot.snapshotId, digest: repairSnapshot.digest },
+        objective: "Repair the checked root cause.",
+        taskEvidence: ["behavioral-change"],
+        evidenceRefs: ["review:root-a"],
+      },
+    });
+    executor.scheduleRepair({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      proposalId: repairProposal.proposalId,
+    });
+
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+
+    expect(executor.snapshot(value.jobId).findingLedger).toEqual([
+      expect.objectContaining({ rootCauseId: "root-cause-b", state: "open", occurrence: 2 }),
+    ]);
+    expect(value.database.prepare(
+      `SELECT event, root_cause_id, fingerprint, occurrence
+         FROM navigator_review_finding_events
+        WHERE slice_id = ? ORDER BY sequence`,
+    ).all(repairSnapshot.sliceId)).toEqual([
+      expect.objectContaining({ event: "opened", root_cause_id: "root-cause-a", occurrence: 1 }),
+      expect.objectContaining({ event: "corrected", root_cause_id: "root-cause-b", occurrence: 2 }),
+    ]);
+  });
+
+  it("stops after one bounded recovery when checked burden plateaus", async () => {
+    const value = fixture();
+    const { executor } = prepareTicketEffectForProtocol(value, 1_110);
+    const findingForCycle = (cycle: number): NavigatorReviewFinding => ({
+      rootCauseId: `plateau-root-${String(cycle)}`,
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-1",
+      severity: "critical",
+      subject: `src/app-${String(cycle)}.ts`,
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: `The checked cycle ${String(cycle)} still has one blocking root.`,
+      evidenceRefs: [`review:plateau:${String(cycle)}`],
+    });
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
+      if (input.attempt.kind === "implementation") {
+        const head = input.attempt.ordinal === 1 ? SHA.ticketOne : `${input.attempt.ordinal + 2}`.repeat(40);
+        return { resource, result: implementationResult(input.attempt, head, input.ticket) };
+      }
+      const cycle = Math.ceil(input.attempt.ordinal / 2);
+      return { resource, result: reviewResult(input.attempt, "findings", findingForCycle(cycle)) };
+    });
+    const protocol = ticketProtocol(value, {
+      run,
+      reconcile: run,
+      observe: validGitObserver().observe,
+    }, value.now);
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      await protocol.processOne(fence, new AbortController().signal);
+      await protocol.processOne(fence, new AbortController().signal);
+      await protocol.processOne(fence, new AbortController().signal);
+      if (cycle === 3) break;
+      expect(executor.snapshot(value.jobId).activeSlice?.state).toBe("repair_pending");
+      const repairSnapshot = executor.prepareRepairNavigation({
+        jobId: value.jobId,
+        ticketArtifactId: value.ticketIds[0],
+        evidenceRefs: [`review:plateau:${String(cycle)}`],
+      });
+      const repairProposal = executor.recordRepairProposal({
+        snapshotId: repairSnapshot.snapshotId,
+        rawProposal: {
+          kind: "implementation",
+          basedOn: { snapshotId: repairSnapshot.snapshotId, digest: repairSnapshot.digest },
+          objective: "Repair the checked plateau root.",
+          taskEvidence: ["behavioral-change"],
+          evidenceRefs: [`review:plateau:${String(cycle)}`],
+        },
+      });
+      executor.scheduleRepair({
+        jobId: value.jobId,
+        ticketArtifactId: value.ticketIds[0],
+        proposalId: repairProposal.proposalId,
+      });
+    }
+
+    const snapshot = executor.snapshot(value.jobId);
+    expect(snapshot.integration.state).toBe("invalidated");
+    expect(snapshot.outcomes.at(-1)).toMatchObject({
+      outcome: "policy_failure",
+      reasonCode: "review_burden_plateau",
+    });
+    expect(value.database.prepare(
+      "SELECT last_blocking_burden, plateau_recoveries, review_cycles FROM navigator_review_convergence WHERE slice_id = ?",
+    ).get(snapshot.activeSlice?.id)).toEqual({ last_blocking_burden: 1, plateau_recoveries: 1, review_cycles: 3 });
+  });
+
+  it("keeps a decreasing checked burden eligible for repair", async () => {
+    const value = fixture();
+    const { executor } = prepareTicketEffectForProtocol(value, 1_110);
+    const finding = (rootCauseId: string, subject: string): NavigatorReviewFinding => ({
+      rootCauseId,
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-1",
+      severity: "critical",
+      subject,
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: `The checked review found ${rootCauseId}.`,
+      evidenceRefs: [`review:${rootCauseId}`],
+    });
+    const firstFindings = [finding("improving-root-a", "src/a.ts"), finding("improving-root-b", "src/b.ts")];
+    const secondFinding = finding("improving-root-c", "src/c.ts");
+    const run = vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const resource = input.attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${input.attempt.id}` };
+      if (input.attempt.kind === "implementation") {
+        const head = input.attempt.ordinal === 1 ? SHA.ticketOne : SHA.repair;
+        return { resource, result: implementationResult(input.attempt, head, input.ticket) };
+      }
+      const cycle = Math.ceil(input.attempt.ordinal / 2);
+      const findings = cycle === 1 ? firstFindings : [secondFinding];
+      return { resource, result: { ...reviewResult(input.attempt, "findings", findings[0]), findings } };
+    });
+    const protocol = ticketProtocol(value, {
+      run,
+      reconcile: run,
+      observe: validGitObserver().observe,
+    }, value.now);
+    const fence = { ownerId: "executor-40", generation: 1, signal: new AbortController().signal };
+
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    const firstReview = executor.prepareRepairNavigation({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      evidenceRefs: ["review:improving-root-a"],
+    });
+    const firstProposal = executor.recordRepairProposal({
+      snapshotId: firstReview.snapshotId,
+      rawProposal: {
+        kind: "implementation",
+        basedOn: { snapshotId: firstReview.snapshotId, digest: firstReview.digest },
+        objective: "Repair the improving review findings.",
+        taskEvidence: ["behavioral-change"],
+        evidenceRefs: ["review:improving-root-a"],
+      },
+    });
+    executor.scheduleRepair({ jobId: value.jobId, ticketArtifactId: value.ticketIds[0], proposalId: firstProposal.proposalId });
+
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+
+    const snapshot = executor.snapshot(value.jobId);
+    expect(snapshot.integration.state).toBe("implementing");
+    expect(snapshot.activeSlice?.state).toBe("repair_pending");
+    expect(value.database.prepare(
+      "SELECT last_blocking_burden, plateau_recoveries, review_cycles FROM navigator_review_convergence WHERE slice_id = ?",
+    ).get(snapshot.activeSlice?.id)).toEqual({ last_blocking_burden: 1, plateau_recoveries: 0, review_cycles: 2 });
+  });
+
   it("fails closed on unadmitted context and uses the registry default for unknown rules", () => {
     const finding = {
       rootCauseId: "spoofed-priority",
@@ -898,24 +1148,13 @@ describe("navigator ticket integration executor", () => {
       }],
     }, guardPolicy);
     const recorded: { facts: NavigatorFindingAssessmentFacts | null } = { facts: null };
-    const emptyDecision = (): NavigatorFindingLedgerDecision => ({
-      outcome: "accepted",
-      allowedNextAction: "accept",
-      reasonCode: null,
-      entries: [],
-      currentRoots: [],
-      blockingBurden: 0,
-      burdenDelta: 0,
-      staleEvidence: [],
-      reasons: [],
-    });
     new NavigatorFindingLedger({
       assess: (facts) => {
         recorded.facts = facts;
-        return emptyDecision();
+        return emptyFindingDecision();
       },
-      resolvePassingReview: emptyDecision,
-      currentDecision: emptyDecision,
+      resolvePassingReview: emptyFindingDecision,
+      currentDecision: emptyFindingDecision,
     }).assess({
       jobId: "job_policy_matrix",
       sliceId: "slice_policy_matrix",
@@ -1000,6 +1239,62 @@ describe("navigator ticket integration executor", () => {
       proposedFindings: [finding],
       confirmedFindings: [finding],
       evidenceRefs: ["review:policy-rejection"],
+      now: 1,
+      maxReviewCycles: 3,
+    });
+    expect(decision).toMatchObject({ outcome: "blocked", allowedNextAction: "stop" });
+    expect(called).toBe(false);
+  });
+
+  it.each([
+    {
+      name: "reused source attempt identity",
+      change: { verificationAttemptId: "attempt_source" },
+    },
+    {
+      name: "incomplete artifact snapshot identity",
+      change: { artifactSnapshotId: "artifact_snapshot" },
+    },
+  ] as const)("rejects $name before persistence", ({ name, change }) => {
+    const descriptorDigest = SKILL_ADMISSION_CATALOG.find((entry) => entry.id === "clean-code-guard")?.bundleDescriptorDigest;
+    if (!descriptorDigest) throw new Error("clean-code-guard admission is unavailable");
+    const finding: NavigatorReviewFinding = {
+      rootCauseId: "snapshot-bound-root",
+      capabilityId: "clean-code-guard",
+      ruleId: "clean.rule-10",
+      severity: "high",
+      subject: "src/app.ts",
+      line: 1,
+      requirementId: null,
+      evidenceClass: "review",
+      summary: "Confirmation must retain its exact evidence identity.",
+      evidenceRefs: ["finding:snapshot-bound"],
+    };
+    let called = false;
+    const decision = new NavigatorFindingLedger({
+      assess: () => {
+        called = true;
+        throw new Error("invalid confirmation reached persistence");
+      },
+      resolvePassingReview: () => emptyFindingDecision(),
+      currentDecision: () => emptyFindingDecision(),
+    }).assess({
+      jobId: "job_snapshot",
+      sliceId: "slice_snapshot",
+      sourceReviewAttemptId: "attempt_source",
+      verificationAttemptId: name === "reused source attempt identity" ? "attempt_source" : "attempt_verification",
+      sourceAttemptDigest: "a".repeat(64),
+      verificationAttemptDigest: "b".repeat(64),
+      exactHeadSha: SHA.base,
+      artifactSnapshotId: "artifact_snapshot",
+      artifactSnapshotDigest: change.artifactSnapshotId === undefined ? "c".repeat(64) : null,
+      specificationSnapshotId: "specification_snapshot",
+      specificationSnapshotDigest: "d".repeat(64),
+      selectedGuards: [{ capabilityId: finding.capabilityId, descriptorDigest }],
+      requirementIds: [],
+      proposedFindings: [finding],
+      confirmedFindings: [finding],
+      evidenceRefs: ["finding:snapshot-bound"],
       now: 1,
       maxReviewCycles: 3,
     });
@@ -1190,7 +1485,6 @@ describe("navigator ticket integration executor", () => {
     });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver,
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -1259,7 +1553,6 @@ describe("navigator ticket integration executor", () => {
     }));
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2066,7 +2359,6 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2123,7 +2415,6 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2189,7 +2480,6 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2257,7 +2547,6 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2353,7 +2642,6 @@ describe("navigator ticket integration executor", () => {
     });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2473,7 +2761,6 @@ describe("navigator ticket integration executor", () => {
     };
     const newExecutor = () => new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests,
       modelRoute: (kind) => ({
@@ -2681,7 +2968,6 @@ describe("navigator ticket integration executor", () => {
     });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: (kind) => kind === "implementation"
@@ -2776,7 +3062,6 @@ describe("navigator ticket integration executor", () => {
       });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
-      database: value.database,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),

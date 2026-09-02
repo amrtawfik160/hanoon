@@ -28,6 +28,7 @@ import {
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
+  NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
@@ -155,7 +156,6 @@ function startResolvedIntegration(
 ): void {
   const executor = new NavigatorImplementationExecutor({
     store: fixture.store,
-    database: fixture.database,
     gitObserver: {
       observe: vi.fn(async (request) => ({
         kind: "navigator_git_observation" as const,
@@ -608,8 +608,10 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.at(-1));
-    const upgradeOffset = NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
+    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.at(-1));
+    const convergenceOffset = NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length;
+    expect(ALL_MIGRATIONS.at(-(convergenceOffset + 1))).toBe(NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.at(-1));
+    const upgradeOffset = convergenceOffset + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
     expect(ALL_MIGRATIONS.at(-(upgradeOffset + 1))).toBe(NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.at(-1));
     const protocolOffset = upgradeOffset + NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
     [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {

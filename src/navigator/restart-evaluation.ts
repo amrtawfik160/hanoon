@@ -278,7 +278,6 @@ function implementationExecutor(
 ) {
   return new NavigatorImplementationExecutor({
     store,
-    database,
     gitObserver: { observe: async (request) => gitObservation(request) },
     pullRequests: {
       createOrRefresh: async (request) => ({
