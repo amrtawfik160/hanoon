@@ -52,7 +52,7 @@ function confirmControllerJob(
   const turn = store.claimNextControllerTurn({
     ownerId: "executor",
     generation: leaseGeneration,
-    now: input.now,
+    now: input.now + 3_000,
   });
   if (!turn) throw new Error("missing controller turn");
   if (!store.getControllerByThreadId("thr_controller_dual")) {

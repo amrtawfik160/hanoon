@@ -24,6 +24,7 @@ import {
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  CONTROLLER_BURST_MIGRATIONS,
 } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
@@ -255,7 +256,7 @@ function ownedFixture(
     inputText: task,
     now: 2_000,
   });
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   if (!store.markControllerSpawned({
     turnId: turn.id, ownerId: "executor", generation: lease.generation, now: 10_000,
@@ -506,10 +507,17 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+    // The burst migration is the newest tail; the managed-automation state
+    // upgrade sits immediately ahead of it and contributes several statements,
+    // so every earlier block is located by offset rather than a fixed index.
+    const burstOffset = CONTROLLER_BURST_MIGRATIONS.length;
+    [...CONTROLLER_BURST_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const stateUpgradeOffset = MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(burstOffset + index + 1))).toBe(migration);
+    });
+    const stateUpgradeOffset = burstOffset + MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));

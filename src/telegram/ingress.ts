@@ -12,6 +12,7 @@ import type { MergeHandler } from "../services/merge-handler";
 import { resolveMergeGrant } from "../services/merge-authority";
 import {
   OWNER_MEMORY_SCOPE,
+  type IntakeRefusalKind,
   type OutboxInput,
   type JobControlKind,
   type ProjectPolicyRecord,
@@ -43,6 +44,8 @@ import { TelegramRequestError } from "./client";
 import { TelegramApiError } from "./errors";
 import { MAX_CONTROLLER_IMAGE_BYTES, isMotionMedia } from "../controller/models";
 import { captionlessPromptFor, clipTooLargeForDownload, controllerImageFromMessage } from "./image";
+import { CAPTIONLESS_DOCUMENT_PROMPT, controllerDocumentFromMessage } from "./document";
+import { controllerSourceFromMessage } from "./source";
 import { controllerVoiceFromMessage } from "./voice";
 
 export type TelegramIngressTransport = {
@@ -86,6 +89,10 @@ const MAX_AUDIT_RECORDS = 256;
 const STATUS_LOGICAL_SUFFIX = ":status";
 const CONTROL_JOB_ID = /^[A-Za-z0-9_-]{1,256}$/;
 const STEERABLE_STATES = new Set<Job["state"]>(["implementing", "remediating"]);
+export const UNSUPPORTED_FILE_REPLY =
+  "I can read PDF, Markdown, and plain-text files. That one I can't — please send it another way or paste the text.";
+export const OVERSIZED_FILE_REPLY =
+  "That file is over my 20 MB limit, so I can't read it. Please send a smaller copy.";
 
 type ControlResolution =
   | { outcome: "job"; job: Job }
@@ -254,12 +261,25 @@ export class TelegramIngress {
   ): Promise<TelegramIngressOutcome | void> {
     const identity = privateHumanIdentity(message.from, message.chat);
     const image = controllerImageFromMessage(message);
+    // Image and clip mime types inside a document keep riding the image path;
+    // the document path accepts only PDF, Markdown, and plain text.
+    const document = image === null ? controllerDocumentFromMessage(message) : null;
     const voiceNote = controllerVoiceFromMessage(message);
-    const text = message.text ?? (image ? message.caption ?? captionlessPromptFor(image) : undefined);
+    const text = message.text ??
+      (image ? message.caption ?? captionlessPromptFor(image) : undefined) ??
+      (document?.status === "accepted" ? message.caption ?? CAPTIONLESS_DOCUMENT_PROMPT : undefined);
     // A recording carries no text yet, so it is the one message shape allowed
     // past here without one. Its words arrive below, after the sender is known
     // to be the owner: transcription is work, and a stranger does not get it.
-    if (text === undefined && voiceNote === null) return;
+    if (text === undefined && voiceNote === null) {
+      // Audio messages and other media the plugin cannot read are refused by
+      // name rather than met with silence.
+      if (identity && ownerMatches(this.store, identity) &&
+          (message.audio !== undefined || document?.status !== undefined)) {
+        await this.sendRefusal(identity.chatId, now, document?.status === "oversized" ? "oversized" : "unsupported");
+      }
+      return;
+    }
 
     const pairingCode = text === undefined ? null : this.pairingCode(text);
     if (pairingCode !== null) {
@@ -294,6 +314,10 @@ export class TelegramIngress {
 
     if (!identity || !ownerMatches(this.store, identity)) {
       this.audit("unauthorized_message", updateId, message.from, message.chat);
+      return;
+    }
+    if (document?.status === "unsupported" || document?.status === "oversized") {
+      await this.sendRefusal(identity.chatId, now, document.status);
       return;
     }
     if (image && image.sizeBytes !== null && !isMotionMedia(image) && image.sizeBytes > MAX_CONTROLLER_IMAGE_BYTES) {
@@ -490,10 +514,22 @@ export class TelegramIngress {
       updateId,
       inputText: normalized,
       image,
+      document: document?.status === "accepted" ? document.document : null,
+      source: controllerSourceFromMessage(message),
       now,
     });
     this.rememberStandingInstruction(normalized, turn.id, now);
     this.onWorkAvailable();
+  }
+
+  /**
+   * One plain reply per burst of refusals: a pile of bad files stays one
+   * bubble. The claim is the store's, under the burst quiet gap, so a restart
+   * mid-pile does not repeat it.
+   */
+  private async sendRefusal(chatId: string, now: number, kind: IntakeRefusalKind): Promise<void> {
+    if (!(await this.store.claimIntakeRefusal(chatId, kind, now))) return;
+    await this.sendPlain(chatId, kind === "oversized" ? OVERSIZED_FILE_REPLY : UNSUPPORTED_FILE_REPLY);
   }
 
   // "Always ship on Fridays" is an instruction, not chatter. Capturing it at

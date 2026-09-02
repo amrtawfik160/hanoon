@@ -197,7 +197,7 @@ function typedMergeControllerFence(fixture: ReturnType<typeof mergeFixture>) {
   const turn = fixture.store.claimNextControllerTurn({
     ownerId: LEASE_OWNER,
     generation: LEASE_GENERATION,
-    now: NOW,
+    now: NOW + 3_000,
   });
   if (!turn) throw new Error("controller turn unavailable");
   expect(fixture.store.markControllerSpawned({

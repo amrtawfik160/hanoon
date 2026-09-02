@@ -285,7 +285,7 @@ function createOwnerControllerJob(fixture: ReturnType<typeof ingressFixture>, up
   const turn = fixture.store.claimNextControllerTurn({
     ownerId: "executor",
     generation: lease.generation,
-    now: 2_000,
+    now: 5000,
   });
   if (!turn) throw new Error("missing controller turn");
   if (!fixture.store.markControllerSpawned({
@@ -1238,7 +1238,7 @@ function parkedControllerInteraction(
   const lease = fixture.store.acquireExecutorLease("executor", 3_000, 60_000);
   if (!lease.acquired) throw new Error("missing executor lease");
   const fence = { ownerId: "executor", generation: lease.generation, now: 3_000 };
-  fixture.store.claimNextControllerTurn(fence);
+  fixture.store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 });
   expect(fixture.store.markControllerSpawned({
     ...fence, turnId: turn.id, projectId: "proj_1", hostId: "host_1", threadId: "thr_ingress_controller",
   })).toBe(true);

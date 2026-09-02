@@ -96,7 +96,7 @@ import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
 import { parseWorkerThreadTitle } from "./agent-skills/role-resolver";
 import {
   BbControllerAdapter,
-  ControllerImagePreparationError,
+  ControllerAttachmentPreparationError,
   parseControllerInteractionResolution,
 } from "./controller/bb-controller";
 import { ControllerEvidenceProjector } from "./controller/evidence-projector";
@@ -662,7 +662,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
       const current = managedAutomationAuthorityIsCurrent(
         binding,
-        controller?.controllerKey ?? null,
+        controller,
         store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
       );
       if (!current || !controller?.hostId) return false;
@@ -1160,12 +1160,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       if (!config.ok) throw new Error(config.message);
       return controllerExecutionProfiles(config.value);
     },
-    downloadImage: async (fileId, maxBytes, signal) => {
+    // The adapter restates the failure with the kind of file that failed.
+    downloadFile: async (fileId, maxBytes, signal) => {
       try {
         return await verifiedTelegramClient().downloadFile(fileId, maxBytes, signal);
       } catch (error) {
         if (error instanceof TelegramFileTooLargeError) {
-          throw new ControllerImagePreparationError(false);
+          throw new ControllerAttachmentPreparationError(false);
         }
         throw error;
       }
@@ -1208,6 +1209,11 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     adapter: controllerAdapter,
     interactionService: controllerInteractionService,
     clock: { now: clock },
+    // Short text documents are inlined into the dispatch through the same
+    // Telegram download the adapter uses for attachments. A failed download
+    // only drops the readable copy; the attachment still rides with the turn.
+    downloadFile: async (fileId, maxBytes, signal) =>
+      verifiedTelegramClient().downloadFile(fileId, maxBytes, signal),
     warn: (message) => bb.log.warn(message),
   });
   const monitors = new MonitorService({
@@ -1463,6 +1469,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     warn: (message) => bb.log.warn(message),
   });
   let systemMonitorsInstalled = false;
+  let nextSystemAutomationAttemptAt = 0;
   const systemMonitors = {
     install: async () => {
       // Turning the setting off has to retire what is already armed, or the
@@ -1493,6 +1500,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       }
       if (systemMonitorsInstalled) return;
       if (!config.ok) return;
+      // Installing goes through `bb automation` commands. A BB outage must not
+      // turn every executor pass into a burst of failed commands, so a partial
+      // install is retried about once a minute rather than on every pass.
+      const attemptAt = clock();
+      if (attemptAt < nextSystemAutomationAttemptAt) return;
+      nextSystemAutomationAttemptAt = attemptAt + 60_000;
       const execution = controllerExecutionProfile(config.value);
       const installed = await installSystemAutomations({
         store,

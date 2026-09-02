@@ -37,7 +37,7 @@ function ownerJobFixture(task: string, policy = policyFixture()) {
   });
   const lease = store.acquireExecutorLease("executor", 10_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   if (!store.markControllerSpawned({
     turnId: turn.id, ownerId: "executor", generation: lease.generation, now: 10_000,
@@ -66,7 +66,7 @@ function addOwnerJob(
   const turn = fixture.store.claimNextControllerTurn({
     ownerId: "executor",
     generation: fixture.leaseGeneration,
-    now: 10_010,
+    now: 13010,
   });
   if (!turn) throw new Error("second controller turn was not claimed");
   if (!fixture.store.markControllerSpawned({
