@@ -105,29 +105,90 @@ describe("BB automation adapter", () => {
     await expect(adapter.create({
       scope: { kind: "environment", environmentId: "env_owner" },
       definition,
-    })).resolves.toMatchObject({ id: "auto_1", enabled: true });
+      identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
+    })).resolves.toMatchObject({ version: 1, operationId: "managed-operation-1", providerAutomationId: "auto_1" });
 
     expect(run).toHaveBeenCalledTimes(1);
     expect((run.mock.calls[0]?.[0] as { command: string } | undefined)?.command)
       .toContain("bb automation create");
   });
 
-  it("lists only automations it can read exactly, so a damaged record is never adopted", async () => {
+  it("translates a BB response into provider-neutral Hanoon observation values", async () => {
+    const adapter = new TerminalBbAutomationAdapter({
+      run: async () => ({ outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) }),
+    });
+
+    const result = await adapter.show({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      projectId: definition.projectId,
+      automationId: "auto_1",
+    });
+
+    expect(result).toMatchObject({
+      providerAutomationId: "auto_1",
+      projectId: definition.projectId,
+      name: definition.name,
+      enabled: true,
+      trigger: { kind: "cron", cron: "0 9 * * *", timezone: "Etc/UTC" },
+      mode: "agent",
+      target: { kind: "environment", environmentId: "env_owner" },
+    });
+    expect(result).not.toHaveProperty("triggerType");
+    expect(result).not.toHaveProperty("execution");
+    expect(result).not.toHaveProperty("origin");
+  });
+
+  it("never adopts a record it cannot read exactly, so a damaged row is skipped", async () => {
+    // BB keeps damaged records visible under a `problem` discriminator; only an
+    // exact definition match may close an ambiguous create.
     const adapter = new TerminalBbAutomationAdapter({
       run: async () => ({
         outcome: "exited",
         exitCode: 0,
         output: JSON.stringify([
-          observed(),
           { id: "auto_broken", projectId: "proj_owner", name: definition.name, problem: "invalid-stored-data" },
         ]),
       }),
     });
 
-    await expect(adapter.list({
+    await expect(adapter.findByDefinition({
       scope: { kind: "environment", environmentId: "env_owner" },
-      projectId: "proj_owner",
-    })).resolves.toEqual([observed()]);
+      definition,
+      identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
+    })).resolves.toBeNull();
+  });
+
+  it("fails closed when BB reads back a different schedule", async () => {
+    const results: CommandResult[] = [
+      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed({
+        trigger: { triggerType: "schedule", cron: "0 10 * * *", timezone: "Etc/UTC" },
+      })) },
+    ];
+    const adapter = new TerminalBbAutomationAdapter({ run: async () => results.shift()! });
+
+    await expect(adapter.show({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      projectId: definition.projectId,
+      automationId: "auto_1",
+      expectedDefinition: definition,
+    })).rejects.toThrow("schedule did not reconcile");
+  });
+
+  it("verifies the provider definition after an update", async () => {
+    const results: CommandResult[] = [
+      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
+      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed({
+        trigger: { triggerType: "schedule", cron: "0 10 * * *", timezone: "Etc/UTC" },
+      })) },
+    ];
+    const adapter = new TerminalBbAutomationAdapter({ run: async () => results.shift()! });
+
+    await expect(adapter.update({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      definition,
+      automationId: "auto_1",
+      expectedEnabled: true,
+    })).rejects.toThrow("schedule did not reconcile");
   });
 
   it("can reconcile an intentionally paused automation without treating it as drift", () => {
@@ -221,6 +282,7 @@ describe("BB automation adapter", () => {
     const failure = await adapter.create({
       scope: { kind: "environment", environmentId: "env_owner" },
       definition: { ...definition, projectId: "proj_personal" },
+      identity: { operationId: "managed-operation-1", ownershipMarker: "hanoon:marker-1" },
     }).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(BbAutomationProjectUnavailableError);
