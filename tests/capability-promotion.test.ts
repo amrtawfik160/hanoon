@@ -356,7 +356,7 @@ describe("new-attempt kill switches", () => {
         inputText: text,
         now,
       });
-      expect(store.claimNextControllerTurn(fence())?.id).toBe(turn.id);
+      expect(store.claimNextControllerTurn({ ...fence(), now: now + 3_000 })?.id).toBe(turn.id);
       if (!store.getControllerByThreadId("thr_controller")) {
         expect(store.markControllerSpawned({
           ...fence(),

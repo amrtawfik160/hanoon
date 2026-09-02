@@ -180,7 +180,7 @@ Self-healing is off by default. To enable it, set the boolean `selfDiagnosisEnab
 
 ### 4. Talk to Hanoon
 
-Send a normal private message. Hanoon answers conversationally, and acts when asked. Screenshots, GIFs, and short videos are part of the same turn — clips are sampled into stills the agent can see.
+Send a normal private message. Hanoon answers conversationally, and acts when asked. Screenshots, GIFs, and short videos are part of the same turn — clips are sampled into stills the agent can see. PDF, Markdown, and plain-text files are attached to the turn too, with their caption kept as the message, and short text files are read inline. Several messages sent in quick succession are answered together as one burst, and a forwarded message keeps the name of who wrote it.
 
 ```text
 what's running right now?

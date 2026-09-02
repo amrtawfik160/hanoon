@@ -31,6 +31,7 @@ import {
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  CONTROLLER_BURST_MIGRATIONS,
 } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { runJobExecutorService } from "../src/services/job-executor-service";
@@ -263,7 +264,7 @@ function ownedFixture(
     inputText: task,
     now: 2_000,
   });
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   if (!store.markControllerSpawned({
     turnId: turn.id, ownerId: "executor", generation: lease.generation, now: 10_000,
@@ -608,19 +609,27 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.at(-1));
+    // The effect-protocol migration is the newest tail, with the burst
+    // migration and then the managed-automation state upgrade ahead of it.
+    // Each contributes several statements, so every block is located by offset
+    // rather than a fixed index.
+    [...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
+    });
     const protocolOffset = NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
-    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+    [...CONTROLLER_BURST_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(protocolOffset + index + 1))).toBe(migration);
     });
-    const stateUpgradeOffset = MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
-    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 1))).toBe(
-      NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1),
-    );
-    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(protocolOffset + stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    const burstOffset = protocolOffset + CONTROLLER_BURST_MIGRATIONS.length;
+    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(burstOffset + index + 1))).toBe(migration);
+    });
+    const stateUpgradeOffset = burstOffset + MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");

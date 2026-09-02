@@ -51,7 +51,8 @@ function stateForThread(thread: ThreadLike): WorkerLivenessState {
   if (thread.runtime.displayStatus === "host-reconnecting" || thread.runtime.displayStatus === "waiting-for-host") {
     return "unknown";
   }
-  if (thread.status === "starting" || thread.runtime.displayStatus === "starting" || thread.runtime.displayStatus === "provisioning") {
+  if (thread.status === "pending" || thread.status === "starting" ||
+    thread.runtime.displayStatus === "starting" || thread.runtime.displayStatus === "provisioning") {
     return "starting";
   }
   if (thread.status === "stopping" || thread.runtime.displayStatus === "stopping") return "stopping";

@@ -312,7 +312,7 @@ function createHanoonCanaryHarness(broker: BrokerCanaryHarness): HanoonCanaryHar
   const initialFence = store.acquireExecutorLease("executor-canary", NOW, 60_000);
   if (!initialFence.acquired) throw new Error("canary_executor_lease_missing");
   const fence = { ownerId: "executor-canary", generation: initialFence.generation, now: NOW };
-  if (store.claimNextControllerTurn(fence)?.id !== queued.id) throw new Error("canary_turn_claim_missing");
+  if (store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id !== queued.id) throw new Error("canary_turn_claim_missing");
   expect(store.markControllerSpawned({
     ...fence,
     turnId: queued.id,

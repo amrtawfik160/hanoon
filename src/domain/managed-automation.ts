@@ -395,6 +395,18 @@ export function isCurrentManagedAutomationAuthority(value: StoredManagedAutomati
   return typeof value === "object" && value !== null && "version" in value && value.version === 1;
 }
 
+/**
+ * True when Hanoon installed this automation for its own upkeep rather than at
+ * the owner's request, so it stays out of the owner's watch list. A current
+ * authority says so with a system-maintenance origin; a legacy row recorded by
+ * the installer says so with `source: "system"`.
+ */
+export function managedAutomationIsSystemOwned(authority: StoredManagedAutomationAuthority): boolean {
+  return isCurrentManagedAutomationAuthority(authority)
+    ? authority.origin === "system-maintenance"
+    : authority.source === "system";
+}
+
 export function currentManagedAutomationAuthority(
   value: unknown,
 ): ManagedAutomationAuthority | null {

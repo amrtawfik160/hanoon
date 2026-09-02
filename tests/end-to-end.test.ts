@@ -595,7 +595,8 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const controllerTurn = store.claimNextControllerTurn({
       ownerId: "controller-setup",
       generation: controllerLease.generation,
-      now: time,
+      // Past the burst quiet gap of the intake turns.
+      now: time + 3_000,
     });
     if (!controllerTurn) throw new Error("controller turn was not claimable");
     expect(store.reserveControllerSpawn({
