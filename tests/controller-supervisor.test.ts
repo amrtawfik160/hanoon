@@ -176,7 +176,7 @@ function submittedTurn(
     inputText: "audit every machine",
     now: 2_000,
   });
-  store.claimNextControllerTurn({ ...fence, now: 2_000 });
+  store.claimNextControllerTurn({ ...fence, now: 5000 });
   expect(store.reserveControllerSpawn({
     controllerKey: turn.controllerKey,
     turnId: turn.id,

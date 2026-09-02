@@ -234,7 +234,7 @@ function fixture(options: {
   });
   const lease = store.acquireExecutorLease("executor", 10_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   expect(store.markControllerSpawned({
     turnId: turn.id,

@@ -76,7 +76,7 @@ function pairOwner(
     // The controller's project and host are recorded when its thread spawns.
     const lease = store.acquireExecutorLease("executor", NOW - 350, 30_000);
     if (!lease.acquired) throw new Error("missing executor lease");
-    const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: NOW - 350 });
+    const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: NOW + 2_650 });
     if (!turn) throw new Error("missing controller turn");
     expect(store.markControllerSpawned({
       turnId: turn.id,

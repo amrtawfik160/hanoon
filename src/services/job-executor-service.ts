@@ -62,6 +62,8 @@ export type JobExecutorDependencies = {
     isStreaming?(): boolean;
     /** Milliseconds until the in-flight turn is out of time, if one is running. */
     nextStallDeadlineMs?(now: number): number | null;
+    /** Milliseconds until a waiting burst has gone quiet, if one is waiting. */
+    nextBurstQuietWaitMs?(now: number): number | null;
   };
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
@@ -1578,7 +1580,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // producing events: a silent thread produces none, which is exactly the
         // case the deadline exists for.
         const deadlineWaitMs = deps.controller?.nextStallDeadlineMs?.(deps.clock.now()) ?? null;
-        const waitMs = [presenceWaitMs, deadlineWaitMs].reduce<number>(
+        // A burst still arriving holds its claim until the quiet gap has passed
+        // its newest message, so the loop wakes exactly then rather than
+        // answering half of what the owner sent.
+        const burstWaitMs = deps.controller?.nextBurstQuietWaitMs?.(deps.clock.now()) ?? null;
+        const waitMs = [presenceWaitMs, deadlineWaitMs, burstWaitMs].reduce<number>(
           (soonest, candidate) => candidate === null ? soonest : Math.min(soonest, Math.max(1, candidate)),
           ordinaryAndSweepWaitMs,
         );

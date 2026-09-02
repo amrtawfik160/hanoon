@@ -42,7 +42,7 @@ function fixture(options: { paired?: boolean; spawned?: boolean } = {}) {
       // BB host and project: both are recorded when its thread is spawned.
       const lease = store.acquireExecutorLease("executor", NOW - 3_000, 30_000);
       if (!lease.acquired) throw new Error("missing executor lease");
-      const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: NOW - 3_000 });
+      const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: NOW - 1_000 });
       if (!turn) throw new Error("missing controller turn");
       expect(store.markControllerSpawned({
         turnId: turn.id,

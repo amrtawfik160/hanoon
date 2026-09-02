@@ -135,6 +135,12 @@ Notices about top-level threads are automatic; nothing needs arming. The plugin 
 
 If a thread seems stuck and you were told nothing, check that it is top-level — a sub-agent's thread is reported to its parent, not to you — and that it is `visible`. To recover a controller thread that has wedged, `bb thread archive <id>`: the plugin reads the archived thread as missing and opens a fresh session on its own, which is safer than editing the database.
 
+## Controller attachments and bursts
+
+Messages sent in quick succession are answered as one burst; each answer starts about two seconds after the last message so the whole burst is read together. The fixed caps are 25 messages per burst, 32 KB of rendered transcript, and 10 attachments counting the first message's own file. A burst gets one answer and no separate acknowledgement; only messages folded into an answer already being written draw the one-line "got that" bubble, once per burst.
+
+The controller accepts PDF, Markdown, and plain-text documents as attachments, plus images and clips as before. A document's caption becomes the message text. Per-file limits: images 10 MB, clips and documents 20 MB; Markdown and plain-text files of up to 64,000 characters are also inlined into the answer's input. A file of another type, or over its limit, gets one short reply at intake and is not queued; several such files arriving together, even across a plugin restart, draw that reply once.
+
 ## Inspect jobs
 
 ```bash

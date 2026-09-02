@@ -141,7 +141,7 @@ describe("conversation digest durability", () => {
     const lease = store.acquireExecutorLease("executor", NOW, 30_000);
     if (!lease.acquired) throw new Error("missing lease");
     const fence = { ownerId: "executor", generation: lease.generation, now: NOW };
-    expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+    expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
     expect(store.markControllerSpawned({
       ...fence,
       turnId: turn.id,
