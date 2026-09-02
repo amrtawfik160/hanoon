@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { vi } from "vitest";
 import { productionResourceKey, projectResourceKey } from "../../src/autonomy/models";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../../src/capabilities/models";
+import { navigatorAcceptanceCriteria } from "../../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
   type NavigatorTicketWorkerAttempt,
@@ -226,6 +227,7 @@ function implementationExecutor(
         const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
         await hooks.bindResource(resource);
         if (attempt.kind === "implementation") {
+          const ticketSnapshot = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
           return {
             resource,
             result: {
@@ -236,13 +238,32 @@ function implementationExecutor(
               changedPaths: ["src/app.ts"],
               focusedVerification: [{ command: "npm test", outcome: "passed" }],
               fullVerification: [{ command: "npm run check", outcome: "passed" }],
+              acceptanceCriteria: navigatorAcceptanceCriteria(ticketSnapshot).map(({ id }) => ({
+                criterionId: id,
+                outcome: "passed",
+                evidenceRefs: [`acceptance:${id}`],
+              })),
               capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
                 capabilityId, outcome: "passed", evidenceRefs: [`worker:${attempt.id}`],
               })),
             },
           };
         }
-        const needsRepair = options.findingsOnFirstReview && attempt.ordinal === 1;
+        const needsRepair = attempt.workOrder.verificationOf !== undefined ||
+          (options.findingsOnFirstReview && attempt.ordinal === 1);
+        const findings = needsRepair
+          ? attempt.workOrder.verificationOf?.findings ?? [{
+            rootCauseId: "live-repair",
+            capabilityId: "code-review",
+            ruleId: "LIVE-REPAIR",
+            severity: "high" as const,
+            subject: "src/app.ts",
+            line: 1,
+            requirementId: "LIVE-REPAIR",
+            summary: "Repair this finding.",
+            evidenceRefs: ["review:1"],
+          }]
+          : [];
         return {
           resource,
           result: {
@@ -250,12 +271,14 @@ function implementationExecutor(
             reviewedHeadSha: attempt.workOrder.baseHeadSha,
             outcome: needsRepair ? "findings" : "passed",
             summary: needsRepair ? "Repair the finding." : "Passed.",
-            findings: needsRepair ? [{
-              ruleId: "LIVE-REPAIR",
-              severity: "high",
-              summary: "Repair this finding.",
-              evidenceRefs: ["review:1"],
-            }] : [],
+            axes: {
+              requirements: {
+                outcome: needsRepair ? "findings" : "passed",
+                evidenceRefs: [`requirements:${attempt.id}`],
+              },
+              standards: { outcome: "passed", evidenceRefs: [`standards:${attempt.id}`] },
+            },
+            findings,
             capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
               capabilityId,
               outcome: needsRepair ? "findings" : "passed",

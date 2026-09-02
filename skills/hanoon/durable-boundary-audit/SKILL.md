@@ -1,12 +1,12 @@
 ---
 name: durable-boundary-audit
-description: "Audit a change against this plugin's durable boundaries — append-only migrations, the fenced capability manifest, executor fences, one-use approvals, and secret-free surfaces — and prove every new guard actually fails. Use when reviewing or finishing a change that touches migrations, the controller manifest, credentials, approvals, or any test that claims to prove a boundary holds."
+description: "Audit Hanoon's durable boundaries: append-only migrations, capability manifests, executor fences, approvals, secret-free surfaces, and single-scheduler clock work. Use when a change touches those boundaries or claims a guard proves them."
 ---
 
 # Durable boundary audit
 
 The generic guards check whether code is clean, tested, and truthfully documented.
-This one checks the five boundaries that make this plugin safe to run unattended.
+This one checks the six boundaries that make this plugin safe to run unattended.
 Each has already been broken at least once, and in every case a green test run was
 the thing that hid it.
 
@@ -29,7 +29,7 @@ This is not ceremony. Each of these shipped green and was caught only this way:
 If you cannot make the guard fail, you have not found its edge — say so rather than
 claiming coverage.
 
-## The five boundaries
+## The six boundaries
 
 **Migrations are append-only.** Append after the current last entry. Never edit,
 reorder, renumber, or drop one, and never rename a constant without checking every
@@ -61,6 +61,14 @@ all agent- or owner-visible. A resolved credential, vault reference, PEM, or raw
 provider error belongs in none of them. Prefer making the leak impossible — narrow
 the type so the secret never reaches the layer — over redacting it late.
 
+**Clock work has one scheduler.** BB automations own recurring and one-shot
+wall-clock triggers. Hanoon monitors own lifecycle events such as thread
+completion and stalls. A migration proves the new automation has the same
+definition and next run before it disables the old clock row. Search durable
+state for a second armed trigger; one task present in both schedulers is a
+release blocker. Automation-created threads cannot create or widen
+automations, and a scheduled prompt cannot widen its stored task authority.
+
 ## What to report
 
 State each boundary the change touches, what you checked, and the result of the
@@ -70,3 +78,7 @@ you did not touch needs no entry.
 If the change cannot satisfy a boundary, stop and report it. On this codebase a
 refused write, a throwing validator, and a failing constraint have each turned out
 to be correct about a real defect more often than the change that tripped them.
+
+The audit is complete when every touched boundary has one observed failing
+case and one restored passing case, or is named unverified. Include the exact
+commands and leave the worktree in its starting state.

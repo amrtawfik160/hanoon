@@ -1,12 +1,21 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { hashSecret } from "../src/crypto";
 import {
   createNavigatorRuntime,
   PluginNavigatorGitObserver,
+  PluginNavigatorPullRequestPublisher,
+  PluginNavigatorTicketWorkerRunner,
   publishPluginNavigatorPullRequest,
 } from "../src/navigator/plugin-runtime";
+import {
+  NAVIGATOR_TICKET_STEP_CONTRACTS,
+  navigatorJsonDigest,
+  navigatorTicketWorkerProfile,
+  navigatorTicketWorkOrderSchema,
+} from "../src/navigator/implementation-contracts";
+import type { NavigatorTicketWorkerAttempt } from "../src/navigator/implementation-executor";
 import { openStore } from "../src/storage/store";
 import { stableWorkArtifactId } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
@@ -52,7 +61,10 @@ function stubGitTerminals(
 function environmentStatus(input: Readonly<{
   headSha: string;
   clean: boolean;
+  branch?: string;
+  detached?: boolean;
 }>) {
+  const branch = input.branch ?? "hanoon/job-43";
   return {
     outcome: "available" as const,
     workspace: {
@@ -64,8 +76,10 @@ function environmentStatus(input: Readonly<{
         hasUncommittedChanges: !input.clean,
         state: input.clean ? "clean" as const : "dirty_uncommitted" as const,
       },
-      checkout: { kind: "branch" as const, branchName: "hanoon/job", headSha: input.headSha },
-      branch: { currentBranch: "hanoon/job", defaultBranch: "main" },
+      checkout: input.detached
+        ? { kind: "detached" as const, headSha: input.headSha }
+        : { kind: "branch" as const, branchName: branch, headSha: input.headSha },
+      branch: { currentBranch: branch, defaultBranch: "main" },
       mergeBase: null,
     },
   };
@@ -140,9 +154,227 @@ describe("plugin navigator git observer", () => {
       changedPaths: ["lib/other.ts", "README.md"],
     });
   });
+
+  it.each([
+    ["a mismatched branch", environmentStatus({ headSha: WORKTREE_HEAD, clean: true, branch: "hanoon/other" })],
+    ["a detached checkout", environmentStatus({ headSha: WORKTREE_HEAD, clean: true, detached: true })],
+  ])("rejects %s instead of echoing the requested integration branch", async (_label, status) => {
+    const { bb } = createFakePluginHost({
+      pluginId: `navigator-plugin-git-branch-${++fixtureSequence}`,
+      sdk: {
+        environments: { status: async () => status },
+        terminals: stubGitTerminals([]),
+      },
+    });
+    const observer = new PluginNavigatorGitObserver(bb.sdk);
+
+    await expect(observer.observe(observationRequest())).rejects.toThrow("integration branch");
+  });
 });
 
 describe("plugin navigator inference and release adapters", () => {
+  it("spawns one real BB ticket worker with immutable artifact contents and reuses the integration worktree", async () => {
+    const spawned: Record<string, unknown>[] = [];
+    const uploads: Array<{ clientFile: Uint8Array }> = [];
+    const { bb } = createFakePluginHost({
+      pluginId: `navigator-plugin-worker-${++fixtureSequence}`,
+      sdk: {
+        projects: {
+          attachments: {
+            upload: async (args) => {
+              uploads.push({ clientFile: args.clientFile as Uint8Array });
+              return { type: "localFile" as const, path: `/tmp/${args.filename ?? "packet.json"}` };
+            },
+          },
+        },
+        threads: {
+          list: async () => [],
+          spawn: async (args) => {
+            spawned.push(args as unknown as Record<string, unknown>);
+            return { id: "thr_real_worker", environmentId: "env_job_43" };
+          },
+          get: async () => ({ status: "idle" }),
+          output: async () => ({ output: JSON.stringify({ kind: "implementation_result" }) }),
+        },
+      },
+    });
+    const store = openStore(bb.storage);
+    const policy = policyFixture();
+    const specification = store.captureWorkArtifact({
+      artifactId: stableWorkArtifactId("proj_1", `worker-spec-${fixtureSequence}`),
+      projectId: "proj_1",
+      effortId: "effort_worker",
+      operationId: `worker-spec-${fixtureSequence}`,
+      kind: "specification",
+      status: "ready",
+      trackerKind: "github",
+      trackerNamespace: "github:acme/cyndra",
+      externalId: `worker-spec-${fixtureSequence}`,
+      externalUrl: null,
+      externalRevision: "1",
+      externalStatus: "open",
+      assignees: [],
+      title: "Worker specification",
+      trackerOrder: 0,
+      content: "# Worker specification\n\nKeep the exact accepted contract.",
+      acceptanceCriteria: ["The contract remains exact"],
+      relationships: [],
+      capturedAt: 30_000,
+    });
+    const ticket = store.captureWorkArtifact({
+      artifactId: stableWorkArtifactId("proj_1", `worker-ticket-${fixtureSequence}`),
+      projectId: "proj_1",
+      effortId: "effort_worker",
+      operationId: `worker-ticket-${fixtureSequence}`,
+      kind: "implementation_ticket",
+      status: "ready",
+      trackerKind: "github",
+      trackerNamespace: "github:acme/cyndra",
+      externalId: `worker-ticket-${fixtureSequence}`,
+      externalUrl: null,
+      externalRevision: "1",
+      externalStatus: "open",
+      assignees: [],
+      title: "Worker ticket",
+      trackerOrder: 1,
+      content: "# Worker ticket\n\nImplement the real worker path.",
+      acceptanceCriteria: ["A real BB worker is created"],
+      relationships: [{
+        kind: "parent",
+        sourceArtifactId: stableWorkArtifactId("proj_1", `worker-ticket-${fixtureSequence}`),
+        sourceRef: `artifact:${stableWorkArtifactId("proj_1", `worker-ticket-${fixtureSequence}`)}`,
+        targetArtifactId: specification.artifact.id,
+        targetRef: `artifact:${specification.artifact.id}`,
+      }],
+      capturedAt: 30_001,
+    });
+    const workOrder = navigatorTicketWorkOrderSchema.parse({
+      kind: "navigator_ticket_work_order",
+      jobId: "job_worker_43",
+      integrationBranch: "hanoon/job-43",
+      baseBranch: "main",
+      worktreeId: "env_job_43",
+      baseHeadSha: BASE_HEAD,
+      comparisonBaseHeadSha: BASE_HEAD,
+      projectPolicyVersion: 1,
+      projectPolicy: policy,
+      projectPolicyDigest: navigatorJsonDigest(policy),
+      specification: {
+        artifactId: specification.artifact.id,
+        snapshotId: specification.snapshot.id,
+        snapshotDigest: specification.snapshot.snapshotDigest,
+      },
+      ticket: {
+        artifactId: ticket.artifact.id,
+        snapshotId: ticket.snapshot.id,
+        snapshotDigest: ticket.snapshot.snapshotDigest,
+      },
+      taskEvidence: [],
+      evidenceRefs: ["ticket:accepted"],
+      changedPaths: [],
+    });
+    const profile = navigatorTicketWorkerProfile({ kind: "implementation", taskEvidence: [], changedPaths: [] });
+    const attempt: NavigatorTicketWorkerAttempt = {
+      id: "navworker_job_43",
+      jobId: "job_worker_43",
+      sliceId: "navslice_job_43",
+      kind: "implementation",
+      ordinal: 1,
+      effectIdempotencyKey: "job_worker_43:navigator-ticket:navworker_job_43",
+      workOrder,
+      workOrderDigest: navigatorJsonDigest(workOrder),
+      stepContract: NAVIGATOR_TICKET_STEP_CONTRACTS.implementation,
+      profile,
+      modelRoute: { pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard },
+      resource: null,
+      createdAt: 30_002,
+      updatedAt: 30_002,
+    };
+    const bindings: string[] = [];
+    const result = await new PluginNavigatorTicketWorkerRunner(bb.sdk, store).run(attempt, {
+      bindResource: async (resource) => { bindings.push(resource.id); },
+    }, new AbortController().signal);
+
+    expect(bindings).toEqual(["thr_real_worker"]);
+    expect(result.resource).toEqual({ kind: "bb_thread", id: "thr_real_worker" });
+    expect(spawned[0]).toMatchObject({
+      projectId: "proj_1",
+      visibility: "hidden",
+      environment: { type: "reuse", environmentId: "env_job_43" },
+      providerId: DEFAULT_MODEL_POOL_REGISTRY.worker.standard.providerId,
+      model: DEFAULT_MODEL_POOL_REGISTRY.worker.standard.modelId,
+    });
+    const packet = JSON.parse(Buffer.from(uploads[0]!.clientFile).toString("utf8")) as Record<string, any>;
+    expect(packet.specification.content).toContain("exact accepted contract");
+    expect(packet.ticket.content).toContain("real worker path");
+  });
+
+  it("publishes one pull request and verifies the remote base, branch, and exact head", async () => {
+    const { bb } = createFakePluginHost({
+      pluginId: `navigator-plugin-publisher-${++fixtureSequence}`,
+      sdk: {
+        environments: {
+          status: async () => environmentStatus({ headSha: REMOTE_HEAD, clean: true, branch: "hanoon/job-43" }),
+          pullRequest: async () => ({
+            outcome: "available",
+            pullRequest: {
+              number: 43,
+              url: "https://github.com/acme/cyndra/pull/43",
+              baseRefName: "main",
+              headRefName: "hanoon/job-43",
+            },
+          }),
+        },
+        terminals: stubGitTerminals([
+          {
+            match: "gh pr create",
+            exitCode: 0,
+            output: '{"number":43,"url":"https://github.com/acme/cyndra/pull/43"}\n',
+          },
+          {
+            match: "git ls-remote --exit-code origin refs/pull/43/head",
+            exitCode: 0,
+            output: `${REMOTE_HEAD}\trefs/pull/43/head\n`,
+          },
+        ]),
+      },
+    });
+    const gitObservation = {
+      kind: "navigator_git_observation" as const,
+      worktreeId: "env_job_43",
+      branch: "hanoon/job-43",
+      headSha: REMOTE_HEAD,
+      baseHeadSha: BASE_HEAD,
+      baseHeadIsAncestor: true,
+      comparisonBaseHeadSha: BASE_HEAD,
+      comparisonBaseHeadIsAncestor: true,
+      clean: true,
+      changedPaths: ["src/app.ts"],
+      evidenceRef: "git:job-43",
+      observedAt: 31_000,
+    };
+    const record = await new PluginNavigatorPullRequestPublisher(bb.sdk).createOrRefresh({
+      operationId: "navigator-pr-job-43",
+      jobId: "job_43",
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-43",
+      headSha: REMOTE_HEAD,
+      title: "Publish the navigator change",
+      body: "One final integration pull request.",
+      gitObservation,
+      gitObservationDigest: navigatorJsonDigest(gitObservation),
+      evidenceRefs: ["git:job-43"],
+    });
+
+    expect(record).toEqual({
+      operationId: "navigator-pr-job-43",
+      jobId: "job_43",
+      number: 43,
+      url: "https://github.com/acme/cyndra/pull/43",
+      headSha: REMOTE_HEAD,
+    });
+  });
+
   it("rejects a proposal when the bound thread used a native tool", async () => {
     const { bb } = createFakePluginHost({
       pluginId: `navigator-plugin-native-tools-${++fixtureSequence}`,

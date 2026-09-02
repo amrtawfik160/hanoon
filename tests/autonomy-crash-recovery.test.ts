@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import type { JobEffect, ProjectPolicy } from "../src/domain/models";
 import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../src/autonomy/models";

@@ -1,5 +1,5 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { BbRunner, type PipelineThreadAttempt } from "../src/bb/runner";
 import { jobStageExecution } from "../src/domain/stage-routing";

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { hashSecret } from "../src/crypto";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import {
@@ -65,7 +65,9 @@ function recordContractEvidence(
     telegramChatId: "7",
     updateId: 120_000 + contractEvidenceNumber,
     inputText: "Record terminal mutation evidence.",
-    now: input.now,
+    // Received before the claim's quiet gap; the executor's lease is 1s, so
+    // the claim itself cannot move later.
+    now: Math.max(0, input.now - 3_000),
   });
   const fence = { ownerId: input.ownerId, generation: input.generation, now: input.now };
   if (store.claimNextControllerTurn(fence)?.id !== turn.id) throw new Error("turn was not claimed");

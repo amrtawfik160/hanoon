@@ -24,6 +24,13 @@ export const CONTROLLER_MEDIA_MIME_TYPES = [
   ...CONTROLLER_STILL_MIME_TYPES,
   ...CONTROLLER_MOTION_MIME_TYPES,
 ] as const;
+/** Document types a burst may carry; anything else is refused at intake. */
+export const CONTROLLER_DOCUMENT_MIME_TYPES = [
+  "application/pdf",
+  "text/markdown",
+  "text/plain",
+] as const;
+export type ControllerDocumentMimeType = (typeof CONTROLLER_DOCUMENT_MIME_TYPES)[number];
 export const MAX_CONTROLLER_IMAGE_BYTES = 10 * 1024 * 1024;
 /** Telegram Bot API `getFile` ceiling. Larger clips stay queued and use the preview still. */
 export const MAX_CONTROLLER_VIDEO_BYTES = 20 * 1024 * 1024;
@@ -33,6 +40,38 @@ export type ControllerImageMimeType = (typeof CONTROLLER_STILL_MIME_TYPES)[numbe
 export type ControllerMotionMimeType = (typeof CONTROLLER_MOTION_MIME_TYPES)[number];
 export type ControllerMediaMimeType = (typeof CONTROLLER_MEDIA_MIME_TYPES)[number];
 export type ControllerMediaKind = "image" | "animation" | "video";
+/** Per-file cap for documents; BB's attachment limit sits above it. */
+export const MAX_CONTROLLER_DOCUMENT_BYTES = 20 * 1024 * 1024;
+/** Text documents at or below this size are also inlined into the dispatch text. */
+export const CONTROLLER_DOCUMENT_INLINE_MAX_CHARS = 64_000;
+
+/** PDFs are attached for the agent's own tools; text types can be inlined. */
+export function isTextDocument(mimeType: ControllerDocumentMimeType): boolean {
+  return mimeType !== "application/pdf";
+}
+
+export type ControllerDocument = {
+  fileId: string;
+  fileName: string;
+  mimeType: ControllerDocumentMimeType;
+  sizeBytes: number | null;
+};
+
+/** One file a dispatch carries, gathered across every member of its burst. */
+export type ControllerAttachment = {
+  fileId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  kind: ControllerMediaKind | "document";
+  /**
+   * The file's contents when the dispatcher already fetched them to inline the
+   * document; the adapter then uploads these instead of downloading again.
+   * Dispatch-time only: never persisted.
+   */
+  bytes?: Uint8Array;
+};
+
 export type ControllerImageThumbnail = {
   fileId: string;
   fileName: string;
@@ -68,6 +107,62 @@ export function isMotionMedia(image: Pick<ControllerImage, "kind" | "mimeType">)
 export function controllerDownloadLimitBytes(image: Pick<ControllerImage, "kind" | "mimeType">): number {
   return isMotionMedia(image) ? MAX_CONTROLLER_VIDEO_BYTES : MAX_CONTROLLER_IMAGE_BYTES;
 }
+
+export function controllerAttachmentDownloadLimitBytes(attachment: ControllerAttachment): number {
+  if (attachment.kind === "document") return MAX_CONTROLLER_DOCUMENT_BYTES;
+  return controllerDownloadLimitBytes({ kind: attachment.kind, mimeType: attachment.mimeType as ControllerMediaMimeType });
+}
+
+/** Every file a turn carries, in a single dispatch-shaped list. */
+export function controllerAttachmentsForTurn(
+  turn: Pick<ControllerTurnRecord, "image" | "document">,
+): ControllerAttachment[] {
+  const attachments: ControllerAttachment[] = [];
+  if (turn.image) {
+    attachments.push({
+      fileId: turn.image.fileId,
+      fileName: turn.image.fileName,
+      mimeType: turn.image.mimeType,
+      sizeBytes: turn.image.sizeBytes,
+      kind: turn.image.kind ?? "image",
+    });
+  }
+  if (turn.document) {
+    attachments.push({
+      fileId: turn.document.fileId,
+      fileName: turn.document.fileName,
+      mimeType: turn.document.mimeType,
+      sizeBytes: turn.document.sizeBytes,
+      kind: "document",
+    });
+  }
+  return attachments;
+}
+/**
+ * Structured provenance for one owner message, persisted per turn so a burst
+ * can be rendered as one attributed transcript. Nothing here contains file
+ * bytes, tokens, or callback data.
+ */
+/** Bounds a source record's strings share at intake, on write, and on read. */
+export const CONTROLLER_SOURCE_NAME_MAX_CHARS = 256;
+export const CONTROLLER_SOURCE_QUOTE_MAX_CHARS = 500;
+export const CONTROLLER_SOURCE_ALBUM_ID_MAX_CHARS = 128;
+
+export type ControllerTurnSource = {
+  kind: "owner" | "forwarded" | "reply" | "album";
+  /** Forwarded sender's display name or chat title, when Telegram supplies one. */
+  forwardedFrom: string | null;
+  /** True when the sender chose to hide their identity. */
+  forwardedHidden: boolean;
+  /** The quoted message's author, when Telegram supplies one. */
+  quotedAuthor: string | null;
+  /** True when the quoted message is the agent's own. */
+  quotedFromAgent: boolean;
+  quotedText: string | null;
+  replyToMessageId: number | null;
+  albumId: string | null;
+};
+
 export type ControllerStreamPhase =
   | "queued"
   | "connecting"
@@ -118,6 +213,11 @@ export type ControllerTurnRecord = {
   ordinal: number;
   inputText: string;
   image: ControllerImage | null;
+  document: ControllerDocument | null;
+  /** Structured provenance for the transcript; null for turns without one. */
+  source: ControllerTurnSource | null;
+  /** Leader turn whose burst this turn folded into; null for leaders and singles. */
+  burstLeaderTurnId: string | null;
   state: ControllerTurnState;
   leaseOwner: string | null;
   leaseGeneration: number | null;

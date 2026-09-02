@@ -40,15 +40,15 @@ const RELEASE_CASE_IDS = [
   "bad-news-plainly",
 ];
 const RELEASE_GOLDEN_SHA256 = "43e2872b5f40fb8266760153dac1e6a9b4b049ddd2bce53b5a223eda5e9bb79b";
-const RELEASE_EXPECTATIONS_SHA256 = "de278dc8d2ad3531ee4c91b0cf1af1fa5d373d242a9f4692bca325c1515b4805";
+const RELEASE_EXPECTATIONS_SHA256 = "c7b7976220654b8f5983a029e897de3af789d9e37a9e55787726d8d29eccb281";
 const RELEASE_EXPECTATIONS = {
-  "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-  "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-  "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true } },
-  "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false } },
-  "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true } },
-  "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-  "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+  "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+  "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": false } },
+  "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+  "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false, "plain-language": true } },
+  "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true, "plain-language": true } },
+  "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+  "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
 } as const;
 
 type FakeBbMode = "all-hold" | "wrong-bounded-uncertainty" | "wrong-execution" | "wrong-environment-path" | "infra" | "ambiguous-spawn" | "spawn-error" | "unscoped-output" | "event-after-output" | "event-between-idle-seal" | "event-between-seal-capture" | "unrelated-spawn" | "missing-environment";
@@ -702,11 +702,12 @@ it("keeps every clause id unique and stable", () => {
   expect(new Set(ANSWER_CLAUSE_IDS).size).toBe(ANSWER_CLAUSES.length);
   expect(ANSWER_CLAUSE_IDS).toContain("no-tool-narration");
   expect(ANSWER_CLAUSE_IDS).toContain("not-process-only");
+  expect(ANSWER_CLAUSE_IDS).toContain("plain-language");
 });
 
 it("pins the answer judge identity and rubric version", () => {
   // Catches silently inheriting project defaults or accepting a different judge profile.
-  expect(ANSWER_RUBRIC_VERSION).toBe("answer-contract-hybrid-v1");
+  expect(ANSWER_RUBRIC_VERSION).toBe("answer-contract-hybrid-v2");
   expect(ANSWER_JUDGE_PROFILE).toEqual({
     provider: "codex",
     model: "gpt-5.6-sol",
@@ -731,7 +732,7 @@ it("records deterministic and model clause provenance with the pinned identity",
     source: "deterministic",
     reason: "Explicitly transfers a routine BB action to the owner.",
     judgeThreadId: null,
-    rubricVersion: "answer-contract-hybrid-v1",
+    rubricVersion: "answer-contract-hybrid-v2",
     judgeProfile: {
       provider: "codex",
       model: "gpt-5.6-sol",
@@ -1449,9 +1450,9 @@ it("ships golden cases covering both a passing and a failing shape of every kind
   }
 });
 
-it("binds the release corpus to exactly seven cases and 42 clauses", () => {
+it("binds the release corpus to exactly seven cases and 49 clauses", () => {
   expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.caseCount).toBe(7);
-  expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.clauseCount).toBe(42);
+  expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.clauseCount).toBe(49);
   expect(ANSWER_LIVE_GATE_RELEASE_CORPUS.caseIds).toEqual(RELEASE_CASE_IDS);
 });
 
@@ -1480,6 +1481,7 @@ it("keeps dead-end referral's golden answer and expectations independent", () =>
       "bounded-uncertainty": true,
       "no-dead-end-referral": false,
       "not-process-only": true,
+      "plain-language": true,
     },
   });
 });
@@ -1493,13 +1495,13 @@ it("ships independent literal expectations for every golden case and clause", ()
     cases: { id: string; aggregate: "pass" | "fail"; clauses: Record<string, boolean> }[];
   };
   const expected = {
-    "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-    "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-    "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true } },
-    "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false } },
-    "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true } },
-    "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
-    "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true } },
+    "status-good": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+    "status-narrates-tools": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": false, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": false } },
+    "status-invents-eta": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": false, "bounded-uncertainty": false, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+    "process-only": { aggregate: "fail", clauses: { "outcome-first": false, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": false, "plain-language": true } },
+    "dead-end-referral": { aggregate: "fail", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": false, "not-process-only": true, "plain-language": true } },
+    "bounded-uncertainty": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
+    "bad-news-plainly": { aggregate: "pass", clauses: { "outcome-first": true, "no-tool-narration": true, "no-invented-progress": true, "bounded-uncertainty": true, "no-dead-end-referral": true, "not-process-only": true, "plain-language": true } },
   };
   expect(parseAnswerExpectations(expectations)).toEqual(expectations);
   expect(expectations.rubricVersion).toBe(ANSWER_RUBRIC_VERSION);

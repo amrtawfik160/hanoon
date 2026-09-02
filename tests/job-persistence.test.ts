@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import type Database from "better-sqlite3";
 import type { JobEffect, ProjectPolicy } from "../src/domain/models";

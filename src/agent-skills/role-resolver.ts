@@ -1,4 +1,4 @@
-import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import {
   ADMITTED_CAPABILITY_SKILL_IDS,
   type CapabilitySkillId,

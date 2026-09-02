@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import {
   CAPABILITY_BY_ID,
@@ -9,6 +9,7 @@ import {
 import {
   CONTROLLER_BUNDLE_IDS,
   CONTROLLER_MANUAL_DISCOVERY_SKILLS,
+  CONTROLLER_REPITCH_SKILLS,
   CONTROLLER_TOOL_BUNDLES,
   assessControllerCapabilityDescriptor,
   controllerSkillsForTurn,
@@ -151,6 +152,24 @@ it("loads manual discovery skills only for an explicit slash invocation", () => 
     .map((entry) => entry.capabilityId)).toEqual(expect.arrayContaining([...CONTROLLER_MANUAL_DISCOVERY_SKILLS]));
 });
 
+it("keeps plain language standing and loads wait-what only for an explicit repitch", () => {
+  expect(controllerSkillsForTurn("Explain the deployment status")).toEqual([
+    "driving-bb",
+    "unslop",
+  ]);
+  expect(controllerSkillsForTurn("/wait-what explain that again")).toEqual([
+    "driving-bb",
+    "unslop",
+    ...CONTROLLER_REPITCH_SKILLS,
+  ]);
+  expect(selectControllerCapabilityProfile("/wait-what explain that again").assignments)
+    .toContainEqual(expect.objectContaining({
+      capabilityId: "wait-what",
+      capabilityKind: "skill",
+      mandatory: false,
+    }));
+});
+
 it("permits only admitted low-risk bundle exposure changes", () => {
   const admitted = CAPABILITY_BY_ID.get("controller-bundle-job-control");
   if (!admitted) throw new Error("missing controller bundle descriptor");
@@ -190,7 +209,7 @@ it("persists one additive bundle expansion and denies a second request", () => {
   expect(store.claimNextControllerTurn({
     ownerId: "controller-capability-test",
     generation: lease.generation,
-    now: 2_002,
+    now: 5002,
   })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     ownerId: "controller-capability-test",

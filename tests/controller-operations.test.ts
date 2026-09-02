@@ -1,5 +1,5 @@
-import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ThreadOperationService, type OperationRequest } from "../src/controller/operations";
@@ -24,7 +24,7 @@ function fixture(options?: { threadStatus?: "active" | "error"; omitRateLimitRec
   });
   const lease = store.acquireExecutorLease("executor", 1_000, 30_000);
   if (!lease.acquired) throw new Error("controller lease unavailable");
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 1_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 4000 });
   if (!turn) throw new Error("controller turn unavailable");
   expect(store.markControllerSpawned({
     turnId: turn.id,

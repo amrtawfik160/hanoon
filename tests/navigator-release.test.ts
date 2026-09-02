@@ -1,14 +1,31 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
+import { CAPABILITY_BY_ID, CAPABILITY_GRAPH_DIGEST, CAPABILITY_REGISTRY_DIGEST } from "../src/capabilities/catalog";
+import {
+  assessGuardEnvelope,
+  persistGuardEnvelopeSettlement,
+  type GuardAssessmentPolicy,
+  type GuardResultEnvelope,
+} from "../src/capabilities/guards";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { hashSecret } from "../src/crypto";
 import type { Job } from "../src/domain/models";
+import { assessReviewGroup } from "../src/domain/review-lenses";
 import { NavigatorImplementationExecutor } from "../src/navigator/implementation-executor";
 import type { NavigatorSnapshot } from "../src/navigator/models";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
-import { ALL_MIGRATIONS, NAVIGATOR_PROMOTION_MIGRATIONS, NAVIGATOR_RELEASE_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  MANAGED_AUTOMATION_MIGRATIONS,
+  MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  NAVIGATOR_PROMOTION_MIGRATIONS,
+  NAVIGATOR_RELEASE_MIGRATIONS,
+  NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
+  NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  CONTROLLER_BURST_MIGRATIONS,
+} from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
@@ -239,7 +256,7 @@ function ownedFixture(
     inputText: task,
     now: 2_000,
   });
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   if (!store.markControllerSpawned({
     turnId: turn.id, ownerId: "executor", generation: lease.generation, now: 10_000,
@@ -489,9 +506,16 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 }
 
 describe("navigator exact-head release", () => {
-  it("appends the navigator release migration after the ticket 41 policy intent migrations", () => {
-    expect(ALL_MIGRATIONS.at(-1)).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-2)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+  it("preserves the shipped navigator order and appends schema repairs after it", () => {
+    // The burst migration is the newest tail; every shipped migration keeps
+    // its position ahead of it.
+    expect(ALL_MIGRATIONS.at(-1)).toBe(CONTROLLER_BURST_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-2)).toBe(MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-3)).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-4)).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-5)).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-6)).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-7)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");
@@ -640,6 +664,156 @@ describe("navigator exact-head release", () => {
     ).all(fixture.job.id)).toEqual([
       { reason_code: "validation_failed", previous_state: "validating" },
     ]);
+  });
+
+  it("records final exact-head review findings in the normalized release convergence ledger", () => {
+    const fixture = ownedFixture();
+    propose(fixture, {
+      kind: "start_release",
+      implementationTicketIds: [...fixture.ticketIds],
+    });
+    fixture.database.prepare(
+      `UPDATE jobs
+          SET state = 'final_reviewing', pr_head_sha = ?, review_thread_id = 'thr_final_quality',
+              routing_mode = 'active', delivery_mode = 'small_fix'
+        WHERE id = ?`,
+    ).run(HEAD, fixture.job.id);
+    const current = fixture.store.getJob(fixture.job.id)!;
+    const attempt = fixture.store.createExecutorAttempt({
+      id: "attempt_final_review_quality",
+      jobId: fixture.job.id,
+      kind: "review",
+      reviewLens: "quality",
+      reviewStage: "final_review",
+      ordinal: 1,
+      headSha: HEAD,
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: fixture.now(),
+    });
+    if (!attempt) throw new Error("final review attempt was not created");
+    const guard = CAPABILITY_BY_ID.get("docs-guard");
+    if (!guard) throw new Error("docs guard is missing");
+    const profile = fixture.store.createCapabilityProfile({
+      subjectKind: "worker_attempt",
+      subjectId: attempt.id,
+      threadId: "thr_final_quality",
+      recipeId: "bounded",
+      recipeVersion: 1,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST,
+      mode: "active",
+      model: {
+        pool: "strong",
+        providerId: "codex-provider",
+        modelId: "gpt-5.6-sol",
+        reasoning: "high",
+        serviceTier: "fast",
+      },
+      assignments: [{
+        capabilityId: guard.id,
+        descriptorDigest: guard.digest,
+        capabilityKind: "skill",
+        mandatory: true,
+      }],
+      reasonCodes: [],
+      traits: ["docs-changed"],
+      now: fixture.now(),
+    });
+    const diffDigest = "d".repeat(64);
+    const guardPolicy: GuardAssessmentPolicy = {
+      profileId: profile.id,
+      profileRevision: profile.revision,
+      reviewedHeadSha: HEAD,
+      diffDigest,
+      selectedGuards: [{
+        capabilityId: guard.id,
+        descriptorDigest: guard.digest,
+        mandatory: true,
+        substitutes: [],
+      }],
+      requirementIds: [],
+      mustFixRuleIds: ["docs.required"],
+      advisoryRuleIds: [],
+    };
+    const guardEnvelope: GuardResultEnvelope = {
+      schemaVersion: 1,
+      profileId: profile.id,
+      profileRevision: profile.revision,
+      reviewedHeadSha: HEAD,
+      diffDigest,
+      guards: [{
+        capabilityId: guard.id,
+        descriptorDigest: guard.digest,
+        outcome: "findings",
+        findings: [{
+          ruleId: "docs.required",
+          severity: "high",
+          subject: "docs/usage.md",
+          line: 4,
+          evidence: "The exact-head behavior is not documented.",
+          evidenceClass: "documentation",
+          requirementId: null,
+        }],
+      }],
+    };
+    const assessment = assessGuardEnvelope(guardEnvelope, guardPolicy);
+    expect(assessment.outcome).toBe("changes_requested");
+    expect(fixture.store.updateExecutorAttempt({
+      jobId: fixture.job.id,
+      attemptId: attempt.id,
+      patch: {
+        threadId: "thr_final_quality",
+        result: {
+          outcome: "changes_requested",
+          reviewedHeadSha: HEAD,
+          reasons: assessment.reasons,
+          guardEnvelope,
+          guardPolicy,
+        },
+      },
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: fixture.now(),
+    })).not.toBeNull();
+    persistGuardEnvelopeSettlement({
+      repository: fixture.store,
+      scopeId: `release-review:${fixture.job.id}`,
+      envelope: guardEnvelope,
+      policy: guardPolicy,
+      now: fixture.now(),
+    });
+    const group = assessReviewGroup(
+      fixture.store.listReviewAttempts(fixture.job.id, "final_review", 1),
+      "small_fix",
+      HEAD,
+    );
+
+    expect(fixture.store.applyExecutorJobEvent({
+      jobId: fixture.job.id,
+      expectedVersion: current.version,
+      event: {
+        type: "REVIEW_CHANGES_REQUESTED",
+        headSha: HEAD,
+        summary: group.summary ?? "",
+        findings: group.findings,
+        reasons: group.reasons,
+      },
+      ownerId: "executor",
+      generation: fixture.leaseGeneration,
+      now: fixture.now(),
+    })).toMatchObject({ state: "implementing" });
+    expect(fixture.database.prepare(
+      `SELECT capability_id, rule_id, disposition, event, head_sha, blocking_burden
+         FROM navigator_release_review_finding_events WHERE job_id = ?`,
+    ).all(fixture.job.id)).toEqual([{
+      capability_id: "docs-guard",
+      rule_id: "docs.required",
+      disposition: "must_fix",
+      event: "opened",
+      head_sha: HEAD,
+      blocking_burden: 1,
+    }]);
   });
 
   it("recovers one successful rollback to navigation and exhausts a repeated signature", async () => {

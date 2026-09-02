@@ -1,6 +1,6 @@
 ---
 name: blast-radius
-description: "Find what a change could break somewhere else before it ships, beyond the diff, and prove the one fact it is safe because of by running real code instead of writing it up. Use when reviewing a change for what it could break elsewhere, judging risk beyond the changed lines, or reading a small diff that looks safe and is not trusted yet."
+description: "Prove a change's blast radius beyond its diff. Use for merge-gating review, cross-module risk, hidden downstream contracts, or a deceptively small change whose safety depends on behavior elsewhere."
 ---
 
 # Blast radius
@@ -54,3 +54,8 @@ A dirty review environment throws your own verdict away, and the merge gate coun
 - **Checks.** Every command you ran to prove or disprove a safety fact, with its exit code.
 
 Cite real code and quote real output. If the one safety fact never reached "you ran it", the verdict says so in plain words.
+
+The review is complete only when the worktree is as clean as it started, every
+blocking finding names an exact location and failure path, every command has an
+exit code, and the central safety fact is either exercised by real code or
+called unproven in the verdict.

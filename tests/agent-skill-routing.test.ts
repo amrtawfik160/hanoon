@@ -1,4 +1,4 @@
-import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import { describe, expect, test } from "vitest";
 import {
   BUNDLED_SKILL_IDS,
@@ -50,7 +50,11 @@ function context(overrides: {
       branchName: "worker",
     },
     host: { id: "host-1", name: "worker host" },
-    provider: { id: "provider-1", model: "model-1" },
+    provider: {
+      id: "provider-1",
+      model: "model-1",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: {
       kind: overrides.originKind ?? null,
       pluginId: overrides.originPluginId === undefined ? PLUGIN_ID : overrides.originPluginId,

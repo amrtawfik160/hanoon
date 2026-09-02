@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { DualEngineCoordinator, DualEngineContractionError } from "../src/navigator/coordinator";
@@ -52,7 +52,7 @@ function confirmControllerJob(
   const turn = store.claimNextControllerTurn({
     ownerId: "executor",
     generation: leaseGeneration,
-    now: input.now,
+    now: input.now + 3_000,
   });
   if (!turn) throw new Error("missing controller turn");
   if (!store.getControllerByThreadId("thr_controller_dual")) {

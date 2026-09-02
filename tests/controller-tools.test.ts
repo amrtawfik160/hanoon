@@ -1,5 +1,5 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { BUNDLED_SKILL_IDS, buildWorkerThreadTitle, type WorkerSkillRole } from "../src/agent-skills/role-resolver";
@@ -22,6 +22,8 @@ import { canonicalControllerJson, sha256ControllerJson } from "../src/controller
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
 import { ControllerEvidenceProjector } from "../src/controller/evidence-projector";
 import { controllerFinalizationJsonSchema } from "../src/controller/finalization-contract";
+import { BbAutomationProjectUnavailableError } from "../src/bb/automation";
+import { createTestManagedAutomations } from "./support/managed-automation-fixture";
 
 type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
 
@@ -57,6 +59,7 @@ function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntr
     },
     pinSortKey: null,
     hasPendingInteraction: false,
+    queuedWork: "none",
     environmentHostId: "host_cyndra",
     environmentName: "Cyndra worktree",
     environmentBranchName: "feature/billing",
@@ -231,7 +234,7 @@ function fixture(options: {
   });
   const lease = store.acquireExecutorLease("executor", 10_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   expect(store.markControllerSpawned({
     turnId: turn.id,
@@ -427,7 +430,7 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   const metadata = registrations.map((tool) => ({
     name: tool.name,
     description: tool.description,
-    statusLabels: tool.experimentalStatusLabels,
+    presentation: tool.presentation,
     schema: tool.inputSchema,
   }));
   const providerJson = JSON.parse(JSON.stringify(metadata));
@@ -446,11 +449,15 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned when `queued` stopped promising that admission alone guarantees
   // execution; scheduler health can still hold an admitted retry.
   // Re-pinned when start_job began describing the job as the software lifecycle.
-  expect(digest).toBe("fda23e417ac4eb6b21d68fb9fb0fdf79be9fe61a347c79060d8b37f0d37555ff");
+  // Re-pinned when clock schedules moved to BB Automations with UTC semantics.
+  // Re-pinned when BB replaced experimental status labels with the stable
+  // presentation contract in plugin SDK 0.4.21.
+  // Re-pinned when watch gained the governed update_schedule variant.
+  expect(digest).toBe("3fd7a98dcc64b9c33ee62cbbd0b3154e651ae8da4c14ac48b762a9cf26551808");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
-    statusLabels: null,
+    presentation: null,
     schema: {
       $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
@@ -468,7 +475,7 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   expect(metadata[22]).toEqual({
     name: "telegram_agent_respond",
     description: "Submit one bounded evidence-backed final response for the current controller turn. Each segment is delivered as its own paragraph: a blank line is inserted between segments for you, so do not add trailing separators or leading blank lines, and keep one paragraph in one segment. A qualifier only applies to the segment it sits in. What you read outside our systems, from a search or a page, is an external_reading claim: it can say what the source said, and never that a job, a check, a deployment, or anything of ours succeeded. Apply the unslop skill to every segment before submitting. That is required, not optional.",
-    statusLabels: null,
+    presentation: null,
     schema: controllerFinalizationJsonSchema,
   });
   // The renderer inserts the paragraph break, so the contract has to say so.
@@ -509,9 +516,9 @@ it("matches the exact trusted 21-tool projection permission matrix", () => {
     ["telegram_agent_remember", ["memory_state"]],
     ["telegram_agent_recall", ["memory_state"]],
     ["telegram_agent_forget", ["memory_state"]],
-    ["telegram_agent_watch", ["monitor_state", "obligation"]],
+    ["telegram_agent_watch", ["monitor_state", "external_mutation", "obligation"]],
     ["telegram_agent_list_watches", ["monitor_state", "obligation"]],
-    ["telegram_agent_cancel_watch", ["monitor_state"]],
+    ["telegram_agent_cancel_watch", ["monitor_state", "external_mutation"]],
     ["telegram_agent_health", ["health_snapshot"]],
     ["telegram_agent_delegate", ["thread_state", "external_mutation", "obligation"]],
     ["telegram_agent_scorecard", ["health_snapshot"]],
@@ -867,7 +874,11 @@ function workerContext(
       branchName: "agent/worker",
     },
     host: { id: "host_worker", name: "Worker host" },
-    provider: { id: "codex", model: "gpt-5.6" },
+    provider: {
+      id: "codex",
+      model: "gpt-5.6",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId },
     ...overrides,
   };
@@ -1145,7 +1156,11 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
     project: { id: "proj_personal", kind: "personal" as const, name: "Personal", gitRemoteUrl: null },
     environment: { id: "env_personal", name: null, path: "/private/path", workspaceProvisionType: "personal" as const, branchName: null },
     host: { id: "host_personal", name: "Host" },
-    provider: { id: "codex", model: "gpt-5.6-luna" },
+    provider: {
+      id: "codex",
+      model: "gpt-5.6-luna",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId: bb.pluginId },
   };
   const selected = await harness.behavior.resolveAgentConfiguration(context);
@@ -1170,11 +1185,19 @@ it("registers the exact controller tools and keeps them off unrelated sessions",
   // The controller is bound to the configured provider; anything else may not.
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
-    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+    provider: {
+      id: "claude-code",
+      model: "claude-opus-5[1m]",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
   })).tools).toEqual([]);
   expect((await harness.behavior.resolveAgentConfiguration({
     ...context,
-    provider: { id: "acp-grok", model: "grok" },
+    provider: {
+      id: "acp-grok",
+      model: "grok",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
   })).tools).toEqual([]);
 
   store.replaceExternalCapabilityInventory({
@@ -1299,7 +1322,11 @@ it("keeps protocol tools in all-tools and old-profile compatibility configuratio
     project: { id: "proj_personal", kind: "personal" as const, name: "Personal", gitRemoteUrl: null },
     environment: { id: "env_personal", name: null, path: "/private/path", workspaceProvisionType: "personal" as const, branchName: null },
     host: { id: "host_personal", name: "Host" },
-    provider: { id: "codex", model: "gpt-5.6-luna" },
+    provider: {
+      id: "codex",
+      model: "gpt-5.6-luna",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId },
   });
   const names = (configuration: { tools: readonly { name: string }[] }) =>
@@ -1447,7 +1474,11 @@ it("exposes an approved bundle only after the persisted continuation profile is 
       branchName: null,
     },
     host: { id: "host_personal", name: "Host" },
-    provider: { id: "codex", model: "gpt-5.6-luna" },
+    provider: {
+      id: "codex",
+      model: "gpt-5.6-luna",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId: bb.pluginId },
   };
   const continuedTools = (await harness.behavior.resolveAgentConfiguration(continuedContext)).tools.map((tool) => tool.name);
@@ -1471,6 +1502,7 @@ it("exposes an approved bundle only after the persisted continuation profile is 
 
 it("rejects repeating schedules that poll live work", async () => {
   const { bb, harness, store } = fixture({ active: true });
+  const automations = createTestManagedAutomations();
   registerControllerTools(bb, {
     store,
     sdk: bb.sdk,
@@ -1478,6 +1510,14 @@ it("rejects repeating schedules that poll live work", async () => {
     health: () => ({ ok: true }),
     notify: vi.fn(),
     now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
   });
 
   await expect(harness.behavior.callAgentTool(
@@ -1496,6 +1536,133 @@ it("rejects repeating schedules that poll live work", async () => {
     { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
     controllerToolContext,
   )).resolves.toContain('"kind":"schedule"');
+  expect(automations.create).toHaveBeenCalledOnce();
+});
+
+it("refuses to create a clock schedule from a system-origin turn, so a scheduled run cannot widen automations", async () => {
+  const { bb, harness, store } = fixture({
+    active: true,
+    controllerTools: "all-tools",
+    origin: "system",
+    inputText: "A BB Automation run finished. Treat this as a scheduled system handoff, not a new owner request.",
+  });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )).rejects.toThrow(/turn the owner sent/i);
+  expect(automations.create).not.toHaveBeenCalled();
+});
+
+it("keeps an owner schedule as a plugin-local watch when BB refuses to host automations for the project", async () => {
+  // Production, 2026-09-02: the controller's personal project is refused by
+  // BB's automations plugin, so the schedule must not simply fail.
+  const { bb, harness, store } = fixture({ active: true });
+  const automations = createTestManagedAutomations();
+  automations.create.mockRejectedValueOnce(new BbAutomationProjectUnavailableError("proj_personal"));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  const result = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )) as { watching: { id: string; kind: string; cron: string; state: string } };
+
+  expect(result.watching).toMatchObject({ kind: "schedule", cron: "0 9 * * 1-5", state: "armed" });
+  expect(store.listMonitors("owner-7-controller", false)).toMatchObject([
+    { id: result.watching.id, kind: "schedule", cron: "0 9 * * 1-5", state: "armed" },
+  ]);
+  expect(automations.bindings.size).toBe(0);
+});
+
+it("updates an owned BB schedule through the governed controller seam without widening its execution", async () => {
+  const { bb, harness, store } = fixture({ active: true });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )) as { watching: { id: string } };
+
+  const result = await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    {
+      kind: "update_schedule",
+      id: created.watching.id,
+      cron: "30 9 * * 1-5",
+      instruction: "Send the revised weekday digest.",
+    },
+    controllerToolContext,
+  );
+
+  expect(parseToolJson(result)).toMatchObject({
+    watching: {
+      id: created.watching.id,
+      cron: "30 9 * * 1-5",
+      instruction: "Send the revised weekday digest.",
+    },
+  });
+  expect(automations.update).toHaveBeenCalledWith(expect.objectContaining({
+    id: created.watching.id,
+    definition: expect.objectContaining({
+      mode: "agent",
+      providerId: "codex",
+      model: "gpt-5.6-sol",
+      permissionMode: "auto",
+      target: { kind: "project-default" },
+      trigger: { kind: "cron", cron: "30 9 * * 1-5", timezone: "Etc/UTC" },
+      prompt: "Send the revised weekday digest.",
+    }),
+  }));
 });
 
 it("retires an already-armed live-work poller without touching clock-time schedules", () => {
@@ -2003,7 +2170,7 @@ it("does not expose a synthetic schedule scope in interrupted evidence", async (
   expect(runtimeProjection(output._hanoonEvidence as RuntimeEvidence)).toEqual({
     outcome: "interrupted",
     proofKinds: [],
-    subjectRefs: [],
+    subjectRefs: ["project:proj_personal"],
   });
 });
 

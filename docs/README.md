@@ -3,6 +3,7 @@
 Telegram Agent gives one private Telegram owner full control of their BB installation, plus a guarded delivery pipeline for code changes.
 
 - [Architecture](architecture.md) — ownership, durable state, what can become an answer, controller interactions, conversation continuity, memory, monitors, and the delivery pipeline.
+- [Hanoon-native full-SDLC and BB automation integration](designs/hanoon-native-sdlc-and-bb-automation.md) — the approved integration of BB orchestration, review repair, plain language, independent employee access, and cron automation.
 - [Configuration](configuration.md) — installation, pairing, model and permission settings including what the permission default does not do, project policies, and the disabled-by-default credential broker foundation settings.
 - [Operations](operations.md) — health checks, memory and monitors, job recovery, token rotation, the credential broker doctor and access commands, and removal.
 - [Disposable live acceptance](live-acceptance.md) — evidence-based testing against a repository that is safe to merge and deploy, plus the not-yet-run credential broker acceptance contract.

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { afterEach, expect, test } from "vitest";
 import { activatePlugin } from "../server";
 import { resolvePluginRoot, verifySkillBundle } from "../src/agent-skills/bundle-integrity.js";

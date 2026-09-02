@@ -4,7 +4,7 @@
  * disposed, so a run left one directory per host behind: 533,000 of them had
  * accumulated in /tmp and filled the machine's disk to 100%.
  *
- * Tests import `@bb/plugin-sdk/testing` through this module (see the alias in
+ * Tests import `@get-bb/plugin-sdk/testing` through this module (see the alias in
  * vitest.config.ts), so every host is tracked here and disposed after the test
  * that made it, without 69 suites each having to remember.
  */

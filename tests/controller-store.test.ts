@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { createHash } from "node:crypto";
 import { expect, expectTypeOf, it } from "vitest";
 import type { ControllerTurnRecord } from "../src/controller/models";
@@ -16,9 +16,15 @@ import {
   TASK_AUTHORITY_REVISION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
+  NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  MANAGED_AUTOMATION_MIGRATIONS,
+  NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
+  MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  CONTROLLER_BURST_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
+import { registerWorkArtifactRelationshipValidation } from "../src/work-artifacts/repository";
 
 let fixtureNumber = 0;
 
@@ -37,7 +43,8 @@ function turnInput(updateId: number, inputText = "What can you do?") {
     telegramChatId: "7",
     updateId,
     inputText,
-    now: 2_000,
+    // Received well before the executor claims, so a burst is already quiet.
+    now: 0,
   };
 }
 
@@ -218,8 +225,18 @@ function expectDuplicateGenerationRepair(
 // indexed from the start and a new migration only ever extends the tail.
 it("keeps every shipped migration at its original position and appends new ones", () => {
   expect(ALL_MIGRATIONS).toHaveLength(
-    80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length + NAVIGATOR_PROMOTION_MIGRATIONS.length,
+    80 + TICKET_41_MIGRATION_COUNT + NAVIGATOR_RELEASE_MIGRATIONS.length +
+      NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
+      MANAGED_AUTOMATION_MIGRATIONS.length +
+      NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length +
+      MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length +
+      CONTROLLER_BURST_MIGRATIONS.length,
   );
+  const burstTail = ALL_MIGRATIONS.length - CONTROLLER_BURST_MIGRATIONS.length;
+  expect(ALL_MIGRATIONS[burstTail]).toContain("source_json");
+  expect(ALL_MIGRATIONS[burstTail]).toContain("doc_file_id");
+  expect(ALL_MIGRATIONS[burstTail]).toContain("burst_leader_turn_id");
+  expect(ALL_MIGRATIONS[burstTail]).toContain("steer_reservation_text");
   expect(ALL_MIGRATIONS[70]).toContain("attempts_before_consensus_lens");
   expect(ALL_MIGRATIONS[71]).toContain("CREATE TABLE audit_intake_findings");
   expect(ALL_MIGRATIONS[72]).toContain("merge_pre_approved_at");
@@ -316,6 +333,103 @@ it("keeps every shipped migration at its original position and appends new ones"
   expect(ALL_MIGRATIONS[54]).toContain("delivery_reconcile_attempts");
   expect(ALL_MIGRATIONS[54]).toContain("busy_wait_notified_at");
   expect(ALL_MIGRATIONS[54]).not.toMatch(/\b(?:DROP|RENAME)\b/u);
+});
+
+it("upgrades the shipped native SDLC schema without rewriting migration history or losing automation evidence", () => {
+  expect(sha256(NAVIGATOR_RELEASE_MIGRATIONS.join(""))).toBe(
+    "d04a08df34b87f662e7209b499ced6657276c9057cc780454a99f94f0cd0fe69",
+  );
+  expect(sha256(MANAGED_AUTOMATION_MIGRATIONS.join(""))).toBe(
+    "c36ce56104daa850b84ed43d2c6d97365ccbb2371b8c29c6e813a0cc028b9dfd",
+  );
+  expect(NAVIGATOR_RELEASE_MIGRATIONS.join("\n")).not.toContain(
+    "navigator_release_review_finding_events",
+  );
+  expect(MANAGED_AUTOMATION_MIGRATIONS.join("\n")).toContain(
+    "state IN ('pending', 'active', 'paused', 'retired', 'failed')",
+  );
+
+  const { bb } = createFakePluginHost({ pluginId: `native-sdlc-upgrade-${fixtureNumber++}` });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  const shippedMigrationCount = ALL_MIGRATIONS.length -
+    NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length -
+    MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, shippedMigrationCount));
+  db.prepare(
+    `INSERT INTO managed_automations (
+       id, controller_key, source_key, project_id, bb_automation_id, name, mode,
+       definition_json, definition_sha256, authority_json, notification_policy,
+       state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "managed-legacy",
+    "owner-7-controller",
+    "legacy:daily",
+    "proj_owner",
+    "auto_legacy",
+    "Legacy daily check",
+    "agent",
+    "{}",
+    "d".repeat(64),
+    "{}",
+    "material",
+    "active",
+    1_000,
+    1_000,
+  );
+  db.prepare(
+    `INSERT INTO managed_automation_run_evidence (
+       binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+       scheduled_for, started_at, observed_at, evidence_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "managed-legacy",
+    "run_legacy",
+    "auto_legacy",
+    "succeeded",
+    "agent",
+    "schedule",
+    1_000,
+    1_001,
+    1_002,
+    "{}",
+  );
+  db.prepare(
+    `INSERT INTO managed_automation_notifications (
+       bb_run_id, binding_id, controller_key, input_text, state, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "run_legacy",
+    "managed-legacy",
+    "owner-7-controller",
+    "A legacy managed automation finished.",
+    "pending",
+    1_003,
+  );
+
+  openStore(bb.storage, bb.storage.kv, () => 2_000);
+
+  expect(db.prepare(
+    "SELECT state FROM managed_automations WHERE id = 'managed-legacy'",
+  ).get()).toEqual({ state: "active" });
+  expect(db.prepare(
+    "SELECT sequence, status FROM managed_automation_run_evidence WHERE bb_run_id = 'run_legacy'",
+  ).get()).toEqual({ sequence: 1, status: "succeeded" });
+  expect(db.prepare(
+    "SELECT sequence, state FROM managed_automation_notifications WHERE bb_run_id = 'run_legacy'",
+  ).get()).toEqual({ sequence: 1, state: "pending" });
+  expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(() => db.prepare(
+    "UPDATE managed_automations SET state = 'updating' WHERE id = 'managed-legacy'",
+  ).run()).not.toThrow();
+  expect(db.prepare(
+    `SELECT name FROM sqlite_master
+       WHERE type = 'table' AND name = 'navigator_release_review_finding_events'`,
+  ).get()).toEqual({ name: "navigator_release_review_finding_events" });
+  expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
+    count: ALL_MIGRATIONS.length,
+  });
 });
 
 it("rolls back an interrupted additive delivery-state migration and starts cleanly on retry", () => {
@@ -598,8 +712,10 @@ it.each([
 it("claims exactly one FIFO turn while a controller turn is dispatching or submitted", () => {
   const { store } = fixture();
   const first = store.enqueueControllerTurn(turnInput(201, "first"));
-  store.enqueueControllerTurn(turnInput(202, "second"));
-  const fence = acquire(store);
+  // Sent after the burst went quiet, so it forms its own burst rather than
+  // folding into the first message.
+  store.enqueueControllerTurn({ ...turnInput(202, "second"), now: 5_000 });
+  const fence = { ...acquire(store), now: 10_000 };
 
   expect(store.claimNextControllerTurn(fence)).toMatchObject({ id: first.id, ordinal: 1, state: "dispatching" });
   expect(store.claimNextControllerTurn(fence)).toBeNull();
@@ -716,7 +832,7 @@ it("rolls back a controller-owned write when its exact turn fence is stale", () 
 it("requeues a stale claim that never persisted dispatch intent", () => {
   const { store } = fixture();
   const first = store.enqueueControllerTurn(turnInput(351, "first"));
-  store.enqueueControllerTurn(turnInput(352, "second"));
+  store.enqueueControllerTurn({ ...turnInput(352, "second"), now: 5_000 });
   const firstFence = acquire(store);
   expect(store.claimNextControllerTurn(firstFence)?.id).toBe(first.id);
   const successor = store.acquireExecutorLease("successor", 32_001, 30_000);
@@ -744,8 +860,8 @@ it("requeues a stale claim that never persisted dispatch intent", () => {
 it("requeues one unaccepted controller turn in a fresh generation without losing FIFO order", () => {
   const { bb, store } = fixture();
   const first = store.enqueueControllerTurn(turnInput(371, "first"));
-  store.enqueueControllerTurn(turnInput(372, "second"));
-  const fence = acquire(store);
+  store.enqueueControllerTurn({ ...turnInput(372, "second"), now: 5_000 });
+  const fence = { ...acquire(store), now: 10_000 };
   expect(store.claimNextControllerTurn(fence)?.id).toBe(first.id);
   expect(store.markControllerSpawned({
     turnId: first.id,
@@ -1246,6 +1362,7 @@ it.each([
   ["owner_message_delivery_unresolved", /did not repeat.*review the conversation/i],
   ["owner_message_waiting_for_fresh_generation", /kept.*message queued.*fresh conversation/i],
   ["image_preparation_failed", /couldn't read that image safely/i],
+  ["document_preparation_failed", /couldn't read that file safely.*PDF, Markdown, or plain-text/i],
 ] as const)("maps the closed %s failure code to store-owned vetted text", (failureCode, expectedText) => {
   expect(failureNotice(failureCode)).toMatch(expectedText);
 });
@@ -1481,7 +1598,8 @@ it("acknowledges an owner message folded into the running answer", () => {
   })).toBe("settled");
 
   expect(store.getControllerTurn(waiting.id)).toMatchObject({ state: "completed" });
-  const notice = store.getOutbox(`controller:${running.id}:steer-folded`);
+  // The burst's own leader identifies the fold: one bubble per burst, not per answer.
+  const notice = store.getOutbox(`controller:${waiting.id}:steer-folded`);
   expect(notice?.payload.text).toMatch(/answer i'm already writing|already writing/i);
   expect(notice?.chatId).toBe("7");
 });
@@ -1523,37 +1641,31 @@ it("sends no folded acknowledgement for a system-origin injection", () => {
 // still-undelivered acknowledgement almost never fires: the first bubble is
 // sent before the second fold settles. One acknowledgement per running
 // answer, however fast delivery is.
-it("acknowledges two owner messages folded into one answer exactly once", () => {
+it("acknowledges two owner messages folded as one burst exactly once", () => {
   const { store } = fixture();
   const { turn: running, fence } = submittedTurn(store, "thr_double_fold");
   const first = store.enqueueControllerTurn(turnInput(78_030, "also check the deploy"));
   const second = store.enqueueControllerTurn(turnInput(78_031, "and the logs too"));
-  const fold = (waitingTurnId: string) => {
-    expect(store.reserveControllerSteer({
-      ...fence,
-      runningTurnId: running.id,
-      waitingTurnId,
-      controllerKey: running.controllerKey,
-      expectedThreadId: "thr_double_fold",
-    })).toBe(true);
-    expect(store.settleControllerSteer({
-      ...fence,
-      runningTurnId: running.id,
-      waitingTurnId,
-      controllerKey: running.controllerKey,
-      outcome: "applied",
-    })).toBe("settled");
-  };
+  // The two messages arrived together, so the steer path reserves the whole
+  // waiting burst — leader plus member — and folds it in one event.
+  expect(store.reserveControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: first.id,
+    memberTurnIds: [second.id],
+    controllerKey: running.controllerKey,
+    expectedThreadId: "thr_double_fold",
+  })).toBe(true);
+  expect(store.settleControllerSteer({
+    ...fence,
+    runningTurnId: running.id,
+    waitingTurnId: first.id,
+    controllerKey: running.controllerKey,
+    outcome: "applied",
+  })).toBe("settled");
 
-  fold(first.id);
-  const leased = store.leaseOutbox(fence.ownerId, fence.generation, fence.now, 10, 30_000);
-  const announcement = leased.find((row) => /already writing/i.test(String(row.payload.text ?? "")));
-  expect(announcement).toBeDefined();
-  expect(store.completeOutbox(
-    announcement!.logicalKey, fence.ownerId, fence.generation, 900, fence.now,
-  )).toBe(true);
-
-  fold(second.id);
+  expect(store.getControllerTurn(first.id)).toMatchObject({ state: "completed" });
+  expect(store.getControllerTurn(second.id)).toMatchObject({ state: "completed" });
   const announcements = store.listOutbox(50)
     .filter((row) => /already writing/i.test(String(row.payload.text ?? "")));
   expect(announcements).toHaveLength(1);

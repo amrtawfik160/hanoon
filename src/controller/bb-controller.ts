@@ -1,7 +1,8 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { OperationDeadlineError, withAbortDeadline } from "../async";
 import {
-  MAX_CONTROLLER_IMAGE_BYTES,
+  controllerAttachmentDownloadLimitBytes,
+  type ControllerAttachment,
   type ControllerImage,
   type ControllerThreadRecord,
   type ControllerTurnRecord,
@@ -25,6 +26,8 @@ export type ControllerLocation = {
 export type ControllerStatus =
   | "idle"
   | "active"
+  /** BB has accepted the thread but has not started its provider session yet. */
+  | "pending"
   | "starting"
   | "stopping"
   | "error"
@@ -93,12 +96,13 @@ type ControllerAdapterMethods = {
     turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
     signal: AbortSignal,
+    attachments?: ControllerAttachment[] | null,
   ): Promise<ControllerLocation>;
   send(
     threadId: string,
     text: string,
     signal: AbortSignal,
-    image?: ControllerImage | null,
+    attachments?: ControllerAttachment[] | null,
     modelFallbackIndex?: number,
   ): Promise<void>;
   /** Redirects a thread that is already working, rather than queueing behind it. */
@@ -182,11 +186,27 @@ type LifecycleReferenceCandidate = Readonly<{
   status: ControllerInteractionReference["status"];
 }>;
 
-export class ControllerImagePreparationError extends Error {
-  public constructor(public readonly retryable: boolean) {
-    super("Controller image could not be prepared");
-    this.name = "ControllerImagePreparationError";
+export type ControllerAttachmentKind = "image" | "document";
+
+/**
+ * A Telegram file could not be turned into a controller input item. The kind
+ * decides what the owner is told: an image failure asks for a smaller image, a
+ * document failure asks for a smaller PDF, Markdown, or plain-text file.
+ */
+export class ControllerAttachmentPreparationError extends Error {
+  public constructor(
+    public readonly retryable: boolean,
+    public readonly kind: ControllerAttachmentKind = "image",
+  ) {
+    super(`Controller ${kind} could not be prepared`);
+    this.name = "ControllerAttachmentPreparationError";
   }
+}
+
+/** The kind an attachment set fails as: an image unless every file is a document. */
+function attachmentFailureKind(attachments: readonly ControllerAttachment[] | null): ControllerAttachmentKind {
+  if (attachments === null || attachments.length === 0) return "image";
+  return attachments.every((attachment) => attachment.kind === "document") ? "document" : "image";
 }
 
 function isRecord(candidate: unknown): candidate is Record<string, unknown> {
@@ -393,7 +413,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
       hostId: string;
       now: number;
     }) => boolean;
-    downloadImage?: (
+    /** Telegram file download for images, clips, and documents alike. */
+    downloadFile?: (
       fileId: string,
       maxBytes: number,
       signal: AbortSignal,
@@ -450,12 +471,15 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     turn: ControllerTurnRecord,
     controller: ControllerThreadRecord,
     signal: AbortSignal,
+    attachments: ControllerAttachment[] | null = null,
   ): Promise<ControllerLocation> {
     let personal: { projectId: string; hostId: string };
     try {
       personal = await this.resolvePersonalProject(signal);
     } catch (error) {
-      if (turn.image) throw new ControllerImagePreparationError(true);
+      if (attachments !== null && attachments.length > 0) {
+        throw new ControllerAttachmentPreparationError(true, attachmentFailureKind(attachments));
+      }
       throw error;
     }
     const execution = this.profileAt(turn.modelFallbackIndex);
@@ -466,7 +490,7 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     const input = await this.promptInput(
       personal.projectId,
       turn.inputText,
-      turn.image,
+      attachments,
       signal,
     );
     const now = this.dependencies.now?.();
@@ -504,19 +528,19 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
     threadId: string,
     text: string,
     signal: AbortSignal,
-    image: ControllerImage | null = null,
+    attachments: ControllerAttachment[] | null = null,
     modelFallbackIndex = 0,
   ): Promise<void> {
     const execution = this.profileAt(modelFallbackIndex);
     let personal: { projectId: string; hostId: string } | null = null;
-    if (image) {
+    if (attachments !== null && attachments.length > 0) {
       try {
         personal = await this.resolvePersonalProject(signal);
       } catch {
-        throw new ControllerImagePreparationError(true);
+        throw new ControllerAttachmentPreparationError(true, attachmentFailureKind(attachments));
       }
     }
-    const input = await this.promptInput(personal?.projectId ?? null, text, image, signal);
+    const input = await this.promptInput(personal?.projectId ?? null, text, attachments, signal);
     await this.providerMutation(signal, async () => this.dependencies.sdk.threads.send({
       threadId,
       mode: "start",
@@ -754,43 +778,69 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
   private async promptInput(
     projectId: string | null,
     text: string,
-    image: ControllerImage | null,
+    attachments: ControllerAttachment[] | null,
     signal: AbortSignal,
   ): Promise<ControllerPromptInput> {
     const input: ControllerPromptInput = [{ type: "text", text, mentions: [] }];
-    if (!image) return input;
-    if (!projectId || !this.dependencies.downloadImage) {
-      throw new ControllerImagePreparationError(false);
+    if (!attachments || attachments.length === 0) return input;
+    if (!projectId || !this.dependencies.downloadFile) {
+      throw new ControllerAttachmentPreparationError(false, attachmentFailureKind(attachments));
     }
+    for (const attachment of attachments) {
+      input.push(await this.prepareAttachment(projectId, attachment, signal));
+    }
+    return input;
+  }
+
+  /**
+   * Uploads one Telegram file into the controller's project — downloading it
+   * first unless the dispatcher already did — and returns the input item that
+   * hands it to the model: a localImage for images and clips, a localFile for
+   * documents.
+   */
+  private async prepareAttachment(
+    projectId: string,
+    attachment: ControllerAttachment,
+    signal: AbortSignal,
+  ): Promise<ControllerPromptInput[number]> {
+    const kind: ControllerAttachmentKind = attachment.kind === "document" ? "document" : "image";
+    const limit = controllerAttachmentDownloadLimitBytes(attachment);
     let bytes: Uint8Array;
     try {
-      bytes = await this.dependencies.downloadImage(
-        image.fileId,
-        MAX_CONTROLLER_IMAGE_BYTES,
-        signal,
-      );
+      bytes = attachment.bytes ?? await this.dependencies.downloadFile!(attachment.fileId, limit, signal);
     } catch (error) {
-      if (error instanceof ControllerImagePreparationError) throw error;
-      throw new ControllerImagePreparationError(true);
+      if (error instanceof ControllerAttachmentPreparationError) {
+        throw new ControllerAttachmentPreparationError(error.retryable, kind);
+      }
+      throw new ControllerAttachmentPreparationError(true, kind);
     }
-    if (bytes.byteLength > MAX_CONTROLLER_IMAGE_BYTES) {
-      throw new ControllerImagePreparationError(false);
+    if (bytes.byteLength > limit) {
+      throw new ControllerAttachmentPreparationError(false, kind);
     }
     try {
       const uploaded = await this.providerMutation(signal, async () =>
         this.dependencies.sdk.projects.attachments.upload({
           projectId,
           clientFile: bytes,
-          filename: image.fileName,
-          mimeType: image.mimeType,
+          filename: attachment.fileName,
+          mimeType: attachment.mimeType,
         }));
-      if (uploaded.type !== "localImage") throw new ControllerImagePreparationError(false);
-      input.push({ type: "localImage", path: uploaded.path });
-      return input;
+      if (kind === "document") {
+        if (uploaded.type !== "localFile") throw new ControllerAttachmentPreparationError(false, kind);
+        return {
+          type: "localFile",
+          path: uploaded.path,
+          name: uploaded.name,
+          ...(uploaded.mimeType !== undefined ? { mimeType: uploaded.mimeType } : {}),
+          ...(uploaded.sizeBytes !== undefined ? { sizeBytes: uploaded.sizeBytes } : {}),
+        };
+      }
+      if (uploaded.type !== "localImage") throw new ControllerAttachmentPreparationError(false, kind);
+      return { type: "localImage", path: uploaded.path };
     } catch (error) {
-      if (error instanceof ControllerImagePreparationError) throw error;
+      if (error instanceof ControllerAttachmentPreparationError) throw error;
       if (error instanceof OperationDeadlineError) throw error;
-      throw new ControllerImagePreparationError(true);
+      throw new ControllerAttachmentPreparationError(true, kind);
     }
   }
 

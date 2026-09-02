@@ -4332,6 +4332,268 @@ BEFORE DELETE ON workflow_engine_contractions
 BEGIN SELECT RAISE(ABORT, 'workflow_engine_contractions are append-only'); END;
 `] as const;
 
+export const NAVIGATOR_REVIEW_LEDGER_MIGRATIONS = [String.raw`
+CREATE TABLE navigator_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE CHECK (length(id) BETWEEN 1 AND 256),
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  verification_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  root_cause_id TEXT NOT NULL CHECK (length(root_cause_id) BETWEEN 1 AND 256),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved', 'disputed')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL,
+  occurrence INTEGER NOT NULL CHECK (occurrence >= 0 AND occurrence <= 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE(verification_attempt_id, root_cause_id)
+);
+CREATE INDEX navigator_review_finding_events_slice
+  ON navigator_review_finding_events(slice_id, sequence);
+CREATE TRIGGER navigator_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+CREATE TRIGGER navigator_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+
+CREATE TABLE navigator_review_convergence (
+  slice_id TEXT PRIMARY KEY REFERENCES navigator_ticket_slices(id),
+  last_blocking_burden INTEGER NOT NULL CHECK (last_blocking_burden >= 0),
+  plateau_recoveries INTEGER NOT NULL CHECK (plateau_recoveries BETWEEN 0 AND 1),
+  review_cycles INTEGER NOT NULL CHECK (review_cycles >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+);
+`] as const;
+
+export const MANAGED_AUTOMATION_MIGRATIONS = [String.raw`
+CREATE TABLE managed_automations (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  controller_key TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  bb_automation_id TEXT UNIQUE,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
+  mode TEXT NOT NULL CHECK (mode IN ('agent', 'script')),
+  definition_json TEXT NOT NULL,
+  definition_sha256 TEXT NOT NULL CHECK (length(definition_sha256) = 64),
+  authority_json TEXT NOT NULL,
+  notification_policy TEXT NOT NULL CHECK (notification_policy IN ('material', 'always', 'silent')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'paused', 'retired', 'failed')),
+  legacy_monitor_id TEXT UNIQUE,
+  observed_json TEXT,
+  observed_sha256 TEXT CHECK (observed_sha256 IS NULL OR length(observed_sha256) = 64),
+  last_reconciled_at INTEGER,
+  last_run_id TEXT,
+  last_run_status TEXT CHECK (last_run_status IS NULL OR last_run_status IN ('running', 'succeeded', 'failed', 'skipped')),
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  UNIQUE(controller_key, source_key)
+);
+CREATE INDEX managed_automations_state ON managed_automations(state, updated_at);
+
+CREATE TABLE managed_automation_run_evidence (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  bb_run_id TEXT NOT NULL,
+  bb_automation_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+  run_mode TEXT NOT NULL CHECK (run_mode IN ('agent', 'script')),
+  trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'manual')),
+  thread_id TEXT,
+  output_sha256 TEXT,
+  error_class TEXT,
+  scheduled_for INTEGER NOT NULL CHECK (scheduled_for >= 0),
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  finished_at INTEGER,
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  evidence_json TEXT NOT NULL,
+  UNIQUE(bb_run_id, status)
+);
+CREATE INDEX managed_automation_run_evidence_binding
+  ON managed_automation_run_evidence(binding_id, sequence);
+CREATE TRIGGER managed_automation_run_evidence_append_only_update
+BEFORE UPDATE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+CREATE TRIGGER managed_automation_run_evidence_append_only_delete
+BEFORE DELETE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+
+CREATE TABLE managed_automation_notifications (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  bb_run_id TEXT NOT NULL UNIQUE,
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  controller_key TEXT NOT NULL,
+  update_id INTEGER UNIQUE,
+  input_text TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'enqueued')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  enqueued_at INTEGER
+);
+CREATE INDEX managed_automation_notifications_state
+  ON managed_automation_notifications(state, sequence);
+`] as const;
+
+export const NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS = [String.raw`
+CREATE TABLE navigator_release_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT REFERENCES workflow_steps(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL CHECK (json_valid(finding_json)),
+  evidence_refs_json TEXT NOT NULL CHECK (json_valid(evidence_refs_json)),
+  occurrence INTEGER NOT NULL CHECK (occurrence BETWEEN 0 AND 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  recorded_at INTEGER NOT NULL,
+  UNIQUE(source_review_attempt_id, fingerprint, event)
+);
+CREATE INDEX navigator_release_review_finding_events_job
+  ON navigator_release_review_finding_events(job_id, sequence);
+CREATE TRIGGER navigator_release_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_release_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
+CREATE TRIGGER navigator_release_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_release_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
+`] as const;
+
+/**
+ * Burst grouping and provenance: per-turn structured source records, document
+ * attachments, the durable link from a folded follower to its leader, and the
+ * reserved steer text for a combined mid-answer addition. Append-only history.
+ */
+export const CONTROLLER_BURST_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN source_json TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_name TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_mime_type TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_size_bytes INTEGER;
+ALTER TABLE controller_turns ADD COLUMN burst_leader_turn_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN steer_reservation_text TEXT;
+`] as const;
+
+export const MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS = [String.raw`
+CREATE TABLE managed_automations_v2 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  controller_key TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  bb_automation_id TEXT UNIQUE,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
+  mode TEXT NOT NULL CHECK (mode IN ('agent', 'script')),
+  definition_json TEXT NOT NULL,
+  definition_sha256 TEXT NOT NULL CHECK (length(definition_sha256) = 64),
+  authority_json TEXT NOT NULL,
+  notification_policy TEXT NOT NULL CHECK (notification_policy IN ('material', 'always', 'silent')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'paused', 'updating', 'retiring', 'retired', 'failed')),
+  legacy_monitor_id TEXT UNIQUE,
+  observed_json TEXT,
+  observed_sha256 TEXT CHECK (observed_sha256 IS NULL OR length(observed_sha256) = 64),
+  last_reconciled_at INTEGER,
+  last_run_id TEXT,
+  last_run_status TEXT CHECK (last_run_status IS NULL OR last_run_status IN ('running', 'succeeded', 'failed', 'skipped')),
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  UNIQUE(controller_key, source_key)
+);
+
+CREATE TABLE managed_automation_run_evidence_v2 (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  binding_id TEXT NOT NULL REFERENCES managed_automations_v2(id),
+  bb_run_id TEXT NOT NULL,
+  bb_automation_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+  run_mode TEXT NOT NULL CHECK (run_mode IN ('agent', 'script')),
+  trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'manual')),
+  thread_id TEXT,
+  output_sha256 TEXT,
+  error_class TEXT,
+  scheduled_for INTEGER NOT NULL CHECK (scheduled_for >= 0),
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  finished_at INTEGER,
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  evidence_json TEXT NOT NULL,
+  UNIQUE(bb_run_id, status)
+);
+
+CREATE TABLE managed_automation_notifications_v2 (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  bb_run_id TEXT NOT NULL UNIQUE,
+  binding_id TEXT NOT NULL REFERENCES managed_automations_v2(id),
+  controller_key TEXT NOT NULL,
+  update_id INTEGER UNIQUE,
+  input_text TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'enqueued')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  enqueued_at INTEGER
+);
+
+INSERT INTO managed_automations_v2 (
+  id, controller_key, source_key, project_id, bb_automation_id, name, mode,
+  definition_json, definition_sha256, authority_json, notification_policy, state,
+  legacy_monitor_id, observed_json, observed_sha256, last_reconciled_at, last_run_id,
+  last_run_status, last_error, created_at, updated_at
+)
+SELECT id, controller_key, source_key, project_id, bb_automation_id, name, mode,
+       definition_json, definition_sha256, authority_json, notification_policy, state,
+       legacy_monitor_id, observed_json, observed_sha256, last_reconciled_at, last_run_id,
+       last_run_status, last_error, created_at, updated_at
+  FROM managed_automations;
+
+INSERT INTO managed_automation_run_evidence_v2 (
+  sequence, binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+  thread_id, output_sha256, error_class, scheduled_for, started_at, finished_at,
+  observed_at, evidence_json
+)
+SELECT sequence, binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+       thread_id, output_sha256, error_class, scheduled_for, started_at, finished_at,
+       observed_at, evidence_json
+  FROM managed_automation_run_evidence;
+
+INSERT INTO managed_automation_notifications_v2 (
+  sequence, bb_run_id, binding_id, controller_key, update_id, input_text, state,
+  created_at, enqueued_at
+)
+SELECT sequence, bb_run_id, binding_id, controller_key, update_id, input_text, state,
+       created_at, enqueued_at
+  FROM managed_automation_notifications;
+
+DROP TRIGGER managed_automation_run_evidence_append_only_update;
+DROP TRIGGER managed_automation_run_evidence_append_only_delete;
+DROP TABLE managed_automation_run_evidence;
+DROP TABLE managed_automation_notifications;
+DROP TABLE managed_automations;
+
+ALTER TABLE managed_automations_v2 RENAME TO managed_automations;
+ALTER TABLE managed_automation_run_evidence_v2 RENAME TO managed_automation_run_evidence;
+ALTER TABLE managed_automation_notifications_v2 RENAME TO managed_automation_notifications;
+
+CREATE INDEX managed_automations_state ON managed_automations(state, updated_at);
+CREATE INDEX managed_automation_run_evidence_binding
+  ON managed_automation_run_evidence(binding_id, sequence);
+CREATE TRIGGER managed_automation_run_evidence_append_only_update
+BEFORE UPDATE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+CREATE TRIGGER managed_automation_run_evidence_append_only_delete
+BEFORE DELETE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+CREATE INDEX managed_automation_notifications_state
+  ON managed_automation_notifications(state, sequence);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -4423,4 +4685,9 @@ export const ALL_MIGRATIONS = [
   ...POLICY_APPROVAL_INTENT_MIGRATIONS,
   ...NAVIGATOR_RELEASE_MIGRATIONS,
   ...NAVIGATOR_PROMOTION_MIGRATIONS,
+  ...NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  ...MANAGED_AUTOMATION_MIGRATIONS,
+  ...NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
+  ...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  ...CONTROLLER_BURST_MIGRATIONS,
 ] as const;

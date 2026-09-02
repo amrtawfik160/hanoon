@@ -49,10 +49,10 @@
       "sourcePath": "skills/hanoon/blast-radius/SKILL.md",
       "source": "first-party",
       "sourceRevision": "repository",
-      "sourceDigest": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d",
+      "sourceDigest": "efc3956ba00a6a0a06c8283fd3f8344f1b700d2923c65f73db801e05d50ac783",
       "license": "first-party",
       "invocationClass": "model",
-      "descriptorDigest": "373f332324ffebb43c1961fb3cb56dc0a8627a6c54056f1d6f396fc396a4b5d5"
+      "descriptorDigest": "6960af3e86855ebe7f58be640afa871fb2fefb032d098151399d35a83c6bed44"
     },
     {
       "id": "checking-system-logs",
@@ -60,10 +60,10 @@
       "sourcePath": "skills/hanoon/checking-system-logs/SKILL.md",
       "source": "first-party",
       "sourceRevision": "repository",
-      "sourceDigest": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245",
+      "sourceDigest": "76d6b6f8ff80a410b65a1c30a51e45b1d2cfa0e82267ce251462ac0c0b64bbaf",
       "license": "first-party",
       "invocationClass": "model",
-      "descriptorDigest": "e86dafdf371e580eea02fa6792141e2bcb1611491d8f6ee6fbcd9da59d8576cc"
+      "descriptorDigest": "76cb8c6f6d5add9fe66369d8d64ab4aca1e00f42a558021f8e6d90285a5fd510"
     },
     {
       "id": "clean-code-guard",
@@ -137,10 +137,10 @@
       "sourcePath": "skills/hanoon/driving-bb/SKILL.md",
       "source": "first-party",
       "sourceRevision": "repository",
-      "sourceDigest": "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216",
+      "sourceDigest": "8ad1cb127379be028e01b3bfd07e3a91defd9971cf1da1b5c268c021470f34d4",
       "license": "first-party",
       "invocationClass": "model",
-      "descriptorDigest": "956e67950b79a179ba0f814836a2812b12147bf76928c9ae39f6ae2b950a22bb"
+      "descriptorDigest": "99e1b9d2f0d8be7ad1073cb81a58eb2b32907189259a7da03958b8230e9632ae"
     },
     {
       "id": "durable-boundary-audit",
@@ -148,10 +148,10 @@
       "sourcePath": "skills/hanoon/durable-boundary-audit/SKILL.md",
       "source": "first-party",
       "sourceRevision": "repository",
-      "sourceDigest": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f",
+      "sourceDigest": "bbe224ed820694e7b54b1030a5aa951d996b7a6d4a6758dcb5b941012484dd2c",
       "license": "first-party",
       "invocationClass": "model",
-      "descriptorDigest": "39270df4fabf5032e62eecc9cd4c99425afd533ce20492b321477aca9f08cd2f"
+      "descriptorDigest": "a145e28c30fc432520a1905f694d711f2ec8fb6827af21828c259588ae2e6b82"
     },
     {
       "id": "grill-me",
@@ -523,19 +523,31 @@
     },
     {
       "path": "skills/hanoon/blast-radius/SKILL.md",
-      "sha256": "05f1dcf76d833e133be0201b43e3bfaec886b272169955ae26f8c2b43e12eb8d"
+      "sha256": "efc3956ba00a6a0a06c8283fd3f8344f1b700d2923c65f73db801e05d50ac783"
     },
     {
       "path": "skills/hanoon/checking-system-logs/SKILL.md",
-      "sha256": "9c1831af51faa71827be4abb0c5a13862576a3bda9788d37f2f886635e6c6245"
+      "sha256": "76d6b6f8ff80a410b65a1c30a51e45b1d2cfa0e82267ce251462ac0c0b64bbaf"
+    },
+    {
+      "path": "skills/hanoon/driving-bb/references/automations.md",
+      "sha256": "972cf6562db772ef70eba7744d8b9dfcc9678f8692cf92f9a0237e5de4ae64d7"
+    },
+    {
+      "path": "skills/hanoon/driving-bb/references/machines-and-models.md",
+      "sha256": "1a8057a027ade9a3f0abda4a80b487ebfb8e6bd84c8f710671403c44ce5c489f"
+    },
+    {
+      "path": "skills/hanoon/driving-bb/references/managed-browser.md",
+      "sha256": "c87cf4a1d31d6f190e3c4cacca35c3db8eed243421fe42c0e160dfbf7ca6c53d"
     },
     {
       "path": "skills/hanoon/driving-bb/SKILL.md",
-      "sha256": "e66fc93e4940ac8372ea88d7c5a3d2d0668db5872e919046e0f82d2ab7ffd216"
+      "sha256": "8ad1cb127379be028e01b3bfd07e3a91defd9971cf1da1b5c268c021470f34d4"
     },
     {
       "path": "skills/hanoon/durable-boundary-audit/SKILL.md",
-      "sha256": "5e0ce676aae53ced4e50e225eb1cb630d7d7f7c33769a63e7fb3886cedc9b44f"
+      "sha256": "bbe224ed820694e7b54b1030a5aa951d996b7a6d4a6758dcb5b941012484dd2c"
     },
     {
       "path": "skills/hanoon/NOTICE",

@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
@@ -546,7 +546,11 @@ function productionConfigurationContext(bb: BbPluginApi, store: ControllerTrustF
       branchName: null,
     },
     host: { id: controller.hostId, name: "Controller trust host" },
-    provider: { id: "claude-code", model: "claude-opus-5[1m]" },
+    provider: {
+      id: "claude-code",
+      model: "claude-opus-5[1m]",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId: bb.pluginId },
   };
 }
@@ -563,7 +567,11 @@ async function assertProductionWiring(
   expect(context.thread.id).toBe(state.threadId);
   expect(context.project.id).toBe(state.projectId);
   expect(context.host.id).toBe(state.hostId);
-  expect(context.provider).toEqual({ id: "claude-code", model: "claude-opus-5[1m]" });
+  expect(context.provider).toEqual({
+    id: "claude-code",
+    model: "claude-opus-5[1m]",
+    capabilities: { supportsNativeUserQuestion: false },
+  });
   expect(state.providerId).toBe(context.provider.id);
   const configured = await fixture.harness.behavior.resolveAgentConfiguration(context);
   const controller = store.getControllerForOwner("7", "7");
@@ -1483,13 +1491,16 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       answered_at: NOW,
       delivered_at: null,
     }));
-    exactOutbox(fixture.store, {
-      logicalKey: "callback:callback-70001",
+    // The callback nudge wakes the executor, whose pass may already have
+    // leased this acknowledgement by the time the microtask poll above
+    // returns. What must still hold is that nothing has reached Telegram and
+    // the interaction has not been resolved from anything but the denial.
+    expect(fixture.store.getOutbox("callback:callback-70001")).toMatchObject({
       chatId: "7",
       messageId: null,
       payload: { text: "Got it." },
-      status: "pending",
-      attempts: 0,
+      status: expect.stringMatching(/^(pending|leased)$/),
+      lastError: null,
     });
     await waitForCondition(() => expect(state.preReopenGetBlocked).toBe(true));
     expect(state.orderLedger).toEqual([

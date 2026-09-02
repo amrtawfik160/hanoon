@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { policyFixture } from "./helpers";
@@ -26,7 +26,7 @@ function fixture() {
   const lease = store.acquireExecutorLease("executor", NOW, 60_000);
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: "executor", generation: lease.generation, now: NOW };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
   expect(store.reserveControllerSpawn({
     controllerKey: CONTROLLER_KEY,
     turnId: turn.id,

@@ -1,4 +1,4 @@
-import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import plugin from "../server";
@@ -372,7 +372,7 @@ it("wires submitted controller turns through the leased job executor", async () 
   });
   const lease = store.acquireExecutorLease("setup", Date.now(), 30_000);
   if (!lease.acquired) throw new Error("missing setup lease");
-  expect(store.claimNextControllerTurn({ ownerId: "setup", generation: lease.generation, now: Date.now() })?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ownerId: "setup", generation: lease.generation, now: Date.now() + 3_000 })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId: "setup",
@@ -450,7 +450,7 @@ it("shows typing, and never a draft, while a Luna controller turn is active", as
   const lease = store.acquireExecutorLease("presence-setup", now, 30_000);
   if (!lease.acquired) throw new Error("missing setup lease");
   const fence = { ownerId: "presence-setup", generation: lease.generation, now };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: turn.id,

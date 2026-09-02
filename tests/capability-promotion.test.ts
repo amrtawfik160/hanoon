@@ -1,5 +1,5 @@
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import {
   DETERMINISTIC_PROMOTION_CATEGORIES,
@@ -356,7 +356,7 @@ describe("new-attempt kill switches", () => {
         inputText: text,
         now,
       });
-      expect(store.claimNextControllerTurn(fence())?.id).toBe(turn.id);
+      expect(store.claimNextControllerTurn({ ...fence(), now: now + 3_000 })?.id).toBe(turn.id);
       if (!store.getControllerByThreadId("thr_controller")) {
         expect(store.markControllerSpawned({
           ...fence(),

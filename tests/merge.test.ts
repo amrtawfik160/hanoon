@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { GateInput } from "../src/domain/gates";
@@ -197,7 +197,7 @@ function typedMergeControllerFence(fixture: ReturnType<typeof mergeFixture>) {
   const turn = fixture.store.claimNextControllerTurn({
     ownerId: LEASE_OWNER,
     generation: LEASE_GENERATION,
-    now: NOW,
+    now: NOW + 3_000,
   });
   if (!turn) throw new Error("controller turn unavailable");
   expect(fixture.store.markControllerSpawned({

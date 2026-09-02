@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -99,6 +99,7 @@ import type {
   GuardSettlementPersistenceResult,
 } from "../capabilities/guards";
 import {
+  assessGuardEnvelope,
   guardAssessmentPolicySchema,
   guardResultEnvelopeSchema,
 } from "../capabilities/guards";
@@ -133,14 +134,19 @@ import {
 import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
 import {
+  CONTROLLER_DOCUMENT_MIME_TYPES,
   CONTROLLER_MEDIA_MIME_TYPES,
   CONTROLLER_IMAGE_MIME_TYPES,
   CONTROLLER_PHASE_TEXT,
+  CONTROLLER_SOURCE_ALBUM_ID_MAX_CHARS,
+  CONTROLLER_SOURCE_NAME_MAX_CHARS,
+  CONTROLLER_SOURCE_QUOTE_MAX_CHARS,
   MAX_CONTROLLER_IMAGE_BYTES,
   MAX_PERSISTED_MEDIA_BYTES,
   normalizeControllerImage,
   type ControllerDeliveryState,
   type ControllerDispatchKind,
+  type ControllerDocument,
   type ControllerImage,
   type ControllerLeaseFence,
   type ControllerMediaKind,
@@ -148,8 +154,17 @@ import {
   type ControllerThreadRecord,
   type ControllerThreadState,
   type ControllerTurnRecord,
+  type ControllerTurnSource,
   type ControllerTurnState,
 } from "../controller/models";
+import {
+  CONTROLLER_BURST_LIMITS,
+  burstMemberView,
+  renderBurstTranscript,
+  selectBurstMembers,
+  type BurstCandidateInput,
+  type ControllerBurstMemberView,
+} from "../controller/burst";
 import { SUPERVISOR_REASONS, type SupervisorReason } from "../controller/supervisor";
 import { MAX_CONTROLLER_OVERLAY } from "../controller/instructions";
 import { isUnsafeProviderText } from "../controller/credential-policy";
@@ -604,7 +619,8 @@ export type ControllerFailureCode =
   | "owner_message_delivery_unresolved"
   | "owner_message_waiting_for_fresh_generation"
   | "owner_message_requeued"
-  | "image_preparation_failed";
+  | "image_preparation_failed"
+  | "document_preparation_failed";
 
 export type ControllerDeliveryReconciliationResult = "pending" | "failed" | "recovery_required" | "stale";
 
@@ -939,6 +955,8 @@ type ControllerSteerSettlementRow = Readonly<{
   waitingOrigin: string | null;
   inputText: string | null;
   telegramChatId: string;
+  /** Comma-separated ids of burst members reserved with the waiting leader. */
+  memberIds: string | null;
 }>;
 
 export type ExecutorReviewThreadInput = ExecutorFence & Readonly<{
@@ -1313,6 +1331,13 @@ type ControllerTurnRow = {
   thumbnail_file_id: string | null;
   thumbnail_file_name: string | null;
   thumbnail_size_bytes: number | null;
+  doc_file_id: string | null;
+  doc_file_name: string | null;
+  doc_mime_type: string | null;
+  doc_size_bytes: number | null;
+  source_json: string | null;
+  burst_leader_turn_id: string | null;
+  steer_reservation_text: string | null;
   state: ControllerTurnState;
   lease_owner: string | null;
   lease_generation: number | null;
@@ -1473,6 +1498,23 @@ type WorkerRecoveryRow = {
   updated_at: number;
   resolved_at: number | null;
 };
+type NavigatorReleaseReviewFinding = Readonly<{
+  sourceAttemptId: string;
+  fingerprint: string;
+  capabilityId: string;
+  ruleId: string;
+  disposition: "must_fix" | "advisory";
+  findingJson: string;
+}>;
+type NavigatorReleaseReviewFindingRow = Readonly<{
+  fingerprint: string;
+  capability_id: string;
+  rule_id: string;
+  disposition: "must_fix" | "advisory";
+  event: "opened" | "reobserved" | "resolved";
+  finding_json: string;
+  occurrence: number;
+}>;
 type TelegramUpdateRow = {
   status: "processing" | "processed" | "failed";
   claim_owner: string | null;
@@ -1551,6 +1593,18 @@ function taskAuthorityWorkerStopPayload(worker: WorkerLiveness): Record<string, 
     resourceKind: worker.resourceKind,
     workerKind: worker.workerKind,
   };
+}
+
+/**
+ * Thrown inside the steer reservation once the leader is written and a member
+ * cannot follow, so the transaction rolls back instead of committing half a
+ * burst. Caught at the reservation's edge and reported as a plain refusal.
+ */
+class ControllerSteerReservationConflict extends Error {
+  public constructor() {
+    super("Controller steer reservation could not take the whole burst");
+    this.name = "ControllerSteerReservationConflict";
+  }
 }
 
 export class IdempotencyConflictError extends Error {
@@ -2940,6 +2994,49 @@ function hasMigration(db: SqliteDatabase, migrationId: number): boolean {
   return db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(migrationId) !== undefined;
 }
 
+const LEGACY_UNKNOWN_MIGRATION_HASH = "legacy-unknown";
+
+/**
+ * BB records a hash for every applied migration and refuses a statement whose
+ * hash differs from the recorded one. It also adopts rows that predate hash
+ * tracking, but only with the statements handed to that particular call.
+ * Because this store applies prefixes of ALL_MIGRATIONS before the full list,
+ * a host upgrade would adopt every row past the first prefix as
+ * "legacy-unknown", after which the full list could never match again
+ * (production, 2026-09-02). Recording the hashes from the complete list first,
+ * for rows that carry none, keeps the host's own check meaningful. A row whose
+ * recorded hash already disagrees is left alone so the host still refuses it.
+ */
+function adoptRecordedMigrationHashes(db: SqliteDatabase): void {
+  const table = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_bb_migrations'",
+  ).get();
+  if (table === undefined) return;
+  const columns = db.prepare("PRAGMA table_info(_bb_migrations)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "statement_hash")) {
+    db.exec("ALTER TABLE _bb_migrations ADD COLUMN statement_hash TEXT");
+  }
+  const unhashed = db.prepare(
+    "SELECT id FROM _bb_migrations WHERE statement_hash IS NULL OR statement_hash = ? ORDER BY id",
+  ).all(LEGACY_UNKNOWN_MIGRATION_HASH) as Array<{ id: number }>;
+  if (unhashed.length === 0) return;
+  const adopt = db.prepare(
+    `UPDATE _bb_migrations SET statement_hash = ?
+      WHERE id = ? AND (statement_hash IS NULL OR statement_hash = ?)`,
+  );
+  db.transaction(() => {
+    for (const row of unhashed) {
+      const statement = ALL_MIGRATIONS[row.id];
+      if (statement === undefined) continue;
+      adopt.run(
+        createHash("sha256").update(statement).digest("hex"),
+        row.id,
+        LEGACY_UNKNOWN_MIGRATION_HASH,
+      );
+    }
+  })();
+}
+
 type OpenControllerGenerationRow = Readonly<{
   id: string;
   controller_key: string;
@@ -3110,25 +3207,34 @@ export function migrateControllerInteractionStorage(
   assertNonNegativeInteger(now, "controller generation migration time");
   const db = storage.database();
   registerWorkArtifactRelationshipValidation(db);
-  storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
+  // Every prefix call must see a fully hashed ledger, or the host adopts the
+  // rows beyond that prefix as unknown and rejects the full list afterwards.
+  const migrate = (statements: readonly string[]): void => {
+    adoptRecordedMigrationHashes(db);
+    storage.migrate(db, [...statements]);
+  };
+  migrate(ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
   if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
-    storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
+    migrate(ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
     db.transaction(() => {
       restoreQuarantinedInteractions(db);
       preflightControllerGenerationConstraint(db, now);
-      storage.migrate(db, [...ALL_MIGRATIONS]);
+      migrate(ALL_MIGRATIONS);
     }).immediate();
     return;
   }
   db.transaction(() => {
     const legacy = validateLegacyControllerQuestions(db);
-    storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
+    migrate(ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
     quarantineLegacyControllerQuestions(db, legacy.invalid);
     restoreQuarantinedInteractions(db);
     preflightControllerGenerationConstraint(db, now);
-    storage.migrate(db, [...ALL_MIGRATIONS]);
+    migrate(ALL_MIGRATIONS);
   }).immediate();
 }
+
+/** Why a file was refused at intake: not a readable type, or over the size cap. */
+export type IntakeRefusalKind = "unsupported" | "oversized";
 
 export interface TelegramAgentStore {
   runExecutorMutation<T>(
@@ -3328,6 +3434,8 @@ export interface TelegramAgentStore {
     updateId: number;
     inputText: string;
     image?: ControllerImage | null;
+    document?: ControllerDocument | null;
+    source?: ControllerTurnSource | null;
     origin?: "owner" | "system";
     threadFollowUp?: ThreadFollowUp;
     now: number;
@@ -3581,12 +3689,20 @@ export interface TelegramAgentStore {
     expectedThreadId?: string | null;
   }): boolean;
   getQueuedControllerTurn(controllerKey: string): ControllerTurnRecord | null;
+  /** The waiting burst behind an answer being written, or null while it is still arriving. */
+  getQueuedControllerSteerBurst(controllerKey: string, now: number): {
+    leader: ControllerTurnRecord;
+    members: ControllerTurnRecord[];
+  } | null;
+  /** Milliseconds until a claimable burst has gone quiet, or null when none is waiting. */
+  nextControllerBurstQuietMs(now: number): number | null;
   getControllerSteerReservation(controllerKey: string): ControllerSteerReservation | null;
   reserveControllerSteer(input: ControllerLeaseFence & {
     runningTurnId: string;
     waitingTurnId: string;
     controllerKey: string;
     expectedThreadId: string;
+    memberTurnIds?: readonly string[];
   }): boolean;
   settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult;
   recordControllerSteerFailure(input: ControllerLeaseFence & {
@@ -3624,6 +3740,8 @@ export interface TelegramAgentStore {
     nextFallbackIndex: number;
   }): ControllerRecoveryOutcome;
   listControllerTurns(controllerKey: string, limit: number): ControllerTurnRecord[];
+  /** The burst members that folded into a leader, in ordinal order. */
+  listControllerBurstMembers(leaderTurnId: string): ControllerTurnRecord[];
   getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null;
   claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim;
   completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void;
@@ -4058,6 +4176,8 @@ export interface TelegramAgentStore {
   enqueueOutbox(item: OutboxInput, now: number): void;
   setLastProject(projectId: string): Promise<void>;
   getLastProject(): Promise<string | null>;
+  /** True when this chat may be told one more intake refusal of this kind; records it. */
+  claimIntakeRefusal(chatId: string, kind: IntakeRefusalKind, now: number): Promise<boolean>;
   getJob(jobId: string): Job | null;
   getActiveJob(): Job | null;
   findJobByThreadId(threadId: string): Job | null;
@@ -4495,6 +4615,9 @@ function parseControllerTurn(row: ControllerTurnRow): ControllerTurnRecord {
     ordinal: row.ordinal,
     inputText: row.input_text,
     image,
+    document: parseControllerDocument(row),
+    source: parseControllerSource(row),
+    burstLeaderTurnId: row.burst_leader_turn_id,
     state: row.state,
     leaseOwner: row.lease_owner,
     leaseGeneration: row.lease_generation,
@@ -4632,6 +4755,106 @@ function parseControllerImage(row: ControllerTurnRow): ControllerImage | null {
   };
   assertControllerImage(image);
   return image;
+}
+
+function parseControllerDocument(row: ControllerTurnRow): ControllerDocument | null {
+  if (
+    row.doc_file_id === null && row.doc_file_name === null &&
+    row.doc_mime_type === null && row.doc_size_bytes === null
+  ) return null;
+  if (row.doc_file_id === null || row.doc_file_name === null || row.doc_mime_type === null) {
+    throw new Error("Persisted controller document is incomplete");
+  }
+  const document: ControllerDocument = {
+    fileId: row.doc_file_id,
+    fileName: row.doc_file_name,
+    mimeType: row.doc_mime_type as ControllerDocument["mimeType"],
+    sizeBytes: row.doc_size_bytes,
+  };
+  assertControllerDocument(document);
+  return document;
+}
+
+function parseControllerSource(row: ControllerTurnRow): ControllerTurnSource | null {
+  if (row.source_json === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.source_json);
+  } catch {
+    throw new Error("Persisted controller source record is not valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Persisted controller source record is not an object");
+  }
+  const source = parsed as Record<string, unknown>;
+  const kind = source.kind;
+  if (kind !== "owner" && kind !== "forwarded" && kind !== "reply" && kind !== "album") {
+    throw new Error("Persisted controller source record has an unknown kind");
+  }
+  const bounded = (value: unknown, field: string, max: number): string | null => {
+    if (value === null || value === undefined) return null;
+    if (typeof value !== "string" || value.length === 0 || value.length > max) {
+      throw new Error(`Persisted controller source record ${field} is invalid`);
+    }
+    return value;
+  };
+  const replyToMessageId = source.replyToMessageId;
+  if (replyToMessageId !== null && replyToMessageId !== undefined &&
+      (typeof replyToMessageId !== "number" || !Number.isSafeInteger(replyToMessageId) || replyToMessageId < 1)) {
+    throw new Error("Persisted controller source record replyToMessageId is invalid");
+  }
+  return {
+    kind,
+    forwardedFrom: bounded(source.forwardedFrom, "forwardedFrom", CONTROLLER_SOURCE_NAME_MAX_CHARS),
+    forwardedHidden: source.forwardedHidden === true,
+    quotedAuthor: bounded(source.quotedAuthor, "quotedAuthor", CONTROLLER_SOURCE_NAME_MAX_CHARS),
+    quotedFromAgent: source.quotedFromAgent === true,
+    quotedText: bounded(source.quotedText, "quotedText", CONTROLLER_SOURCE_QUOTE_MAX_CHARS),
+    replyToMessageId: replyToMessageId ?? null,
+    albumId: bounded(source.albumId, "albumId", CONTROLLER_SOURCE_ALBUM_ID_MAX_CHARS),
+  };
+}
+
+function assertControllerSource(source: ControllerTurnSource): void {
+  if (typeof source !== "object" || source === null) {
+    throw new TypeError("controller source record is required");
+  }
+  if (source.kind !== "owner" && source.kind !== "forwarded" && source.kind !== "reply" && source.kind !== "album") {
+    throw new TypeError("controller source kind is invalid");
+  }
+  const bounded = (value: string | null, field: string, max: number): void => {
+    if (value === null) return;
+    if (typeof value !== "string" || value.length === 0 || value.length > max) {
+      throw new TypeError(`controller source ${field} must be between 1 and ${max} characters`);
+    }
+  };
+  bounded(source.forwardedFrom, "forwardedFrom", CONTROLLER_SOURCE_NAME_MAX_CHARS);
+  bounded(source.quotedAuthor, "quotedAuthor", CONTROLLER_SOURCE_NAME_MAX_CHARS);
+  bounded(source.quotedText, "quotedText", CONTROLLER_SOURCE_QUOTE_MAX_CHARS);
+  bounded(source.albumId, "albumId", CONTROLLER_SOURCE_ALBUM_ID_MAX_CHARS);
+  if (typeof source.forwardedHidden !== "boolean" || typeof source.quotedFromAgent !== "boolean") {
+    throw new TypeError("controller source flags must be booleans");
+  }
+  if (source.replyToMessageId !== null &&
+      (typeof source.replyToMessageId !== "number" || !Number.isSafeInteger(source.replyToMessageId) || source.replyToMessageId < 1)) {
+    throw new TypeError("controller source replyToMessageId must be a positive integer");
+  }
+}
+
+function assertControllerDocument(document: ControllerDocument): void {
+  if (typeof document.fileId !== "string" || document.fileId.length === 0 || document.fileId.length > 1_024) {
+    throw new TypeError("controller document fileId must be between 1 and 1024 characters");
+  }
+  if (typeof document.fileName !== "string" || document.fileName.length === 0 || document.fileName.length > 1_024) {
+    throw new TypeError("controller document fileName must be between 1 and 1024 characters");
+  }
+  if (!(CONTROLLER_DOCUMENT_MIME_TYPES as readonly string[]).includes(document.mimeType)) {
+    throw new TypeError("controller document mime type is unsupported");
+  }
+  if (document.sizeBytes !== null &&
+      (typeof document.sizeBytes !== "number" || !Number.isSafeInteger(document.sizeBytes) || document.sizeBytes < 0)) {
+    throw new TypeError("controller document sizeBytes must be a non-negative integer");
+  }
 }
 
 function parseThreadOperation(row: ThreadOperationRow): ThreadOperation {
@@ -5037,6 +5260,7 @@ const CONTROLLER_FAILURE_TEXT: Readonly<Record<ControllerFailureCode, string>> =
   owner_message_waiting_for_fresh_generation: "I kept your message queued because that controller is still busy. If it does not free up soon, I’ll continue in a fresh conversation.",
   owner_message_requeued: "I couldn't finish that one, but nothing had started yet, so I've put your message back and I'm picking it up again in a fresh conversation. Nothing was repeated.",
   image_preparation_failed: "I couldn't read that image safely. Please resend a smaller JPEG, PNG, WebP, or GIF.",
+  document_preparation_failed: "I couldn't read that file safely. Please resend it as a smaller PDF, Markdown, or plain-text file.",
 };
 
 /** Shown when a message arrives mid-turn and is folded into the running reply. */
@@ -6462,6 +6686,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     updateId: number;
     inputText: string;
     image?: ControllerImage | null;
+    document?: ControllerDocument | null;
+    source?: ControllerTurnSource | null;
     origin?: "owner" | "system";
     threadFollowUp?: ThreadFollowUp;
     now: number;
@@ -6473,6 +6699,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     assertControllerText(input.inputText, "controller input");
     const image = input.image ? normalizeControllerImage(input.image) : null;
     if (image) assertControllerImage(image);
+    const document = input.document ?? null;
+    if (document) assertControllerDocument(document);
+    const source = input.source ?? null;
+    if (source) assertControllerSource(source);
+    const sourceJson = source === null ? null : JSON.stringify(source);
     const threadFollowUp = input.threadFollowUp === undefined
       ? null
       : validatedThreadFollowUp(input.threadFollowUp);
@@ -6523,6 +6754,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           existing.thumbnail_file_id !== (image?.thumbnail?.fileId ?? null) ||
           existing.thumbnail_file_name !== (image?.thumbnail?.fileName ?? null) ||
           existing.thumbnail_size_bytes !== (image?.thumbnail?.sizeBytes ?? null) ||
+          existing.doc_file_id !== (document?.fileId ?? null) ||
+          existing.doc_file_name !== (document?.fileName ?? null) ||
+          existing.doc_mime_type !== (document?.mimeType ?? null) ||
+          existing.doc_size_bytes !== (document?.sizeBytes ?? null) ||
+          existing.source_json !== sourceJson ||
           existing.thread_follow_up_json !== threadFollowUpJson
         ) {
           throw new IdempotencyConflictError(input.updateId);
@@ -6538,8 +6774,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
            image_file_id, image_file_name, image_mime_type, image_size_bytes,
            image_kind, image_duration_seconds,
            thumbnail_file_id, thumbnail_file_name, thumbnail_size_bytes,
+           doc_file_id, doc_file_name, doc_mime_type, doc_size_bytes,
+           source_json,
            state, origin, thread_follow_up_json, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
       ).run(
         id,
         input.updateId,
@@ -6555,6 +6793,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         image?.thumbnail?.fileId ?? null,
         image?.thumbnail?.fileName ?? null,
         image?.thumbnail?.sizeBytes ?? null,
+        document?.fileId ?? null,
+        document?.fileName ?? null,
+        document?.mimeType ?? null,
+        document?.sizeBytes ?? null,
+        sourceJson,
         input.origin === "system" ? "system" : "owner",
         threadFollowUpJson,
         input.now,
@@ -7004,6 +7247,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         telegram_chat_id: string;
       } | undefined;
       if (!turn) return "stale" as const;
+      const fullTurnRow = this.db.prepare(
+        "SELECT * FROM controller_turns WHERE id = ?",
+      ).get(input.turnId) as ControllerTurnRow | undefined;
       const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
       if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
         return "stale" as const;
@@ -7055,7 +7301,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       this.appendControllerDigestRow({
         controllerKey: turn.controller_key,
         ordinal: turn.ordinal,
-        ownerText: turn.input_text,
+        // A burst's answer covers every member, so the conversation digest
+        // records the attributed transcript — never file contents, which only
+        // exist in the dispatch text and its attachments.
+        ownerText: fullTurnRow ? this.controllerBurstTranscript(fullTurnRow) : turn.input_text,
         agentText: reply.text,
         now: input.now,
       });
@@ -7072,36 +7321,51 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     }).immediate();
   }
 
+  /**
+   * The oldest queued turn an executor generation could claim right now: its
+   * owner still paired, nothing before it waiting on transcription, and no
+   * dispatch or answer already running on its controller.
+   */
+  private oldestClaimableControllerTurnRow(now: number): ControllerTurnRow | undefined {
+    return this.db.prepare(
+      `SELECT turn.* FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+         JOIN owners ON owners.singleton = 1
+          AND owners.revoked_at IS NULL
+          AND owners.telegram_user_id = controller.telegram_user_id
+          AND owners.telegram_chat_id = controller.telegram_chat_id
+        WHERE turn.state = 'queued'
+          AND turn.delivery_state = 'none'
+          AND turn.next_dispatch_at <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_voice_inbox AS voice
+             WHERE voice.controller_key = turn.controller_key
+               AND voice.state <> 'completed'
+               AND voice.ordinal <= turn.ordinal
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM controller_turns AS active
+             WHERE active.controller_key = turn.controller_key
+               AND active.state IN ('dispatching', 'submitted')
+          )
+        ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
+    ).get(now) as ControllerTurnRow | undefined;
+  }
+
   public claimNextControllerTurn(
     fence: ControllerLeaseFence & { leaseMs?: number },
   ): ControllerTurnRecord | null {
     this.assertLeaseIdentity("controller-turn", fence.ownerId, fence.generation, fence.now);
     return this.db.transaction((): ControllerTurnRecord | null => {
       if (!this.executorLeaseIsCurrent(fence.ownerId, fence.generation, fence.now)) return null;
-      const row = this.db.prepare(
-        `SELECT turn.* FROM controller_turns AS turn
-           JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
-           JOIN owners ON owners.singleton = 1
-            AND owners.revoked_at IS NULL
-            AND owners.telegram_user_id = controller.telegram_user_id
-            AND owners.telegram_chat_id = controller.telegram_chat_id
-          WHERE turn.state = 'queued'
-            AND turn.delivery_state = 'none'
-            AND turn.next_dispatch_at <= ?
-            AND NOT EXISTS (
-              SELECT 1 FROM controller_voice_inbox AS voice
-               WHERE voice.controller_key = turn.controller_key
-                 AND voice.state <> 'completed'
-                 AND voice.ordinal <= turn.ordinal
-            )
-            AND NOT EXISTS (
-              SELECT 1 FROM controller_turns AS active
-               WHERE active.controller_key = turn.controller_key
-                 AND active.state IN ('dispatching', 'submitted')
-            )
-          ORDER BY turn.created_at ASC, turn.ordinal ASC LIMIT 1`,
-      ).get(fence.now) as ControllerTurnRow | undefined;
+      const row = this.oldestClaimableControllerTurnRow(fence.now);
       if (!row) return null;
+      // The burst is claimed with the leader: followers whose arrival stayed
+      // within the quiet gap fold into it here, in the same transaction, so
+      // every Telegram update is accounted for by one answer. A burst still in
+      // flight holds the claim until the newest message has gone quiet.
+      const burst = this.selectBurstRows({ controllerKey: row.controller_key, leader: row, now: fence.now, allowAttachments: true });
+      if (burst.holdUntil !== null) return null;
       const updated = this.db.prepare(
         `UPDATE controller_turns
             SET state = 'dispatching', lease_owner = ?, lease_generation = ?, updated_at = ?
@@ -7113,9 +7377,98 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             SET pending_spawn_token = COALESCE(pending_spawn_token, ?), updated_at = ?
           WHERE controller_key = ? AND bb_thread_id IS NULL`,
       ).run(row.id, fence.now, row.controller_key);
+      for (const member of burst.members) {
+        const folded = this.settleFoldedControllerTurn({
+          waitingTurnId: member.id,
+          controllerKey: row.controller_key,
+          leaderTurnId: row.id,
+          now: fence.now,
+        });
+        if (!folded) throw new Error("Controller burst follower changed before it could fold");
+      }
       const claimed = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(row.id) as ControllerTurnRow;
       return parseControllerTurn(claimed);
     }).immediate();
+  }
+
+  private burstMemberView(row: ControllerTurnRow): ControllerBurstMemberView {
+    return burstMemberView({
+      inputText: row.input_text,
+      source: parseControllerSource(row),
+      image: row.image_file_name === null ? null : { fileName: row.image_file_name },
+      document: row.doc_file_name === null ? null : { fileName: row.doc_file_name },
+    });
+  }
+
+  private burstCandidate(row: ControllerTurnRow, now: number): BurstCandidateInput {
+    return {
+      id: row.id,
+      ordinal: row.ordinal,
+      createdAt: row.created_at,
+      joinable: row.origin === "owner" && row.thread_follow_up_json === null,
+      dispatchable: row.next_dispatch_at <= now,
+      attachmentCount: (row.image_file_id !== null ? 1 : 0) + (row.doc_file_id !== null ? 1 : 0),
+    };
+  }
+
+  /**
+   * Scans the queued turns behind a leader for burst membership. Returns the
+   * joining rows in ordinal order, and — while the newest candidate is still
+   * fresh — the moment the burst goes quiet, which holds the claim.
+   */
+  private selectBurstRows(input: {
+    controllerKey: string;
+    leader: ControllerTurnRow;
+    now: number;
+    allowAttachments: boolean;
+  }): { members: ControllerTurnRow[]; holdUntil: number | null } {
+    const leader = this.burstCandidate(input.leader, input.now);
+    // A system turn or lifecycle follow-up is no burst: it neither waits out
+    // the quiet gap nor takes the owner's words that arrived right behind it.
+    if (!leader.joinable) return { members: [], holdUntil: null };
+    // The scan stops at the count cap, so rows beyond it are never read.
+    const candidates = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE controller_key = ? AND state = 'queued' AND delivery_state = 'none'
+          AND ordinal > ?
+        ORDER BY ordinal ASC LIMIT ?`,
+    ).all(input.controllerKey, input.leader.ordinal, CONTROLLER_BURST_LIMITS.maxMembers) as ControllerTurnRow[];
+    const voiceBlock = this.db.prepare(
+      `SELECT MIN(ordinal) AS ordinal FROM controller_voice_inbox
+        WHERE controller_key = ? AND state <> 'completed' AND ordinal > ?`,
+    ).get(input.controllerKey, input.leader.ordinal) as { ordinal: number | null };
+    // The scan either joins a candidate or stops for good, so the members
+    // joined before any candidate are exactly the candidates before it. The
+    // rendered length for each candidate can therefore be measured up front.
+    const leaderView = this.burstMemberView(input.leader);
+    const prefixViews: ControllerBurstMemberView[] = [];
+    const lengthById = new Map<string, number>();
+    for (const row of candidates) {
+      lengthById.set(row.id, renderBurstTranscript([
+        leaderView,
+        ...prefixViews,
+        this.burstMemberView(row),
+      ]).length);
+      prefixViews.push(this.burstMemberView(row));
+    }
+    const selection = selectBurstMembers({
+      candidates: candidates.map((row) => this.burstCandidate(row, input.now)),
+      leaderCreatedAt: input.leader.created_at,
+      leaderAttachmentCount: leader.attachmentCount,
+      now: input.now,
+      voiceBlockOrdinal: voiceBlock.ordinal,
+      limits: CONTROLLER_BURST_LIMITS,
+      transcriptChars: (candidate) => lengthById.get(candidate.id) ?? Number.MAX_SAFE_INTEGER,
+      allowAttachments: input.allowAttachments,
+    });
+    const byId = new Map(candidates.map((row) => [row.id, row]));
+    return {
+      members: selection.memberIds.flatMap((id) => {
+        const row = byId.get(id);
+        return row ? [row] : [];
+      }),
+      holdUntil: selection.holdUntil,
+    };
   }
 
   public prepareControllerDispatch(input: ControllerLeaseFence & {
@@ -8662,13 +9015,38 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     waitingTurnId: string;
     controllerKey: string;
     expectedThreadId: string;
+    /** Burst members joining the waiting leader in one combined addition. */
+    memberTurnIds?: readonly string[];
   }): boolean {
     this.assertControllerSteerInput(input);
     assertControllerKey(input.controllerKey);
     assertControllerIdentifier(input.expectedThreadId, "expectedThreadId");
+    const memberIds = input.memberTurnIds ?? [];
+    // Once the leader is reserved, every later refusal throws rather than
+    // returns: a return commits the transaction, and a reservation without its
+    // members would be a burst half-steered.
+    try {
+      return this.reserveControllerSteerTransaction(input, memberIds);
+    } catch (error) {
+      if (error instanceof ControllerSteerReservationConflict) return false;
+      throw error;
+    }
+  }
+
+  private reserveControllerSteerTransaction(
+    input: ControllerLeaseFence & {
+      runningTurnId: string;
+      waitingTurnId: string;
+      controllerKey: string;
+      expectedThreadId: string;
+    },
+    memberIds: readonly string[],
+  ): boolean {
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      return this.db.prepare(
+      // Reserve the leader first, so a member write racing the claim cannot
+      // leave membership without a reservation.
+      const reserved = this.db.prepare(
         `UPDATE controller_turns
             SET steer_reservation_turn_id = ?, updated_at = ?
           WHERE id = ? AND controller_key = ? AND state = 'submitted'
@@ -8689,6 +9067,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
               SELECT 1 FROM controller_turns AS waiting
                WHERE waiting.id = ? AND waiting.controller_key = controller_turns.controller_key
                  AND waiting.state = 'queued' AND waiting.image_file_id IS NULL
+                 AND waiting.doc_file_id IS NULL
             )`,
       ).run(
         input.waitingTurnId,
@@ -8701,6 +9080,37 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.expectedThreadId,
         input.waitingTurnId,
       ).changes === 1;
+      if (!reserved) return false;
+      for (const memberId of memberIds) {
+        const joined = this.db.prepare(
+          `UPDATE controller_turns
+              SET burst_leader_turn_id = ?, updated_at = ?
+            WHERE id = ? AND controller_key = ? AND state = 'queued'
+              AND burst_leader_turn_id IS NULL
+              AND image_file_id IS NULL AND doc_file_id IS NULL
+              AND thread_follow_up_json IS NULL AND origin = 'owner'`,
+        ).run(input.waitingTurnId, input.now, memberId, input.controllerKey).changes === 1;
+        if (!joined) throw new ControllerSteerReservationConflict();
+      }
+      if (memberIds.length > 0) {
+        const waiting = this.db.prepare(
+          "SELECT * FROM controller_turns WHERE id = ?",
+        ).get(input.waitingTurnId) as ControllerTurnRow | undefined;
+        if (!waiting) throw new ControllerSteerReservationConflict();
+        const members = memberIds.map((id) =>
+          this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(id) as ControllerTurnRow);
+        const transcript = renderBurstTranscript([
+          this.burstMemberView(waiting),
+          ...members.map((row) => this.burstMemberView(row)),
+        ]);
+        const recorded = this.db.prepare(
+          `UPDATE controller_turns
+              SET steer_reservation_text = ?, updated_at = ?
+            WHERE id = ? AND steer_reservation_turn_id = ?`,
+        ).run(transcript, input.now, input.runningTurnId, input.waitingTurnId).changes === 1;
+        if (!recorded) throw new ControllerSteerReservationConflict();
+      }
+      return true;
     }).immediate();
   }
 
@@ -8710,6 +9120,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       `SELECT running.id AS running_turn_id,
               running.steer_reservation_turn_id AS waiting_turn_id,
               running.controller_key,
+              running.steer_reservation_text AS reservation_text,
               controller.bb_thread_id AS thread_id,
               waiting.input_text
          FROM controller_turns AS running
@@ -8725,6 +9136,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       running_turn_id: string;
       waiting_turn_id: string;
       controller_key: string;
+      reservation_text: string | null;
       thread_id: string | null;
       input_text: string | null;
     } | undefined;
@@ -8734,7 +9146,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       runningTurnId: row.running_turn_id,
       waitingTurnId: row.waiting_turn_id,
       threadId: row.thread_id ?? "",
-      inputText: row.input_text,
+      inputText: row.reservation_text ?? row.input_text,
       idempotencyKey: `controller-steer:${row.running_turn_id}:${row.waiting_turn_id}`,
     };
   }
@@ -8746,7 +9158,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
               waiting.ordinal AS waitingOrdinal,
               waiting.origin AS waitingOrigin,
               waiting.input_text AS inputText,
-              controller.telegram_chat_id AS telegramChatId
+              controller.telegram_chat_id AS telegramChatId,
+              (SELECT GROUP_CONCAT(id) FROM (
+                 SELECT id FROM controller_turns
+                  WHERE burst_leader_turn_id = waiting.id AND state = 'queued'
+                  ORDER BY ordinal
+               ) AS members) AS memberIds
          FROM controller_turns AS running
          JOIN controller_threads AS controller ON controller.controller_key = running.controller_key
          LEFT JOIN controller_turns AS waiting
@@ -8783,24 +9200,60 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).changes === 1;
   }
 
-  private completeAppliedControllerSteer(
-    input: ControllerSteerSettlementInput,
-    row: ControllerSteerSettlementRow,
-  ): void {
-    const folded = CONTROLLER_STEER_FOLDED_RESPONSE;
+  /**
+   * Settles one queued turn as folded into the answer identified by
+   * `leaderTurnId`: the folded outcome in place of an answer of its own, and
+   * the durable link to its leader. A claim-time fold needs nothing more: the
+   * leader's own answer covers the member, and the leader's digest row will
+   * carry the whole attributed transcript, so recording the member again would
+   * count it twice and acknowledging it would describe an answer that is not
+   * yet being written.
+   */
+  private settleFoldedControllerTurn(input: {
+    waitingTurnId: string;
+    controllerKey: string;
+    leaderTurnId: string;
+    now: number;
+  }): boolean {
     const updated = this.db.prepare(
       `UPDATE controller_turns
           SET state = 'completed', response_text = ?, stream_phase = 'complete',
-              completed_at = ?, updated_at = ?
+              completed_at = ?, updated_at = ?, burst_leader_turn_id = ?
         WHERE id = ? AND controller_key = ? AND state = 'queued'`,
-    ).run(folded, input.now, input.now, input.waitingTurnId, input.controllerKey);
-    if (updated.changes !== 1) return;
-    if (row.waitingOrdinal === null) throw new Error("queued controller steer has no ordinal");
+    ).run(
+      CONTROLLER_STEER_FOLDED_RESPONSE,
+      input.now,
+      input.now,
+      input.leaderTurnId,
+      input.waitingTurnId,
+      input.controllerKey,
+    );
+    return updated.changes === 1;
+  }
+
+  /**
+   * Folds one queued turn into an answer already being written, whose digest
+   * row knows nothing of it: the member's words enter the digest as their own
+   * row, and the owner is acknowledged once per folded burst — keyed by the
+   * burst's own leader, so six messages folded together draw one bubble, while
+   * a genuinely separate later burst is still told once itself.
+   */
+  private foldQueuedControllerTurn(input: {
+    waitingTurnId: string;
+    controllerKey: string;
+    leaderTurnId: string;
+    telegramChatId: string;
+    now: number;
+  }): boolean {
+    if (!this.settleFoldedControllerTurn(input)) return false;
+    const member = this.db.prepare(
+      "SELECT ordinal, origin, input_text FROM controller_turns WHERE id = ?",
+    ).get(input.waitingTurnId) as { ordinal: number; origin: string; input_text: string };
     this.appendControllerDigestRow({
-      controllerKey: row.controllerKey,
-      ordinal: row.waitingOrdinal,
-      ownerText: row.inputText ?? "",
-      agentText: folded,
+      controllerKey: input.controllerKey,
+      ordinal: member.ordinal,
+      ownerText: member.input_text,
+      agentText: CONTROLLER_STEER_FOLDED_RESPONSE,
       now: input.now,
     });
     // The answer itself arrives folded into the reply already being written, so
@@ -8808,53 +9261,66 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     // Telegram exactly like being ignored. That debt exists only for the
     // owner's own words: a system injection folded the same way was never a
     // message the owner sent, and acknowledging it reads as answering nobody.
-    if (row.waitingOrigin !== "owner") return;
+    if (member.origin !== "owner") return true;
     //
-    // Once per answer, though. Keying this by the waiting turn gave every fold
-    // its own row, and checking only for a still-undelivered duplicate assumed
-    // the outbox was slower than the settles. It isn't: it drains sub-second,
-    // so the first bubble was sent before the second fold settled and the
-    // owner got the identical sentence twice. The running turn is the one
-    // thing every fold into the same answer shares, so the row is keyed by it
-    // and its bare existence, delivered or not, is the fence. It is never
-    // re-persisted: the upsert would flip a sent row back to pending.
-    const logicalKey = `controller:${input.runningTurnId}:steer-folded`;
+    // Once per folded burst, though. The burst's own leader is the key: every
+    // member folded in the same event shares it, so the owner gets the identical
+    // sentence once, while a later burst that folds separately is still
+    // acknowledged. It is never re-persisted: the upsert would flip a sent row
+    // back to pending.
+    const logicalKey = `controller:${input.leaderTurnId}:steer-folded`;
     const announcementExists = this.db.prepare(
       "SELECT 1 FROM outbox WHERE logical_key = ? LIMIT 1",
     ).get(logicalKey) !== undefined;
-    if (announcementExists) return;
-    // A still-undelivered acknowledgement from a previous answer also says
+    if (announcementExists) return true;
+    // A still-undelivered acknowledgement from a previous fold also says
     // everything this one would.
     const announcementPending = this.db.prepare(
       `SELECT 1 FROM outbox
         WHERE chat_id = ? AND status IN ('pending', 'leased', 'failed')
           AND payload_json = ? LIMIT 1`,
-    ).get(row.telegramChatId, foldedAnnouncementJson()) !== undefined;
-    if (announcementPending) return;
+    ).get(input.telegramChatId, foldedAnnouncementJson()) !== undefined;
+    if (announcementPending) return true;
     persistControllerOutbox(this.db, {
       logicalKey,
-      chatId: row.telegramChatId,
+      chatId: input.telegramChatId,
       payload: FOLDED_ANNOUNCEMENT_PAYLOAD,
     }, input.now);
+    return true;
   }
 
   private retryUnappliedControllerSteer(input: ControllerSteerSettlementInput): void {
     this.db.prepare(
       `UPDATE controller_turns
-          SET retry_count = retry_count + 1, updated_at = ?
-        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
-    ).run(input.now, input.waitingTurnId, input.controllerKey);
+          SET retry_count = retry_count + 1, burst_leader_turn_id = NULL, updated_at = ?
+        WHERE (id = ? OR burst_leader_turn_id = ?) AND controller_key = ? AND state = 'queued'`,
+    ).run(input.now, input.waitingTurnId, input.waitingTurnId, input.controllerKey);
   }
 
   private preserveAmbiguousControllerSteer(input: ControllerSteerSettlementInput): void {
+    // Counted before the write: the write itself clears the membership that
+    // the count reads.
+    const members = this.memberCount(input);
     const preserved = this.db.prepare(
       `UPDATE controller_turns
           SET recovery_source_turn_id = ?,
+              burst_leader_turn_id = NULL,
               last_error = 'Controller steer delivery was uncertain; queued message preserved',
               updated_at = ?
-        WHERE id = ? AND controller_key = ? AND state = 'queued'`,
-    ).run(input.runningTurnId, input.now, input.waitingTurnId, input.controllerKey);
-    if (preserved.changes !== 1) throw new Error("Ambiguous controller steer message could not be preserved");
+        WHERE (id = ? OR burst_leader_turn_id = ?) AND controller_key = ? AND state = 'queued'`,
+    ).run(input.runningTurnId, input.now, input.waitingTurnId, input.waitingTurnId, input.controllerKey);
+    if (preserved.changes !== 1 + members) {
+      throw new Error("Ambiguous controller steer message could not be preserved");
+    }
+  }
+
+  /** Queued burst members reserved with the waiting leader at settlement time. */
+  private memberCount(input: ControllerSteerSettlementInput): number {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM controller_turns
+        WHERE burst_leader_turn_id = ? AND controller_key = ? AND state = 'queued'`,
+    ).get(input.waitingTurnId, input.controllerKey) as { count: number };
+    return row.count;
   }
 
   public settleControllerSteer(input: ControllerSteerSettlementInput): ControllerSteerSettlementResult {
@@ -8884,6 +9350,28 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   /**
+   * Folds the steered waiting burst into the running answer: the leader and
+   * every member reserved with it are settled with the folded outcome, and the
+   * owner is acknowledged once for the burst.
+   */
+  private completeAppliedControllerSteer(
+    input: ControllerSteerSettlementInput,
+    row: ControllerSteerSettlementRow,
+  ): void {
+    const members = (row.memberIds ?? "").split(",").filter((id) => id.length > 0);
+    for (const waitingTurnId of [input.waitingTurnId, ...members]) {
+      const folded = this.foldQueuedControllerTurn({
+        waitingTurnId,
+        controllerKey: input.controllerKey,
+        leaderTurnId: input.waitingTurnId,
+        telegramChatId: row.telegramChatId,
+        now: input.now,
+      });
+      if (!folded) throw new Error("Reserved controller steer turn changed before it could fold");
+    }
+  }
+
+  /**
    * Counts a steer BB would not take and releases its reservation together
    * with the retry increment. The reconcile loop runs at draft speed while an
    * answer streams, so an unbounded retry here would be a hot loop against BB
@@ -8900,6 +9388,75 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       controllerKey: running.controllerKey,
       outcome: "not_applied",
     }) === "settled";
+  }
+
+  /**
+   * The oldest owner message waiting behind an answer being written, together
+   * with the burst that arrived with it. Members stop at the same gap and caps
+   * as a claimed burst, and — because steering is text-only — before any
+   * member that carries an attachment. Null while the burst tail is still
+   * fresh, so an answer is not cut before the burst has gone quiet.
+   */
+  public getQueuedControllerSteerBurst(controllerKey: string, now: number): {
+    leader: ControllerTurnRecord;
+    members: ControllerTurnRecord[];
+  } | null {
+    assertControllerKey(controllerKey);
+    assertNonNegativeInteger(now, "steer burst now");
+    const leaderRow = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE controller_key = ? AND state = 'queued' AND thread_follow_up_json IS NULL
+        ORDER BY created_at ASC, ordinal ASC LIMIT 1`,
+    ).get(controllerKey) as ControllerTurnRow | undefined;
+    if (!leaderRow) return null;
+    const selection = this.selectBurstRows({
+      controllerKey,
+      leader: leaderRow,
+      now,
+      allowAttachments: false,
+    });
+    if (selection.holdUntil !== null) return null;
+    return {
+      leader: parseControllerTurn(leaderRow),
+      members: selection.members.map((row) => parseControllerTurn(row)),
+    };
+  }
+
+  /**
+   * Milliseconds until a claimable controller burst has gone quiet, or null
+   * when nothing is waiting or the next burst can be claimed now. The executor
+   * sleeps up to this so a burst still arriving is not answered half-empty.
+   */
+  public nextControllerBurstQuietMs(now: number): number | null {
+    const leader = this.oldestClaimableControllerTurnRow(now);
+    if (!leader) return null;
+    const burst = this.selectBurstRows({
+      controllerKey: leader.controller_key,
+      leader,
+      now,
+      allowAttachments: true,
+    });
+    if (burst.holdUntil === null) return null;
+    return Math.max(1, burst.holdUntil - now);
+  }
+
+  /**
+   * The attributed transcript a completed turn answered: its own words when it
+   * led no burst, otherwise the numbered transcript of every member that
+   * folded into it. Deliberately free of inlined document bodies, which are
+   * dispatch-time only and must not persist into the digest.
+   */
+  private controllerBurstTranscript(turn: ControllerTurnRow): string {
+    const members = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE burst_leader_turn_id = ? AND state = 'completed'
+        ORDER BY ordinal ASC`,
+    ).all(turn.id) as ControllerTurnRow[];
+    if (members.length === 0) return turn.input_text;
+    return renderBurstTranscript([
+      this.burstMemberView(turn),
+      ...members.map((row) => this.burstMemberView(row)),
+    ]);
   }
 
   /**
@@ -9783,8 +10340,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * had no accepted answer cannot have done anything worth not repeating, so
    * replaying it is safe. `input_accepted` is deliberately not part of that
    * test: turns have run dozens of tool calls with it still 0, so trusting it
-   * would replay real work. An image is left out because the retry would carry
-   * only the text, which is not the message the owner sent.
+   * would replay real work. An image or document is left out because the retry
+   * would carry only the text, which is not the message the owner sent. The
+   * members that folded into a failed burst leader follow it to the
+   * replacement, so the retry answers the whole burst rather than its first
+   * line.
    *
    * Only an unclassified or recovery-exhausted failure is replayed. An expired
    * sign-in or a rejected provider would fail again the same way until the
@@ -9798,7 +10358,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number,
   ): boolean {
     if (failureCode !== "unknown" && failureCode !== "recovery_exhausted") return false;
-    if (row.origin !== "owner" || row.image_file_id !== null) return false;
+    if (row.origin !== "owner" || row.image_file_id !== null || row.doc_file_id !== null) return false;
     if (row.recovery_source_turn_id !== null) return false;
     if (row.tool_calls !== 0 || row.accepted_finalization_id !== null) return false;
     const touched = this.db.prepare(
@@ -9817,12 +10377,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         telegramChatId: row.telegram_chat_id,
         updateId: Math.max(latestUpdate.update_id + 1, THREAD_FOLLOW_UP_UPDATE_ID_BASE),
         inputText: row.input_text,
+        source: parseControllerSource(row),
         origin: "owner",
         now,
       });
       this.db.prepare(
         "UPDATE controller_turns SET recovery_source_turn_id = ? WHERE id = ? AND state = 'queued'",
       ).run(row.id, replacement.id);
+      this.db.prepare(
+        `UPDATE controller_turns SET burst_leader_turn_id = ?, updated_at = ?
+          WHERE burst_leader_turn_id = ? AND controller_key = ? AND state = 'completed'`,
+      ).run(replacement.id, now, row.id, row.controller_key);
       return true;
     } catch {
       return false;
@@ -9844,6 +10409,17 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const rows = this.db.prepare(
       "SELECT * FROM controller_turns WHERE controller_key = ? ORDER BY ordinal ASC LIMIT ?",
     ).all(controllerKey, limit) as ControllerTurnRow[];
+    return rows.map(parseControllerTurn);
+  }
+
+  /** The burst members that folded into a leader, in ordinal order. */
+  public listControllerBurstMembers(leaderTurnId: string): ControllerTurnRecord[] {
+    assertControllerIdentifier(leaderTurnId, "leaderTurnId");
+    const rows = this.db.prepare(
+      `SELECT * FROM controller_turns
+        WHERE burst_leader_turn_id = ?
+        ORDER BY ordinal ASC`,
+    ).all(leaderTurnId) as ControllerTurnRow[];
     return rows.map(parseControllerTurn);
   }
 
@@ -12848,6 +13424,26 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return typeof value === "string" && value.length > 0 && value.length <= 200 ? value : null;
   }
 
+  /**
+   * Claims the one intake refusal a chat is told per burst of files it cannot
+   * read: true when none of this kind was sent within the quiet gap, in which
+   * case this one is recorded. Durable, so a restart mid-burst cannot draw a
+   * second bubble for the same pile of files.
+   */
+  public async claimIntakeRefusal(
+    chatId: string,
+    kind: IntakeRefusalKind,
+    now: number,
+  ): Promise<boolean> {
+    assertCanonicalPositiveDecimal(chatId, "chatId");
+    assertNonNegativeInteger(now, "now");
+    const key = `intake-refusal:${chatId}:${kind}`;
+    const last = await this.kv.get<unknown>(key);
+    if (typeof last === "number" && now - last < CONTROLLER_BURST_LIMITS.quietGapMs) return false;
+    await this.kv.set(key, now);
+    return true;
+  }
+
   public getJob(jobId: string): Job | null {
     return this.readJobById(jobId);
   }
@@ -13595,7 +14191,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const transitioned = transition(current, event, now);
       persistJobTransition(this.db, jobId, expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, now);
-      this.settleNavigatorReleaseReturn(current, transitioned.job, event, now);
+      this.settleNavigatorReleaseReturn({
+        previous: current,
+        next: transitioned.job,
+        event,
+        now,
+        reviewAttemptIds: [],
+      });
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(jobId, "head_changed", now);
         this.ownerBoundaryRepository.revokeForJob(jobId, "head_changed", now);
@@ -13666,7 +14268,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (terminalProductionState && productionClaimId === null) return null;
       persistJobTransition(this.db, input.jobId, input.expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, input.now);
-      this.settleNavigatorReleaseReturn(current, transitioned.job, input.event, input.now);
+      this.settleNavigatorReleaseReturn({
+        previous: current,
+        next: transitioned.job,
+        event: input.event,
+        now: input.now,
+        reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
+      });
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(input.jobId, "head_changed", input.now);
         this.ownerBoundaryRepository.revokeForJob(input.jobId, "head_changed", input.now);
@@ -17471,52 +18079,221 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.autonomyRepository.markDrainingInTransaction(job.id, now);
   }
 
-  private settleNavigatorReleaseReturn(previous: Job, next: Job, event: JobEvent, now: number): void {
-    if (previous.workflowEngine !== "navigator-v1") return;
-    if (!(NAVIGATOR_RELEASE_STATES as readonly string[]).includes(previous.state)) return;
-    const returnedToNavigation = next.state === "implementing";
-    const releaseFinished = next.state === "complete" || next.state === "merged" || next.state === "production_failed";
+  private settleNavigatorReleaseReturn(input: Readonly<{
+    previous: Job;
+    next: Job;
+    event: JobEvent;
+    now: number;
+    reviewAttemptIds: readonly string[];
+  }>): void {
+    if (input.previous.workflowEngine !== "navigator-v1") return;
+    if (!(NAVIGATOR_RELEASE_STATES as readonly string[]).includes(input.previous.state)) return;
+    this.recordNavigatorReleaseReviewFindings(
+      input.previous,
+      input.event,
+      input.reviewAttemptIds,
+      input.now,
+    );
+    const returnedToNavigation = input.next.state === "implementing";
+    const releaseFinished = input.next.state === "complete" ||
+      input.next.state === "merged" || input.next.state === "production_failed";
     if (!returnedToNavigation && !releaseFinished) return;
     this.db.prepare(
       `UPDATE jobs SET current_workflow_step_id = NULL, workflow_revision = workflow_revision + 1
         WHERE id = ?`,
-    ).run(next.id);
-    next.currentWorkflowStepId = null;
-    next.workflowRevision += 1;
+    ).run(input.next.id);
+    input.next.currentWorkflowStepId = null;
+    input.next.workflowRevision += 1;
     if (!returnedToNavigation) return;
-    const reasonCode = event.type === "VALIDATION_FAILED"
+    const reasonCode = input.event.type === "VALIDATION_FAILED"
       ? "validation_failed"
-      : event.type === "REVIEW_CHANGES_REQUESTED"
+      : input.event.type === "REVIEW_CHANGES_REQUESTED"
         ? "review_changes_requested"
-        : event.type === "REVIEW_PASSED"
+        : input.event.type === "REVIEW_PASSED"
           ? "documentation_required"
-          : event.type === "PRODUCTION_INCIDENT_RECOVERED"
+          : input.event.type === "PRODUCTION_INCIDENT_RECOVERED"
             ? "production_incident_recovered"
             : "release_findings";
     this.db.prepare(
       `INSERT INTO navigator_release_findings (
          job_id, workflow_step_id, reason_code, previous_state, recorded_at
        ) VALUES (?, ?, ?, ?, ?)`,
-    ).run(next.id, previous.currentWorkflowStepId, reasonCode, previous.state, now);
-    if (event.type !== "PRODUCTION_INCIDENT_RECOVERED") return;
+    ).run(
+      input.next.id,
+      input.previous.currentWorkflowStepId,
+      reasonCode,
+      input.previous.state,
+      input.now,
+    );
+    if (input.event.type !== "PRODUCTION_INCIDENT_RECOVERED") return;
     const owner = this.getOwner();
     if (owner === null) return;
-    const phase = event.phase === "canary" ? "canary" : "deploy";
+    const phase = input.event.phase === "canary" ? "canary" : "deploy";
     const text = phase === "canary"
       ? "Production canary failed. The configured rollback restored the previous release. No action is required."
       : "Production deploy failed. The configured rollback restored the previous release. No action is required.";
     const item: OutboxInput = {
-      logicalKey: `job:${next.id}:production-incident:${phase}`,
+      logicalKey: `job:${input.next.id}:production-incident:${phase}`,
       chatId: owner.chatId,
       payload: { text, disable_web_page_preview: true },
     };
-    const payloadJson = serializeOutbox(item, now);
+    const payloadJson = serializeOutbox(item, input.now);
     this.db.prepare(
       `INSERT OR IGNORE INTO outbox (
          logical_key, chat_id, message_id, payload_json, status, attempts,
          next_attempt_at, created_at, updated_at
        ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)`,
-    ).run(item.logicalKey, item.chatId, payloadJson, now, now, now);
+    ).run(item.logicalKey, item.chatId, payloadJson, input.now, input.now, input.now);
+  }
+
+  private recordNavigatorReleaseReviewFindings(
+    job: Job,
+    event: JobEvent,
+    reviewAttemptIds: readonly string[],
+    now: number,
+  ): void {
+    if (job.state !== "final_reviewing" ||
+      (event.type !== "REVIEW_CHANGES_REQUESTED" && event.type !== "REVIEW_PASSED")) return;
+    if (!job.prHeadSha || reviewAttemptIds.length === 0) {
+      throw new Error("final review convergence evidence is unavailable");
+    }
+    const observed = this.normalizedReleaseReviewFindings(job, reviewAttemptIds);
+    if (event.type === "REVIEW_CHANGES_REQUESTED" && observed.size === 0) {
+      throw new Error("final review requested changes without normalized findings");
+    }
+    const currentRows = this.currentReleaseReviewFindingRows(job.id);
+    const current = new Map(currentRows.map((row) => [row.fingerprint, row]));
+    const blockingBurden = [...observed.values()].filter((finding) => finding.disposition === "must_fix").length;
+    for (const finding of observed.values()) {
+      const prior = current.get(finding.fingerprint);
+      this.appendReleaseReviewFindingEvent({
+        job,
+        sourceAttemptId: finding.sourceAttemptId,
+        fingerprint: finding.fingerprint,
+        capabilityId: finding.capabilityId,
+        ruleId: finding.ruleId,
+        disposition: finding.disposition,
+        event: prior?.event === "opened" || prior?.event === "reobserved" ? "reobserved" : "opened",
+        findingJson: finding.findingJson,
+        occurrence: Math.min(3, (prior?.occurrence ?? 0) + 1),
+        blockingBurden,
+        now,
+      });
+    }
+    this.resolveClosedReleaseReviewFindings({
+      job,
+      currentRows,
+      observed,
+      sourceAttemptId: reviewAttemptIds[0]!,
+      blockingBurden,
+      now,
+    });
+  }
+
+  private normalizedReleaseReviewFindings(
+    job: Job,
+    reviewAttemptIds: readonly string[],
+  ): Map<string, NavigatorReleaseReviewFinding> {
+    const observed = new Map<string, NavigatorReleaseReviewFinding>();
+    for (const attemptId of reviewAttemptIds) {
+      const attempt = this.getAttempt(attemptId);
+      if (!attempt || attempt.jobId !== job.id || attempt.reviewStage !== "final_review" ||
+        attempt.headSha !== job.prHeadSha || attempt.resultJson === null) {
+        throw new Error("final review convergence attempt is invalid");
+      }
+      const raw = JSON.parse(attempt.resultJson) as Record<string, unknown>;
+      const envelope = guardResultEnvelopeSchema.safeParse(raw.guardEnvelope);
+      const policy = guardAssessmentPolicySchema.safeParse(raw.guardPolicy);
+      if (!envelope.success || !policy.success) continue;
+      const assessment = assessGuardEnvelope(envelope.data, policy.data);
+      if (assessment.outcome === "blocked") throw new Error("final review guard assessment is blocked");
+      for (const finding of assessment.findings) {
+        if (observed.has(finding.fingerprint)) continue;
+        observed.set(finding.fingerprint, {
+          sourceAttemptId: attempt.id,
+          fingerprint: finding.fingerprint,
+          capabilityId: finding.capabilityId,
+          ruleId: finding.ruleId,
+          disposition: finding.disposition,
+          findingJson: JSON.stringify(finding),
+        });
+      }
+    }
+    return observed;
+  }
+
+  private currentReleaseReviewFindingRows(jobId: string): NavigatorReleaseReviewFindingRow[] {
+    return this.db.prepare(
+      `SELECT finding.* FROM navigator_release_review_finding_events AS finding
+        WHERE finding.job_id = ? AND finding.sequence = (
+          SELECT MAX(latest.sequence) FROM navigator_release_review_finding_events AS latest
+           WHERE latest.job_id = finding.job_id AND latest.fingerprint = finding.fingerprint
+        )`,
+    ).all(jobId) as NavigatorReleaseReviewFindingRow[];
+  }
+
+  private appendReleaseReviewFindingEvent(input: Readonly<{
+    job: Job;
+    sourceAttemptId: string;
+    fingerprint: string;
+    capabilityId: string;
+    ruleId: string;
+    disposition: "must_fix" | "advisory";
+    event: "opened" | "reobserved" | "resolved";
+    findingJson: string;
+    occurrence: number;
+    blockingBurden: number;
+    now: number;
+  }>): void {
+    this.db.prepare(
+      `INSERT INTO navigator_release_review_finding_events (
+         job_id, workflow_step_id, source_review_attempt_id, fingerprint,
+         capability_id, rule_id, disposition, event, head_sha, finding_json,
+         evidence_refs_json, occurrence, blocking_burden, recorded_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.job.id,
+      input.job.currentWorkflowStepId,
+      input.sourceAttemptId,
+      input.fingerprint,
+      input.capabilityId,
+      input.ruleId,
+      input.disposition,
+      input.event,
+      input.job.prHeadSha,
+      input.findingJson,
+      JSON.stringify([`review-attempt:${input.sourceAttemptId}`, `guard-finding:${input.fingerprint}`]),
+      input.occurrence,
+      input.blockingBurden,
+      input.now,
+    );
+  }
+
+  private resolveClosedReleaseReviewFindings(input: Readonly<{
+    job: Job;
+    currentRows: readonly NavigatorReleaseReviewFindingRow[];
+    observed: ReadonlyMap<string, NavigatorReleaseReviewFinding>;
+    sourceAttemptId: string;
+    blockingBurden: number;
+    now: number;
+  }>): void {
+    for (const prior of input.currentRows) {
+      const open = prior.event === "opened" || prior.event === "reobserved";
+      if (!open || input.observed.has(prior.fingerprint)) continue;
+      this.appendReleaseReviewFindingEvent({
+        job: input.job,
+        sourceAttemptId: input.sourceAttemptId,
+        fingerprint: prior.fingerprint,
+        capabilityId: prior.capability_id,
+        ruleId: prior.rule_id,
+        disposition: prior.disposition,
+        event: "resolved",
+        findingJson: prior.finding_json,
+        occurrence: prior.occurrence,
+        blockingBurden: input.blockingBurden,
+        now: input.now,
+      });
+    }
   }
 
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {

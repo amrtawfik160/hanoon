@@ -23,24 +23,25 @@ npm run check
 bb plugin types --check .
 ```
 
-The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the vendored plugin declarations still match the installed BB contract.
+The full check performs TypeScript validation, the complete Vitest suite, and a BB plugin build. The SDK check confirms the exact pinned `@get-bb/plugin-sdk` development dependency still matches the installed BB host contract.
 
 ## Answer-quality evaluation
 
 The deterministic suite proves the plumbing; it cannot tell you whether an answer reads the way the controller instructions promise. Run the release-grade calibration with an absolute artifact path outside this repository: `npm run eval:answers -- --project <project-id> --artifact /absolute/path/outside/repository/live-answer-gate.json`. The command rejects relative paths and paths inside the repository.
 
-It is deliberately outside `npm run check`: each case has six independent clause judgments, with each non-deterministic clause using its own hidden BB judge turn. Clause concurrency is one, so those turns run serially; the current seven-case corpus can consume up to 42 provider turns, and cost and elapsed time grow with the number of cases and clauses. The golden cases carry the verdict a correctly calibrated judge must reach, so the rubric is checked against known-good and known-bad answers *before* it is trusted to judge a prompt change. A disagreement with a golden case exits non-zero — a rubric that misgrades its own fixtures cannot grade anything else. `--case <id>` remains available for one-case diagnosis, but its incomplete artifact is never release-passed.
+It is deliberately outside `npm run check`: each case has seven independent clause judgments, with each non-deterministic clause using its own hidden BB judge turn. Clause concurrency is one, so those turns run serially; the current seven-case corpus can consume up to 49 provider turns, and cost and elapsed time grow with the number of cases and clauses. The golden cases carry the verdict a correctly calibrated judge must reach, so the rubric is checked against known-good and known-bad answers *before* it is trusted to judge a prompt change. A disagreement with a golden case exits non-zero — a rubric that misgrades its own fixtures cannot grade anything else. `--case <id>` remains available for one-case diagnosis, but its incomplete artifact is never release-passed.
 
 ## Change boundaries
 
 - Telegram ingress is I/O only: accept, authenticate, persist, and nudge. It must not spawn BB sessions or touch worktrees.
 - The leased executor is the only execution engine. New paths that start work must go through its generation fence and durable effects.
+- External-resource retirement must persist its durable intent before deletion and reconcile interruptions; a deleted resource must never retain an active binding.
 - Project policy is immutable for an active job. Do not let mutable controller settings rewrite worker execution.
 - Reviews use newly spawned BB threads with fresh provider conversations. Do not fork or resume the implementation conversation for review.
 - BB threads do not replace worktrees. Threads own conversation/history/status/permissions; the worktree owns branch, checkout, files, and artifacts.
 - Merge evidence uses the full head from `git ls-remote origin refs/pull/<number>/head`. Do not substitute cached API metadata.
 - Merge, deploy, and canary require distinct durable receipts. Never infer completion from an HTTP success or prose response.
-- Secrets, pairing links, callback nonces, raw private messages, and credential-like output must not enter fixtures, logs, documentation, or persisted evidence.
+- Secrets, pairing links, callback nonces, raw private messages, and raw automation/provider output must not enter fixtures, logs, documentation, persisted evidence, or controller prompts. Persist only an allowlisted, redacted projection.
 
 ## Tests
 

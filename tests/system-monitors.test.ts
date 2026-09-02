@@ -1,17 +1,27 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
-import { SYSTEM_MONITORS, installSystemMonitors } from "../src/services/system-monitors";
+import {
+  SYSTEM_MONITORS,
+  installSystemAutomations,
+  systemAutomationInstallationComplete,
+} from "../src/services/system-monitors";
+import { BbAutomationProjectUnavailableError } from "../src/bb/automation";
+import { ManagedAutomationService } from "../src/services/managed-automation-service";
+import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
+import { nextCronOccurrence, MonitorService } from "../src/services/monitor-service";
 import { admitConfirmedJob, policyFixture } from "./helpers";
-import { MonitorService } from "../src/services/monitor-service";
+import { createFakeBbAutomationAdapter } from "./support/fake-bb-automation-adapter";
 
 let fixtureNumber = 0;
 const CONTROLLER_KEY = "owner-7-controller";
 const NOW = 1_800_000_000_000;
+const EXECUTION = { model: "gpt-5.6-sol", permissionMode: "auto" as const };
 
-function fixture(paired = true) {
+function fixture(options: { paired?: boolean; spawned?: boolean } = {}) {
+  const paired = options.paired ?? true;
   const { bb } = createFakePluginHost({ pluginId: `telegram-system-monitors-${fixtureNumber++}` });
   const store = openStore(bb.storage, bb.storage.kv, () => NOW);
   if (paired) {
@@ -27,53 +37,169 @@ function fixture(paired = true) {
       inputText: "hello",
       now: NOW - 4_000,
     });
+    if (options.spawned ?? true) {
+      // Upkeep runs as BB automations, which need the controller's verified
+      // BB host and project: both are recorded when its thread is spawned.
+      const lease = store.acquireExecutorLease("executor", NOW - 3_000, 30_000);
+      if (!lease.acquired) throw new Error("missing executor lease");
+      const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: NOW - 1_000 });
+      if (!turn) throw new Error("missing controller turn");
+      expect(store.markControllerSpawned({
+        turnId: turn.id,
+        ownerId: "executor",
+        generation: lease.generation,
+        now: NOW - 3_000,
+        projectId: "proj_a",
+        hostId: "host_a",
+        threadId: "thr_controller",
+      })).toBe(true);
+      // The controller keeps its host and project; the lease itself must not
+      // linger, or a test that admits a job cannot take its own lease.
+      expect(store.releaseExecutorLease("executor", lease.generation, NOW - 3_000)).toBe(true);
+    }
   }
-  return { bb, store };
+  const repository = new ManagedAutomationRepository(bb.storage.database());
+  const fake = createFakeBbAutomationAdapter(NOW);
+  const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+  return { bb, store, repository, fake, service };
 }
 
-function install(store: TelegramAgentStore, now = NOW) {
-  return installSystemMonitors({ store, clock: { now: () => now }, warn: () => undefined });
+function install(value: ReturnType<typeof fixture>, now = NOW) {
+  return installSystemAutomations({
+    store: value.store,
+    service: value.service,
+    providerId: "codex",
+    execution: EXECUTION,
+    clock: { now: () => now },
+    warn: () => undefined,
+  });
+}
+
+/** The plugin-local rows an installation carried before upkeep moved to BB. */
+function installLegacyRows(store: TelegramAgentStore, now = NOW) {
+  for (const definition of SYSTEM_MONITORS) {
+    store.ensureSystemMonitor({
+      systemKey: definition.systemKey,
+      controllerKey: CONTROLLER_KEY,
+      cron: definition.cron,
+      instruction: definition.instruction,
+      dueAt: nextCronOccurrence(definition.cron, now)!,
+      now,
+    });
+  }
 }
 
 it("appends the system monitor migration after every shipped one", () => {
   expect(ALL_MIGRATIONS[22]).toContain("ALTER TABLE monitors ADD COLUMN system_key");
 });
 
-it("installs every system monitor once and stays idempotent across restarts", () => {
-  const { store } = fixture();
+it("installs every upkeep schedule as a BB agent automation once and stays idempotent across restarts", async () => {
+  const value = fixture();
 
-  expect(install(store)).toBe(SYSTEM_MONITORS.length);
-  const first = store.listSystemMonitors();
+  await expect(install(value)).resolves.toBe(SYSTEM_MONITORS.length);
+  const first = value.service.list(CONTROLLER_KEY);
   expect(first).toHaveLength(SYSTEM_MONITORS.length);
+  expect(first.every((binding) => binding.state === "active" && binding.authority.source === "system")).toBe(true);
+  expect(first.map((binding) => binding.definition.mode)).toEqual(["agent", "agent", "agent"]);
 
-  expect(install(store, NOW + 60_000)).toBe(SYSTEM_MONITORS.length);
+  await expect(install(value, NOW + 60_000)).resolves.toBe(SYSTEM_MONITORS.length);
 
-  const second = store.listSystemMonitors();
-  expect(second).toHaveLength(SYSTEM_MONITORS.length);
-  expect(second.map((monitor) => monitor.id).sort()).toEqual(first.map((monitor) => monitor.id).sort());
+  expect(value.fake.create).toHaveBeenCalledTimes(SYSTEM_MONITORS.length);
+  expect(value.service.list(CONTROLLER_KEY).map((binding) => binding.id).sort())
+    .toEqual(first.map((binding) => binding.id).sort());
+  expect(value.store.listSystemMonitors()).toEqual([]);
 });
 
-it("installs nothing until an owner is paired", () => {
-  const { store } = fixture(false);
+it("hands an armed legacy schedule to BB and cancels the local row only after BB reads it back", async () => {
+  const value = fixture();
+  installLegacyRows(value.store);
+  expect(value.store.listSystemMonitors().every((monitor) => monitor.state === "armed")).toBe(true);
 
-  expect(install(store)).toBe(0);
+  await expect(install(value)).resolves.toBe(SYSTEM_MONITORS.length);
 
-  expect(store.listSystemMonitors()).toEqual([]);
+  expect(value.store.listSystemMonitors().every((monitor) => monitor.state === "cancelled")).toBe(true);
+  const bindings = value.service.list(CONTROLLER_KEY);
+  expect(bindings).toHaveLength(SYSTEM_MONITORS.length);
+  expect(bindings.every((binding) => binding.state === "active" && binding.legacyMonitorId !== null)).toBe(true);
 });
 
-it("re-arms a system monitor the owner cancelled", () => {
-  const { store } = fixture();
-  install(store);
-  const monitor = store.listSystemMonitors()[0];
-  if (!monitor) throw new Error("missing monitor");
-  expect(store.cancelMonitor(monitor.id, NOW + 1_000)).toBe(true);
+it("counts only the schedules BB accepted, so the install latch stays open until every one exists", async () => {
+  const value = fixture();
+  value.fake.create.mockRejectedValueOnce(new Error("BB unavailable"));
 
-  install(store, NOW + 2_000);
+  const partial = await install(value);
 
-  expect(store.listSystemMonitors().filter((each) => each.state === "armed").map((each) => each.id)).toContain(monitor.id);
+  expect(partial).toBe(SYSTEM_MONITORS.length - 1);
+  expect(systemAutomationInstallationComplete(partial)).toBe(false);
+
+  const completed = await install(value, NOW + 60_000);
+
+  expect(completed).toBe(SYSTEM_MONITORS.length);
+  expect(systemAutomationInstallationComplete(completed)).toBe(true);
+  expect(value.service.list(CONTROLLER_KEY)).toHaveLength(SYSTEM_MONITORS.length);
 });
 
-it("does not spend the owner's armed-monitor budget", () => {
+it("reinstalls upkeep after self-maintenance was switched off and on again", async () => {
+  const value = fixture();
+  await install(value);
+  for (const binding of value.service.list(CONTROLLER_KEY)) {
+    await value.service.retire({
+      id: binding.id,
+      scope: { kind: "host_path", hostId: "host_a", cwd: null },
+      now: NOW + 1,
+    });
+  }
+  expect(value.service.list(CONTROLLER_KEY)).toEqual([]);
+
+  await expect(install(value, NOW + 2)).resolves.toBe(SYSTEM_MONITORS.length);
+
+  expect(value.service.list(CONTROLLER_KEY).every((binding) => binding.state === "active")).toBe(true);
+});
+
+it("keeps upkeep as plugin-local schedules when BB refuses to host automations for the controller's project", async () => {
+  // Production, 2026-09-02: the controller runs in BB's personal project,
+  // which BB's automations plugin answers with "Project not found".
+  const value = fixture();
+  value.fake.create.mockRejectedValue(new BbAutomationProjectUnavailableError("proj_a"));
+  const warnings: string[] = [];
+
+  const installed = await installSystemAutomations({
+    store: value.store,
+    service: value.service,
+    providerId: "codex",
+    execution: EXECUTION,
+    clock: { now: () => NOW },
+    warn: (message) => warnings.push(message),
+  });
+
+  expect(installed).toBe(SYSTEM_MONITORS.length);
+  expect(systemAutomationInstallationComplete(installed)).toBe(true);
+  expect(value.store.listSystemMonitors().map((monitor) => monitor.state)).toEqual(["armed", "armed", "armed"]);
+  expect(value.fake.automations.size).toBe(0);
+  expect(warnings).toHaveLength(SYSTEM_MONITORS.length);
+  expect(warnings[0]).toMatch(/not available for project proj_a; system-stale-jobs stays a plugin-local schedule/);
+  // The same pass on the next tick is idempotent: the local rows are reused.
+  await expect(install(value, NOW + 60_000)).resolves.toBe(SYSTEM_MONITORS.length);
+  expect(value.store.listSystemMonitors()).toHaveLength(SYSTEM_MONITORS.length);
+});
+
+it("installs nothing until an owner is paired", async () => {
+  const value = fixture({ paired: false });
+
+  await expect(install(value)).resolves.toBe(0);
+
+  expect(value.fake.create).not.toHaveBeenCalled();
+});
+
+it("installs nothing until the controller has a verified BB host and project", async () => {
+  const value = fixture({ spawned: false });
+
+  await expect(install(value)).resolves.toBe(0);
+
+  expect(value.fake.create).not.toHaveBeenCalled();
+});
+
+it("does not spend the owner's armed-monitor budget on legacy upkeep rows", () => {
   const { store } = fixture();
   // The owner's own cap is 20; filling it must not block the agent's upkeep.
   for (let index = 0; index < 20; index += 1) {
@@ -87,12 +213,14 @@ it("does not spend the owner's armed-monitor budget", () => {
     });
   }
 
-  expect(install(store)).toBe(SYSTEM_MONITORS.length);
+  installLegacyRows(store);
+
+  expect(store.listSystemMonitors()).toHaveLength(SYSTEM_MONITORS.length);
 });
 
-it("fires a system monitor as an ordinary follow-up turn", async () => {
+it("fires a legacy system monitor as an ordinary follow-up turn until it is handed to BB", async () => {
   const { store } = fixture();
-  install(store);
+  installLegacyRows(store);
   const due = store.listSystemMonitors()
     .map((monitor) => monitor.dueAt ?? 0)
     .reduce((left, right) => Math.min(left, right));
@@ -137,7 +265,7 @@ it("reports a scorecard entirely from durable state", () => {
     scope: "owner", kind: "fact", subject: "old idea", body: "stale", source: "agent", now: NOW,
   });
   store.forgetMemory({ id: forgotten.id, now: NOW });
-  install(store);
+  installLegacyRows(store);
 
   const scorecard = store.buildAutonomyScorecard({ now: NOW, windowMs: 7 * 86_400_000 });
 
@@ -156,9 +284,9 @@ it("rejects a nonsensical scorecard window", () => {
   expect(() => store.buildAutonomyScorecard({ now: NOW, windowMs: 0 })).toThrow(/windowMs/);
 });
 
-it("hides its own upkeep from the owner's monitor list", () => {
+it("hides legacy upkeep rows from the owner's monitor list", () => {
   const { store } = fixture();
-  install(store);
+  installLegacyRows(store);
   store.createMonitor({
     controllerKey: CONTROLLER_KEY, kind: "schedule", cron: "0 9 * * *",
     instruction: "my own watch", dueAt: NOW + 86_400_000, now: NOW,
@@ -171,9 +299,9 @@ it("hides its own upkeep from the owner's monitor list", () => {
   expect(store.listSystemMonitors()).toHaveLength(SYSTEM_MONITORS.length);
 });
 
-it("retires its upkeep when self-maintenance is switched off", () => {
+it("retires legacy upkeep rows when self-maintenance is switched off", () => {
   const { store } = fixture();
-  install(store);
+  installLegacyRows(store);
   expect(store.listSystemMonitors().every((each) => each.state === "armed")).toBe(true);
   const ownWatch = store.createMonitor({
     controllerKey: CONTROLLER_KEY, kind: "schedule", cron: "0 9 * * *",
