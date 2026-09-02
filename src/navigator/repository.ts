@@ -31,7 +31,11 @@ import {
 import {
   NavigatorFindingLedger,
 } from "./finding-ledger";
-import { navigatorClaimContract, type NavigatorClaimedEffectKind } from "./claim-contracts";
+import {
+  navigatorClaimContract,
+  type NavigatorClaimedEffectKind,
+  type NavigatorRequiredResourceClaim,
+} from "./claim-contracts";
 import {
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
@@ -50,6 +54,11 @@ import { WorkArtifactRepository } from "../work-artifacts/repository";
 import { OwnerBoundaryRepository } from "../storage/owner-boundary-repository";
 import { ReleaseAuthorityRepository } from "../storage/release-authority-repository";
 import { taskArtifactGraphDigest, TaskAuthorityRepository } from "../storage/task-authority-repository";
+import {
+  NavigatorReleaseSettlementRepository,
+  type NavigatorReleaseEffectSettlementInput,
+  type NavigatorReleaseTransitionInput,
+} from "./release-settlement";
 import {
   navigatorPlanningInput,
   navigatorPlanningInputSchema,
@@ -111,11 +120,18 @@ type NavigatorTicketClaimRow = Readonly<{
 }>;
 
 type NavigatorLeaseClaimPlan = Readonly<{
+  jobId: string;
   jobClaimIds: readonly number[];
+  missingJobClaims: readonly NavigatorRequiredResourceClaim[];
   ticketClaim: NavigatorTicketClaimRow | null;
 }>;
 
 class NavigatorLeaseConflictError extends Error {}
+
+function sqliteErrorCode(error: unknown): unknown {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return (error as { code?: unknown }).code;
+}
 
 function isNavigatorClaimedEffectKind(kind: StoredEffect["kind"]): kind is NavigatorClaimedEffectKind {
   return kind === "run_navigator_skill" || kind === "run_navigator_ticket_worker" || kind === "run_navigator_release";
@@ -688,6 +704,7 @@ export class NavigatorRepository {
   private readonly releaseAuthorities: ReleaseAuthorityRepository;
   private readonly ownerBoundaries: OwnerBoundaryRepository;
   private readonly ticketSettlement: NavigatorTicketSettlementRepository;
+  private readonly releaseSettlement: NavigatorReleaseSettlementRepository;
   private readonly findingLedger: NavigatorFindingLedger;
 
   public constructor(
@@ -701,6 +718,7 @@ export class NavigatorRepository {
     this.ownerBoundaries = new OwnerBoundaryRepository(db);
     this.findingLedger = findingLedger;
     this.ticketSettlement = new NavigatorTicketSettlementRepository(db, this.findingLedger);
+    this.releaseSettlement = new NavigatorReleaseSettlementRepository(db, this.taskAuthorities);
   }
 
   public settleNavigatorTicketWorkerAttempt(
@@ -711,6 +729,14 @@ export class NavigatorRepository {
 
   public bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
     return this.ticketSettlement.bindResource(input);
+  }
+
+  public settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean {
+    return this.releaseSettlement.settleEffect(input);
+  }
+
+  public recordNavigatorReleaseTransition(input: NavigatorReleaseTransitionInput): void {
+    this.releaseSettlement.recordReleaseTransition(input);
   }
 
   private createNavigatorCapabilityProfile(input: Readonly<{
@@ -1942,8 +1968,12 @@ export class NavigatorRepository {
       `SELECT claim_id, resource_key, resource_kind, state, owner_id, generation, lease_expires_at
          FROM job_resource_claims WHERE job_id = ? AND state = 'held' ORDER BY claim_id`,
     ).all(effect.jobId) as NavigatorLeaseClaimRow[];
-    if (claims.length !== contract.resourceClaims.length || claims.some((claim) => !contract.resourceClaims.some((requirement) =>
+    if (claims.some((claim) => !contract.resourceClaims.some((requirement) =>
       claim.resource_kind === requirement.resourceKind && claim.resource_key === requirement.resourceKey))) return null;
+    const missingJobClaims = contract.resourceClaims.filter((requirement) => !claims.some((claim) =>
+      claim.resource_kind === requirement.resourceKind && claim.resource_key === requirement.resourceKey));
+    if (missingJobClaims.some((requirement) =>
+      effect.kind !== "run_navigator_release" || requirement.resourceKind === "project")) return null;
     const ticketClaim = contract.requiresTicketWorkArtifact
       ? this.navigatorTicketClaimForEffect(effect)
       : null;
@@ -1953,7 +1983,9 @@ export class NavigatorRepository {
     if (contract.requiresTicketWorkArtifact && !this.claimCanTransfer(ticketClaim, input, allowExpiredTransfer)) return null;
     if (!claims.every((claim) => this.claimCanTransfer(claim, input, allowExpiredTransfer))) return null;
     return {
+      jobId: effect.jobId,
       jobClaimIds: claims.map((claim) => claim.claim_id),
+      missingJobClaims,
       ticketClaim,
     };
   }
@@ -1963,10 +1995,15 @@ export class NavigatorRepository {
     input: Readonly<{ ownerId: string; generation: number; now: number }>,
     allowExpiredTransfer: boolean,
   ): boolean {
+    const previousExecutorIsGone = claim !== null && !this.executorLeaseCurrent(
+      claim.owner_id,
+      claim.generation,
+      input.now,
+    );
     return claim !== null && claim.state === "held" &&
       (claim.owner_id === input.ownerId && claim.generation === input.generation &&
         claim.lease_expires_at > input.now ||
-        allowExpiredTransfer && claim.lease_expires_at <= input.now);
+        allowExpiredTransfer && (claim.lease_expires_at <= input.now || previousExecutorIsGone));
   }
 
   private navigatorTicketClaimForEffect(effect: StoredEffect): NavigatorTicketClaimRow | null {
@@ -2003,6 +2040,34 @@ export class NavigatorRepository {
       if (updateJobClaims.run(input.ownerId, input.generation, expiry, input.now, claimId).changes !== 1) {
         throw new NavigatorLeaseConflictError("navigator job resource claim changed during effect lease");
       }
+    }
+    try {
+      const insertJobClaim = this.db.prepare(
+        `INSERT INTO job_resource_claims (
+           job_id, resource_key, resource_kind, state, owner_id, generation,
+           lease_expires_at, acquired_at, renewed_at
+         ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
+      );
+      for (const requirement of plan.missingJobClaims) {
+        if (insertJobClaim.run(
+          plan.jobId,
+          requirement.resourceKey,
+          requirement.resourceKind,
+          input.ownerId,
+          input.generation,
+          expiry,
+          input.now,
+          input.now,
+        ).changes !== 1) {
+          throw new NavigatorLeaseConflictError("navigator job resource claim was not acquired");
+        }
+      }
+    } catch (error) {
+      if (error instanceof NavigatorLeaseConflictError) throw error;
+      if (sqliteErrorCode(error) === "SQLITE_CONSTRAINT_UNIQUE") {
+        throw new NavigatorLeaseConflictError("navigator job resource claim changed during effect lease");
+      }
+      throw error;
     }
     if (plan.ticketClaim !== null && this.db.prepare(
       `UPDATE work_artifact_claims SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
@@ -2059,144 +2124,6 @@ export class NavigatorRepository {
     return [attempt?.skill_id === "prototype" ? "prototype_write" : "artifact_write"];
   }
 
-  public leaseSkillEffect(input: Readonly<{
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }>): StoredEffect | null {
-    assertIdentifier(input.ownerId, "ownerId");
-    assertPositiveInteger(input.generation, "generation");
-    assertNonNegativeInteger(input.now, "now");
-    assertPositiveInteger(input.leaseMs, "leaseMs");
-    return this.db.transaction((): StoredEffect | null => {
-      if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return null;
-      const row = this.db.prepare(
-        `SELECT effect.*
-           FROM effects AS effect
-           JOIN navigator_skill_attempts AS attempt ON attempt.effect_idempotency_key = effect.idempotency_key
-           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
-           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
-           JOIN jobs AS job ON job.id = effect.job_id
-          WHERE effect.kind = 'run_navigator_skill'
-            AND job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
-            AND job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
-            AND job.cancel_requested_at IS NULL
-            AND effect.job_id = attempt.job_id AND attempt.job_id = step.job_id
-            AND step.job_id = snapshot.job_id
-            AND attempt.job_version = step.job_version AND step.job_version = snapshot.job_version
-            AND attempt.workflow_revision = step.workflow_revision
-            AND step.workflow_revision = snapshot.workflow_revision
-            AND attempt.snapshot_digest = snapshot.digest
-            AND job.workflow_revision = step.workflow_revision
-            AND job.current_workflow_step_id = attempt.workflow_step_id
-            AND NOT EXISTS (
-              SELECT 1 FROM workflow_step_outcomes AS outcome
-               WHERE outcome.workflow_step_id = attempt.workflow_step_id
-            )
-            AND ((effect.status IN ('pending', 'failed') AND effect.next_attempt_at <= ?)
-              OR (effect.status = 'leased' AND effect.lease_expires_at <= ?))
-          ORDER BY effect.created_at, effect.idempotency_key
-          LIMIT 1`,
-      ).get(input.now, input.now) as EffectRow | undefined;
-      if (!row) return null;
-      const skill = this.db.prepare(
-        "SELECT skill_id FROM navigator_skill_attempts WHERE effect_idempotency_key = ?",
-      ).get(row.idempotency_key) as { skill_id: string } | undefined;
-      if (!skill || !this.taskAuthorities.admitEffect(
-        row.job_id,
-        row.idempotency_key,
-        skill.skill_id === "prototype" ? "prototype_write" : "artifact_write",
-        input.now,
-      )) return null;
-      const updated = this.db.prepare(
-        `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
-             lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
-          WHERE idempotency_key = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
-            OR (status = 'leased' AND lease_expires_at <= ?))`,
-      ).run(
-        input.ownerId,
-        input.generation,
-        input.now + input.leaseMs,
-        input.now,
-        row.idempotency_key,
-        input.now,
-        input.now,
-      );
-      if (updated.changes !== 1) return null;
-      const leased = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?")
-        .get(row.idempotency_key) as EffectRow;
-      return parseStoredEffect(leased);
-    }).immediate();
-  }
-
-  public leaseReleaseEffect(input: Readonly<{
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }>): StoredEffect | null {
-    assertIdentifier(input.ownerId, "ownerId");
-    assertPositiveInteger(input.generation, "generation");
-    assertNonNegativeInteger(input.now, "now");
-    assertPositiveInteger(input.leaseMs, "leaseMs");
-    return this.db.transaction((): StoredEffect | null => {
-      if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return null;
-      const row = this.db.prepare(
-        `SELECT effect.*
-           FROM effects AS effect
-           JOIN navigator_release_attempts AS attempt ON attempt.effect_idempotency_key = effect.idempotency_key
-           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
-           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
-           JOIN jobs AS job ON job.id = effect.job_id
-          WHERE effect.kind = 'run_navigator_release'
-            AND job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
-            AND job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
-            AND job.cancel_requested_at IS NULL
-            AND effect.job_id = attempt.job_id AND attempt.job_id = step.job_id
-            AND step.job_id = snapshot.job_id
-            AND attempt.job_version = step.job_version AND step.job_version = snapshot.job_version
-            AND attempt.workflow_revision = step.workflow_revision
-            AND step.workflow_revision = snapshot.workflow_revision
-            AND attempt.snapshot_digest = snapshot.digest
-            AND job.workflow_revision = step.workflow_revision
-            AND job.current_workflow_step_id = attempt.workflow_step_id
-            AND NOT EXISTS (
-              SELECT 1 FROM navigator_release_outcomes AS outcome WHERE outcome.attempt_id = attempt.id
-            )
-            AND ((effect.status IN ('pending', 'failed') AND effect.next_attempt_at <= ?)
-              OR (effect.status = 'leased' AND effect.lease_expires_at <= ?))
-          ORDER BY effect.created_at, effect.idempotency_key
-          LIMIT 1`,
-      ).get(input.now, input.now) as EffectRow | undefined;
-      if (!row) return null;
-      if (!(["commit", "push", "pull_request"] as const).every((operation) => this.taskAuthorities.admitEffect(
-        row.job_id,
-        row.idempotency_key,
-        operation,
-        input.now,
-      ))) return null;
-      const updated = this.db.prepare(
-        `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
-             lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
-          WHERE idempotency_key = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
-            OR (status = 'leased' AND lease_expires_at <= ?))`,
-      ).run(
-        input.ownerId,
-        input.generation,
-        input.now + input.leaseMs,
-        input.now,
-        row.idempotency_key,
-        input.now,
-        input.now,
-      );
-      if (updated.changes !== 1) return null;
-      const leased = this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?")
-        .get(row.idempotency_key) as EffectRow;
-      return parseStoredEffect(leased);
-    }).immediate();
-  }
-
   public getReleaseAttempt(id: string): NavigatorReleaseAttempt | null {
     assertIdentifier(id, "attemptId");
     const row = this.db.prepare("SELECT * FROM navigator_release_attempts WHERE id = ?").get(id) as {
@@ -2226,7 +2153,7 @@ export class NavigatorRepository {
     };
   }
 
-  public bindAttemptResource(input: Readonly<{
+  public bindNavigatorSkillResource(input: Readonly<{
     attemptId: string;
     effectIdempotencyKey: string;
     resource: { kind: "bb_thread"; id: string };
@@ -2253,7 +2180,7 @@ export class NavigatorRepository {
     }).immediate();
   }
 
-  public settleAttempt(input: Readonly<{
+  public settleNavigatorSkillAttempt(input: Readonly<{
     attemptId: string;
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;

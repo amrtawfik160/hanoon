@@ -15,7 +15,7 @@ import type { Job } from "../src/domain/models";
 import { assessReviewGroup } from "../src/domain/review-lenses";
 import { NavigatorImplementationExecutor } from "../src/navigator/implementation-executor";
 import type { NavigatorSnapshot } from "../src/navigator/models";
-import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
+import { NavigatorReleaseOperation } from "../src/navigator/release-operation";
 import {
   NavigatorEffectProtocol,
   type NavigatorEffectContext,
@@ -91,6 +91,7 @@ function modelRoute() {
 type OwnedFixture = Readonly<{
   bb: ReturnType<typeof createFakePluginHost>["bb"];
   store: TelegramAgentStore;
+  navigatorEffects: import("../src/navigator/effect-persistence").NavigatorEffectPersistence;
   implementationPersistence: import("../src/navigator/implementation-persistence").NavigatorImplementationPersistence;
   database: Database.Database;
   job: Job;
@@ -244,6 +245,7 @@ function ownedFixture(
     return {
       bb,
       store,
+      navigatorEffects: composition.navigatorEffects,
       implementationPersistence: composition.navigatorImplementation,
       database: bb.storage.database(),
       job: selected,
@@ -288,6 +290,7 @@ function ownedFixture(
   const fixture = {
     bb,
     store,
+    navigatorEffects: composition.navigatorEffects,
     implementationPersistence: composition.navigatorImplementation,
     database: bb.storage.database(),
     job: bound,
@@ -346,11 +349,9 @@ function releaseExecutor(
 ) {
   return {
     publish,
-    executor: new NavigatorReleaseExecutor({
-      store: fixture.store,
+    executor: new NavigatorReleaseOperation({
       publishPullRequest: publish,
       integrationWorktreeId: () => "env_job_42",
-      clock: { now: fixture.now },
     }),
   };
 }
@@ -697,7 +698,7 @@ describe("navigator exact-head release", () => {
 
     const { executor, publish } = releaseExecutor(fixture);
     const protocol = new NavigatorEffectProtocol({
-      store: fixture.store,
+      store: fixture.navigatorEffects,
       clock: { now: fixture.now },
       adapters: [
         {
@@ -718,7 +719,7 @@ describe("navigator exact-head release", () => {
       prNumber: 42,
       environmentId: "env_job_42",
     });
-    expect(await executor.processOne(fence(fixture), new AbortController().signal)).toBe(false);
+    expect(await protocol.processOne(fence(fixture), new AbortController().signal)).toBe(false);
     expect(publish).toHaveBeenCalledTimes(1);
     const reopened = openStore(fixture.bb.storage, fixture.bb.storage.kv, fixture.now);
     expect(reopened.getJob(fixture.job.id)).toMatchObject({
@@ -743,7 +744,7 @@ describe("navigator exact-head release", () => {
       receipt: undefined as never,
     }));
     const protocol = new NavigatorEffectProtocol({
-      store: fixture.store,
+      store: fixture.navigatorEffects,
       clock: { now: fixture.now },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -773,7 +774,7 @@ describe("navigator exact-head release", () => {
        BEGIN SELECT RAISE(ABORT, 'release receipt fault'); END`,
     );
     const protocol = new NavigatorEffectProtocol({
-      store: fixture.store,
+      store: fixture.navigatorEffects,
       clock: { now: fixture.now },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -802,7 +803,7 @@ describe("navigator exact-head release", () => {
     const execute = vi.fn(async () => ({ outcome: "ambiguous" as const, reason: "publish receipt was lost" }));
     const reconcile = vi.fn(async (context: NavigatorEffectContext) => releaseReceipt(context));
     const protocol = new NavigatorEffectProtocol({
-      store: fixture.store,
+      store: fixture.navigatorEffects,
       clock: { now: fixture.now },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -835,7 +836,7 @@ describe("navigator exact-head release", () => {
     }
     const execute = vi.fn(async (context: NavigatorEffectContext) => releaseReceipt(context));
     const protocol = new NavigatorEffectProtocol({
-      store: fixture.store,
+      store: fixture.navigatorEffects,
       clock: { now: () => now },
       leaseMs: 30,
       adapters: [

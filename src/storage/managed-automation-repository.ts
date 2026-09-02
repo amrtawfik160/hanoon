@@ -26,6 +26,7 @@ import {
   type ManagedAutomationOperationClass,
   type ManagedAutomationOperationRequest,
   type StoredManagedAutomationAuthority,
+  managedAutomationAuthorityCoversOperation,
 } from "../domain/managed-automation";
 
 type SqliteDatabase = Database.Database;
@@ -62,6 +63,11 @@ export type ManagedAutomationBinding = Readonly<{
   updatedAt: number;
 }>;
 
+export type ManagedAutomationReservation = Readonly<{
+  binding: ManagedAutomationBinding;
+  operationId: string;
+}>;
+
 export type ManagedAutomationExecutorFence = Readonly<{
   ownerId: string;
   generation: number;
@@ -85,6 +91,7 @@ export type ManagedAutomationOperation = Readonly<{
   operationClass: ManagedAutomationOperationClass;
   version: 1;
   targetProjectId: string;
+  targetHostId: string | null;
   definitionRevision: number;
   authority: StoredManagedAutomationAuthority;
   capabilityEvidence: ManagedAutomationCapabilityEvidence | null;
@@ -179,22 +186,35 @@ export interface ManagedAutomationPersistence {
     fence: ManagedAutomationMutationFence;
   }>): ManagedAutomationBinding;
   fail(id: string, errorClass: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
-  beginUpdate(input: Readonly<{ id: string; definition: ManagedAutomationDefinition; now: number; fence: ManagedAutomationMutationFence }>): ManagedAutomationBinding;
+  beginUpdate(input: Readonly<{
+    id: string;
+    definition: ManagedAutomationDefinition;
+    now: number;
+    fence: ManagedAutomationMutationFence;
+    authority?: StoredManagedAutomationAuthority;
+  }>): ManagedAutomationBinding;
   beginEnabledChange(input: Readonly<{
     id: string;
     enabled: boolean;
     now: number;
     fence: ManagedAutomationMutationFence;
+    authority?: StoredManagedAutomationAuthority;
   }>): ManagedAutomationBinding;
   beginRunNow(input: Readonly<{
     id: string;
     idempotencyKey: string;
     now: number;
     fence: ManagedAutomationMutationFence;
-  }>): ManagedAutomationBinding;
+    authority?: StoredManagedAutomationAuthority;
+  }>): ManagedAutomationReservation;
   markPolicyBlocked(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
   markExecutionContractBlocked(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
-  beginRetirement(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
+  beginRetirement(
+    id: string,
+    now: number,
+    fence: ManagedAutomationMutationFence,
+    authority?: StoredManagedAutomationAuthority,
+  ): ManagedAutomationBinding;
   retire(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
   recordRun(bindingId: string, run: ManagedAutomationRun, now: number, fence: ManagedAutomationMutationFence): boolean;
   listPendingNotifications(limit?: number): ManagedAutomationNotification[];
@@ -240,6 +260,7 @@ type ManagedAutomationOperationRow = Readonly<{
   operation_class: string;
   operation_version: number;
   target_project_id: string;
+  target_host_id: string | null;
   definition_revision: number;
   authority_json: string;
   capability_evidence_json: string | null;
@@ -539,7 +560,17 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
     throw new Error("Managed automation operation definition revision is invalid");
   }
   const targetProjectId = z.string().min(1).max(256).parse(row.target_project_id);
+  const targetHostId = row.target_host_id === null
+    ? null
+    : z.string().min(1).max(256).parse(row.target_host_id);
   const authority = parseManagedAutomationAuthority(JSON.parse(row.authority_json));
+  if (isCurrentManagedAutomationAuthority(authority) && !managedAutomationAuthorityCoversOperation(authority, {
+    operationClass,
+    targetProjectId,
+    targetHostId,
+  })) {
+    throw new Error("Managed automation operation target is outside its authority");
+  }
   const capabilityEvidence = row.capability_evidence_json === null
     ? authorityEvidence(authority)
     : managedAutomationCapabilityEvidenceSchema.parse(JSON.parse(row.capability_evidence_json));
@@ -588,6 +619,7 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
     operationClass,
     version,
     targetProjectId,
+    targetHostId,
     definitionRevision: row.definition_revision,
     authority,
     capabilityEvidence,
@@ -621,6 +653,7 @@ function operationIdFor(bindingId: string, operation: ManagedAutomationOperation
     : {
         bindingId,
         operationClass: operation.operationClass,
+        ...(operation.targetHostId === undefined ? {} : { targetHostId: operation.targetHostId }),
         definitionRevision: operation.definitionRevision,
         idempotencyKey: operation.idempotencyKey,
       };
@@ -654,6 +687,13 @@ function assertCurrentOperationInput(
   if (authority.controllerKey !== controllerKey || authority.projectId !== projectId ||
     operation.targetProjectId !== projectId || operation.definitionRevision !== definitionRevision) {
     throw new TypeError("managed automation operation does not match its binding");
+  }
+  if (operation.targetHostId !== undefined && operation.targetHostId !== authority.hostId) {
+    throw new TypeError("managed automation operation does not match its authority host");
+  }
+  if (authority.origin === "automation-triggered" &&
+    (operation.targetHostId === undefined || !managedAutomationAuthorityCoversOperation(authority, operation))) {
+    throw new TypeError("automation-triggered operation is outside its recursive authority");
   }
   if (authority.origin === "owner" && (fence.kind !== "controller" ||
     authority.taskAuthority.kind !== "controller-turn" ||
@@ -976,7 +1016,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         if (bindingUpdate.changes !== 1) throw new Error("managed automation retirement settlement could not update its binding");
       } else if (outcome === "succeeded") {
         const automation = input.automation!;
-        if (run !== null) this.recordRunInTransaction(binding, run, input.now);
+        if (run !== null) this.recordRunInTransaction(binding, run, input.now, operation.id);
         const bindingUpdate = this.db.prepare(
           `UPDATE managed_automations
               SET bb_automation_id = ?, provider_ownership_marker = COALESCE(provider_ownership_marker, ?),
@@ -1180,6 +1220,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     if (existing) {
       if (existing.bindingId !== binding.id || existing.operationClass !== request.operationClass ||
         existing.version !== request.version || existing.targetProjectId !== request.targetProjectId ||
+        (existing.targetHostId !== null && existing.targetHostId !== (request.targetHostId ?? authority.hostId)) ||
         existing.definitionRevision !== request.definitionRevision ||
         existing.operationKey !== operationKeyFor(binding.id, request)) {
         throw new Error("managed automation operation identity does not match its binding");
@@ -1219,12 +1260,13 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     const id = operationIdFor(bindingId, request);
     this.db.prepare(
       `INSERT INTO managed_automation_operations (
-         id, binding_id, operation_key, operation_class, operation_version, target_project_id, definition_revision,
+         id, binding_id, operation_key, operation_class, operation_version, target_project_id, target_host_id,
+         definition_revision,
          authority_json, capability_evidence_json, controller_owner_id,
          controller_generation, controller_turn_id, state, attempts,
          lease_owner, lease_generation, lease_expires_at, provider_automation_id, provider_ownership_marker,
          outcome_json, last_error, next_attempt_at, created_at, updated_at, settled_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, NULL)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, NULL)`,
     ).run(
       id,
       bindingId,
@@ -1232,6 +1274,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       request.operationClass,
       request.version,
       request.targetProjectId,
+      request.targetHostId ?? authority.hostId,
       request.definitionRevision,
       canonical(authority),
       canonical(authority.capabilityEvidence),
@@ -1331,6 +1374,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     definition: ManagedAutomationDefinition;
     now: number;
     fence: ManagedAutomationMutationFence;
+    authority?: StoredManagedAutomationAuthority;
   }): ManagedAutomationBinding {
     const definition = managedAutomationDefinitionSchema.parse(input.definition);
     const definitionSha256 = managedAutomationDigest(definition);
@@ -1350,13 +1394,16 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         throw new Error("managed automation update lifecycle is invalid");
       }
       const definitionRevision = existing.definitionRevision + 1;
+      const authority = input.authority ?? existing.authority;
       const request: ManagedAutomationOperationRequest = {
         version: 1,
         operationClass: "update",
         targetProjectId: existing.projectId,
+        targetHostId: isCurrentManagedAutomationAuthority(authority)
+          ? authority.hostId
+          : undefined,
         definitionRevision,
       };
-      const authority = existing.authority;
       assertCurrentOperationInput(
         authority,
         request,
@@ -1377,6 +1424,8 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       const result = this.db.prepare(
         `UPDATE managed_automations
             SET name = ?, mode = ?, definition_json = ?, definition_sha256 = ?,
+                authority_json = ?, authority_version = ?, capability_profile_id = ?,
+                capability_profile_revision = ?, capability_evidence_json = ?,
                 definition_revision = ?, state = 'updating', last_error = NULL,
                 last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
           WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
@@ -1385,6 +1434,11 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         definition.mode,
         canonical({ version: 1, value: definition }),
         definitionSha256,
+        canonical(authority),
+        authorityVersion(authority),
+        authorityEvidence(authority)?.profileId ?? null,
+        authorityEvidence(authority)?.profileRevision ?? null,
+        authorityEvidence(authority) ? canonical(authorityEvidence(authority)) : null,
         definitionRevision,
         operationIdFor(existing.id, request),
         input.now,
@@ -1400,6 +1454,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     enabled: boolean;
     now: number;
     fence: ManagedAutomationMutationFence;
+    authority?: StoredManagedAutomationAuthority;
   }): ManagedAutomationBinding {
     return this.db.transaction(() => {
       this.assertMutationFence(input.fence, input.id, input.now);
@@ -1417,13 +1472,16 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         throw new Error("managed automation enablement is already pending");
       }
       const definitionRevision = existing.definitionRevision + 1;
+      const authority = input.authority ?? existing.authority;
       const request: ManagedAutomationOperationRequest = {
         version: 1,
         operationClass,
         targetProjectId: existing.projectId,
+        targetHostId: isCurrentManagedAutomationAuthority(authority)
+          ? authority.hostId
+          : undefined,
         definitionRevision,
       };
-      const authority = existing.authority;
       assertCurrentOperationInput(
         authority,
         request,
@@ -1443,10 +1501,17 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       );
       const result = this.db.prepare(
         `UPDATE managed_automations
-            SET definition_revision = ?, state = 'updating', last_error = NULL,
+            SET authority_json = ?, authority_version = ?, capability_profile_id = ?,
+                capability_profile_revision = ?, capability_evidence_json = ?,
+                definition_revision = ?, state = 'updating', last_error = NULL,
                 last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
           WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
       ).run(
+        canonical(authority),
+        authorityVersion(authority),
+        authorityEvidence(authority)?.profileId ?? null,
+        authorityEvidence(authority)?.profileRevision ?? null,
+        authorityEvidence(authority) ? canonical(authorityEvidence(authority)) : null,
         definitionRevision,
         operationIdFor(existing.id, request),
         input.now,
@@ -1462,7 +1527,8 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     idempotencyKey: string;
     now: number;
     fence: ManagedAutomationMutationFence;
-  }): ManagedAutomationBinding {
+    authority?: StoredManagedAutomationAuthority;
+  }): ManagedAutomationReservation {
     const idempotencyKey = z.string().min(1).max(256).parse(input.idempotencyKey);
     return this.db.transaction(() => {
       this.assertMutationFence(input.fence, input.id, input.now);
@@ -1471,14 +1537,17 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         !["active", "paused", "failed"].includes(existing.state)) {
         throw new Error("managed automation run-now lifecycle is invalid");
       }
+      const authority = input.authority ?? existing.authority;
       const request: ManagedAutomationOperationRequest = {
         version: 1,
         operationClass: "run_now",
         targetProjectId: existing.projectId,
+        targetHostId: isCurrentManagedAutomationAuthority(authority)
+          ? authority.hostId
+          : undefined,
         definitionRevision: existing.definitionRevision,
         idempotencyKey,
       };
-      const authority = existing.authority;
       assertCurrentOperationInput(
         authority,
         request,
@@ -1487,21 +1556,33 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         existing.projectId,
         existing.definitionRevision,
       );
-      const id = operationIdFor(existing.id, request);
-      const current = this.getOperation(id);
+      const operationKey = operationKeyFor(existing.id, request);
+      const currentRow = this.db.prepare(
+        `SELECT id FROM managed_automation_operations
+          WHERE binding_id = ? AND operation_key = ?`,
+      ).get(existing.id, operationKey) as { id: string } | undefined;
+      const current = currentRow ? this.getOperation(currentRow.id) : null;
       if (current) {
-        if (current.bindingId !== existing.id || current.operationKey !== operationKeyFor(existing.id, request)) {
+        if (current.bindingId !== existing.id || current.operationClass !== "run_now" ||
+          current.version !== request.version || current.targetProjectId !== request.targetProjectId ||
+          (current.targetHostId !== null && current.targetHostId !== (request.targetHostId ?? authority.hostId)) ||
+          current.operationKey !== operationKey) {
           throw new Error("managed automation run-now idempotency identity conflict");
         }
-        if (current.state === "succeeded") return existing;
-        if (current.state === "pending" || current.state === "leased") return existing;
+        if (current.state === "succeeded") return { binding: existing, operationId: current.id };
+        if (current.state === "pending" || current.state === "leased") {
+          return { binding: existing, operationId: current.id };
+        }
+        if (current.definitionRevision !== existing.definitionRevision) {
+          throw new Error("managed automation run-now idempotency identity is from an older revision");
+        }
         const requeued = this.db.prepare(
           `UPDATE managed_automation_operations
               SET state = 'pending', lease_owner = NULL, lease_generation = NULL,
                   lease_expires_at = NULL, outcome_json = NULL, last_error = NULL,
                   next_attempt_at = ?, updated_at = ?, settled_at = NULL
             WHERE id = ? AND state IN ('failed', 'ambiguous')`,
-        ).run(input.now, input.now, id);
+        ).run(input.now, input.now, current.id);
         if (requeued.changes !== 1) throw new Error("managed automation run-now retry fence was lost");
       } else {
         const last = existing.lastOperationId ? this.getOperation(existing.lastOperationId) : null;
@@ -1520,11 +1601,25 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       }
       const bindingUpdate = this.db.prepare(
         `UPDATE managed_automations
-            SET last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
+            SET authority_json = ?, authority_version = ?, capability_profile_id = ?,
+                capability_profile_revision = ?, capability_evidence_json = ?,
+                last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
           WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
-      ).run(id, input.now, input.id);
+      ).run(
+        canonical(authority),
+        authorityVersion(authority),
+        authorityEvidence(authority)?.profileId ?? null,
+        authorityEvidence(authority)?.profileRevision ?? null,
+        authorityEvidence(authority) ? canonical(authorityEvidence(authority)) : null,
+        current?.id ?? operationIdFor(existing.id, request),
+        input.now,
+        input.id,
+      );
       if (bindingUpdate.changes !== 1) throw new Error("managed automation run-now intent fence was lost");
-      return this.get(input.id)!;
+      return {
+        binding: this.get(input.id)!,
+        operationId: current?.id ?? operationIdFor(existing.id, request),
+      };
     }).immediate();
   }
 
@@ -1556,7 +1651,12 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     }).immediate();
   }
 
-  public beginRetirement(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding {
+  public beginRetirement(
+    id: string,
+    now: number,
+    fence: ManagedAutomationMutationFence,
+    requestedAuthority?: StoredManagedAutomationAuthority,
+  ): ManagedAutomationBinding {
     return this.db.transaction(() => {
       this.assertMutationFence(fence, id, now);
       const existing = this.get(id);
@@ -1575,13 +1675,16 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
         throw new Error("managed automation retirement lifecycle is invalid");
       }
       const definitionRevision = existing.definitionRevision + 1;
+      const authority = requestedAuthority ?? existing.authority;
       const request: ManagedAutomationOperationRequest = {
         version: 1,
         operationClass: "retire",
         targetProjectId: existing.projectId,
+        targetHostId: isCurrentManagedAutomationAuthority(authority)
+          ? authority.hostId
+          : undefined,
         definitionRevision,
       };
-      const authority = existing.authority;
       assertCurrentOperationInput(
         authority,
         request,
@@ -1601,10 +1704,22 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       );
       const result = this.db.prepare(
         `UPDATE managed_automations
-            SET definition_revision = ?, state = 'retiring', last_error = NULL,
+            SET authority_json = ?, authority_version = ?, capability_profile_id = ?,
+                capability_profile_revision = ?, capability_evidence_json = ?,
+                definition_revision = ?, state = 'retiring', last_error = NULL,
                 last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
           WHERE id = ? AND state IN ('pending', 'active', 'paused', 'failed')`,
-      ).run(definitionRevision, operationIdFor(existing.id, request), now, id);
+      ).run(
+        canonical(authority),
+        authorityVersion(authority),
+        authorityEvidence(authority)?.profileId ?? null,
+        authorityEvidence(authority)?.profileRevision ?? null,
+        authorityEvidence(authority) ? canonical(authorityEvidence(authority)) : null,
+        definitionRevision,
+        operationIdFor(existing.id, request),
+        now,
+        id,
+      );
       if (result.changes !== 1) throw new Error("managed automation retirement intent fence was lost");
       return this.get(id)!;
     }).immediate();
@@ -1629,7 +1744,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       this.assertMutationFence(fence, bindingId, now);
       const binding = this.get(bindingId);
       if (!binding) throw new Error("managed automation run binding is missing");
-      return this.recordRunInTransaction(binding, run, now);
+      return this.recordRunInTransaction(binding, run, now, binding.lastOperationId);
     }).immediate();
   }
 
@@ -1637,6 +1752,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
     binding: ManagedAutomationBinding,
     rawRun: ManagedAutomationRun,
     now: number,
+    initiatingOperationId: string | null,
   ): boolean {
     const run = managedAutomationRunSchema.parse(rawRun);
     if (binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
@@ -1655,7 +1771,7 @@ export class ManagedAutomationRepository implements ManagedAutomationPersistence
       exitCode: run.exitCode,
       finishedAt: run.finishedAt,
       id: run.id,
-      initiatingOperationId: binding.lastOperationId,
+      initiatingOperationId,
       output: outputSha256 === null ? null : { screened: true, sha256: outputSha256 },
       runMode: run.runMode,
       scheduledFor: run.scheduledFor,

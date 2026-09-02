@@ -557,10 +557,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   });
   const navigatorRuntime = createNavigatorRuntime({
     effectPersistence: composition.navigatorEffects,
-    workflowPersistence: composition.navigatorWorkflow,
+    planningPersistence: composition.navigatorPlanning,
     implementationRead: composition.navigatorImplementationRead,
     implementationPersistence: composition.navigatorImplementation,
-    releasePersistence: composition.navigatorRelease,
     sdk: bb.sdk,
     modelRoute: () => {
       if (!config.ok) throw new Error(config.message);
@@ -699,14 +698,20 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
       const evidence = binding.capabilityEvidence;
       if (!authority || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
-        !["create", "update", "enable", "disable", "run_now", "retire"].includes(operation.operationClass) ||
-        operation.targetProjectId !== binding.projectId) return false;
+        !["create", "update", "enable", "disable", "run_now", "retire", "reconcile"].includes(operation.operationClass) ||
+        operation.targetProjectId !== binding.projectId ||
+        (operation.targetHostId !== undefined && operation.targetHostId !== null &&
+          operation.targetHostId !== authority.hostId)) return false;
       if (authority.origin === "system-maintenance") {
         const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
         return descriptor !== undefined && descriptor.version === evidence.descriptorVersion &&
           evidence.profileId === `system-maintenance:${authority.standingAuthority.systemKey}` &&
           evidence.evidenceRefs.length === 1 &&
           evidence.evidenceRefs[0] === `system-maintenance:${authority.standingAuthority.systemKey}`;
+      }
+      if (authority.origin === "automation-triggered") {
+        return evidence.evidenceRefs.includes(`automation-parent-operation:${authority.taskAuthority.operationId}`) &&
+          evidence.evidenceRefs.some((ref) => ref.startsWith("automation-parent-run:"));
       }
       if (authority.origin !== "owner" || authority.taskAuthority.kind !== "controller-turn" ||
         authority.taskAuthority.turnId === "") return false;

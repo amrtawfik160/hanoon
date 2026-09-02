@@ -84,6 +84,8 @@ export type ManagedAutomationCreateReceipt = Readonly<{
 export type ManagedAutomationRun = Readonly<{
   id: string;
   automationId: string;
+  /** Provider idempotency marker, when the provider exposes it in run history. */
+  idempotencyKey?: string | null;
   runMode: "agent" | "script";
   threadId: string | null;
   status: "running" | "succeeded" | "failed" | "skipped";
@@ -204,6 +206,7 @@ export const managedAutomationObservationEnvelopeSchema = z.object({
 export const managedAutomationRunSchema = z.object({
   id: boundedId,
   automationId: boundedId,
+  idempotencyKey: boundedId.nullable().optional(),
   runMode: z.enum(["agent", "script"]),
   threadId: boundedId.nullable(),
   status: z.enum(["running", "succeeded", "failed", "skipped"]),
@@ -233,6 +236,33 @@ export const managedAutomationCapabilityEvidenceSchema = z.object({
   descriptorDigest: sha256,
   evidenceRefs: z.array(evidenceReference).min(1).max(32),
 }).strict();
+
+export const managedAutomationRecursionSchema = z.object({
+  version: z.literal(1),
+  rootAutomationId: boundedId,
+  parentAutomationId: boundedId,
+  depth: z.number().int().nonnegative().safe().max(8),
+  maxDepth: z.number().int().positive().safe().max(8),
+  lineage: z.array(boundedId).min(1).max(9),
+}).strict().superRefine((recursion, context) => {
+  if (recursion.depth > recursion.maxDepth) {
+    context.addIssue({ code: "custom", path: ["depth"], message: "recursion depth exceeds its bound" });
+  }
+  if (recursion.lineage.length !== recursion.depth + 1) {
+    context.addIssue({ code: "custom", path: ["lineage"], message: "recursion lineage does not match its depth" });
+  }
+  if (recursion.lineage[0] !== recursion.rootAutomationId) {
+    context.addIssue({ code: "custom", path: ["lineage", 0], message: "recursion lineage has the wrong root" });
+  }
+  if (recursion.lineage[recursion.lineage.length - 1] !== recursion.parentAutomationId) {
+    context.addIssue({ code: "custom", path: ["lineage"], message: "recursion lineage has the wrong parent" });
+  }
+  if (new Set(recursion.lineage).size !== recursion.lineage.length) {
+    context.addIssue({ code: "custom", path: ["lineage"], message: "recursion lineage contains a cycle" });
+  }
+});
+
+export type ManagedAutomationRecursion = z.infer<typeof managedAutomationRecursionSchema>;
 
 const taskAuthoritySchema = z.discriminatedUnion("kind", [
   z.object({
@@ -327,11 +357,54 @@ export const managedAutomationAuthoritySchema = z.discriminatedUnion("origin", [
       operationId: boundedId,
       revision: positiveRevision,
     }).strict(),
-    standingAuthority: z.null(),
+    standingAuthority: z.object({
+      version: z.literal(1),
+      kind: z.literal("project-policy"),
+      policyId: boundedId,
+      revision: positiveRevision,
+    }).strict(),
+    recursion: managedAutomationRecursionSchema,
+    operationScope: z.object({
+      version: z.literal(1),
+      operationClass: z.enum([
+        "create",
+        "update",
+        "enable",
+        "disable",
+        "run_now",
+        "retire",
+        "reconcile",
+      ]),
+      targetProjectId: boundedId,
+      targetHostId: boundedId,
+    }).strict(),
     capabilityEvidence: managedAutomationCapabilityEvidenceSchema,
     mayWidenAutomation: z.literal(false),
   }).strict(),
-]);
+]).superRefine((authority, context) => {
+  if (authority.origin !== "automation-triggered") return;
+  if (authority.recursion.parentAutomationId !== authority.taskAuthority.automationId) {
+    context.addIssue({
+      code: "custom",
+      path: ["recursion", "parentAutomationId"],
+      message: "recursive parent does not match task authority",
+    });
+  }
+  if (authority.operationScope.targetProjectId !== authority.projectId) {
+    context.addIssue({
+      code: "custom",
+      path: ["operationScope", "targetProjectId"],
+      message: "operation target project is outside authority",
+    });
+  }
+  if (authority.operationScope.targetHostId !== authority.hostId) {
+    context.addIssue({
+      code: "custom",
+      path: ["operationScope", "targetHostId"],
+      message: "operation target host is outside authority",
+    });
+  }
+});
 
 export type ManagedAutomationAuthority = z.infer<typeof managedAutomationAuthoritySchema>;
 export type ManagedAutomationCapabilityEvidence = z.infer<typeof managedAutomationCapabilityEvidenceSchema>;
@@ -352,6 +425,7 @@ export const managedAutomationOperationRequestSchema = z.object({
   version: z.literal(1),
   operationClass: managedAutomationOperationClassSchema,
   targetProjectId: boundedId,
+  targetHostId: boundedId.optional(),
   definitionRevision: positiveRevision,
   idempotencyKey: boundedId.optional(),
 }).strict();
@@ -409,7 +483,7 @@ export function parseManagedAutomationAuthority(value: unknown): StoredManagedAu
 }
 
 export function isCurrentManagedAutomationAuthority(value: StoredManagedAutomationAuthority): value is ManagedAutomationAuthority {
-  return typeof value === "object" && value !== null && "version" in value && value.version === 1;
+  return managedAutomationAuthoritySchema.safeParse(value).success;
 }
 
 export function currentManagedAutomationAuthority(
@@ -417,4 +491,23 @@ export function currentManagedAutomationAuthority(
 ): ManagedAutomationAuthority | null {
   const parsed = parseManagedAutomationAuthority(value);
   return isCurrentManagedAutomationAuthority(parsed) ? parsed : null;
+}
+
+export function managedAutomationAuthorityCoversOperation(
+  authority: StoredManagedAutomationAuthority,
+  operation: Readonly<{
+    operationClass: ManagedAutomationOperationClass;
+    targetProjectId: string;
+    targetHostId?: string | null;
+  }>,
+): boolean {
+  if (!isCurrentManagedAutomationAuthority(authority)) return false;
+  if (authority.projectId !== operation.targetProjectId) return false;
+  if (operation.targetHostId !== undefined && operation.targetHostId !== null &&
+    authority.hostId !== operation.targetHostId) return false;
+  if (authority.origin !== "automation-triggered") return true;
+  if (operation.targetHostId === undefined || operation.targetHostId === null) return false;
+  return authority.operationScope.operationClass === operation.operationClass &&
+    authority.operationScope.targetProjectId === operation.targetProjectId &&
+    authority.operationScope.targetHostId === operation.targetHostId;
 }

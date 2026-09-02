@@ -1,4 +1,5 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type {
   BbAutomation,
@@ -23,6 +24,9 @@ import {
 } from "../src/storage/managed-automation-repository";
 import { openStore, openStoreComposition, type MonitorRecord } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
+import { AutonomyScheduler } from "../src/autonomy/scheduler";
+import { AutonomyRepository } from "../src/storage/autonomy-repository";
+import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { hashSecret } from "../src/crypto";
 import { registerControllerTools } from "../src/controller/tools";
 import { policyFixture } from "./helpers";
@@ -32,7 +36,31 @@ import type {
   ManagedAutomationObservation,
   ManagedAutomationProviderIdentity,
 } from "../src/domain/managed-automation";
-import { runRequiredNavigatorLiveScenarios } from "./support/navigator-live-scenarios";
+import type { EffectFence } from "../src/services/effect-runner";
+import {
+  NavigatorEffectProtocol,
+  type NavigatorEffectOutcome,
+} from "../src/navigator/effect-protocol";
+import {
+  NavigatorImplementationExecutor,
+  type NavigatorGitObservationRequest,
+} from "../src/navigator/implementation-executor";
+import {
+  navigatorAcceptanceCriteria,
+  type NavigatorPullRequestRecord,
+  type NavigatorPullRequestRequest,
+} from "../src/navigator/implementation-contracts";
+import { NavigatorPlanningService } from "../src/navigator/planning-service";
+import { NavigatorReleaseOperation } from "../src/navigator/release-operation";
+import {
+  createNavigatorReleaseEffectAdapter,
+} from "../src/navigator/plugin-runtime";
+import {
+  createNavigatorTicketEffectAdapter,
+  type NavigatorTicketWorkerInput,
+  type NavigatorTicketWorkerOperation,
+} from "../src/navigator/ticket-adapter";
+import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 
 const NOW = 1_800_000_000_000;
 const SCOPE = { kind: "environment", environmentId: "env_owner" } as const;
@@ -171,6 +199,7 @@ function fixture() {
 function fakeAdapter() {
   const automations = new Map<string, BbAutomation>();
   const runs = new Map<string, BbAutomationRun[]>();
+  let manualRunNumber = 0;
   const create = vi.fn(async ({ definition: value, identity }: {
     definition: BbAutomationDefinition;
     identity: ManagedAutomationProviderIdentity;
@@ -209,7 +238,7 @@ function fakeAdapter() {
     }),
     show: vi.fn(async ({ automationId, expectedDefinition, expectedEnabled, identity }) => {
       const found = automations.get(automationId);
-      if (!found) throw new Error("missing automation");
+      if (!found) throw new BbAutomationNotFoundError();
       if (expectedDefinition) {
         assertAutomationMatches({ ...expectedDefinition, name: providerName(expectedDefinition.name, identity) }, found, expectedEnabled ?? true);
       }
@@ -222,7 +251,12 @@ function fakeAdapter() {
       automations.set(automationId, updated);
       return managedObservation(updated, expectedDefinition);
     }),
-    runNow: vi.fn(async ({ automationId }) => runEvidence({ automationId, trigger: "manual" })),
+    runNow: vi.fn(async ({ automationId, idempotencyKey }) => runEvidence({
+      id: `run_${++manualRunNumber}`,
+      automationId,
+      idempotencyKey,
+      trigger: "manual",
+    })),
     runs: vi.fn(async ({ automationId }) => runs.get(automationId) ?? []),
     delete: vi.fn(async ({ automationId }) => {
       if (!automations.delete(automationId)) throw new BbAutomationNotFoundError();
@@ -954,105 +988,537 @@ describe("managed BB automations", () => {
   });
 
   it("restarts one leased executor across automation, Navigator findings, and guarded release", async () => {
-    const { bb } = createFakePluginHost({ pluginId: `managed-navigator-restart-${fixtureNumber++}` });
-    let currentTime = NOW;
-    const now = () => currentTime++;
-    const composition = openStoreComposition(bb.storage, bb.storage.kv, now);
-    const store = composition.store;
-    const repository = composition.managedAutomation;
-    const fake = fakeAdapter();
-    const predecessor = store.acquireExecutorLease("integrated-predecessor", NOW, 120_000);
-    if (!predecessor.acquired) throw new Error("missing integrated predecessor lease");
-    let successorGeneration: number | null = null;
-    fake.create.mockImplementationOnce(async ({ definition: value, identity }) => {
-      const created = automation(value, {
-        id: "auto_integrated",
-        name: providerName(value.name, identity),
+    const controllerFixture = submittedControllerFixture();
+    try {
+      let currentTime = 2_000;
+      const now = () => currentTime;
+      const composition = openStoreComposition(controllerFixture.bb.storage, controllerFixture.bb.storage.kv, now);
+      const store = composition.store;
+      const database: Database.Database = controllerFixture.bb.storage.database();
+      const repository = composition.managedAutomation;
+      const controller = store.getControllerForOwner("7", "7");
+      if (!controller?.threadId) throw new Error("integrated controller fixture is incomplete");
+      const policy = policyFixture();
+      store.upsertProjectPolicy(policy, currentTime);
+      const job = store.createConfirmedControllerJob({
+        controllerThreadId: controller.threadId,
+        projectId: policy.projectId,
+        task: "Implement the integrated restart flow and release it",
+        now: currentTime,
       });
-      fake.automations.set(created.id, created);
-      expect(store.releaseExecutorLease("integrated-predecessor", predecessor.generation, NOW + 1)).toBe(true);
-      const successor = store.acquireExecutorLease("integrated-successor", NOW + 1, 1_000_000);
-      if (!successor.acquired) throw new Error("missing integrated successor lease");
-      successorGeneration = successor.generation;
-      return {
-        version: 1,
-        operationId: identity.operationId,
-        ownershipMarker: identity.ownershipMarker,
-        providerAutomationId: created.id,
+
+      const specificationId = stableWorkArtifactId(policy.projectId, `integrated-spec-${job.id}`);
+      const ticketId = stableWorkArtifactId(policy.projectId, `integrated-ticket-${job.id}`);
+      const artifactInput = (input: Readonly<{
+        artifactId: string;
+        operationId: string;
+        kind: CaptureWorkArtifactInput["kind"];
+        title: string;
+        trackerOrder: number;
+        relationships?: CaptureWorkArtifactInput["relationships"];
+      }>): CaptureWorkArtifactInput => ({
+        artifactId: input.artifactId,
+        projectId: policy.projectId,
+        effortId: job.id,
+        operationId: input.operationId,
+        kind: input.kind,
+        status: "ready",
+        trackerKind: "github",
+        trackerNamespace: "github:acme/cyndra",
+        externalId: input.operationId,
+        externalUrl: `https://github.com/acme/cyndra/issues/${input.operationId}`,
+        externalRevision: `${input.operationId}:1`,
+        externalStatus: "open",
+        assignees: [],
+        title: input.title,
+        trackerOrder: input.trackerOrder,
+        content: `# ${input.title}\n\nRestartable production-composition evidence.`,
+        acceptanceCriteria: [`${input.title} is accepted`],
+        relationships: input.relationships ?? [],
+        capturedAt: currentTime,
+      });
+      const specification = store.captureWorkArtifact(artifactInput({
+        artifactId: specificationId,
+        operationId: `integrated-spec-${job.id}`,
+        kind: "specification",
+        title: "Integrated restart specification",
+        trackerOrder: 0,
+      }));
+      const ticket = store.captureWorkArtifact(artifactInput({
+        artifactId: ticketId,
+        operationId: `integrated-ticket-${job.id}`,
+        kind: "implementation_ticket",
+        title: "Integrated restart ticket",
+        trackerOrder: 1,
+        relationships: [{
+          kind: "parent",
+          sourceArtifactId: ticketId,
+          sourceRef: `artifact:${ticketId}`,
+          targetArtifactId: specificationId,
+          targetRef: `artifact:${specificationId}`,
+        }],
+      }));
+      const boundJob = store.bindNavigatorJobArtifacts({
+        jobId: job.id,
+        expectedVersion: job.version,
+        artifactBindings: [specification, ticket].map(({ artifact: value, snapshot }) => ({
+          artifactId: value.id,
+          snapshotId: snapshot.id,
+          snapshotDigest: snapshot.snapshotDigest,
+        })),
+        now: currentTime,
+      });
+
+      const gitObserver = {
+        observe: vi.fn(async (request: NavigatorGitObservationRequest) => ({
+          kind: "navigator_git_observation" as const,
+          worktreeId: request.worktreeId,
+          branch: request.integrationBranch,
+          headSha: request.expectedHeadSha,
+          baseHeadSha: request.baseHeadSha,
+          baseHeadIsAncestor: true,
+          comparisonBaseHeadSha: request.comparisonBaseHeadSha,
+          comparisonBaseHeadIsAncestor: true,
+          clean: true,
+          changedPaths: [...request.expectedChangedPaths],
+          evidenceRef: `integrated-git:${request.purpose}:${request.expectedHeadSha}`,
+          observedAt: now(),
+        })),
       };
-    });
-    const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true);
+      const publishPullRequest = vi.fn(async (request: NavigatorPullRequestRequest): Promise<NavigatorPullRequestRecord> => ({
+        operationId: request.operationId,
+        jobId: request.jobId,
+        number: 65,
+        url: "https://github.com/acme/cyndra/pull/65",
+        headSha: request.headSha,
+      }));
+      const implementationExecutor = new NavigatorImplementationExecutor({
+        store,
+        persistence: composition.navigatorImplementation,
+        gitObserver,
+        pullRequests: { createOrRefresh: publishPullRequest },
+        modelRoute: (kind) => ({
+          pool: kind === "review" ? "strong" : "standard",
+          ...DEFAULT_MODEL_POOL_REGISTRY.worker[kind === "review" ? "strong" : "standard"],
+        }),
+        clock: { now },
+      });
+      implementationExecutor.startIntegration({
+        jobId: boundJob.id,
+        specificationArtifactId: specificationId,
+        implementationTicketIds: [ticketId],
+        baseBranch: policy.baseBranch,
+        integrationBranch: `hanoon/${boundJob.id}`,
+        worktreeId: `env_${boundJob.id}`,
+        baseHeadSha: "1".repeat(40),
+        evidenceRefs: ["integrated:restart"],
+      });
 
-    await expect(service.create({
-      ...createInput({ kind: "executor", value: {
-        ownerId: "integrated-predecessor",
-        generation: predecessor.generation,
-      } }),
-      authority: versionedSystemAuthority("integrated-restart"),
-      now: NOW,
-    })).rejects.toThrow(/fence/u);
-    if (successorGeneration === null) throw new Error("provider did not transfer the executor lease");
+      const finding = {
+        rootCauseId: "integrated-restart",
+        capabilityId: "code-review",
+        ruleId: "INTEGRATED-RESTART",
+        severity: "high" as const,
+        subject: "src/integrated-restart.ts",
+        line: 1,
+        requirementId: null,
+        summary: "The restart path must preserve the fenced operation identity.",
+        evidenceRefs: ["integrated:review"],
+      };
+      const workerRun = (input: NavigatorTicketWorkerInput) => {
+        const { attempt, ticket: ticketSnapshot } = input;
+        const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        if (attempt.kind === "implementation") {
+          const headSha = attempt.ordinal === 1 ? "2".repeat(40) : "3".repeat(40);
+          return {
+            resource,
+            result: {
+              kind: "implementation_result" as const,
+              baseHeadSha: attempt.workOrder.baseHeadSha,
+              headSha,
+              summary: "Implemented the restart-safe flow.",
+              changedPaths: ["src/integrated-restart.ts"],
+              focusedVerification: [{ command: "npm test -- managed", outcome: "passed" as const }],
+              fullVerification: [{ command: "npm run check", outcome: "passed" as const }],
+              acceptanceCriteria: navigatorAcceptanceCriteria(ticketSnapshot).map(({ id }) => ({
+                criterionId: id,
+                outcome: "passed" as const,
+                evidenceRefs: [`integrated:acceptance:${id}`],
+              })),
+              capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
+                capabilityId,
+                outcome: "passed" as const,
+                evidenceRefs: [`integrated:worker:${attempt.id}`],
+              })),
+            },
+          };
+        }
+        const findings = attempt.workOrder.verificationOf === undefined && attempt.ordinal === 1
+          ? [finding]
+          : attempt.workOrder.verificationOf?.findings ?? [];
+        const hasFindings = findings.length > 0;
+        return {
+          resource,
+          result: {
+            kind: "code_review_result" as const,
+            reviewedHeadSha: attempt.workOrder.baseHeadSha,
+            outcome: hasFindings ? "findings" as const : "passed" as const,
+            summary: hasFindings ? "Confirmed the restart finding." : "The restart finding is resolved.",
+            axes: {
+              requirements: {
+                outcome: hasFindings ? "findings" as const : "passed" as const,
+                evidenceRefs: [`integrated:requirements:${attempt.id}`],
+              },
+              standards: { outcome: "passed" as const, evidenceRefs: [`integrated:standards:${attempt.id}`] },
+            },
+            findings,
+            capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
+              capabilityId,
+              outcome: hasFindings ? "findings" as const : "passed" as const,
+              evidenceRefs: [`integrated:review:${attempt.id}`],
+            })),
+          },
+        };
+      };
+      const ticketOperation: NavigatorTicketWorkerOperation = {
+        run: vi.fn(async (input) => workerRun(input)),
+        reconcile: vi.fn(async (input) => workerRun(input)),
+        observe: gitObserver.observe,
+      };
+      const releaseOperation = new NavigatorReleaseOperation({
+        publishPullRequest: (input) => implementationExecutor.publishPullRequest(input),
+        integrationWorktreeId: (jobId) => `env_${jobId}`,
+      });
+      const unusedNavigatorEffect = async (): Promise<NavigatorEffectOutcome> => ({
+        outcome: "permanent",
+        reason: "integrated restart does not invoke Navigator skills",
+      });
+      const navigatorProtocol = new NavigatorEffectProtocol({
+        store: composition.navigatorEffects,
+        clock: { now },
+        adapters: [
+          { kind: "run_navigator_skill", execute: unusedNavigatorEffect },
+          createNavigatorTicketEffectAdapter(ticketOperation),
+          createNavigatorReleaseEffectAdapter(releaseOperation),
+        ],
+      });
+      const planning = new NavigatorPlanningService({
+        persistence: composition.navigatorPlanning,
+        navigator: {
+          propose: async (snapshot) => ({
+            kind: "start_release" as const,
+            basedOn: snapshot.identity,
+            rationale: "The accepted exact-head ticket is ready for the guarded release entry.",
+            evidenceRefs: ["integrated:release"],
+            implementationTicketIds: [ticketId],
+          }),
+        },
+        observeInference: async () => ({
+          nativeToolCalls: [],
+          claimedCodeWorktreeId: null,
+          dynamicEffectToolIds: [],
+          externalStateDigest: "e".repeat(64),
+        }),
+        modelRoute: () => ({
+          pool: "standard" as const,
+          ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard,
+        }),
+        clock: { now },
+      });
 
-    const pending = repository.list("owner-7-controller").find((binding) => binding.sourceKey === createInput().sourceKey);
-    if (!pending?.lastOperationId) throw new Error("integrated automation operation was not reserved");
-    expect(pending).toMatchObject({ state: "pending", bbAutomationId: null });
-    expect(repository.getOperation(pending.lastOperationId)).toMatchObject({ state: "leased", attempts: 1 });
+      const integratedAuthority = {
+        ...versionedSystemAuthority("integrated-restart"),
+        projectId: policy.projectId,
+        hostId: "host_1",
+      };
+      const firstExecutorSignal = new AbortController();
+      const successorSignal = new AbortController();
+      let activeFence: EffectFence | null = null;
+      let successorGeneration: number | null = null;
+      const fake = fakeAdapter();
+      const originalProviderCreate = fake.adapter.create;
+      const providerCreate = vi.spyOn(fake.adapter, "create").mockImplementationOnce(async (input) => {
+        const created = await originalProviderCreate(input);
+        if (!activeFence) throw new Error("integrated provider call has no executor fence");
+        currentTime = 2_001;
+        expect(store.releaseExecutorLease(activeFence.ownerId, activeFence.generation, currentTime)).toBe(true);
+        const successor = store.acquireExecutorLease("integrated-successor", currentTime, 120_000);
+        if (!successor.acquired) throw new Error("missing integrated successor lease");
+        successorGeneration = successor.generation;
+        firstExecutorSignal.abort(new Error("integrated executor lease lost"));
+        const signal = input.signal;
+        await new Promise<void>((resolve) => {
+          if (!signal || signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return created;
+      });
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => true, { now });
+      const reconciler = new ManagedAutomationReconciler({
+        repository,
+        service,
+        store,
+        notify: vi.fn(),
+        clock: { now },
+      });
+      const pending = await service.create({
+        scope: { kind: "host", hostId: "host_1", cwd: null },
+        controllerKey: controller.controllerKey,
+        sourceKey: `integrated-restart:${job.id}`,
+        definition: {
+          ...definition,
+          projectId: policy.projectId,
+          name: "Integrated restart automation",
+        },
+        authority: integratedAuthority,
+        notificationPolicy: "silent",
+        deferProvider: true,
+        operation: {
+          version: 1,
+          operationClass: "create",
+          targetProjectId: policy.projectId,
+          targetHostId: "host_1",
+          definitionRevision: 1,
+        },
+        now: currentTime,
+        fence: {
+          kind: "executor",
+          value: {
+            ownerId: controllerFixture.fence.ownerId,
+            generation: controllerFixture.fence.generation,
+          },
+        },
+      });
+      if (!pending.lastOperationId) throw new Error("integrated automation operation was not reserved");
+      expect(pending).toMatchObject({ state: "pending", bbAutomationId: null });
+      expect(store.releaseExecutorLease(
+        controllerFixture.fence.ownerId,
+        controllerFixture.fence.generation,
+        currentTime,
+      )).toBe(true);
 
-    const reconciler = new ManagedAutomationReconciler({
-      repository,
-      service,
-      store,
-      notify: vi.fn(),
-      clock: { now: () => NOW + 120_001 },
-    });
-    const successorSignal = new AbortController().signal;
-    await reconciler.processDue(NOW + 120_001, successorSignal, {
-      ownerId: "integrated-successor",
-      generation: successorGeneration,
-      signal: successorSignal,
-    });
-    expect(repository.get(pending.id)).toMatchObject({
-      state: "active",
-      bbAutomationId: "auto_integrated",
-      lastOperationOutcome: "succeeded",
-    });
-    expect(repository.getOperation(pending.lastOperationId)).toMatchObject({ state: "succeeded" });
-    expect(fake.create).toHaveBeenCalledTimes(1);
+      const automations = {
+        processDue: async (dueAt: number, signal: AbortSignal | undefined, fence: EffectFence) => {
+          activeFence = fence;
+          return reconciler.processDue(dueAt, signal, fence);
+        },
+      };
+      await runJobExecutorService({
+        store,
+        clock: { now },
+        automations,
+        maxConcurrentJobs: () => null,
+        effectRunnerFactory: () => ({ run: async () => undefined }),
+        waitForWork: async () => undefined,
+        releaseOnShutdown: true,
+      }, firstExecutorSignal.signal);
 
-    expect(store.releaseExecutorLease("integrated-successor", successorGeneration, NOW + 120_002)).toBe(true);
-    let liveTime = NOW + 200_000;
-    const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store,
-      implementationPersistence: composition.navigatorImplementation,
-      evaluationPersistence: composition.navigatorEvaluation,
-      database: bb.storage.database(),
-      now: () => liveTime++,
-      sequence: fixtureNumber,
-    });
-    expect(liveRuns).toEqual(expect.arrayContaining([
-      expect.objectContaining({ scenario: "repair", terminalState: "cancelled" }),
-      expect.objectContaining({ scenario: "successful_rollback", terminalState: "cancelled" }),
-    ]));
+      expect(providerCreate).toHaveBeenCalledTimes(1);
+      expect(repository.getOperation(pending.lastOperationId)).toMatchObject({ state: "leased", attempts: 1 });
+      expect(repository.get(pending.id)).toMatchObject({ state: "pending", bbAutomationId: null });
+      if (successorGeneration === null) throw new Error("provider did not transfer the executor lease");
+      expect(store.releaseExecutorLease("integrated-successor", successorGeneration, 2_002)).toBe(true);
+      currentTime = 122_002;
 
-    const database = bb.storage.database();
-    expect(database.prepare(
-      `SELECT binding_id, operation_key, COUNT(*) AS count
-         FROM managed_automation_operations
-        GROUP BY binding_id, operation_key
-       HAVING COUNT(*) > 1`,
-    ).all()).toEqual([]);
-    expect(database.prepare(
-      `SELECT attempt_id, COUNT(*) AS count
-         FROM navigator_ticket_worker_outcomes
-        GROUP BY attempt_id
-       HAVING COUNT(*) > 1`,
-    ).all()).toEqual([]);
-    expect(database.prepare(
-      `SELECT attempt_id, COUNT(*) AS count
-         FROM navigator_release_outcomes
-        GROUP BY attempt_id
-       HAVING COUNT(*) > 1`,
-    ).all()).toEqual([]);
+      let navigatorStarted = false;
+      let repairScheduled = false;
+      let ticketClosed = false;
+      let releaseSettled = false;
+      const closeAcceptedTicket = (fence: EffectFence): void => {
+        const claim = store.getHeldWorkArtifactClaim(ticketId);
+        if (claim && !store.releaseWorkArtifactClaim({
+          claimId: claim.id,
+          ownerId: fence.ownerId,
+          generation: fence.generation,
+          reason: "accepted",
+          now: now(),
+        })) throw new Error("integrated ticket claim was not released");
+        const artifact = store.getWorkArtifact(ticketId);
+        const snapshot = store.getCurrentWorkArtifactSnapshot(ticketId);
+        if (!artifact || !snapshot) throw new Error("integrated ticket disappeared before closure");
+        const closed = store.observeWorkArtifact({
+          artifactId: ticketId,
+          expectedExternalRevision: artifact.externalRevision,
+          externalRevision: `${artifact.externalRevision}:closed`,
+          externalStatus: "closed",
+          assignees: [],
+          title: snapshot.title,
+          content: snapshot.content,
+          acceptanceCriteria: snapshot.acceptanceCriteria,
+          relationships: snapshot.relationships,
+          observedAt: now(),
+        });
+        const navigatorSnapshot = implementationExecutor.snapshot(job.id);
+        const review = [...navigatorSnapshot.attempts].reverse().find((attempt) =>
+          attempt.kind === "review" && attempt.workOrder.baseHeadSha === "3".repeat(40));
+        if (!review) throw new Error("integrated accepted review is missing");
+        const intent = store.authorizeWorkArtifactResolution({
+          artifactId: ticketId,
+          operationId: `integrated-resolution:${job.id}`,
+          outcome: "resolved",
+          snapshotId: review.workOrder.ticket.snapshotId,
+          expectedExternalRevision: closed.artifact.externalRevision,
+          evidenceRefs: [`navigator-result:${review.id}`],
+          now: now(),
+        });
+        if (!intent) throw new Error("integrated ticket resolution was not authorized");
+        if (!store.finalizeWorkArtifactResolution({
+          intentId: intent.id,
+          externalRevision: closed.artifact.externalRevision,
+          now: now(),
+        })) throw new Error("integrated ticket resolution was not finalized");
+        implementationExecutor.markTicketResolved({ jobId: job.id, ticketArtifactId: ticketId });
+      };
+      const navigatorRunner = {
+        processOne: async (fence: EffectFence, signal: AbortSignal): Promise<boolean> => {
+          const progressed = await navigatorProtocol.processOne(fence, signal);
+          const snapshot = implementationExecutor.snapshot(job.id);
+          if (!repairScheduled && snapshot.activeSlice?.state === "repair_pending") {
+            const repair = implementationExecutor.prepareRepairNavigation({
+              jobId: job.id,
+              ticketArtifactId: ticketId,
+              evidenceRefs: ["integrated:repair"],
+            });
+            const decision = implementationExecutor.recordRepairProposal({
+              snapshotId: repair.snapshotId,
+              rawProposal: {
+                kind: "implementation",
+                basedOn: { snapshotId: repair.snapshotId, digest: repair.digest },
+                objective: "Repair the confirmed restart finding.",
+                taskEvidence: ["behavioral-change"],
+                evidenceRefs: ["integrated:repair"],
+              },
+            });
+            if (decision.decision !== "accepted") throw new Error("integrated repair proposal was not accepted");
+            implementationExecutor.scheduleRepair({
+              jobId: job.id,
+              ticketArtifactId: ticketId,
+              proposalId: decision.proposalId,
+            });
+            repairScheduled = true;
+          }
+          if (!ticketClosed && snapshot.activeSlice?.state === "accepted") {
+            closeAcceptedTicket(fence);
+            const releaseDecision = await planning.proposeNext({
+              jobId: job.id,
+              externalStateDigest: "e".repeat(64),
+              evidenceRefs: ["integrated:release"],
+            });
+            if (releaseDecision.decision !== "accepted" || releaseDecision.effectIdempotencyKey === null) {
+              throw new Error(`integrated release proposal was ${releaseDecision.reasonCode}`);
+            }
+            ticketClosed = true;
+          }
+          const release = store.listEffectsForJob(job.id).find((effect) => effect.kind === "run_navigator_release");
+          if (!releaseSettled && release?.status === "done") {
+            releaseSettled = true;
+            successorSignal.abort(new Error("integrated restart flow complete"));
+          }
+          return progressed;
+        },
+      };
+
+      await runJobExecutorService({
+        store,
+        clock: { now },
+        automations,
+        navigatorEffects: navigatorRunner,
+        scheduler: new AutonomyScheduler(new AutonomyRepository(database), store),
+        maxConcurrentJobs: () => 1,
+        reconcileJob: async (_job, _signal, fence) => {
+          if (navigatorStarted) return;
+          const artifact = store.getWorkArtifact(ticketId);
+          const snapshot = store.getCurrentWorkArtifactSnapshot(ticketId);
+          if (!artifact || !snapshot) throw new Error("integrated ticket is unavailable to the executor");
+          store.observeWorkArtifact({
+            artifactId: ticketId,
+            expectedExternalRevision: artifact.externalRevision,
+            externalRevision: `${artifact.externalRevision}:claimed`,
+            externalStatus: "open",
+            assignees: ["integrated-worker"],
+            title: snapshot.title,
+            content: snapshot.content,
+            acceptanceCriteria: snapshot.acceptanceCriteria,
+            relationships: snapshot.relationships,
+            observedAt: now(),
+          });
+          const claim = store.claimWorkArtifact({
+            artifactId: ticketId,
+            workflowStepId: `integrated-claim:${ticketId}`,
+            jobId: job.id,
+            snapshotId: snapshot.id,
+            externalAssignee: "integrated-worker",
+            ownerId: fence.ownerId,
+            generation: fence.generation,
+            now: now(),
+            leaseMs: 30_000,
+          });
+          if (!claim) throw new Error("integrated ticket claim was not acquired");
+          implementationExecutor.beginClaimedTicket({
+            jobId: job.id,
+            ticketArtifactId: ticketId,
+            claimId: claim.id,
+            taskEvidence: ["behavioral-change"],
+            evidenceRefs: ["integrated:claim"],
+            ownerId: fence.ownerId,
+            generation: fence.generation,
+          });
+          navigatorStarted = true;
+        },
+        effectRunnerFactory: () => ({ run: async () => undefined }),
+        waitForWork: async () => undefined,
+        releaseOnShutdown: true,
+      }, successorSignal.signal);
+
+      const finalNavigator = implementationExecutor.snapshot(job.id);
+      expect(repository.get(pending.id)).toMatchObject({
+        state: "active",
+        bbAutomationId: "auto_1",
+        lastOperationOutcome: "succeeded",
+      });
+      expect(repository.getOperation(pending.lastOperationId)).toMatchObject({ state: "succeeded" });
+      expect(providerCreate).toHaveBeenCalledTimes(1);
+      expect(finalNavigator.integration).toMatchObject({
+        state: "ready_for_release",
+        currentHeadSha: "3".repeat(40),
+        pullRequestNumber: 65,
+        pullRequestUrl: "https://github.com/acme/cyndra/pull/65",
+      });
+      expect(finalNavigator.findingLedger).toEqual([
+        expect.objectContaining({ rootCauseId: "integrated-restart", state: "resolved" }),
+      ]);
+      expect(finalNavigator.outcomes.map((outcome) => outcome.outcome).sort()).toEqual([
+        "succeeded",
+        "findings",
+        "findings",
+        "succeeded",
+        "succeeded",
+      ].sort());
+      expect(publishPullRequest).toHaveBeenCalledTimes(1);
+      expect(database.prepare(
+        `SELECT binding_id, operation_key, COUNT(*) AS count
+           FROM managed_automation_operations
+          GROUP BY binding_id, operation_key
+         HAVING COUNT(*) > 1`,
+      ).all()).toEqual([]);
+      expect(database.prepare(
+        `SELECT attempt_id, COUNT(*) AS count
+           FROM navigator_ticket_worker_outcomes
+          GROUP BY attempt_id
+         HAVING COUNT(*) > 1`,
+      ).all()).toEqual([]);
+      expect(database.prepare(
+        `SELECT attempt_id, COUNT(*) AS count
+           FROM navigator_release_outcomes
+          GROUP BY attempt_id
+         HAVING COUNT(*) > 1`,
+      ).all()).toEqual([]);
+    } finally {
+      await controllerFixture.dispose();
+    }
   });
 
   it("keeps run evidence append-only and de-duplicates a repeated observation", async () => {
@@ -1157,7 +1623,7 @@ describe("managed BB automations", () => {
       fence: { kind: "executor", value: { ownerId: "retirement-successor", generation: successorGeneration } },
     });
     expect(service.get(binding.id)?.state).toBe("retired");
-    expect(fake.adapter.delete).toHaveBeenCalledTimes(2);
+    expect(fake.adapter.delete).toHaveBeenCalledTimes(1);
   });
 
   it("reconciles an interrupted governed definition update from durable intent", async () => {
@@ -1202,7 +1668,106 @@ describe("managed BB automations", () => {
       fence: { kind: "executor", value: { ownerId: "update-successor", generation: successorGeneration } },
     });
     expect(service.get(binding.id)).toMatchObject({ state: "active", name: updatedDefinition.name });
-    expect(fake.adapter.update).toHaveBeenCalledTimes(2);
+    expect(fake.adapter.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles an ambiguous enable and disable without repeating the provider action", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    const originalSetEnabled = fake.adapter.setEnabled;
+    let failedAfterDisable = true;
+    vi.spyOn(fake.adapter, "setEnabled").mockImplementation(async (input) => {
+      const observed = await originalSetEnabled(input);
+      if (failedAfterDisable && input.enabled === false) {
+        failedAfterDisable = false;
+        throw new Error("provider reply lost after disable");
+      }
+      return observed;
+    });
+    await expect(service.setEnabled({
+      id: binding.id,
+      scope: SCOPE,
+      enabled: false,
+      now: NOW + 1,
+      fence: EXECUTOR_FENCE,
+    })).rejects.toThrow("provider reply lost after disable");
+    await service.reconcile({
+      binding: service.get(binding.id)!,
+      scope: SCOPE,
+      now: NOW + 60_002,
+      fence: EXECUTOR_FENCE,
+    });
+
+    let failedAfterEnable = true;
+    vi.mocked(fake.adapter.setEnabled).mockImplementation(async (input) => {
+      const observed = await originalSetEnabled(input);
+      if (failedAfterEnable && input.enabled === true) {
+        failedAfterEnable = false;
+        throw new Error("provider reply lost after enable");
+      }
+      return observed;
+    });
+    await expect(service.setEnabled({
+      id: binding.id,
+      scope: SCOPE,
+      enabled: true,
+      now: NOW + 3,
+      fence: EXECUTOR_FENCE,
+    })).rejects.toThrow("provider reply lost after enable");
+    await service.reconcile({
+      binding: service.get(binding.id)!,
+      scope: SCOPE,
+      now: NOW + 120_004,
+      fence: EXECUTOR_FENCE,
+    });
+
+    expect(fake.adapter.setEnabled).toHaveBeenCalledTimes(2);
+    expect(service.get(binding.id)).toMatchObject({ state: "active", observed: { enabled: true } });
+  });
+
+  it("reconciles an ambiguous run-now from provider run history before retrying", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    const originalRunNow = fake.adapter.runNow;
+    const originalShow = fake.adapter.show;
+    let lostReadback = true;
+    vi.spyOn(fake.adapter, "runNow").mockImplementation(async (input) => {
+      const run = await originalRunNow(input);
+      fake.runs.set(input.automationId, [run]);
+      return run;
+    });
+    vi.spyOn(fake.adapter, "show").mockImplementation(async (input) => {
+      const observed = await originalShow(input);
+      if (lostReadback) {
+        lostReadback = false;
+        throw new Error("provider run read-back lost");
+      }
+      return observed;
+    });
+
+    await expect(service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "ambiguous-run-now",
+      now: NOW + 1,
+      fence: EXECUTOR_FENCE,
+    })).rejects.toThrow("provider run read-back lost");
+    const recovered = await service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "ambiguous-run-now",
+      now: NOW + 2,
+      fence: EXECUTOR_FENCE,
+    });
+
+    expect(recovered).toMatchObject({ id: "run_1", idempotencyKey: expect.stringContaining("idempotency:") });
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
+    expect(fake.adapter.runs).toHaveBeenCalledTimes(1);
   });
 
   it("routes update, enablement, run-now, and retirement through one durable operation contract", async () => {
@@ -1280,6 +1845,123 @@ describe("managed BB automations", () => {
     expect(bb.storage.database().prepare(
       "SELECT COUNT(*) AS count FROM managed_automation_run_evidence WHERE binding_id = ?",
     ).get(binding.id)).toEqual({ count: 1 });
+  });
+
+  it("returns the exact run-now receipt after another run and a definition revision", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    const first = await service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "run-now-a",
+      now: NOW + 1,
+      fence: EXECUTOR_FENCE,
+    });
+    const second = await service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "run-now-b",
+      now: NOW + 2,
+      fence: EXECUTOR_FENCE,
+    });
+    const replayBeforeRevision = await service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "run-now-a",
+      now: NOW + 3,
+      fence: EXECUTOR_FENCE,
+    });
+    await service.update({
+      id: binding.id,
+      scope: SCOPE,
+      definition: { ...definition, prompt: "The revised scheduled prompt." },
+      now: NOW + 4,
+      fence: EXECUTOR_FENCE,
+    });
+    const replayAfterRevision = await service.runNow({
+      id: binding.id,
+      scope: SCOPE,
+      idempotencyKey: "run-now-a",
+      now: NOW + 5,
+      fence: EXECUTOR_FENCE,
+    });
+
+    expect(first?.id).toBe("run_1");
+    expect(second?.id).toBe("run_2");
+    expect(replayBeforeRevision?.id).toBe("run_1");
+    expect(replayAfterRevision?.id).toBe("run_1");
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires explicit target-scoped recursion evidence for automation-triggered mutations", async () => {
+    const { repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const parent = await service.create(createInput({
+      kind: "executor",
+      value: { ownerId: EXECUTOR_FENCE.value.ownerId, generation: EXECUTOR_FENCE.value.generation },
+    }));
+    const child = await service.create({
+      ...createInput(),
+      sourceKey: "owner-schedule:recursive-child",
+    });
+    const parentRun = await service.runNow({
+      id: parent.id,
+      scope: SCOPE,
+      idempotencyKey: "recursive-parent-run",
+      now: NOW + 1,
+      fence: EXECUTOR_FENCE,
+    });
+    expect(parentRun?.status).toBe("succeeded");
+    const parentOperationId = repository.get(parent.id)?.lastOperationId ?? null;
+    if (!parentOperationId) throw new Error("parent run operation was not recorded");
+    const childBefore = repository.get(child.id)!;
+
+    expect(() => service.intentAdapters.automationTriggered.submit({
+      id: child.id,
+      operationClass: "run_now",
+      parentOperationId,
+      rootAutomationId: child.id,
+      now: NOW + 2,
+      fence: EXECUTOR_FENCE,
+    })).toThrow(/lineage|recursive|cycle/i);
+    expect(repository.get(child.id)?.lastOperationId).toBe(childBefore.lastOperationId);
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
+
+    const submitted = service.intentAdapters.automationTriggered.submit({
+      id: child.id,
+      operationClass: "run_now",
+      parentOperationId,
+      rootAutomationId: "automation-root",
+      now: NOW + 3,
+      fence: EXECUTOR_FENCE,
+    });
+    const operation = repository.getOperation(submitted.lastOperationId!);
+    expect(operation).toMatchObject({
+      state: "pending",
+      targetProjectId: child.projectId,
+      targetHostId: "host_owner",
+      authority: {
+        origin: "automation-triggered",
+        taskAuthority: { automationId: parent.id, operationId: parentOperationId },
+        recursion: { rootAutomationId: "automation-root", parentAutomationId: parent.id, depth: 1 },
+        operationScope: {
+          operationClass: "run_now",
+          targetProjectId: child.projectId,
+          targetHostId: "host_owner",
+        },
+        capabilityEvidence: {
+          evidenceRefs: expect.arrayContaining([
+            `automation-parent-operation:${parentOperationId}`,
+            expect.stringMatching(/^automation-parent-run:/u),
+          ]),
+        },
+      },
+    });
+    expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
   });
 
   it("rolls back a binding advance when its operation insert faults and never settles work without run evidence", async () => {

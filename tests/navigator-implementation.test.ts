@@ -83,6 +83,7 @@ let fixtureSequence = 0;
 
 type Fixture = Readonly<{
   store: TelegramAgentStore;
+  navigatorEffects: import("../src/navigator/effect-persistence").NavigatorEffectPersistence;
   implementationPersistence: import("../src/navigator/implementation-persistence").NavigatorImplementationPersistence;
   findingLedger: NavigatorFindingLedger;
   database: Database.Database;
@@ -298,6 +299,7 @@ function fixture(
 
   return {
     store,
+    navigatorEffects: composition.navigatorEffects,
     implementationPersistence: composition.navigatorImplementation,
     findingLedger: composition.findingLedger,
     database: bb.storage.database(),
@@ -597,7 +599,7 @@ function ticketProtocol(
 ): NavigatorEffectProtocol {
   const unused = async () => ({ outcome: "permanent" as const, reason: "unused in this test" });
   return new NavigatorEffectProtocol({
-    store: value.store,
+    store: value.navigatorEffects,
     clock: { now },
     leaseMs,
     adapters: [
@@ -1720,7 +1722,7 @@ describe("navigator ticket integration executor", () => {
       observe: gitObserver.observe,
     };
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: value.now },
       adapters: [
         {
@@ -1787,7 +1789,7 @@ describe("navigator ticket integration executor", () => {
     if (!effect) throw new Error("navigator ticket worker effect was not stored");
 
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: value.now },
       adapters: [
         {
@@ -1837,7 +1839,7 @@ describe("navigator ticket integration executor", () => {
       observe: gitObserver.observe,
     };
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => now.value },
       leaseMs: 30,
       adapters: [
@@ -2147,7 +2149,7 @@ describe("navigator ticket integration executor", () => {
       observe: gitObserver.observe,
     };
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => 1_110 },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -2228,7 +2230,7 @@ describe("navigator ticket integration executor", () => {
       receipt: undefined as never,
     }));
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => 1_110 },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -2288,7 +2290,7 @@ describe("navigator ticket integration executor", () => {
       };
     });
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => now },
       leaseMs: 30,
       adapters: [
@@ -2332,7 +2334,7 @@ describe("navigator ticket integration executor", () => {
        BEGIN SELECT RAISE(ABORT, 'ticket settlement fault'); END`,
     );
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => 1_110 },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -2500,7 +2502,7 @@ describe("navigator ticket integration executor", () => {
     const execute = vi.fn(async () => ({ outcome: "ambiguous" as const, reason: "worker receipt was lost" }));
     const reconcile = vi.fn(async (context: NavigatorEffectContext) => completedTicketReceipt(context));
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => 1_110 },
       adapters: [
         { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
@@ -2529,7 +2531,7 @@ describe("navigator ticket integration executor", () => {
     configureTicketClaimCase(value, prepared.effect, prepared.claimId, claimCase, now);
     const execute = vi.fn(async (context: NavigatorEffectContext) => completedTicketReceipt(context));
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => now },
       leaseMs: 30,
       adapters: [

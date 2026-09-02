@@ -312,12 +312,9 @@ import {
   NavigatorImplementationRepository,
   type NavigatorImplementationPersistence,
 } from "../navigator/implementation-persistence";
-import type {
-  NavigatorEffectPersistence,
-  NavigatorReleasePersistence,
-} from "../navigator/effect-persistence";
+import type { NavigatorEffectPersistence } from "../navigator/effect-persistence";
 import type { NavigatorImplementationReadStore } from "../navigator/implementation-executor";
-import type { NavigatorWorkflowPersistence } from "../navigator/executor";
+import type { NavigatorPlanningPersistence } from "../navigator/planning-service";
 import {
   createNavigatorEvaluationPersistence,
   type NavigatorEvaluationPersistence,
@@ -348,7 +345,6 @@ import type {
   WorkflowMode,
 } from "../navigator/models";
 import {
-  NAVIGATOR_RELEASE_STATES,
   type NavigatorReleaseAttempt,
   type NavigatorReleaseIncidentPhase,
   type NavigatorReleaseRollbackOutcome,
@@ -357,13 +353,11 @@ import type {
   NavigatorCapabilityAssignment,
   NavigatorCapabilityEvidence,
   NavigatorCapabilityOperation,
-  NavigatorReleaseReceipt,
   NavigatorTicketAttemptContext,
   NavigatorTicketSettlementInput,
   NavigatorTicketWorkerResourceBindingInput,
   NavigatorSkillReceipt,
 } from "../navigator/effect-contracts";
-import { navigatorReleaseReceiptSchema } from "../navigator/effect-contracts";
 
 /**
  * A tapped controller button. `replayed` is a Telegram redelivery of a callback
@@ -894,26 +888,6 @@ export type ExecutorEventInput = ExecutorFence & Readonly<{
   event: JobEvent;
   nativeAdapter?: NativeAdapterTransitionEnvelope;
 }>;
-
-export type NavigatorReleaseEffectSettlementInput = ExecutorFence & Readonly<{
-  effectIdempotencyKey: string;
-  number: number;
-  url: string;
-  environmentId: string;
-  receipt?: NavigatorReleaseReceipt;
-}>;
-
-function navigatorReleaseStartedEvent(
-  input: NavigatorReleaseEffectSettlementInput,
-  url: string,
-): Extract<JobEvent, { type: "RELEASE_STARTED" }> {
-  return {
-    type: "RELEASE_STARTED",
-    number: input.number,
-    url,
-    environmentId: input.environmentId,
-  };
-}
 
 export type ExecutorAttemptInput = ExecutorFence & Readonly<{
   id: string;
@@ -1531,23 +1505,6 @@ type WorkerRecoveryRow = {
   updated_at: number;
   resolved_at: number | null;
 };
-type NavigatorReleaseReviewFinding = Readonly<{
-  sourceAttemptId: string;
-  fingerprint: string;
-  capabilityId: string;
-  ruleId: string;
-  disposition: "must_fix" | "advisory";
-  findingJson: string;
-}>;
-type NavigatorReleaseReviewFindingRow = Readonly<{
-  fingerprint: string;
-  capability_id: string;
-  rule_id: string;
-  disposition: "must_fix" | "advisory";
-  event: "opened" | "reobserved" | "resolved";
-  finding_json: string;
-  occurrence: number;
-}>;
 type TelegramUpdateRow = {
   status: "processing" | "processed" | "failed";
   claim_owner: string | null;
@@ -4104,25 +4061,6 @@ export interface TelegramAgentStore {
   }): NavigatorPlanningResultRecord | null;
   getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null;
   getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null;
-  leaseNavigatorEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null;
-  settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean;
-  leaseNavigatorSkillEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null;
-  leaseNavigatorReleaseEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null;
   getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null;
   recordNavigatorReleaseIncident(input: {
     jobId: string;
@@ -4139,27 +4077,6 @@ export interface TelegramAgentStore {
     rollbackOutcome?: NavigatorReleaseRollbackOutcome;
   }): number;
   recordExecutorProductionRecoveryObservation(input: PolicyBoundaryObservationInput): boolean;
-  bindNavigatorSkillAttemptResource(input: {
-    attemptId: string;
-    effectIdempotencyKey: string;
-    resource: { kind: "bb_thread"; id: string };
-    ownerId: string;
-    generation: number;
-    now: number;
-  }): boolean;
-  settleNavigatorSkillAttempt(input: {
-    attemptId: string;
-    effectIdempotencyKey: string;
-    observedExternalStateDigest: string;
-    result: unknown;
-    receipt?: NavigatorSkillReceipt;
-    publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
-    reconciledArtifactIds?: readonly string[];
-    policyFailureReason?: string;
-    ownerId: string;
-    generation: number;
-    now: number;
-  }): NavigatorWorkflowStepOutcome | null;
   setJobStatusMessage(jobId: string, messageId: number, expectedVersion: number, now: number): Job;
   enqueueSteeringEffect(
     jobId: string,
@@ -12826,164 +12743,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.getRoutingDecision(decisionDigest);
   }
 
-  public leaseNavigatorEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null {
-    return this.navigatorRepository.leaseEffect(input);
-  }
-
-  public settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean {
-    this.assertExecutorFence(input);
-    if (!input.effectIdempotencyKey) throw new TypeError("navigator release effect identity is required");
-    if (!Number.isSafeInteger(input.number) || input.number < 1) throw new TypeError("release pull request number is invalid");
-    const url = assertSafeExternalHttpsUrl(input.url, "navigator release pull request URL");
-    if (!input.environmentId) throw new TypeError("navigator release environment identity is required");
-    const parsedReceipt = navigatorReleaseReceiptSchema.safeParse(input.receipt);
-    if (!parsedReceipt.success) return false;
-    const receipt = parsedReceipt.data;
-    const settle = this.db.transaction((): boolean => {
-      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
-      const effectRow = this.effectByKey(input.effectIdempotencyKey);
-      if (!effectRow || !this.navigatorReleaseEffectIsCurrent(effectRow, input)) return false;
-      if (!this.releaseReceiptMatches(receipt, effectRow, input, url)) return false;
-      const current = this.readJobById(effectRow.job_id);
-      if (!current || current.cancelRequestedAt !== null || current.state === "cancelled") return false;
-      if (current.state === "implementing" && !this.applyNavigatorReleaseStart(current, input, url)) return false;
-      this.recordNavigatorReleaseReceipt(receipt, effectRow.job_id, input);
-      const completed = this.completeNavigatorReleaseEffect(effectRow, input);
-      if (!completed) throw new Error("navigator release effect lease changed before receipt settlement");
-      return completed;
-    });
-    return settle.immediate();
-  }
-
-  private releaseReceiptMatches(
-    receipt: NavigatorReleaseReceipt,
-    effectRow: EffectRow,
-    input: NavigatorReleaseEffectSettlementInput,
-    url: string,
-  ): boolean {
-    const effect = parseEffect(effectRow);
-    const attemptId = typeof effect.payload.attemptId === "string" ? effect.payload.attemptId : null;
-    return receipt.effectIdempotencyKey === input.effectIdempotencyKey && receipt.attemptId === attemptId &&
-      receipt.number === input.number && receipt.url === url && receipt.environmentId === input.environmentId &&
-      receipt.resource.id === input.environmentId;
-  }
-
-  private recordNavigatorReleaseReceipt(
-    receipt: NavigatorReleaseReceipt,
-    jobId: string,
-    input: NavigatorReleaseEffectSettlementInput,
-  ): void {
-    const receiptJson = JSON.stringify(receipt);
-    this.db.prepare(
-      `INSERT INTO navigator_effect_receipts (
-         effect_idempotency_key, job_id, kind, receipt_json, receipt_digest,
-         owner_id, generation, recorded_at
-       ) VALUES (?, ?, 'run_navigator_release', ?, ?, ?, ?, ?)`,
-    ).run(
-      receipt.effectIdempotencyKey,
-      jobId,
-      receiptJson,
-      createHash("sha256").update(receiptJson, "utf8").digest("hex"),
-      input.ownerId,
-      input.generation,
-      input.now,
-    );
-  }
-
-  private navigatorReleaseEffectIsCurrent(
-    effect: EffectRow,
-    input: NavigatorReleaseEffectSettlementInput,
-  ): boolean {
-    if (effect.kind !== "run_navigator_release" ||
-      !this.effectLeaseIsActiveForRow(effect, input.ownerId, input.generation, input.now)) return false;
-    return (["commit", "push", "pull_request"] as const).every((authorityEffect) =>
-      this.taskAuthorityRepository.effectAdmissionIsCurrent(
-        effect.job_id,
-        input.effectIdempotencyKey,
-        authorityEffect,
-      ));
-  }
-
-  private applyNavigatorReleaseStart(
-    current: Job,
-    input: NavigatorReleaseEffectSettlementInput,
-    url: string,
-  ): boolean {
-    const event = navigatorReleaseStartedEvent(input, url);
-    const evidenceGate = this.executorEvidenceGate(current, event);
-    if (!evidenceGate.valid) return false;
-    const transitioned = transition(current, event, input.now);
-    this.persistNavigatorReleaseStart({ current, input, transitioned, event, evidenceGate });
-    return true;
-  }
-
-  private persistNavigatorReleaseStart(input: Readonly<{
-    current: Job;
-    input: NavigatorReleaseEffectSettlementInput;
-    transitioned: ReturnType<typeof transition>;
-    event: JobEvent;
-    evidenceGate: { valid: boolean; completeReviewAttemptIds: readonly string[] };
-  }>): void {
-    const { current, input: settlement, transitioned, event, evidenceGate } = input;
-    persistJobTransition(this.db, current.id, current.version, transitioned.job);
-    persistPendingEffects(this.db, transitioned.effects, settlement.now);
-    this.settleNavigatorReleaseReturn({
-      previous: current,
-      next: transitioned.job,
-      event,
-      now: settlement.now,
-      reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
-    });
-    this.enqueueFinishNoteInTransaction(current, transitioned.job, settlement.now);
-    this.markAdmissionDrainingForTerminal(transitioned.job, settlement.now);
-  }
-
-  private completeNavigatorReleaseEffect(
-    effect: EffectRow,
-    input: NavigatorReleaseEffectSettlementInput,
-  ): boolean {
-    return this.db.prepare(
-      `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
-          lease_expires_at = NULL, last_error = NULL, updated_at = ?
-        WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
-          AND lease_generation = ? AND lease_expires_at > ?
-          AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
-            AND generation = ? AND lease_expires_at > ?)`,
-    ).run(
-      input.now,
-      effect.idempotency_key,
-      input.ownerId,
-      input.generation,
-      input.now,
-      input.ownerId,
-      input.generation,
-      input.now,
-    ).changes === 1;
-  }
-
-  public leaseNavigatorSkillEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null {
-    return this.navigatorRepository.leaseSkillEffect(input);
-  }
-
-  public leaseNavigatorReleaseEffect(input: {
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): StoredEffect | null {
-    return this.navigatorRepository.leaseReleaseEffect(input);
-  }
-
   public getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null {
     return this.navigatorRepository.getReleaseAttempt(id);
   }
@@ -13033,33 +12792,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           WHERE job_id = ? AND phase = ? AND failure_signature = ? AND rollback_outcome = ?`,
       ).get(input.jobId, input.phase, input.failureSignature, input.rollbackOutcome) as { count: number };
     return row.count;
-  }
-
-  public bindNavigatorSkillAttemptResource(input: {
-    attemptId: string;
-    effectIdempotencyKey: string;
-    resource: { kind: "bb_thread"; id: string };
-    ownerId: string;
-    generation: number;
-    now: number;
-  }): boolean {
-    return this.navigatorRepository.bindAttemptResource(input);
-  }
-
-  public settleNavigatorSkillAttempt(input: {
-    attemptId: string;
-    effectIdempotencyKey: string;
-    observedExternalStateDigest: string;
-    result: unknown;
-    receipt?: NavigatorSkillReceipt;
-    publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
-    reconciledArtifactIds?: readonly string[];
-    policyFailureReason?: string;
-    ownerId: string;
-    generation: number;
-    now: number;
-  }): NavigatorWorkflowStepOutcome | null {
-    return this.navigatorRepository.settleAttempt(input);
   }
 
   public setJobStatusMessage(
@@ -13938,7 +13670,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const transitioned = transition(current, event, now);
       persistJobTransition(this.db, jobId, expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, now);
-      this.settleNavigatorReleaseReturn({
+      this.navigatorRepository.recordNavigatorReleaseTransition({
         previous: current,
         next: transitioned.job,
         event,
@@ -14015,7 +13747,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (terminalProductionState && productionClaimId === null) return null;
       persistJobTransition(this.db, input.jobId, input.expectedVersion, transitioned.job);
       persistPendingEffects(this.db, transitioned.effects, input.now);
-      this.settleNavigatorReleaseReturn({
+      this.navigatorRepository.recordNavigatorReleaseTransition({
         previous: current,
         next: transitioned.job,
         event: input.event,
@@ -17876,223 +17608,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.autonomyRepository.markDrainingInTransaction(job.id, now);
   }
 
-  private settleNavigatorReleaseReturn(input: Readonly<{
-    previous: Job;
-    next: Job;
-    event: JobEvent;
-    now: number;
-    reviewAttemptIds: readonly string[];
-  }>): void {
-    if (input.previous.workflowEngine !== "navigator-v1") return;
-    if (!(NAVIGATOR_RELEASE_STATES as readonly string[]).includes(input.previous.state)) return;
-    this.recordNavigatorReleaseReviewFindings(
-      input.previous,
-      input.event,
-      input.reviewAttemptIds,
-      input.now,
-    );
-    const returnedToNavigation = input.next.state === "implementing";
-    const releaseFinished = input.next.state === "complete" ||
-      input.next.state === "merged" || input.next.state === "production_failed";
-    if (!returnedToNavigation && !releaseFinished) return;
-    this.db.prepare(
-      `UPDATE jobs SET current_workflow_step_id = NULL, workflow_revision = workflow_revision + 1
-        WHERE id = ?`,
-    ).run(input.next.id);
-    input.next.currentWorkflowStepId = null;
-    input.next.workflowRevision += 1;
-    if (!returnedToNavigation) return;
-    const reasonCode = input.event.type === "VALIDATION_FAILED"
-      ? "validation_failed"
-      : input.event.type === "REVIEW_CHANGES_REQUESTED"
-        ? "review_changes_requested"
-        : input.event.type === "REVIEW_PASSED"
-          ? "documentation_required"
-          : input.event.type === "PRODUCTION_INCIDENT_RECOVERED"
-            ? "production_incident_recovered"
-            : "release_findings";
-    this.db.prepare(
-      `INSERT INTO navigator_release_findings (
-         job_id, workflow_step_id, reason_code, previous_state, recorded_at
-       ) VALUES (?, ?, ?, ?, ?)`,
-    ).run(
-      input.next.id,
-      input.previous.currentWorkflowStepId,
-      reasonCode,
-      input.previous.state,
-      input.now,
-    );
-    if (input.event.type !== "PRODUCTION_INCIDENT_RECOVERED") return;
-    const owner = this.getOwner();
-    if (owner === null) return;
-    const phase = input.event.phase === "canary" ? "canary" : "deploy";
-    const text = phase === "canary"
-      ? "Production canary failed. The configured rollback restored the previous release. No action is required."
-      : "Production deploy failed. The configured rollback restored the previous release. No action is required.";
-    const item: OutboxInput = {
-      logicalKey: `job:${input.next.id}:production-incident:${phase}`,
-      chatId: owner.chatId,
-      payload: { text, disable_web_page_preview: true },
-    };
-    const payloadJson = serializeOutbox(item, input.now);
-    this.db.prepare(
-      `INSERT OR IGNORE INTO outbox (
-         logical_key, chat_id, message_id, payload_json, status, attempts,
-         next_attempt_at, created_at, updated_at
-       ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)`,
-    ).run(item.logicalKey, item.chatId, payloadJson, input.now, input.now, input.now);
-  }
-
-  private recordNavigatorReleaseReviewFindings(
-    job: Job,
-    event: JobEvent,
-    reviewAttemptIds: readonly string[],
-    now: number,
-  ): void {
-    if (job.state !== "final_reviewing" ||
-      (event.type !== "REVIEW_CHANGES_REQUESTED" && event.type !== "REVIEW_PASSED")) return;
-    if (!job.prHeadSha || reviewAttemptIds.length === 0) {
-      throw new Error("final review convergence evidence is unavailable");
-    }
-    const observed = this.normalizedReleaseReviewFindings(job, reviewAttemptIds);
-    if (event.type === "REVIEW_CHANGES_REQUESTED" && observed.size === 0) {
-      throw new Error("final review requested changes without normalized findings");
-    }
-    const currentRows = this.currentReleaseReviewFindingRows(job.id);
-    const current = new Map(currentRows.map((row) => [row.fingerprint, row]));
-    const blockingBurden = [...observed.values()].filter((finding) => finding.disposition === "must_fix").length;
-    for (const finding of observed.values()) {
-      const prior = current.get(finding.fingerprint);
-      this.appendReleaseReviewFindingEvent({
-        job,
-        sourceAttemptId: finding.sourceAttemptId,
-        fingerprint: finding.fingerprint,
-        capabilityId: finding.capabilityId,
-        ruleId: finding.ruleId,
-        disposition: finding.disposition,
-        event: prior?.event === "opened" || prior?.event === "reobserved" ? "reobserved" : "opened",
-        findingJson: finding.findingJson,
-        occurrence: Math.min(3, (prior?.occurrence ?? 0) + 1),
-        blockingBurden,
-        now,
-      });
-    }
-    this.resolveClosedReleaseReviewFindings({
-      job,
-      currentRows,
-      observed,
-      sourceAttemptId: reviewAttemptIds[0]!,
-      blockingBurden,
-      now,
-    });
-  }
-
-  private normalizedReleaseReviewFindings(
-    job: Job,
-    reviewAttemptIds: readonly string[],
-  ): Map<string, NavigatorReleaseReviewFinding> {
-    const observed = new Map<string, NavigatorReleaseReviewFinding>();
-    for (const attemptId of reviewAttemptIds) {
-      const attempt = this.getAttempt(attemptId);
-      if (!attempt || attempt.jobId !== job.id || attempt.reviewStage !== "final_review" ||
-        attempt.headSha !== job.prHeadSha || attempt.resultJson === null) {
-        throw new Error("final review convergence attempt is invalid");
-      }
-      const raw = JSON.parse(attempt.resultJson) as Record<string, unknown>;
-      const envelope = guardResultEnvelopeSchema.safeParse(raw.guardEnvelope);
-      const policy = guardAssessmentPolicySchema.safeParse(raw.guardPolicy);
-      if (!envelope.success || !policy.success) continue;
-      const assessment = assessGuardEnvelope(envelope.data, policy.data);
-      if (assessment.outcome === "blocked") throw new Error("final review guard assessment is blocked");
-      for (const finding of assessment.findings) {
-        if (observed.has(finding.fingerprint)) continue;
-        observed.set(finding.fingerprint, {
-          sourceAttemptId: attempt.id,
-          fingerprint: finding.fingerprint,
-          capabilityId: finding.capabilityId,
-          ruleId: finding.ruleId,
-          disposition: finding.disposition,
-          findingJson: JSON.stringify(finding),
-        });
-      }
-    }
-    return observed;
-  }
-
-  private currentReleaseReviewFindingRows(jobId: string): NavigatorReleaseReviewFindingRow[] {
-    return this.db.prepare(
-      `SELECT finding.* FROM navigator_release_review_finding_events AS finding
-        WHERE finding.job_id = ? AND finding.sequence = (
-          SELECT MAX(latest.sequence) FROM navigator_release_review_finding_events AS latest
-           WHERE latest.job_id = finding.job_id AND latest.fingerprint = finding.fingerprint
-        )`,
-    ).all(jobId) as NavigatorReleaseReviewFindingRow[];
-  }
-
-  private appendReleaseReviewFindingEvent(input: Readonly<{
-    job: Job;
-    sourceAttemptId: string;
-    fingerprint: string;
-    capabilityId: string;
-    ruleId: string;
-    disposition: "must_fix" | "advisory";
-    event: "opened" | "reobserved" | "resolved";
-    findingJson: string;
-    occurrence: number;
-    blockingBurden: number;
-    now: number;
-  }>): void {
-    this.db.prepare(
-      `INSERT INTO navigator_release_review_finding_events (
-         job_id, workflow_step_id, source_review_attempt_id, fingerprint,
-         capability_id, rule_id, disposition, event, head_sha, finding_json,
-         evidence_refs_json, occurrence, blocking_burden, recorded_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      input.job.id,
-      input.job.currentWorkflowStepId,
-      input.sourceAttemptId,
-      input.fingerprint,
-      input.capabilityId,
-      input.ruleId,
-      input.disposition,
-      input.event,
-      input.job.prHeadSha,
-      input.findingJson,
-      JSON.stringify([`review-attempt:${input.sourceAttemptId}`, `guard-finding:${input.fingerprint}`]),
-      input.occurrence,
-      input.blockingBurden,
-      input.now,
-    );
-  }
-
-  private resolveClosedReleaseReviewFindings(input: Readonly<{
-    job: Job;
-    currentRows: readonly NavigatorReleaseReviewFindingRow[];
-    observed: ReadonlyMap<string, NavigatorReleaseReviewFinding>;
-    sourceAttemptId: string;
-    blockingBurden: number;
-    now: number;
-  }>): void {
-    for (const prior of input.currentRows) {
-      const open = prior.event === "opened" || prior.event === "reobserved";
-      if (!open || input.observed.has(prior.fingerprint)) continue;
-      this.appendReleaseReviewFindingEvent({
-        job: input.job,
-        sourceAttemptId: input.sourceAttemptId,
-        fingerprint: prior.fingerprint,
-        capabilityId: prior.capability_id,
-        ruleId: prior.rule_id,
-        disposition: prior.disposition,
-        event: "resolved",
-        findingJson: prior.finding_json,
-        occurrence: prior.occurrence,
-        blockingBurden: input.blockingBurden,
-        now: input.now,
-      });
-    }
-  }
-
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {
     // A project that deploys nothing finishes at `merged` and never reaches
     // `complete`, so the owner is told there instead of not at all.
@@ -19081,38 +18596,42 @@ export type StoreComposition = Readonly<{
   navigatorCoordinator: NavigatorCoordinatorPersistence;
   navigatorEvaluation: NavigatorEvaluationPersistence;
   navigatorEffects: NavigatorEffectPersistence;
-  navigatorWorkflow: NavigatorWorkflowPersistence;
+  navigatorPlanning: NavigatorPlanningPersistence;
   navigatorImplementationRead: NavigatorImplementationReadStore;
   navigatorImplementation: NavigatorImplementationPersistence;
-  navigatorRelease: NavigatorReleasePersistence;
   findingLedger: NavigatorFindingLedger;
   managedAutomation: ManagedAutomationPersistence;
 }>;
 
-function createNavigatorEffectPersistence(store: TelegramAgentStore): NavigatorEffectPersistence {
+function createNavigatorEffectPersistence(
+  store: TelegramAgentStore,
+  navigatorRepository: NavigatorRepository,
+): NavigatorEffectPersistence {
   return {
-    leaseNavigatorEffect: (input) => store.leaseNavigatorEffect(input),
+    leaseNavigatorEffect: (input) => navigatorRepository.leaseEffect(input),
     isExecutorLeaseCurrent: (ownerId, generation, now) => store.isExecutorLeaseCurrent(ownerId, generation, now),
     getEffect: (jobId, idempotencyKey) => store.getEffect(jobId, idempotencyKey),
     getJob: (jobId) => store.getJob(jobId),
-    getNavigatorWorkflowStep: (id) => store.getNavigatorWorkflowStep(id),
-    getNavigatorProposal: (id) => store.getNavigatorProposal(id),
-    getNavigatorProposalDecision: (id) => store.getNavigatorProposalDecision(id),
-    getNavigatorSkillAttempt: (id) => store.getNavigatorSkillAttempt(id),
-    getNavigatorReleaseAttempt: (id) => store.getNavigatorReleaseAttempt(id),
-    getNavigatorCapabilityEvidence: (effectIdempotencyKey) => store.getNavigatorCapabilityEvidence(effectIdempotencyKey),
-    admitNavigatorCapabilityEvidence: (input) => store.admitNavigatorCapabilityEvidence(input),
-    getNavigatorTicketAttemptContext: (input) => store.getNavigatorTicketAttemptContext(input),
-    bindNavigatorTicketWorkerResource: (input) => store.bindNavigatorTicketWorkerResource(input),
+    getNavigatorWorkflowStep: (id) => navigatorRepository.getWorkflowStep(id),
+    getNavigatorProposal: (id) => navigatorRepository.getProposal(id),
+    getNavigatorProposalDecision: (id) => navigatorRepository.getProposalDecision(id),
+    getNavigatorSkillAttempt: (id) => navigatorRepository.getAttempt(id),
+    getNavigatorPlanningResult: (attemptId) => store.getNavigatorPlanningResult(attemptId),
+    recordNavigatorPlanningResult: (input) => store.recordNavigatorPlanningResult(input),
+    getNavigatorReleaseAttempt: (id) => navigatorRepository.getReleaseAttempt(id),
+    getNavigatorCapabilityEvidence: (effectIdempotencyKey) => navigatorRepository.getNavigatorCapabilityEvidence(effectIdempotencyKey),
+    admitNavigatorCapabilityEvidence: (input) => navigatorRepository.admitNavigatorCapabilityEvidence(input),
+    getNavigatorTicketAttemptContext: (input) => navigatorRepository.getNavigatorTicketAttemptContext(input),
+    bindNavigatorTicketWorkerResource: (input) => navigatorRepository.bindNavigatorTicketWorkerResource(input),
+    bindNavigatorSkillResource: (input) => navigatorRepository.bindNavigatorSkillResource(input),
     getCurrentWorkArtifactSnapshot: (artifactId) => store.getCurrentWorkArtifactSnapshot(artifactId),
     isWorkArtifactSnapshotValid: (snapshotId) => store.isWorkArtifactSnapshotValid(snapshotId),
     listCurrentHeldResourceClaims: (jobId, limit) => store.listCurrentHeldResourceClaims(jobId, limit),
     taskAuthorityOperationIsCurrent: (effect, operation) => store.taskAuthorityOperationIsCurrent(effect, operation),
     renewJobOperationFences: (input) => store.renewJobOperationFences(input),
-    settleNavigatorSkillAttempt: (input) => store.settleNavigatorSkillAttempt(input),
-    settleNavigatorTicketWorkerAttempt: (input) => store.settleNavigatorTicketWorkerAttempt(input),
-    settleNavigatorReleaseEffect: (input) => store.settleNavigatorReleaseEffect(input),
-    completeEffect: (key, ownerId, generation, now) => store.completeEffect(key, ownerId, generation, now),
+    settleNavigatorSkillAttempt: (input) => navigatorRepository.settleNavigatorSkillAttempt(input),
+    settleNavigatorTicketWorkerAttempt: (input) => navigatorRepository.settleNavigatorTicketWorkerAttempt(input),
+    settleNavigatorReleaseEffect: (input) => navigatorRepository.settleNavigatorReleaseEffect(input),
     failEffect: (key, ownerId, generation, error, nextAttemptAt, now) =>
       store.failEffect(key, ownerId, generation, error, nextAttemptAt, now),
     deadLetterEffect: (key, ownerId, generation, error, now) =>
@@ -19120,22 +18639,10 @@ function createNavigatorEffectPersistence(store: TelegramAgentStore): NavigatorE
   };
 }
 
-function createNavigatorWorkflowPersistence(store: TelegramAgentStore): NavigatorWorkflowPersistence {
+function createNavigatorPlanningPersistence(store: TelegramAgentStore): NavigatorPlanningPersistence {
   return {
     createNavigatorSnapshot: (input) => store.createNavigatorSnapshot(input),
     recordNavigatorProposal: (input) => store.recordNavigatorProposal(input),
-    leaseNavigatorSkillEffect: (input) => store.leaseNavigatorSkillEffect(input),
-    getNavigatorSkillAttempt: (id) => store.getNavigatorSkillAttempt(id),
-    taskAuthorityOperationIsCurrent: (effect, operation) => store.taskAuthorityOperationIsCurrent(effect, operation),
-    renewJobOperationFences: (input) => store.renewJobOperationFences(input),
-    bindNavigatorSkillAttemptResource: (input) => store.bindNavigatorSkillAttemptResource(input),
-    getNavigatorPlanningResult: (attemptId) => store.getNavigatorPlanningResult(attemptId),
-    recordNavigatorPlanningResult: (input) => store.recordNavigatorPlanningResult(input),
-    settleNavigatorSkillAttempt: (input) => store.settleNavigatorSkillAttempt(input),
-    failEffect: (key, ownerId, generation, error, nextAttemptAt, now) =>
-      store.failEffect(key, ownerId, generation, error, nextAttemptAt, now),
-    deadLetterEffect: (key, ownerId, generation, error, now) =>
-      store.deadLetterEffect(key, ownerId, generation, error, now),
   };
 }
 
@@ -19145,18 +18652,6 @@ function createNavigatorImplementationReadStore(store: TelegramAgentStore): Navi
     getWorkArtifact: (id) => store.getWorkArtifact(id),
     getCurrentWorkArtifactSnapshot: (artifactId) => store.getCurrentWorkArtifactSnapshot(artifactId),
     isWorkArtifactSnapshotValid: (snapshotId) => store.isWorkArtifactSnapshotValid(snapshotId),
-  };
-}
-
-function createNavigatorReleasePersistence(store: TelegramAgentStore): NavigatorReleasePersistence {
-  return {
-    leaseNavigatorReleaseEffect: (input) => store.leaseNavigatorReleaseEffect(input),
-    getNavigatorReleaseAttempt: (id) => store.getNavigatorReleaseAttempt(id),
-    getJob: (jobId) => store.getJob(jobId),
-    taskAuthorityOperationIsCurrent: (effect, operation) => store.taskAuthorityOperationIsCurrent(effect, operation),
-    deadLetterEffect: (key, ownerId, generation, error, now) =>
-      store.deadLetterEffect(key, ownerId, generation, error, now),
-    settleNavigatorReleaseEffect: (input) => store.settleNavigatorReleaseEffect(input),
   };
 }
 
@@ -19184,11 +18679,10 @@ export function openStoreComposition(
     store,
     navigatorCoordinator: createNavigatorCoordinatorPersistence(store),
     navigatorEvaluation: createNavigatorEvaluationPersistence(store, db),
-    navigatorEffects: createNavigatorEffectPersistence(store),
-    navigatorWorkflow: createNavigatorWorkflowPersistence(store),
+    navigatorEffects: createNavigatorEffectPersistence(store, navigatorEffects),
+    navigatorPlanning: createNavigatorPlanningPersistence(store),
     navigatorImplementationRead: createNavigatorImplementationReadStore(store),
     navigatorImplementation: new NavigatorImplementationRepository(db, store, findingLedger),
-    navigatorRelease: createNavigatorReleasePersistence(store),
     findingLedger,
     managedAutomation: new ManagedAutomationRepository(db),
   };

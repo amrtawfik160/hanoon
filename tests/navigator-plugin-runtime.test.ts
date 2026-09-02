@@ -803,16 +803,15 @@ describe("plugin navigator inference and release adapters", () => {
     ).run("thr_native_shell", selected.id);
     const runtime = createNavigatorRuntime({
       effectPersistence: composition.navigatorEffects,
-      workflowPersistence: composition.navigatorWorkflow,
+      planningPersistence: composition.navigatorPlanning,
       implementationRead: composition.navigatorImplementationRead,
       implementationPersistence: composition.navigatorImplementation,
-      releasePersistence: composition.navigatorRelease,
       sdk: bb.sdk,
       modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
       clock: { now: () => now + 3 },
     });
 
-    const decision = await runtime.navigator.proposeNext({
+    const decision = await runtime.planning.proposeNext({
       jobId: selected.id,
       externalStateDigest: EXTERNAL_DIGEST,
       evidenceRefs: ["eval:native-tool"],

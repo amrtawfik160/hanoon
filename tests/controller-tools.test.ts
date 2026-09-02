@@ -389,6 +389,43 @@ it("refuses to file a reference from a system-origin controller turn", async () 
   expect(store.listReferenceDocuments(null)).toEqual([]);
 });
 
+it("refuses system-origin automation commands before persistence or provider access", async () => {
+  const { bb, harness, store } = fixture({
+    active: true,
+    controllerTools: "all-tools",
+    origin: "system",
+    inputText: "A scheduled monitor tried to change its schedule.",
+  });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_100,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  const result = await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Change the schedule." },
+    controllerToolContext,
+  );
+
+  expect(result).toEqual(structuredToolError("origin_denied"));
+  expect(automations.create).not.toHaveBeenCalled();
+  expect(store.listMonitors("owner-7-controller", true)).toEqual([]);
+  expect(automations.list("owner-7-controller", true)).toEqual([]);
+});
+
 it("reports typed merge approval as queued and passes the exact controller fence", async () => {
   const { bb, harness, store, turn } = fixture({
     active: true,
@@ -464,7 +501,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned when BB replaced experimental status labels with the stable
   // presentation contract in plugin SDK 0.4.21.
   // Re-pinned when watch gained the governed update_schedule variant.
-  expect(digest).toBe("3fd7a98dcc64b9c33ee62cbbd0b3154e651ae8da4c14ac48b762a9cf26551808");
+  // Re-pinned when the registered watch gained pause, resume, and run-now.
+  expect(digest).toBe("fbc732c7b92946735b91e190ace661a1599bbf71f8dcd35fb3dba4b50d664af6");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -1605,6 +1643,53 @@ it("updates an owned BB schedule through the governed controller seam without wi
       prompt: "Send the revised weekday digest.",
     }),
   }));
+});
+
+it("exposes pause, resume, run-now, and cancel through one replay-safe owner command family", async () => {
+  const { bb, harness, store } = fixture({ active: true, automationCapability: true });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  const created = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )) as { watching: { id: string } };
+  const id = created.watching.id;
+  const command = (kind: "pause_schedule" | "resume_schedule" | "run_now") =>
+    harness.behavior.callAgentTool("telegram_agent_watch", { kind, id }, controllerToolContext);
+
+  await command("pause_schedule");
+  await command("resume_schedule");
+  const run = parseToolJson(await command("run_now")) as { run: { id: string } };
+  const replay = parseToolJson(await command("run_now")) as { run: { id: string } };
+  expect(run.run.id).toBe(replay.run.id);
+  expect(automations.pause).toHaveBeenCalledOnce();
+  expect(automations.resume).toHaveBeenCalledOnce();
+  expect(automations.runNow).toHaveBeenCalledOnce();
+
+  await harness.behavior.callAgentTool(
+    "telegram_agent_cancel_watch",
+    { id },
+    controllerToolContext,
+  );
+  expect(automations.retire).toHaveBeenCalledOnce();
+  expect(automations.list("owner-7-controller", true)).toEqual([expect.objectContaining({ id, state: "retired" })]);
 });
 
 it("retires an already-armed live-work poller without touching clock-time schedules", () => {

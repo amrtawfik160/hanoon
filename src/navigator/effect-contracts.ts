@@ -75,6 +75,7 @@ export type NavigatorSkillEffectContext = NavigatorEffectContextBase & Readonly<
   workflowStep: Readonly<NavigatorWorkflowStep>;
   acceptedProposal: Readonly<NavigatorProposalRecord>;
   attempt: Readonly<NavigatorSkillAttempt>;
+  bindResource(resource: Readonly<{ kind: "bb_thread"; id: string }>): Promise<void>;
 }>;
 
 export type NavigatorTicketEffectContext = NavigatorEffectContextBase & Readonly<{

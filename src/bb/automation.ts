@@ -96,6 +96,7 @@ export type BbAutomation = z.infer<typeof bbAutomationSchema>;
 const bbAutomationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),
+  idempotencyKey: z.string().min(1).nullable().optional(),
   runMode: z.enum(["agent", "script"]),
   threadId: z.string().min(1).nullable(),
   status: z.enum(["running", "succeeded", "failed", "skipped"]),
@@ -336,6 +337,13 @@ export class BbAutomationNotFoundError extends Error {
   }
 }
 
+export class BbAutomationObservationMismatchError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "BbAutomationObservationMismatchError";
+  }
+}
+
 export class TerminalBbAutomationAdapter {
   public readonly agentAutomationCapabilities = INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES;
 
@@ -422,7 +430,8 @@ export class TerminalBbAutomationAdapter {
       try {
         assertAutomationMatches(expectedDefinition, candidate);
         return toManagedAutomationObservation(candidate, input.definition);
-      } catch {
+      } catch (error) {
+        if (!(error instanceof BbAutomationObservationMismatchError)) throw error;
         // The list is an observation set; only an exact definition match closes
         // an ambiguous create attempt.
       }
@@ -563,48 +572,50 @@ export function assertAutomationMatches(
 ): void {
   if (observed.projectId !== expected.projectId || observed.name !== expected.name ||
     observed.enabled !== expectedEnabled) {
-    throw new Error("BB automation identity did not reconcile");
+    throw new BbAutomationObservationMismatchError("BB automation identity did not reconcile");
   }
   if (expected.trigger.kind === "cron") {
     if (observed.trigger.triggerType !== "schedule" || observed.trigger.cron !== expected.trigger.cron ||
       observed.trigger.timezone !== expected.trigger.timezone || (expectedEnabled && observed.nextRunAt === null)) {
-      throw new Error("BB automation schedule did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB automation schedule did not reconcile");
     }
   } else {
     const expectedRunAt = Date.parse(expected.trigger.at);
     if (observed.trigger.triggerType !== "once" || !Number.isFinite(expectedRunAt) ||
       observed.trigger.runAt !== expectedRunAt) {
-      throw new Error("BB automation one-shot trigger did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB automation one-shot trigger did not reconcile");
     }
   }
-  if (observed.execution.mode !== expected.mode) throw new Error("BB automation execution mode did not reconcile");
+  if (observed.execution.mode !== expected.mode) {
+    throw new BbAutomationObservationMismatchError("BB automation execution mode did not reconcile");
+  }
   if (expected.mode === "agent" && observed.execution.mode === "agent") {
     if (observed.execution.prompt !== expected.prompt || observed.execution.providerId !== expected.providerId ||
       observed.execution.model !== expected.model || observed.execution.permissionMode !== expected.permissionMode) {
-      throw new Error("BB agent automation execution did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB agent automation execution did not reconcile");
     }
     if (expected.reasoningLevel && observed.execution.reasoningLevel !== expected.reasoningLevel) {
-      throw new Error("BB agent automation reasoning level did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB agent automation reasoning level did not reconcile");
     }
     if (expected.serviceTier && observed.execution.serviceTier !== expected.serviceTier) {
-      throw new Error("BB agent automation service tier did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB agent automation service tier did not reconcile");
     }
     const environment = observed.execution.environment;
     switch (expected.target.kind) {
       case "project-default":
         if (observed.execution.targetThreadId !== undefined || environment.type !== "project-default") {
-          throw new Error("BB agent automation target did not reconcile");
+          throw new BbAutomationObservationMismatchError("BB agent automation target did not reconcile");
         }
         break;
       case "target-thread":
         if (observed.execution.targetThreadId !== expected.target.threadId) {
-          throw new Error("BB agent automation target did not reconcile");
+          throw new BbAutomationObservationMismatchError("BB agent automation target did not reconcile");
         }
         break;
       case "environment":
         if (observed.execution.targetThreadId !== undefined || environment.type !== "reuse" ||
           environment.environmentId !== expected.target.environmentId) {
-          throw new Error("BB agent automation target did not reconcile");
+          throw new BbAutomationObservationMismatchError("BB agent automation target did not reconcile");
         }
         break;
       case "new-worktree":
@@ -612,26 +623,26 @@ export function assertAutomationMatches(
           environment.workspace.type !== "managed-worktree" ||
           environment.workspace.baseBranch.kind !== "named" ||
           environment.workspace.baseBranch.name !== expected.target.baseBranch) {
-          throw new Error("BB agent automation target did not reconcile");
+          throw new BbAutomationObservationMismatchError("BB agent automation target did not reconcile");
         }
         break;
     }
   }
   if (expected.mode === "script" && observed.execution.mode === "script") {
     if (observed.execution.interpreter !== expected.interpreter || observed.execution.timeoutMs !== expected.timeoutMs) {
-      throw new Error("BB script automation execution did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB script automation execution did not reconcile");
     }
     const script = observed.execution.script;
     if (script === undefined || (expected.source.kind === "inline"
       ? script !== expected.source.script
       : observed.execution.scriptFile !== basename(expected.source.path) ||
         createHash("sha256").update(script, "utf8").digest("hex") !== expected.source.sha256)) {
-      throw new Error("BB script automation source did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB script automation source did not reconcile");
     }
     const observedEnv = observed.execution.env ?? {};
     const expectedEnv = expected.env ?? {};
     if (JSON.stringify(Object.entries(observedEnv).sort()) !== JSON.stringify(Object.entries(expectedEnv).sort())) {
-      throw new Error("BB script automation environment did not reconcile");
+      throw new BbAutomationObservationMismatchError("BB script automation environment did not reconcile");
     }
   }
 }

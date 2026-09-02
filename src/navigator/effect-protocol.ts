@@ -44,7 +44,13 @@ export type NavigatorEffectKind = (typeof NAVIGATOR_EFFECT_KINDS)[number];
 type NavigatorJob = NonNullable<ReturnType<NavigatorEffectPersistence["getJob"]>>;
 
 export type NavigatorEffectOutcome =
-  | Readonly<{ outcome: "completed"; receipt: NavigatorEffectReceipt }>
+  | Readonly<{
+    outcome: "completed";
+    receipt: NavigatorEffectReceipt;
+    publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
+    policyFailureReason?: string;
+  }>
   | Readonly<{ outcome: "transient"; reason: string }>
   | Readonly<{ outcome: "permanent"; reason: string }>
   | Readonly<{ outcome: "lease_cancelled"; reason: string }>
@@ -208,6 +214,7 @@ function frozenExecutionContext(input: Readonly<{
   resourceClaims: readonly JobResourceClaim[];
   authorityOperations: readonly TaskAuthorityOperation[];
   capabilityEvidence: readonly import("./effect-contracts").NavigatorCapabilityEvidence[];
+  bindResource(resource: Readonly<{ kind: "bb_thread"; id: string }>): Promise<void>;
 }>): NavigatorEffectContext {
   const base = {
     effect: cloneAndFreezeNavigatorValue({ ...input.effect, payload: { ...input.effect.payload } }),
@@ -226,6 +233,7 @@ function frozenExecutionContext(input: Readonly<{
       workflowStep: cloneAndFreezeNavigatorValue(input.workflowStep),
       acceptedProposal: cloneAndFreezeNavigatorValue(input.acceptedProposal),
       attempt: cloneAndFreezeNavigatorValue(input.skillAttempt),
+      bindResource: input.bindResource,
     });
   }
   if (input.effect.kind === "run_navigator_ticket_worker" && input.ticketContext) {
@@ -296,7 +304,9 @@ export class NavigatorEffectProtocol {
     const attempts = this.attemptEvidence(effect, admission.job, stepValidation.workflowStep, fence, now);
     if ("reason" in attempts) return attempts;
     const { skillAttempt, releaseAttempt, ticketContext } = attempts;
-    const artifactValidation = this.validateArtifactBindings(admission.job.artifactBindings);
+    const artifactValidation = effect.kind === "run_navigator_ticket_worker"
+      ? this.validateArtifactBindings(admission.job.artifactBindings)
+      : null;
     if (artifactValidation !== null) return { reason: artifactValidation };
     const operations = authorityOperations(effect, skillAttempt);
     return this.authorityIsCurrent(effect, operations)
@@ -308,6 +318,7 @@ export class NavigatorEffectProtocol {
         workflow: stepValidation,
         attempts,
         operations,
+        bindResource: (resource) => this.bindSkillResource(effect, fence, resource),
       }) }
       : { reason: "Navigator task authority evidence is absent, stale, or denied" };
   }
@@ -318,8 +329,9 @@ export class NavigatorEffectProtocol {
     signal: AbortSignal;
     admission: NavigatorAdmissionEvidence;
     workflow: NavigatorWorkflowContext;
-    attempts: NavigatorAttemptEvidence;
-    operations: readonly TaskAuthorityOperation[];
+      attempts: NavigatorAttemptEvidence;
+      operations: readonly TaskAuthorityOperation[];
+      bindResource(resource: Readonly<{ kind: "bb_thread"; id: string }>): Promise<void>;
   }>): NavigatorEffectContext {
     const { skillAttempt, releaseAttempt, ticketContext } = input.attempts;
     return frozenExecutionContext({
@@ -336,7 +348,24 @@ export class NavigatorEffectProtocol {
       releaseAttempt,
       ticketContext,
       capabilityEvidence: input.admission.capabilityEvidence,
+      bindResource: input.bindResource,
     });
+  }
+
+  private async bindSkillResource(
+    effect: StoredEffect,
+    fence: Pick<EffectFence, "ownerId" | "generation">,
+    resource: Readonly<{ kind: "bb_thread"; id: string }>,
+  ): Promise<void> {
+    const bound = this.dependencies.store.bindNavigatorSkillResource({
+      attemptId: payloadIdentifier(effect, "attemptId") ?? "",
+      effectIdempotencyKey: effect.idempotencyKey,
+      resource,
+      ownerId: fence.ownerId,
+      generation: fence.generation,
+      now: this.dependencies.clock.now(),
+    });
+    if (!bound) throw new Error("Navigator skill resource fence was lost");
   }
 
   private prepareAdmission(
@@ -797,6 +826,9 @@ export class NavigatorEffectProtocol {
             observedExternalStateDigest: receipt.observedExternalStateDigest,
             result: receipt.result,
             receipt,
+            publishedArtifactBindings: outcome.publishedArtifactBindings,
+            reconciledArtifactIds: outcome.reconciledArtifactIds,
+            policyFailureReason: outcome.policyFailureReason,
             ownerId: context.fence.ownerId,
             generation: context.fence.generation,
             now,

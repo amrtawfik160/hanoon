@@ -4,10 +4,10 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY, type ModelRoute } from "../src/capabilities/models";
 import type { Job } from "../src/domain/models";
 import {
-  NavigatorWorkflowExecutor,
-  type NavigatorSkillRunner,
+  NavigatorPlanningService,
   type WorkflowNavigator,
-} from "../src/navigator/executor";
+} from "../src/navigator/planning-service";
+import type { NavigatorSkillRunner } from "../src/navigator/skill-runner";
 import type {
   NavigatorInferenceObservation,
   NavigatorProposal,
@@ -24,7 +24,7 @@ import {
   type NavigatorEffectContext,
   type NavigatorEffectOutcome,
 } from "../src/navigator/effect-protocol";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { openStore, openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
@@ -34,6 +34,7 @@ let fixtureNumber = 0;
 type Fixture = Readonly<{
   db: Database.Database;
   store: TelegramAgentStore;
+  navigatorEffects: import("../src/navigator/effect-persistence").NavigatorEffectPersistence;
   job: Job;
   artifactId: string;
   snapshotId: string;
@@ -69,7 +70,8 @@ function fixture(
 ): Fixture {
   const fixtureId = fixtureNumber++;
   const { bb } = createFakePluginHost({ pluginId: `navigator-executor-${fixtureId}` });
-  const store = openStore(bb.storage, bb.storage.kv, () => 1_100);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, () => 1_100);
+  const store = composition.store;
   const artifactId = stableWorkArtifactId("proj_1", "ticket-38");
   const artifact = store.captureWorkArtifact(artifactInput(artifactId));
   const specificationId = stableWorkArtifactId("proj_1", "ticket-39-specification");
@@ -112,6 +114,7 @@ function fixture(
   return {
     db: bb.storage.database(),
     store,
+    navigatorEffects: composition.navigatorEffects,
     job,
     artifactId,
     snapshotId: artifact.snapshot.id,
@@ -174,6 +177,10 @@ function navigatorWith(
   return { propose: vi.fn(async (snapshot: NavigatorSnapshot) => proposal(snapshot)) };
 }
 
+type PlanningHarness = NavigatorPlanningService & Readonly<{
+  processOne(fence: Readonly<{ ownerId: string; generation: number; signal: AbortSignal }>, signal: AbortSignal): Promise<boolean>;
+}>;
+
 function executor(
   fixtureValue: Fixture,
   input: Readonly<{
@@ -183,37 +190,54 @@ function executor(
     modelRoute?: () => ModelRoute;
     now?: () => number;
   }> = {},
-): NavigatorWorkflowExecutor {
-  return new NavigatorWorkflowExecutor({
-    store: fixtureValue.store,
+): PlanningHarness {
+  const planning = new NavigatorPlanningService({
+    persistence: {
+      createNavigatorSnapshot: (input) => fixtureValue.store.createNavigatorSnapshot(input),
+      recordNavigatorProposal: (input) => fixtureValue.store.recordNavigatorProposal(input),
+    },
     navigator: input.navigator ?? navigatorWith(),
     observeInference: input.observe ?? (async () => observation()),
-    skillRunner: input.skillRunner ?? {
-      run: vi.fn(async (attempt, hooks) => {
-        const resource = attempt.resource ?? { kind: "bb_thread" as const, id: "thr_research_38" };
-        await hooks.bindResource(resource);
-        return {
-          resource,
-          observedExternalStateDigest: "e".repeat(64),
-          result: {
-            kind: "research_result",
-            summary: "The executor must persist acceptance before dispatch.",
-            artifactEvidence: [{
-              artifactId: fixtureValue.artifactId,
-              snapshotId: fixtureValue.snapshotId,
-              snapshotDigest: fixtureValue.snapshotDigest,
-              finding: "Proposal acceptance and effect creation share one transaction.",
-              evidenceRefs: ["source:ticket-38"],
-            }],
-          },
-        };
-      }),
-    },
     modelRoute: input.modelRoute ?? (() => ({
       pool: "strong",
       ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong,
     })),
     clock: { now: input.now ?? (() => 1_100) },
+  });
+  const protocol = new NavigatorEffectProtocol({
+    store: fixtureValue.navigatorEffects,
+    clock: { now: input.now ?? (() => 1_100) },
+    adapters: [
+      {
+        kind: "run_navigator_skill",
+        execute: async (context): Promise<NavigatorEffectOutcome> => {
+          if (context.kind !== "run_navigator_skill") {
+            return { outcome: "permanent", reason: "navigator test skill adapter received another effect kind" };
+          }
+          if (input.skillRunner === undefined) return skillCompletion(context);
+          const run = await input.skillRunner.run(context.attempt, {
+            bindResource: context.bindResource,
+          }, context.signal);
+          return {
+            outcome: "completed",
+            receipt: {
+              kind: "run_navigator_skill",
+              effectIdempotencyKey: context.effect.idempotencyKey,
+              attemptId: context.attempt.id,
+              resource: run.resource,
+              observedExternalStateDigest: run.observedExternalStateDigest,
+              result: run.result,
+            },
+          };
+        },
+      },
+      { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+      { kind: "run_navigator_release", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+    ],
+  });
+  return Object.assign(planning, {
+    processOne: (fence: Readonly<{ ownerId: string; generation: number; signal: AbortSignal }>, signal: AbortSignal) =>
+      protocol.processOne(fence, signal),
   });
 }
 
@@ -230,7 +254,7 @@ function protocolFor(
     ...(skillReconcile === undefined ? {} : { reconcile: skillReconcile }),
   };
   return new NavigatorEffectProtocol({
-    store: value.store,
+    store: value.navigatorEffects,
     clock: { now },
     leaseMs,
     adapters: [
@@ -886,8 +910,7 @@ describe("navigator-v1 durable executor slice", () => {
       candidateSkillIds: ["research", "wayfinder"],
       advice: null,
     });
-    const lease = value.store.acquireExecutorLease("executor-ask-matt", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("ask-matt executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-ask-matt");
     await workflow.processOne({
       ownerId: "executor-ask-matt",
       generation: lease.generation,
@@ -990,8 +1013,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const lease = value.store.acquireExecutorLease("executor-routing-revision", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("routing revision executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-routing-revision");
     await workflow.processOne({
       ownerId: "executor-routing-revision",
       generation: lease.generation,
@@ -1046,8 +1068,7 @@ describe("navigator-v1 durable executor slice", () => {
     }, 1_090);
     expect(cancelled).toMatchObject({ state: "cancelled", cancelRequestedAt: 1_090 });
 
-    const lease = value.store.acquireExecutorLease("executor-cancelled-before-dispatch", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("cancelled-before-dispatch executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-cancelled-before-dispatch");
     await expect(workflow.processOne({
       ownerId: "executor-cancelled-before-dispatch",
       generation: lease.generation,
@@ -1100,8 +1121,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const lease = value.store.acquireExecutorLease("executor-cancelled-in-flight", now, 30_000);
-    if (!lease.acquired) throw new Error("cancelled-in-flight executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-cancelled-in-flight", now);
     const processing = workflow.processOne({
       ownerId: "executor-cancelled-in-flight",
       generation: lease.generation,
@@ -1147,7 +1167,7 @@ describe("navigator-v1 durable executor slice", () => {
       evidenceRefs: [],
     });
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => 1_100 },
       adapters: [
         { kind: "run_navigator_skill", execute: async (context) => skillCompletion(context) },
@@ -1347,7 +1367,7 @@ describe("navigator-v1 durable executor slice", () => {
     expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "pending" });
 
     const protocol = new NavigatorEffectProtocol({
-      store: value.store,
+      store: value.navigatorEffects,
       clock: { now: () => 1_100 },
       leaseMs: 1_000,
       adapters: [
@@ -1459,7 +1479,7 @@ describe("navigator-v1 durable executor slice", () => {
          lease_expires_at, acquired_at, renewed_at
        ) VALUES (?, 'project:proj_1:pipeline', 'project', 'held', ?, ?, ?, ?, ?)`,
     ).run(value.job.id, "navigator-first", firstLease.generation, 2_100, 1_100, 1_100);
-    const first = value.store.leaseNavigatorEffect({
+    const first = value.navigatorEffects.leaseNavigatorEffect({
       ownerId: "navigator-first",
       generation: firstLease.generation,
       now: 1_100,
@@ -1471,7 +1491,7 @@ describe("navigator-v1 durable executor slice", () => {
       leaseOwner: "navigator-first",
       leaseGeneration: firstLease.generation,
     });
-    expect(value.store.leaseNavigatorEffect({
+    expect(value.navigatorEffects.leaseNavigatorEffect({
       ownerId: "navigator-first",
       generation: firstLease.generation,
       now: 1_100,
@@ -1483,7 +1503,7 @@ describe("navigator-v1 durable executor slice", () => {
     expect(value.store.releaseExecutorLease("navigator-first", firstLease.generation, 1_201)).toBe(true);
     const secondLease = value.store.acquireExecutorLease("navigator-second", 1_201, 10_000);
     if (!secondLease.acquired) throw new Error("second navigator executor lease was unavailable");
-    const transferred = value.store.leaseNavigatorEffect({
+    const transferred = value.navigatorEffects.leaseNavigatorEffect({
       ownerId: "navigator-second",
       generation: secondLease.generation,
       now: 1_201,
@@ -1713,8 +1733,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const firstLease = value.store.acquireExecutorLease("executor-first", now, 100);
-    if (!firstLease.acquired) throw new Error("first executor lease was unavailable");
+    const firstLease = executorLeaseWithProjectClaim(value, "executor-first", now, 100);
     expect(await workflow.processOne({
       ownerId: "executor-first",
       generation: firstLease.generation,
@@ -1766,8 +1785,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const lease = value.store.acquireExecutorLease("executor-drift", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("drift executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-drift");
     await workflow.processOne({
       ownerId: "executor-drift",
       generation: lease.generation,
@@ -1816,8 +1834,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const lease = value.store.acquireExecutorLease("executor-unbound-evidence", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("unbound evidence executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-unbound-evidence");
     await workflow.processOne({
       ownerId: "executor-unbound-evidence",
       generation: lease.generation,
@@ -1861,8 +1878,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const lease = value.store.acquireExecutorLease("executor-result-bound", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("result bound executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-result-bound");
     await workflow.processOne({
       ownerId: "executor-result-bound",
       generation: lease.generation,
@@ -1884,8 +1900,7 @@ describe("navigator-v1 durable executor slice", () => {
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const lease = value.store.acquireExecutorLease("executor-append-only", 1_100, 30_000);
-    if (!lease.acquired) throw new Error("append-only executor lease was unavailable");
+    const lease = executorLeaseWithProjectClaim(value, "executor-append-only");
     await workflow.processOne({
       ownerId: "executor-append-only",
       generation: lease.generation,

@@ -14,6 +14,7 @@ import type {
   NavigatorArtifactBinding,
   NavigatorProposalDecision,
   NavigatorProposalRecord,
+  NavigatorPlanningResultRecord,
   NavigatorSkillAttempt,
   NavigatorWorkflowStep,
   NavigatorWorkflowStepOutcome,
@@ -42,6 +43,16 @@ export interface NavigatorEffectPersistence {
   getNavigatorProposal(id: string): NavigatorProposalRecord | null;
   getNavigatorProposalDecision(id: string): NavigatorProposalDecision | null;
   getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
+  getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null;
+  recordNavigatorPlanningResult(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): NavigatorPlanningResultRecord | null;
   getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null;
   getNavigatorCapabilityEvidence(effectIdempotencyKey: string): readonly NavigatorCapabilityEvidence[];
   admitNavigatorCapabilityEvidence(input: Readonly<{
@@ -63,6 +74,14 @@ export interface NavigatorEffectPersistence {
     attemptId: string;
     effectIdempotencyKey: string;
     resource: NavigatorTicketWorkerResource;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): boolean;
+  bindNavigatorSkillResource(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    resource: Readonly<{ kind: "bb_thread"; id: string }>;
     ownerId: string;
     generation: number;
     now: number;
@@ -110,7 +129,6 @@ export interface NavigatorEffectPersistence {
     environmentId: string;
     receipt?: NavigatorReleaseReceipt;
   }>): boolean;
-  completeEffect(key: string, ownerId: string, generation: number, now: number): boolean;
   failEffect(
     key: string,
     ownerId: string,
@@ -121,26 +139,3 @@ export interface NavigatorEffectPersistence {
   ): boolean;
   deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
 }
-
-export type NavigatorReleasePersistence = Readonly<{
-  leaseNavigatorReleaseEffect(input: Readonly<{
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }>): StoredEffect | null;
-  getNavigatorReleaseAttempt(id: string): NavigatorReleaseAttempt | null;
-  getJob(jobId: string): Job | null;
-  taskAuthorityOperationIsCurrent(effect: JobEffect, operation: TaskAuthorityOperation): boolean;
-  deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
-  settleNavigatorReleaseEffect(input: Readonly<{
-    ownerId: string;
-    generation: number;
-    now: number;
-    effectIdempotencyKey: string;
-    number: number;
-    url: string;
-    environmentId: string;
-    receipt?: NavigatorReleaseReceipt;
-  }>): boolean;
-}>;

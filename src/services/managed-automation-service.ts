@@ -1,5 +1,6 @@
 import {
   BbAutomationNotFoundError,
+  BbAutomationObservationMismatchError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
 } from "../bb/automation";
@@ -17,11 +18,14 @@ import {
 } from "../storage/managed-automation-repository";
 import type {
   ManagedAutomationCapabilities,
+  ManagedAutomationAuthority,
+  ManagedAutomationCapabilityEvidence,
   ManagedAutomationCreateReceipt,
   ManagedAutomationDefinition,
   ManagedAutomationObservation,
   ManagedAutomationOperationRequest,
   ManagedAutomationProviderIdentity,
+  ManagedAutomationRecursion,
   ManagedAutomationRun,
   ManagedAutomationScope,
   ManagedAutomationTarget,
@@ -29,6 +33,9 @@ import type {
 } from "../domain/managed-automation";
 import {
   isCurrentManagedAutomationAuthority,
+  managedAutomationAuthorityCoversOperation,
+  managedAutomationAuthoritySchema,
+  managedAutomationRecursionSchema,
   managedAutomationRunSchema,
 } from "../domain/managed-automation";
 import type { EffectFence } from "./effect-runner";
@@ -165,6 +172,13 @@ export type ManagedAutomationOperationExecution = Readonly<{
   run: ManagedAutomationRun | null;
 }>;
 
+export type ManagedAutomationCapabilityOperation = Readonly<Pick<
+  ManagedAutomationOperation,
+  "operationClass" | "targetProjectId" | "definitionRevision" | "capabilityEvidence"
+> & {
+  targetHostId?: string | null;
+}>;
+
 const MANAGED_AUTOMATION_OPERATION_LEASE_MS = 120_000;
 const MANAGED_AUTOMATION_OPERATION_RENEWAL_MS = 30_000;
 
@@ -181,11 +195,8 @@ function runFromSettledOperation(operation: ManagedAutomationOperation): Managed
   if (!operation.outcome || !("kind" in operation.outcome) || operation.outcome.kind !== "settled") return null;
   const evidence = operation.outcome.evidence;
   if (evidence === null || typeof evidence !== "object" || !("run" in evidence)) return null;
-  try {
-    return managedAutomationRunSchema.parse(evidence.run);
-  } catch {
-    return null;
-  }
+  const parsedRun = managedAutomationRunSchema.safeParse(evidence.run);
+  return parsedRun.success ? parsedRun.data : null;
 }
 
 function operationRunEvidence(run: ManagedAutomationRun): Readonly<Record<string, unknown>> {
@@ -213,14 +224,369 @@ async function deleteAutomationForRetirement(
   }
 }
 
+async function automationIsAbsent(
+  adapter: ManagedAutomationAdapter,
+  input: Parameters<ManagedAutomationAdapter["show"]>[0],
+): Promise<boolean> {
+  try {
+    await adapter.show(input);
+    return false;
+  } catch (error) {
+    if (error instanceof BbAutomationNotFoundError) return true;
+    throw error;
+  }
+}
+
+type ManagedAutomationAuthoritativeParent = Readonly<{
+  binding: ManagedAutomationBinding;
+  operation: ManagedAutomationOperation;
+  run: ManagedAutomationRun;
+}>;
+
+function authoritativeParent(
+  repository: Pick<ManagedAutomationPersistence, "get" | "getOperation">,
+  operationId: string,
+): ManagedAutomationAuthoritativeParent | null {
+  const operation = repository.getOperation(operationId);
+  const binding = operation ? repository.get(operation.bindingId) : null;
+  const run = operation ? runFromSettledOperation(operation) : null;
+  if (!operation || !binding || !run || operation.operationClass !== "run_now" || operation.state !== "succeeded" ||
+    run.status !== "succeeded" || run.idempotencyKey !== operation.operationKey ||
+    binding.bbAutomationId !== operation.providerAutomationId || run.automationId !== operation.providerAutomationId) {
+    return null;
+  }
+  return { binding, operation, run };
+}
+
+type AutomationTriggeredMutationPlan = Readonly<{
+  authority: ManagedAutomationAuthority;
+  capabilityEvidence: ManagedAutomationCapabilityEvidence;
+  candidateBinding: ManagedAutomationBinding;
+  operation: ManagedAutomationCapabilityOperation;
+  runNowIdempotencyKey: string;
+}>;
+
+function assertRecursiveTarget(
+  parent: ManagedAutomationAuthoritativeParent,
+  binding: ManagedAutomationBinding,
+): string {
+  if (parent.binding.projectId !== binding.projectId) {
+    throw new Error("automation-triggered mutation target project is outside its parent");
+  }
+  const targetHostId = managedAutomationHostId(binding);
+  const parentHostId = managedAutomationHostId(parent.binding);
+  if (!targetHostId || !parentHostId || targetHostId !== parentHostId) {
+    throw new Error("automation-triggered mutation target host is outside its parent");
+  }
+  return targetHostId;
+}
+
+function recursiveLineageValues(
+  input: ManagedAutomationRecursiveMutationInput,
+  parent: ManagedAutomationAuthoritativeParent,
+  parentAuthority: ManagedAutomationAuthority,
+): Readonly<{ rootAutomationId: string; maxDepth: number; lineage: readonly string[] }> {
+  const parentRecursion = parentAuthority.origin === "automation-triggered"
+    ? parentAuthority.recursion
+    : null;
+  const rootAutomationId = input.rootAutomationId ?? parentRecursion?.rootAutomationId ?? parent.binding.id;
+  const maxDepth = input.maxDepth ?? parentRecursion?.maxDepth ?? 3;
+  const lineage = parentRecursion
+    ? [...parentRecursion.lineage, parent.binding.id]
+    : input.rootAutomationId
+      ? [rootAutomationId, parent.binding.id]
+      : [parent.binding.id];
+  return { rootAutomationId, maxDepth, lineage };
+}
+
+function buildRecursiveLineage(
+  input: ManagedAutomationRecursiveMutationInput,
+  parent: ManagedAutomationAuthoritativeParent,
+  binding: ManagedAutomationBinding,
+  parentAuthority: ManagedAutomationAuthority,
+): ManagedAutomationRecursion {
+  const { rootAutomationId, maxDepth, lineage } = recursiveLineageValues(input, parent, parentAuthority);
+  if (lineage.includes(binding.id)) {
+    throw new Error("automation-triggered mutation target is already in its parent lineage");
+  }
+  return managedAutomationRecursionSchema.parse({
+    version: 1,
+    rootAutomationId,
+    parentAutomationId: parent.binding.id,
+    depth: lineage.length - 1,
+    maxDepth,
+    lineage,
+  });
+}
+
+function recursiveCapabilityEvidence(
+  parent: ManagedAutomationAuthoritativeParent,
+): ManagedAutomationCapabilityEvidence {
+  const parentEvidence = parent.operation.capabilityEvidence;
+  if (!parentEvidence) throw new Error("automation-triggered mutation has no parent capability evidence");
+  return {
+    ...parentEvidence,
+    evidenceRefs: [...new Set([
+      ...parentEvidence.evidenceRefs,
+      `automation-parent-operation:${parent.operation.id}`,
+      `automation-parent-run:${parent.run.id}`,
+    ])],
+  };
+}
+
+function currentParentAuthority(parent: ManagedAutomationAuthoritativeParent): ManagedAutomationAuthority {
+  const authority = isCurrentManagedAutomationAuthority(parent.operation.authority)
+    ? parent.operation.authority
+    : null;
+  if (!authority) throw new Error("automation-triggered mutation parent authority is not current");
+  return authority;
+}
+
+function recursiveTaskAuthority(parent: ManagedAutomationAuthoritativeParent) {
+  return {
+    version: 1 as const,
+    kind: "automation" as const,
+    automationId: parent.binding.id,
+    operationId: parent.operation.id,
+    revision: parent.operation.definitionRevision,
+  };
+}
+
+function recursiveOperationScope(
+  operationClass: ManagedAutomationRecursiveMutationInput["operationClass"],
+  projectId: string,
+  hostId: string,
+) {
+  return {
+    version: 1 as const,
+    operationClass,
+    targetProjectId: projectId,
+    targetHostId: hostId,
+  };
+}
+
+function recursiveStandingAuthority(projectId: string) {
+  return {
+    version: 1 as const,
+    kind: "project-policy" as const,
+    policyId: `project-policy:${projectId}`,
+    revision: 1,
+  };
+}
+
+function buildAutomationTriggeredAuthority(input: Readonly<{
+  binding: ManagedAutomationBinding;
+  parent: ManagedAutomationAuthoritativeParent;
+  operationClass: ManagedAutomationRecursiveMutationInput["operationClass"];
+  targetHostId: string;
+  recursion: ManagedAutomationRecursion;
+  capabilityEvidence: ManagedAutomationCapabilityEvidence;
+}>): ManagedAutomationAuthority {
+  return managedAutomationAuthoritySchema.parse({
+    version: 1,
+    origin: "automation-triggered",
+    controllerKey: input.binding.controllerKey,
+    projectId: input.binding.projectId,
+    hostId: input.targetHostId,
+    taskAuthority: recursiveTaskAuthority(input.parent),
+    standingAuthority: recursiveStandingAuthority(input.binding.projectId),
+    recursion: input.recursion,
+    operationScope: recursiveOperationScope(input.operationClass, input.binding.projectId, input.targetHostId),
+    capabilityEvidence: input.capabilityEvidence,
+    mayWidenAutomation: false,
+  });
+}
+
+function automationTriggeredOperation(input: Readonly<{
+  binding: ManagedAutomationBinding;
+  operationClass: ManagedAutomationRecursiveMutationInput["operationClass"];
+  targetHostId: string;
+  definitionRevision: number;
+  capabilityEvidence: ManagedAutomationCapabilityEvidence;
+}>): ManagedAutomationCapabilityOperation {
+  return {
+    operationClass: input.operationClass,
+    targetProjectId: input.binding.projectId,
+    targetHostId: input.targetHostId,
+    definitionRevision: input.definitionRevision,
+    capabilityEvidence: input.capabilityEvidence,
+  };
+}
+
+function automationTriggeredCandidate(input: Readonly<{
+  binding: ManagedAutomationBinding;
+  mutation: ManagedAutomationRecursiveMutationInput;
+  authority: ManagedAutomationAuthority;
+  capabilityEvidence: ManagedAutomationCapabilityEvidence;
+  definitionRevision: number;
+}>): ManagedAutomationBinding {
+  return {
+    ...input.binding,
+    authority: input.authority,
+    capabilityEvidence: input.capabilityEvidence,
+    definition: input.mutation.definition ?? input.binding.definition,
+    definitionRevision: input.definitionRevision,
+  };
+}
+
+function buildAutomationTriggeredMutationPlan(
+  input: ManagedAutomationRecursiveMutationInput,
+  binding: ManagedAutomationBinding,
+  parent: ManagedAutomationAuthoritativeParent,
+  targetHostId: string,
+): AutomationTriggeredMutationPlan {
+  const parentAuthority = currentParentAuthority(parent);
+  const recursion = buildRecursiveLineage(input, parent, binding, parentAuthority);
+  const capabilityEvidence = recursiveCapabilityEvidence(parent);
+  const authority = buildAutomationTriggeredAuthority({
+    binding,
+    parent,
+    operationClass: input.operationClass,
+    targetHostId,
+    recursion,
+    capabilityEvidence,
+  });
+  const definitionRevision = input.operationClass === "update"
+    ? binding.definitionRevision + 1
+    : binding.definitionRevision;
+  const operation = automationTriggeredOperation({
+    binding,
+    operationClass: input.operationClass,
+    targetHostId,
+    definitionRevision,
+    capabilityEvidence,
+  });
+  return {
+    authority,
+    capabilityEvidence,
+    candidateBinding: automationTriggeredCandidate({
+      binding,
+      mutation: input,
+      authority,
+      capabilityEvidence,
+      definitionRevision,
+    }),
+    operation,
+    runNowIdempotencyKey: input.idempotencyKey ?? `automation-run:${parent.operation.id}:${binding.id}`,
+  };
+}
+
+function beginTriggeredUpdate(input: Readonly<{
+  repository: ManagedAutomationPersistence;
+  mutation: ManagedAutomationRecursiveMutationInput;
+  plan: AutomationTriggeredMutationPlan;
+}>): ManagedAutomationBinding {
+  if (!input.mutation.definition) throw new TypeError("automation-triggered update needs its definition");
+  return input.repository.beginUpdate({
+    id: input.plan.candidateBinding.id,
+    definition: input.mutation.definition,
+    authority: input.plan.authority,
+    now: input.mutation.now,
+    fence: input.mutation.fence,
+  });
+}
+
+function beginTriggeredEnablement(input: Readonly<{
+  repository: ManagedAutomationPersistence;
+  mutation: ManagedAutomationRecursiveMutationInput;
+  plan: AutomationTriggeredMutationPlan;
+}>): ManagedAutomationBinding {
+  const enabled = input.mutation.enabled ?? input.mutation.operationClass === "enable";
+  return input.repository.beginEnabledChange({
+    id: input.plan.candidateBinding.id,
+    enabled,
+    authority: input.plan.authority,
+    now: input.mutation.now,
+    fence: input.mutation.fence,
+  });
+}
+
+function beginTriggeredRunNow(input: Readonly<{
+  repository: ManagedAutomationPersistence;
+  plan: AutomationTriggeredMutationPlan;
+  mutation: ManagedAutomationRecursiveMutationInput;
+}>): ManagedAutomationBinding {
+  return input.repository.beginRunNow({
+    id: input.plan.candidateBinding.id,
+    idempotencyKey: input.plan.runNowIdempotencyKey,
+    authority: input.plan.authority,
+    now: input.mutation.now,
+    fence: input.mutation.fence,
+  }).binding;
+}
+
+function beginTriggeredMutation(input: Readonly<{
+  repository: ManagedAutomationPersistence;
+  mutation: ManagedAutomationRecursiveMutationInput;
+  plan: AutomationTriggeredMutationPlan;
+}>): ManagedAutomationBinding {
+  if (input.mutation.operationClass === "update") return beginTriggeredUpdate(input);
+  if (input.mutation.operationClass === "enable" || input.mutation.operationClass === "disable") {
+    return beginTriggeredEnablement(input);
+  }
+  if (input.mutation.operationClass === "run_now") return beginTriggeredRunNow(input);
+  return input.repository.beginRetirement(
+    input.plan.candidateBinding.id,
+    input.mutation.now,
+    input.mutation.fence,
+    input.plan.authority,
+  );
+}
+
+type ManagedAutomationClaimedOperationInput = Readonly<{
+  binding: ManagedAutomationBinding;
+  operation: ManagedAutomationOperation;
+  scope: ManagedAutomationScope;
+  signal?: AbortSignal;
+  now?: number;
+}>;
+
+type ManagedAutomationEnablementInput = Readonly<{
+  id: string;
+  scope: ManagedAutomationScope;
+  now: number;
+  fence: ManagedAutomationMutationFence;
+  signal?: AbortSignal;
+}>;
+
+export type ManagedAutomationRecursiveMutationInput = Readonly<{
+  id: string;
+  operationClass: Exclude<ManagedAutomationOperationRequest["operationClass"], "create" | "reconcile">;
+  parentOperationId: string;
+  rootAutomationId?: string;
+  maxDepth?: number;
+  idempotencyKey?: string;
+  enabled?: boolean;
+  definition?: ManagedAutomationDefinition;
+  now: number;
+  fence: ManagedAutomationMutationFence;
+}>;
+
+export type ManagedAutomationIntentAdapters = Readonly<{
+  automationTriggered: Readonly<{
+    submit(input: ManagedAutomationRecursiveMutationInput): ManagedAutomationBinding;
+  }>;
+}>;
+
 export class ManagedAutomationService {
+  public readonly intentAdapters: ManagedAutomationIntentAdapters;
+
   public constructor(
     private readonly repository: ManagedAutomationPersistence,
     private readonly adapter: ManagedAutomationAdapter,
     private readonly authorityIsCurrent: (binding: ManagedAutomationBinding) => boolean,
-    private readonly capabilityIsCurrent: (binding: ManagedAutomationBinding, operation: ManagedAutomationOperation) => boolean = () => true,
+    private readonly capabilityIsCurrent: (
+      binding: ManagedAutomationBinding,
+      operation: ManagedAutomationCapabilityOperation,
+    ) => boolean = () => true,
     private readonly clock: { now(): number } | undefined = undefined,
-  ) {}
+  ) {
+    this.intentAdapters = Object.freeze({
+      automationTriggered: Object.freeze({
+        submit: (input: ManagedAutomationRecursiveMutationInput) => this.submitAutomationTriggeredOperation(input),
+      }),
+    });
+  }
 
   public get(id: string): ManagedAutomationBinding | null {
     return this.repository.get(id);
@@ -230,17 +596,45 @@ export class ManagedAutomationService {
     return this.repository.list(controllerKey, includeRetired);
   }
 
+  /**
+   * Submit a mutation from a completed automation run. The parent run is the
+   * authority evidence; the target and operation class are copied into the
+   * child authority so a recursive turn cannot widen its reach implicitly.
+   */
+  public submitAutomationTriggeredOperation(
+    input: ManagedAutomationRecursiveMutationInput,
+  ): ManagedAutomationBinding {
+    if (input.fence.kind !== "executor") {
+      throw new Error("automation-triggered mutation requires an executor fence");
+    }
+    const binding = this.repository.get(input.id);
+    if (!binding) throw new Error("managed automation is unavailable");
+    const parent = authoritativeParent(this.repository, input.parentOperationId);
+    if (!parent) throw new Error("automation-triggered mutation requires an authoritative parent run");
+    const targetHostId = assertRecursiveTarget(parent, binding);
+    const plan = buildAutomationTriggeredMutationPlan(input, binding, parent, targetHostId);
+    if (!managedAutomationAuthorityCoversOperation(plan.authority, plan.operation) ||
+      !this.authorityIsCurrent(plan.candidateBinding) || !this.capabilityIsCurrent(plan.candidateBinding, plan.operation)) {
+      throw new Error("automation-triggered mutation authority or evidence is not current");
+    }
+    return beginTriggeredMutation({ repository: this.repository, mutation: input, plan });
+  }
+
   public async create(input: CreateManagedAutomationInput): Promise<ManagedAutomationBinding> {
-    const operation = input.operation ?? (
+    const requestedOperation = input.operation ?? (
       isCurrentManagedAutomationAuthority(input.authority)
         ? {
             version: 1 as const,
             operationClass: "create" as const,
             targetProjectId: input.definition.projectId,
+            targetHostId: input.authority.hostId,
             definitionRevision: 1,
           }
         : undefined
     );
+    const operation = requestedOperation && isCurrentManagedAutomationAuthority(input.authority)
+      ? { ...requestedOperation, targetHostId: requestedOperation.targetHostId ?? input.authority.hostId }
+      : requestedOperation;
     const deferred = input.deferProvider === true || input.operation !== undefined;
     if (input.deferProvider === true && !operation) {
       throw new TypeError("deferred managed automation creation requires an operation fence");
@@ -281,6 +675,7 @@ export class ManagedAutomationService {
     }
     await this.executeReservedOperation({
       binding: reserved,
+      operationId: requireOperationId(reserved),
       scope: input.scope,
       now: input.now,
       fence: input.fence,
@@ -306,6 +701,10 @@ export class ManagedAutomationService {
       (!operation.capabilityEvidence || !binding.capabilityEvidence ||
         managedAutomationDigest(operation.capabilityEvidence) !== managedAutomationDigest(binding.capabilityEvidence))) {
       return { allowed: false, errorClass: "managed_automation_capability_evidence_stale" };
+    }
+    if (isCurrentManagedAutomationAuthority(operation.authority) &&
+      !managedAutomationAuthorityCoversOperation(operation.authority, operation)) {
+      return { allowed: false, errorClass: "managed_automation_operation_stale" };
     }
     if (isCurrentManagedAutomationAuthority(operation.authority) && operation.authority.origin === "owner" &&
       (!operation.controllerFence || operation.authority.taskAuthority.turnId !== operation.controllerFence.turnId)) {
@@ -342,19 +741,102 @@ export class ManagedAutomationService {
     return { allowed: true };
   }
 
-  public async executeClaimedOperation(input: {
-    binding: ManagedAutomationBinding;
-    operation: ManagedAutomationOperation;
-    scope: ManagedAutomationScope;
-    signal?: AbortSignal;
-    now?: number;
-  }): Promise<ManagedAutomationOperationExecution> {
+  private async observeRetriedUpdate(
+    input: ManagedAutomationClaimedOperationInput,
+    identity: ManagedAutomationProviderIdentity,
+  ): Promise<ManagedAutomationOperationExecution | null> {
+    try {
+      const automation = await this.adapter.show({
+        scope: input.scope,
+        projectId: input.binding.projectId,
+        automationId: input.binding.bbAutomationId!,
+        expectedDefinition: input.binding.definition,
+        expectedEnabled: input.binding.observed?.enabled ?? true,
+        identity,
+        signal: input.signal,
+      });
+      return { automation, run: null };
+    } catch (error) {
+      if (error instanceof BbAutomationObservationMismatchError) return null;
+      throw error;
+    }
+  }
+
+  private async observeRetriedEnablement(
+    input: ManagedAutomationClaimedOperationInput,
+    identity: ManagedAutomationProviderIdentity,
+  ): Promise<ManagedAutomationOperationExecution | null> {
+    try {
+      const automation = await this.adapter.show({
+        scope: input.scope,
+        projectId: input.binding.projectId,
+        automationId: input.binding.bbAutomationId!,
+        expectedDefinition: input.binding.definition,
+        expectedEnabled: input.operation.operationClass === "enable",
+        identity,
+        signal: input.signal,
+      });
+      return { automation, run: null };
+    } catch (error) {
+      if (error instanceof BbAutomationObservationMismatchError) return null;
+      throw error;
+    }
+  }
+
+  private async observeRetriedRunNow(
+    input: ManagedAutomationClaimedOperationInput,
+    identity: ManagedAutomationProviderIdentity,
+  ): Promise<ManagedAutomationOperationExecution | null> {
+    const runs = await this.adapter.runs({
+      scope: input.scope,
+      projectId: input.binding.projectId,
+      automationId: input.binding.bbAutomationId!,
+      limit: 200,
+      signal: input.signal,
+    });
+    const run = runs.find((candidate) => candidate.idempotencyKey === input.operation.operationKey);
+    if (!run) return null;
+    const automation = await this.adapter.show({
+      scope: input.scope,
+      projectId: input.binding.projectId,
+      automationId: input.binding.bbAutomationId!,
+      expectedDefinition: input.binding.definition,
+      expectedEnabled: input.binding.observed?.enabled ?? true,
+      identity,
+      signal: input.signal,
+    });
+    return { automation, run };
+  }
+
+  private async observeRetriedOperation(
+    input: ManagedAutomationClaimedOperationInput,
+    identity: ManagedAutomationProviderIdentity,
+  ): Promise<ManagedAutomationOperationExecution | null> {
+    if (input.operation.attempts <= 1) return null;
+    if (input.operation.operationClass === "update") return this.observeRetriedUpdate(input, identity);
+    if (["enable", "disable"].includes(input.operation.operationClass)) {
+      return this.observeRetriedEnablement(input, identity);
+    }
+    if (input.operation.operationClass === "run_now") return this.observeRetriedRunNow(input, identity);
+    return null;
+  }
+
+  public async executeClaimedOperation(
+    input: ManagedAutomationClaimedOperationInput,
+  ): Promise<ManagedAutomationOperationExecution> {
     const admission = this.admitOperation(input.binding, input.operation);
     if (!admission.allowed) throw new Error(admission.errorClass);
     const providerIdentity = existingProviderIdentity(input.binding, input.operation);
     if (!providerIdentity) throw new Error("managed_automation_provider_identity_missing");
     if (input.operation.operationClass === "retire") {
       if (input.binding.bbAutomationId !== null) {
+        if (input.operation.attempts > 1 && await automationIsAbsent(this.adapter, {
+          scope: input.scope,
+          projectId: input.binding.projectId,
+          automationId: input.binding.bbAutomationId,
+          identity: providerIdentity,
+          signal: input.signal,
+        })) return { automation: null, run: null };
         await deleteAutomationForRetirement(this.adapter, {
           scope: input.scope,
           projectId: input.binding.projectId,
@@ -364,6 +846,8 @@ export class ManagedAutomationService {
       }
       return { automation: null, run: null };
     }
+    const reconciled = await this.observeRetriedOperation(input, providerIdentity);
+    if (reconciled) return reconciled;
     if (input.operation.operationClass === "update") {
       const automation = await this.adapter.update({
         scope: input.scope,
@@ -478,6 +962,7 @@ export class ManagedAutomationService {
 
   private async executeReservedOperation(input: {
     binding: ManagedAutomationBinding;
+    operationId: string;
     scope: ManagedAutomationScope;
     now: number;
     fence: ManagedAutomationMutationFence;
@@ -486,9 +971,7 @@ export class ManagedAutomationService {
     if (input.fence.kind !== "executor") {
       throw new Error("managed automation operation is pending executor work");
     }
-    const operationId = input.binding.lastOperationId;
-    if (!operationId) throw new Error("managed automation operation identity is missing");
-    const existing = this.repository.getOperation(operationId);
+    const existing = this.repository.getOperation(input.operationId);
     if (!existing) throw new Error("managed automation operation is missing");
     if (existing.state === "succeeded") {
       return {
@@ -497,7 +980,7 @@ export class ManagedAutomationService {
       };
     }
     const operation = this.repository.claimOperation({
-      operationId,
+      operationId: input.operationId,
       ownerId: input.fence.value.ownerId,
       generation: input.fence.value.generation,
       now: input.now,
@@ -589,6 +1072,7 @@ export class ManagedAutomationService {
       durableOperation.operationClass !== "reconcile") {
       await this.executeReservedOperation({
         binding: input.binding,
+        operationId: requireOperationId(input.binding),
         scope: input.scope,
         now: input.now,
         fence: input.fence,
@@ -598,6 +1082,14 @@ export class ManagedAutomationService {
     }
     if (input.binding.bbAutomationId === null) throw new Error("managed automation has no BB automation id");
     if (input.binding.state === "retiring") {
+      const identity = existingProviderIdentity(input.binding);
+      if (await automationIsAbsent(this.adapter, {
+        scope: input.scope,
+        projectId: input.binding.projectId,
+        automationId: input.binding.bbAutomationId,
+        ...(identity ? { identity } : {}),
+        signal: input.signal,
+      })) return this.repository.retire(input.binding.id, input.now, input.fence);
       await deleteAutomationForRetirement(this.adapter, {
         scope: input.scope,
         projectId: input.binding.projectId,
@@ -667,14 +1159,15 @@ export class ManagedAutomationService {
     }
   }
 
-  public async setEnabled(input: {
-    id: string;
-    scope: ManagedAutomationScope;
-    enabled: boolean;
-    now: number;
-    fence: ManagedAutomationMutationFence;
-    signal?: AbortSignal;
-  }): Promise<ManagedAutomationBinding> {
+  public pause(input: ManagedAutomationEnablementInput): Promise<ManagedAutomationBinding> {
+    return this.setEnabled({ ...input, enabled: false });
+  }
+
+  public resume(input: ManagedAutomationEnablementInput): Promise<ManagedAutomationBinding> {
+    return this.setEnabled({ ...input, enabled: true });
+  }
+
+  public async setEnabled(input: ManagedAutomationEnablementInput & { enabled: boolean }): Promise<ManagedAutomationBinding> {
     const binding = requireActiveBinding(this.repository, input.id);
     if (input.enabled && binding.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     if (input.enabled && binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
@@ -689,6 +1182,7 @@ export class ManagedAutomationService {
     if (input.fence.kind === "controller") return updating;
     await this.executeReservedOperation({
       binding: updating,
+      operationId: requireOperationId(updating),
       scope: input.scope,
       now: input.now,
       fence: input.fence,
@@ -715,6 +1209,7 @@ export class ManagedAutomationService {
     if (input.fence.kind === "controller") return updating;
     await this.executeReservedOperation({
       binding: updating,
+      operationId: requireOperationId(updating),
       scope: input.scope,
       now: input.now,
       fence: input.fence,
@@ -782,7 +1277,7 @@ export class ManagedAutomationService {
     if (binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
       throw new Error("managed automation authority is not current");
     }
-    const pending = this.repository.beginRunNow({
+    const reservation = this.repository.beginRunNow({
       id: binding.id,
       idempotencyKey: input.idempotencyKey,
       now: input.now,
@@ -790,7 +1285,8 @@ export class ManagedAutomationService {
     });
     if (input.fence.kind === "controller") return null;
     const execution = await this.executeReservedOperation({
-      binding: pending,
+      binding: reservation.binding,
+      operationId: reservation.operationId,
       scope: input.scope,
       now: input.now,
       fence: input.fence,
@@ -818,6 +1314,7 @@ export class ManagedAutomationService {
     if (input.fence.kind === "controller") return binding;
     await this.executeReservedOperation({
       binding,
+      operationId: requireOperationId(binding),
       scope: input.scope,
       now: input.now,
       fence: input.fence,
@@ -827,13 +1324,18 @@ export class ManagedAutomationService {
   }
 }
 
+function requireOperationId(binding: ManagedAutomationBinding): string {
+  if (!binding.lastOperationId) throw new Error("managed automation operation identity is missing");
+  return binding.lastOperationId;
+}
+
 function requireActiveBinding(
   repository: ManagedAutomationPersistence,
   id: string,
 ): ManagedAutomationBinding {
   const binding = repository.get(id);
   if (!binding || binding.bbAutomationId === null ||
-    !["active", "paused", "failed"].includes(binding.state)) {
+    !["active", "paused", "updating", "failed"].includes(binding.state)) {
     throw new Error("managed automation is unavailable");
   }
   return binding;

@@ -5,12 +5,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import {
-  NavigatorWorkflowExecutor,
-  type NavigatorSkillRunner,
-} from "../src/navigator/executor";
-import type { NavigatorProposal, NavigatorSkillAttempt, NavigatorSnapshot } from "../src/navigator/models";
-import { NavigatorPlanningPublisher } from "../src/navigator/planning-publisher";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+  NavigatorPlanningService,
+  type WorkflowNavigator,
+} from "../src/navigator/planning-service";
+import type { NavigatorSkillRunner } from "../src/navigator/skill-runner";
+import type {
+  NavigatorInferenceObservation,
+  NavigatorProposal,
+  NavigatorSkillAttempt,
+  NavigatorSnapshot,
+} from "../src/navigator/models";
+import { NavigatorPlanningPublisher, NavigatorPublicationDriftError } from "../src/navigator/planning-publisher";
+import {
+  NavigatorEffectProtocol,
+  type NavigatorEffectContext,
+  type NavigatorEffectOutcome,
+} from "../src/navigator/effect-protocol";
+import { openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import { WorkArtifactCoordinator } from "../src/work-artifacts/coordinator";
 import {
   GitHubWorkTracker,
@@ -162,6 +173,7 @@ class PlanningGitHubGateway implements GitHubIssueGateway {
 
 type PlanningFixture = Readonly<{
   store: TelegramAgentStore;
+  navigatorEffects: import("../src/navigator/effect-persistence").NavigatorEffectPersistence;
   tracker: WorkTracker;
   coordinator: WorkArtifactCoordinator;
   publisher: NavigatorPlanningPublisher;
@@ -182,7 +194,8 @@ async function planningFixture(kind: "github" | "local_markdown"): Promise<Plann
   const fixtureId = fixtureNumber++;
   const { bb } = createFakePluginHost({ pluginId: `navigator-planning-${kind}-${fixtureId}` });
   let clock = 10_000;
-  const store = openStore(bb.storage, bb.storage.kv, () => clock);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, () => clock);
+  const store = composition.store;
   const gateway = kind === "github" ? new PlanningGitHubGateway() : null;
   const repositoryRoot = await mkdtemp(join(tmpdir(), "navigator-planning-"));
   temporaryDirectories.push(repositoryRoot);
@@ -230,9 +243,16 @@ async function planningFixture(kind: "github" | "local_markdown"): Promise<Plann
     }],
     now: ++clock,
   });
+  bb.storage.database().prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at
+     ) VALUES (?, 'project:proj_39:pipeline', 'project', 'held', ?, ?, ?, ?, ?)`,
+  ).run(draft.id, fence.ownerId, fence.generation, clock + 1_000_000, clock, clock);
   bb.storage.database().prepare("UPDATE jobs SET state = 'implementing' WHERE id = ?").run(draft.id);
   return {
     store,
+    navigatorEffects: composition.navigatorEffects,
     tracker,
     coordinator,
     publisher: new NavigatorPlanningPublisher(store, coordinator),
@@ -251,6 +271,7 @@ async function runPlanningStep(
     skillId: string;
     subjectArtifactIds: readonly string[];
     result(attempt: NavigatorSkillAttempt): unknown;
+    publish?: boolean;
   }>,
 ): Promise<Readonly<{ attempt: NavigatorSkillAttempt; rawResult: unknown }>> {
   let rawResult: unknown;
@@ -277,8 +298,11 @@ async function runPlanningStep(
       objective: `Run ${input.skillId} for ticket 39.`,
     }),
   };
-  const executor = new NavigatorWorkflowExecutor({
-    store: fixture.store,
+  const planning = new NavigatorPlanningService({
+    persistence: {
+      createNavigatorSnapshot: (snapshotInput) => fixture.store.createNavigatorSnapshot(snapshotInput),
+      recordNavigatorProposal: (proposalInput) => fixture.store.recordNavigatorProposal(proposalInput),
+    },
     navigator,
     observeInference: async () => ({
       nativeToolCalls: [],
@@ -286,12 +310,10 @@ async function runPlanningStep(
       dynamicEffectToolIds: [],
       externalStateDigest: "e".repeat(64),
     }),
-    skillRunner: runner,
-    planningPublisher: fixture.publisher,
     modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
     clock: { now: fixture.advance },
   });
-  const decision = await executor.proposeNext({
+  const decision = await planning.proposeNext({
     jobId: fixture.jobId,
     externalStateDigest: "e".repeat(64),
     evidenceRefs: ["ticket:39"],
@@ -302,7 +324,19 @@ async function runPlanningStep(
       `planning proposal was ${decision.decision}: ${decision.reasonCode}; subjects=${input.subjectArtifactIds.join(",")}; bound=${boundIds?.join(",")}`,
     );
   }
-  await expect(executor.processOne({
+  const protocol = new NavigatorEffectProtocol({
+    store: fixture.navigatorEffects,
+    clock: { now: fixture.advance },
+    adapters: [
+      {
+        kind: "run_navigator_skill",
+        execute: (context) => executePlanningSkill(fixture, context, runner, input.publish ?? true),
+      },
+      { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+      { kind: "run_navigator_release", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+    ],
+  });
+  await expect(protocol.processOne({
     ...fixture.fence,
     signal: new AbortController().signal,
   }, new AbortController().signal)).resolves.toBe(true);
@@ -315,6 +349,42 @@ async function runPlanningStep(
   }
   expect(outcome).toMatchObject({ outcome: "succeeded" });
   return { attempt, rawResult };
+}
+
+function planningHarness(
+  fixture: PlanningFixture,
+  navigator: WorkflowNavigator,
+  runner: NavigatorSkillRunner,
+  observeInference: (snapshot: NavigatorSnapshot) => Promise<NavigatorInferenceObservation> = async () => ({
+    nativeToolCalls: [],
+    claimedCodeWorktreeId: null,
+    dynamicEffectToolIds: [],
+    externalStateDigest: "e".repeat(64),
+  }),
+): Readonly<{ planning: NavigatorPlanningService; protocol: NavigatorEffectProtocol }> {
+  const planning = new NavigatorPlanningService({
+    persistence: {
+      createNavigatorSnapshot: (input) => fixture.store.createNavigatorSnapshot(input),
+      recordNavigatorProposal: (input) => fixture.store.recordNavigatorProposal(input),
+    },
+    navigator,
+    observeInference,
+    modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
+    clock: { now: fixture.advance },
+  });
+  const protocol = new NavigatorEffectProtocol({
+    store: fixture.navigatorEffects,
+    clock: { now: fixture.advance },
+    adapters: [
+      {
+        kind: "run_navigator_skill",
+        execute: (context) => executePlanningSkill(fixture, context, runner),
+      },
+      { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+      { kind: "run_navigator_release", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+    ],
+  });
+  return { planning, protocol };
 }
 
 function artifactsOfKind(
@@ -349,6 +419,84 @@ function pauseAfterNextCreate(tracker: WorkTracker): Readonly<{
     return artifact;
   });
   return { started, release };
+}
+
+async function executePlanningSkill(
+  fixture: PlanningFixture,
+  context: NavigatorEffectContext,
+  runner: NavigatorSkillRunner,
+  publish = true,
+): Promise<NavigatorEffectOutcome> {
+  if (context.kind !== "run_navigator_skill") {
+    return { outcome: "permanent", reason: "planning skill received another effect kind" };
+  }
+  const existing = fixture.navigatorEffects.getNavigatorPlanningResult(context.attempt.id);
+  const run = existing === null
+    ? await runner.run(context.attempt, { bindResource: context.bindResource }, context.signal)
+    : {
+      resource: context.attempt.resource,
+      observedExternalStateDigest: existing.observedExternalStateDigest,
+      result: existing.result,
+    };
+  if (run.resource === null) throw new Error("durable planning result has no bound resource");
+  await context.bindResource(run.resource);
+  const durable = existing ?? fixture.navigatorEffects.recordNavigatorPlanningResult({
+    attemptId: context.attempt.id,
+    effectIdempotencyKey: context.effect.idempotencyKey,
+    observedExternalStateDigest: run.observedExternalStateDigest,
+    result: run.result,
+    ownerId: context.fence.ownerId,
+    generation: context.fence.generation,
+    now: fixture.advance(),
+  });
+  if (durable === null) throw new Error("planning result fence was lost");
+  if (!publish) {
+    return {
+      outcome: "completed",
+      receipt: {
+        kind: "run_navigator_skill",
+        effectIdempotencyKey: context.effect.idempotencyKey,
+        attemptId: context.attempt.id,
+        resource: run.resource,
+        observedExternalStateDigest: durable.observedExternalStateDigest,
+        result: durable.result,
+      },
+    };
+  }
+  let publication;
+  try {
+    publication = await fixture.publisher.publish(context.attempt, durable.result, {
+      ...fixture.fence,
+      now: fixture.advance(),
+    });
+  } catch (error) {
+    if (!(error instanceof NavigatorPublicationDriftError)) throw error;
+    return {
+      outcome: "completed",
+      receipt: {
+        kind: "run_navigator_skill",
+        effectIdempotencyKey: context.effect.idempotencyKey,
+        attemptId: context.attempt.id,
+        resource: run.resource,
+        observedExternalStateDigest: durable.observedExternalStateDigest,
+        result: durable.result,
+      },
+      policyFailureReason: "stale_artifact_snapshot",
+    } as NavigatorEffectOutcome;
+  }
+  return {
+    outcome: "completed",
+    receipt: {
+      kind: "run_navigator_skill",
+      effectIdempotencyKey: context.effect.idempotencyKey,
+      attemptId: context.attempt.id,
+      resource: run.resource,
+      observedExternalStateDigest: durable.observedExternalStateDigest,
+      result: durable.result,
+    },
+    publishedArtifactBindings: publication.artifactBindings,
+    reconciledArtifactIds: publication.reconciledArtifactIds,
+  };
 }
 
 describe.each(["github", "local_markdown"] as const)("navigator planning through %s", (trackerKind) => {
@@ -564,65 +712,26 @@ describe.each(["github", "local_markdown"] as const)("navigator planning through
     const map = artifactsOfKind(fixture.store, fixture.jobId, "map")[0]!;
     const decision = artifactsOfKind(fixture.store, fixture.jobId, "decision_ticket")[0]!;
     const decisionSnapshot = fixture.store.getCurrentWorkArtifactSnapshot(decision.id)!;
-    const navigator = {
-      propose: async (snapshot: NavigatorSnapshot): Promise<NavigatorProposal> => ({
-        kind: "invoke_skill",
-        basedOn: snapshot.identity,
-        rationale: "Persist authoritative evidence before prototype publication.",
-        evidenceRefs: ["ticket:39:SPEC-39-004"],
-        skillId: "research",
-        subjectArtifactIds: [decision.id],
-        objective: "Bind the decision snapshot.",
+    const research = await runPlanningStep(fixture, {
+      skillId: "research",
+      subjectArtifactIds: [decision.id],
+      publish: false,
+      result: () => ({
+        kind: "research_result",
+        summary: "The accepted snapshot is bound for publication.",
+        artifactEvidence: [{
+          artifactId: decision.id,
+          snapshotId: decisionSnapshot.id,
+          snapshotDigest: decisionSnapshot.snapshotDigest,
+          finding: "Research placeholder superseded by the prototype verdict.",
+          evidenceRefs: ["source:prototype-session"],
+        }],
       }),
-    };
-    const executor = new NavigatorWorkflowExecutor({
-      store: fixture.store,
-      navigator,
-      observeInference: async () => ({
-        nativeToolCalls: [],
-        claimedCodeWorktreeId: null,
-        dynamicEffectToolIds: [],
-        externalStateDigest: "e".repeat(64),
-      }),
-      skillRunner: {
-        run: vi.fn(async (attempt, hooks) => {
-          const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
-          await hooks.bindResource(resource);
-          return {
-            resource,
-            observedExternalStateDigest: "e".repeat(64),
-            result: {
-              kind: "research_result",
-              summary: "The accepted snapshot is bound for publication.",
-              artifactEvidence: [{
-                artifactId: decision.id,
-                snapshotId: decisionSnapshot.id,
-                snapshotDigest: decisionSnapshot.snapshotDigest,
-                finding: "Research placeholder superseded by the prototype verdict.",
-                evidenceRefs: ["source:prototype-session"],
-              }],
-            },
-          };
-        }),
-      },
-      modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
-      clock: { now: fixture.advance },
     });
-    const accepted = await executor.proposeNext({
-      jobId: fixture.jobId,
-      externalStateDigest: "e".repeat(64),
-      evidenceRefs: [],
-    });
-    await executor.processOne({
-      ...fixture.fence,
-      signal: new AbortController().signal,
-    }, new AbortController().signal);
-    const attempt = fixture.store.getNavigatorSkillAttempt(accepted.attemptId!);
-    if (!attempt) throw new Error("prototype publication attempt disappeared");
     await fixture.publisher.publish({
-      ...attempt,
+      ...research.attempt,
       skillId: "prototype",
-      workflowStepId: `${attempt.workflowStepId}:prototype-publication`,
+      workflowStepId: `${research.attempt.workflowStepId}:prototype-publication`,
     }, {
       kind: "prototype_result",
       summary: "The prototype produced a concrete answer.",
@@ -664,51 +773,39 @@ describe.each(["github", "local_markdown"] as const)("STD-39-002 through %s", (t
         objective: "Publish the planning map.",
       }),
     };
-    const executor = new NavigatorWorkflowExecutor({
-      store: fixture.store,
-      navigator,
-      observeInference: async () => ({
-        nativeToolCalls: [],
-        claimedCodeWorktreeId: null,
-        dynamicEffectToolIds: [],
-        externalStateDigest: "e".repeat(64),
-      }),
-      skillRunner: {
-        run: vi.fn(async (attempt, hooks) => {
-          const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
-          await hooks.bindResource(resource);
-          return {
-            resource,
-            observedExternalStateDigest: "e".repeat(64),
-            result: {
-              kind: "wayfinder_result",
-              summary: "The old owner ticket snapshot produced a map.",
-              map: {
-                title: "Drifted map",
-                body: "## Destination\n\nReject stale publication.\n\n## Decisions so far\n\n## Not yet specified\n\nOne decision.",
-                acceptanceCriteria: ["Drift fails closed"],
-              },
-              decisionTickets: [{
-                title: "Resolve drift",
-                body: "## Question\n\nWhich snapshot is authoritative?",
-                acceptanceCriteria: ["Use the current snapshot"],
-                blockedBy: [],
-              }],
-              evidenceRefs: ["ticket:39:STD-39-002"],
+    const runner: NavigatorSkillRunner = {
+      run: vi.fn(async (attempt, hooks) => {
+        const resource = { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+        await hooks.bindResource(resource);
+        return {
+          resource,
+          observedExternalStateDigest: "e".repeat(64),
+          result: {
+            kind: "wayfinder_result",
+            summary: "The old owner ticket snapshot produced a map.",
+            map: {
+              title: "Drifted map",
+              body: "## Destination\n\nReject stale publication.\n\n## Decisions so far\n\n## Not yet specified\n\nOne decision.",
+              acceptanceCriteria: ["Drift fails closed"],
             },
-          };
-        }),
-      },
-      planningPublisher: fixture.publisher,
-      modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
-      clock: { now: fixture.advance },
-    });
-    const accepted = await executor.proposeNext({
+            decisionTickets: [{
+              title: "Resolve drift",
+              body: "## Question\n\nWhich snapshot is authoritative?",
+              acceptanceCriteria: ["Use the current snapshot"],
+              blockedBy: [],
+            }],
+            evidenceRefs: ["ticket:39:STD-39-002"],
+          },
+        };
+      }),
+    };
+    const services = planningHarness(fixture, navigator, runner);
+    const accepted = await services.planning.proposeNext({
       jobId: fixture.jobId,
       externalStateDigest: "e".repeat(64),
       evidenceRefs: [],
     });
-    const processing = executor.processOne({
+    const processing = services.protocol.processOne({
       ...fixture.fence,
       signal: new AbortController().signal,
     }, new AbortController().signal);

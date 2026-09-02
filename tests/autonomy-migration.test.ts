@@ -26,7 +26,7 @@ import {
 } from "../src/work-artifacts/repository";
 import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
 import { runJobExecutorService } from "../src/services/job-executor-service";
-import { openStore } from "../src/storage/store";
+import { openStoreComposition } from "../src/storage/store";
 
 const LEGACY_MIGRATION_COUNT = 16;
 const LEGACY_PROJECT_ID = "proj_legacy";
@@ -1434,8 +1434,9 @@ it("continues preceding-schema active Navigator attempts without fabricating cap
     .toEqual({ count: 0 });
 
   const adapter = vi.fn(async () => ({ outcome: "permanent" as const, reason: "must remain quarantined" }));
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, () => 1_100);
   const protocol = new NavigatorEffectProtocol({
-    store: openStore(bb.storage, bb.storage.kv, () => 1_100),
+    store: composition.navigatorEffects,
     clock: { now: () => 1_100 },
     adapters: [
       { kind: "run_navigator_skill", execute: adapter },
@@ -1445,7 +1446,7 @@ it("continues preceding-schema active Navigator attempts without fabricating cap
   });
   const abort = new AbortController();
   await runJobExecutorService({
-    store: openStore(bb.storage, bb.storage.kv, () => 1_100),
+    store: composition.store,
     clock: { now: () => 1_100 },
     navigatorEffects: protocol,
     effectRunnerFactory: () => ({ run: async () => undefined }),

@@ -1,6 +1,6 @@
 import { selectNavigatorPlanningRoute, type NavigatorRoutingSignals } from "./planning-contracts";
 import type { NavigatorSnapshot } from "./models";
-import type { WorkflowNavigator } from "./executor";
+import type { WorkflowNavigator } from "./planning-service";
 
 function signalsFromSnapshot(snapshot: NavigatorSnapshot): NavigatorRoutingSignals {
   const specificationReady = snapshot.artifactBindings.length > 1;

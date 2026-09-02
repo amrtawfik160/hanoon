@@ -23,15 +23,17 @@ import {
   type NavigatorTicketWorkerOperation,
 } from "../src/navigator/ticket-adapter";
 import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
+import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-runtime";
 import { DurableNavigatorPromotionEvidenceReader } from "../src/navigator/promotion-evidence";
 import {
   NAVIGATOR_LIVE_SCENARIOS,
   NavigatorPromotionService,
 } from "../src/navigator/promotion";
-import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
+import { NavigatorReleaseOperation } from "../src/navigator/release-operation";
 import { EffectRunner } from "../src/services/effect-runner";
-import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
+import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../src/autonomy/models";
 import { openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
+import type { NavigatorEffectPersistence } from "../src/navigator/effect-persistence";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture, productionPolicyFixture, sha } from "./helpers";
 import { runRequiredNavigatorLiveScenarios } from "./support/navigator-live-scenarios";
@@ -45,7 +47,7 @@ function modelRoute() {
 }
 
 function ticketProtocol(
-  store: TelegramAgentStore,
+  store: NavigatorEffectPersistence,
   now: () => number,
   operation: NavigatorTicketWorkerOperation,
 ): NavigatorEffectProtocol {
@@ -240,7 +242,7 @@ function confirmNavigatorAdmission(
 
 describe("dual-engine coordinator", () => {
   it("refuses live evidence that is only a SQL-stamped terminal job", async () => {
-    const { store, database, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
+    const { store, database, navigatorEffects, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
     const corpus = await coordinator.evaluateCorpus();
     const liveRuns = NAVIGATOR_LIVE_SCENARIOS.map((scenario) => {
       const live = createLiveJob(store, database, scenario, now);
@@ -264,12 +266,12 @@ describe("dual-engine coordinator", () => {
   });
 
   it("evaluates the fixed corpus, persists reviewed evidence, and admits navigator-v1", async () => {
-    const { store, database, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
+    const { store, database, navigatorEffects, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
     const corpus = await coordinator.evaluateCorpus();
     expect(corpus).toMatchObject({ total: 58, correct: 58, unauthorizedEffects: 0 });
 
     const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store, implementationPersistence: navigatorImplementation, evaluationPersistence: navigatorEvaluation, database, now, sequence: fixtureSequence,
+      store, navigatorEffects, implementationPersistence: navigatorImplementation, evaluationPersistence: navigatorEvaluation, database, now, sequence: fixtureSequence,
     });
     const trials = seedTrials(store, now);
     coordinator.persistEvaluationEvidence({
@@ -309,10 +311,10 @@ describe("dual-engine coordinator", () => {
   });
 
   it("does not persist restart as passed or safety zeros unless those were measured", async () => {
-    const { store, database, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
+    const { store, database, navigatorEffects, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
     const corpus = await coordinator.evaluateCorpus();
     const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store, implementationPersistence: navigatorImplementation, evaluationPersistence: navigatorEvaluation, database, now, sequence: fixtureSequence,
+      store, navigatorEffects, implementationPersistence: navigatorImplementation, evaluationPersistence: navigatorEvaluation, database, now, sequence: fixtureSequence,
     });
     const trials = seedTrials(store, now);
     coordinator.persistEvaluationEvidence({
@@ -345,7 +347,7 @@ describe("dual-engine coordinator", () => {
 
 describe("disposable navigator live path", () => {
   it("creates tickets, implements them sequentially with one repair, opens one pull request, and deploys", async () => {
-    const { store, database, now, navigatorImplementation } = openCoordinatorFixture();
+    const { store, database, navigatorEffects, now, navigatorImplementation } = openCoordinatorFixture();
     const specificationId = stableWorkArtifactId("proj_1", `spec-dual-${fixtureSequence}`);
     const firstTicketId = stableWorkArtifactId("proj_1", `ticket-dual-1-${fixtureSequence}`);
     const secondTicketId = stableWorkArtifactId("proj_1", `ticket-dual-2-${fixtureSequence}`);
@@ -412,7 +414,6 @@ describe("disposable navigator live path", () => {
          lease_expires_at, acquired_at, renewed_at
        ) VALUES (?, ?, 'project', 'held', 'executor', ?, ?, ?, ?)`,
     ).run(draft.id, projectResourceKey("proj_1"), lease.generation, claimTime + 100_000, claimTime, claimTime);
-
     const ticketOperation: NavigatorTicketWorkerOperation = {
       run: vi.fn(async (input: NavigatorTicketWorkerInput) => {
         const { attempt, ticket: ticketSnapshot } = input;
@@ -528,7 +529,7 @@ describe("disposable navigator live path", () => {
       }),
       clock: { now },
     });
-    const protocol = ticketProtocol(store, now, ticketOperation);
+    const protocol = ticketProtocol(navigatorEffects, now, ticketOperation);
     executor.startIntegration({
       jobId: draft.id,
       specificationArtifactId: specificationId,
@@ -703,8 +704,33 @@ describe("disposable navigator live path", () => {
       now: now(),
     });
     expect(releaseDecision.decision).toBe("accepted");
-    const release = new NavigatorReleaseExecutor({
-      store,
+    const jobPolicy = store.getJob(draft.id)?.policy;
+    if (!jobPolicy) throw new Error("missing dual-engine job policy");
+    const insertReleaseClaim = database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, ?, 'held', 'executor', ?, ?, ?, ?)`,
+    );
+    insertReleaseClaim.run(
+      draft.id,
+      repositoryMergeResourceKey(jobPolicy.githubRepository),
+      "repository_merge",
+      lease.generation,
+      claimTime + 100_000,
+      claimTime,
+      claimTime,
+    );
+    insertReleaseClaim.run(
+      draft.id,
+      productionResourceKey(jobPolicy),
+      "production_target",
+      lease.generation,
+      claimTime + 100_000,
+      claimTime,
+      claimTime,
+    );
+    const release = new NavigatorReleaseOperation({
       publishPullRequest: async () => ({
         operationId: "pr-43",
         jobId: draft.id,
@@ -713,9 +739,17 @@ describe("disposable navigator live path", () => {
         headSha: HEAD,
       }),
       integrationWorktreeId: () => "env_job_dual",
-      clock: { now },
     });
-    expect(await release.processOne({
+    const releaseProtocol = new NavigatorEffectProtocol({
+      store: navigatorEffects,
+      clock: { now },
+      adapters: [
+        { kind: "run_navigator_skill", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+        { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+        createNavigatorReleaseEffectAdapter(release),
+      ],
+    });
+    expect(await releaseProtocol.processOne({
       ownerId: "executor",
       generation: lease.generation,
       signal: new AbortController().signal,
@@ -733,7 +767,7 @@ describe("disposable navigator live path", () => {
       `UPDATE job_admissions SET project_id = ?, state = 'admitted', admitted_at = ? WHERE job_id = ?`,
     ).run("proj_1", now(), draft.id);
     const insertClaim = database.prepare(
-      `INSERT INTO job_resource_claims (
+      `INSERT OR IGNORE INTO job_resource_claims (
          job_id, resource_key, resource_kind, state, owner_id, generation,
          lease_expires_at, acquired_at, renewed_at
        ) VALUES (?, ?, ?, 'held', 'executor', ?, 130000, 10100, 10100)`,

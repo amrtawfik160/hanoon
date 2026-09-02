@@ -14,10 +14,12 @@ import {
   type NavigatorTicketWorkerOperation,
 } from "../../src/navigator/ticket-adapter";
 import { NavigatorEffectProtocol } from "../../src/navigator/effect-protocol";
+import { NavigatorReleaseOperation } from "../../src/navigator/release-operation";
+import type { NavigatorEffectPersistence } from "../../src/navigator/effect-persistence";
+import { createNavigatorReleaseEffectAdapter } from "../../src/navigator/plugin-runtime";
 import { assertNavigatorLiveScenarioEvidence } from "../../src/navigator/live-evidence";
 import type { NavigatorEvaluationPersistence } from "../../src/navigator/evaluation-persistence";
 import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/navigator/promotion";
-import { NavigatorReleaseExecutor } from "../../src/navigator/release-executor";
 import { EffectRunner } from "../../src/services/effect-runner";
 import type { ProductionStageSnapshot } from "../../src/services/production-runner";
 import type { TelegramAgentStore } from "../../src/storage/store";
@@ -245,6 +247,7 @@ function claimProjectResource(
 
 function implementationExecutor(
   store: TelegramAgentStore,
+  navigatorEffects: NavigatorEffectPersistence,
   persistence: NavigatorImplementationPersistence,
   now: () => number,
   options: Readonly<{ staleHead: boolean; findingsOnFirstReview: boolean }>,
@@ -357,7 +360,7 @@ function implementationExecutor(
   });
   const unused = async () => ({ outcome: "permanent" as const, reason: "unused in live scenario" });
   const protocol = new NavigatorEffectProtocol({
-    store,
+    store: navigatorEffects,
     clock: { now },
     adapters: [
       { kind: "run_navigator_skill", execute: unused },
@@ -408,6 +411,7 @@ async function processUntilOutcome(
 
 async function runImplementation(
   store: TelegramAgentStore,
+  navigatorEffects: NavigatorEffectPersistence,
   persistence: NavigatorImplementationPersistence,
   database: Database.Database,
   now: () => number,
@@ -417,7 +421,7 @@ async function runImplementation(
   options: Readonly<{ staleHead: boolean; findingsOnFirstReview: boolean }>,
 ) {
   isolateLiveIntegration(database, opened.jobId);
-  const running = implementationExecutor(store, persistence, now, options);
+  const running = implementationExecutor(store, navigatorEffects, persistence, now, options);
   const executor = running.executor;
   executor.startIntegration({
     jobId: opened.jobId,
@@ -718,13 +722,14 @@ async function runNextProductionEffect(
 
 function startResolvedIntegration(
   store: TelegramAgentStore,
+  navigatorEffects: NavigatorEffectPersistence,
   persistence: NavigatorImplementationPersistence,
   database: Database.Database,
   now: () => number,
   opened: Readonly<{ jobId: string; specificationId: string; ticketId: string }>,
 ): void {
   isolateLiveIntegration(database, opened.jobId);
-  const running = implementationExecutor(store, persistence, now, {
+  const running = implementationExecutor(store, navigatorEffects, persistence, now, {
     staleHead: false,
     findingsOnFirstReview: false,
   });
@@ -750,6 +755,7 @@ function startResolvedIntegration(
 
 export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
   store: TelegramAgentStore;
+  navigatorEffects: NavigatorEffectPersistence;
   implementationPersistence: NavigatorImplementationPersistence;
   evaluationPersistence: NavigatorEvaluationPersistence;
   database: Database.Database;
@@ -797,7 +803,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
 
       if (scenario === "stale_head") {
         await runImplementation(
-          input.store, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
+          input.store, input.navigatorEffects, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
           { staleHead: true, findingsOnFirstReview: false },
         );
         cancelJob(input.store, opened.jobId, input.now);
@@ -807,7 +813,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
 
       if (scenario === "repair") {
         const running = await runImplementation(
-          input.store, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
+          input.store, input.navigatorEffects, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
           { staleHead: false, findingsOnFirstReview: true },
         );
         await repairAndAccept(running, opened);
@@ -864,7 +870,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
       }
 
       if (scenario === "re_release") {
-        startResolvedIntegration(input.store, input.implementationPersistence, input.database, input.now, opened);
+        startResolvedIntegration(input.store, input.navigatorEffects, input.implementationPersistence, input.database, input.now, opened);
         markShippedChange(input.database, opened.jobId);
         propose(input.store, opened.jobId, input.now, {
           kind: "start_release",
@@ -896,7 +902,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
       }
 
       const running = await runImplementation(
-        input.store, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
+        input.store, input.navigatorEffects, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
         { staleHead: false, findingsOnFirstReview: true },
       );
       await repairAndAccept(running, opened);
@@ -911,8 +917,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
         kind: "start_release",
         implementationTicketIds: [opened.ticketId],
       });
-      const release = new NavigatorReleaseExecutor({
-        store: input.store,
+      const release = new NavigatorReleaseOperation({
         publishPullRequest: async () => ({
           operationId: "pr-43",
           jobId: opened.jobId,
@@ -921,9 +926,17 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
           headSha: NEXT_HEAD,
         }),
         integrationWorktreeId: () => `env_${opened.jobId}`,
-        clock: { now: input.now },
       });
-      await release.processOne({
+      const releaseProtocol = new NavigatorEffectProtocol({
+        store: input.navigatorEffects,
+        clock: { now: input.now },
+        adapters: [
+          { kind: "run_navigator_skill", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          createNavigatorReleaseEffectAdapter(release),
+        ],
+      });
+      await releaseProtocol.processOne({
         ownerId,
         generation: lease.generation,
         signal: new AbortController().signal,

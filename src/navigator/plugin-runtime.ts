@@ -4,18 +4,12 @@ import { buildPublishPullRequestCommand, parsePublishedPullRequest } from "../bb
 import { PR_HEAD_COMMAND, parseLsRemoteHead } from "../bb/validation";
 import { TerminalCommandRunner, shellSingleQuote, type CommandResult } from "../bb/terminal-command";
 import { modelRouteSpawnArgs } from "../domain/stage-execution";
-import type {
-  NavigatorEffectPersistence,
-  NavigatorReleasePersistence,
-} from "./effect-persistence";
-import type { NavigatorWorkflowPersistence } from "./executor";
+import type { NavigatorEffectPersistence } from "./effect-persistence";
+import type { NavigatorPlanningPersistence, WorkflowNavigator } from "./planning-service";
 import type { NavigatorImplementationPersistence } from "./implementation-persistence";
 import type { NavigatorImplementationReadStore } from "./implementation-executor";
-import {
-  NavigatorWorkflowExecutor,
-  type NavigatorSkillRunner,
-  type WorkflowNavigator,
-} from "./executor";
+import { NavigatorPlanningService } from "./planning-service";
+import type { NavigatorSkillRunner } from "./skill-runner";
 import {
   NavigatorImplementationExecutor,
   type NavigatorPullRequestPublisher,
@@ -32,7 +26,7 @@ import {
   type NavigatorTicketWorkerOperation,
   type NavigatorTicketWorkerRun,
 } from "./ticket-adapter";
-import { navigatorReleaseTitle, NavigatorReleaseExecutor } from "./release-executor";
+import { navigatorReleaseTitle, NavigatorReleaseOperation } from "./release-operation";
 import {
   NavigatorEffectProtocol,
   type NavigatorEffectAdapter,
@@ -67,9 +61,9 @@ const NATIVE_TOOL_ITEM_TYPES: Readonly<Record<string, string>> = {
 
 export type NavigatorPluginRuntime = Readonly<{
   effects: NavigatorEffectProtocol;
-  navigator: NavigatorWorkflowExecutor;
+  planning: NavigatorPlanningService;
   implementation: NavigatorImplementationExecutor;
-  release: NavigatorReleaseExecutor;
+  release: NavigatorReleaseOperation;
 }>;
 
 function releaseReceipt(
@@ -89,7 +83,7 @@ function releaseReceipt(
 }
 
 async function executeReleaseAdapter(
-  operation: Pick<NavigatorReleaseExecutor, "executeEntry" | "integrationEnvironmentId">,
+  operation: Pick<NavigatorReleaseOperation, "executeEntry" | "integrationEnvironmentId">,
   context: NavigatorEffectContext,
 ): Promise<NavigatorEffectOutcome> {
   if (context.kind !== "run_navigator_release") {
@@ -105,7 +99,7 @@ async function executeReleaseAdapter(
 }
 
 export function createNavigatorReleaseEffectAdapter(
-  operation: Pick<NavigatorReleaseExecutor, "executeEntry" | "integrationEnvironmentId">,
+  operation: Pick<NavigatorReleaseOperation, "executeEntry" | "integrationEnvironmentId">,
 ): NavigatorEffectAdapter {
   return { kind: "run_navigator_release", execute: (context) => executeReleaseAdapter(operation, context) };
 }
@@ -720,21 +714,19 @@ async function observePluginNavigatorInference(
 
 export function createNavigatorRuntime(input: Readonly<{
   effectPersistence: NavigatorEffectPersistence;
-  workflowPersistence: NavigatorWorkflowPersistence;
+  planningPersistence: NavigatorPlanningPersistence;
   implementationRead: NavigatorImplementationReadStore;
   implementationPersistence: NavigatorImplementationPersistence;
-  releasePersistence: NavigatorReleasePersistence;
   sdk: BbSdk;
   modelRoute(): ModelRoute;
   clock: { now(): number };
   navigator?: WorkflowNavigator;
 }>): NavigatorPluginRuntime {
   const skillRunner = new PluginNavigatorSkillRunner(input.sdk);
-  const navigator = new NavigatorWorkflowExecutor({
-    store: input.workflowPersistence,
+  const planning = new NavigatorPlanningService({
+    persistence: input.planningPersistence,
     navigator: input.navigator ?? new DeterministicWorkflowNavigator(),
     observeInference: (snapshot) => observePluginNavigatorInference(input.effectPersistence, input.sdk, snapshot),
-    skillRunner,
     modelRoute: input.modelRoute,
     clock: input.clock,
   });
@@ -753,11 +745,9 @@ export function createNavigatorRuntime(input: Readonly<{
     modelRoute: () => input.modelRoute(),
     clock: input.clock,
   });
-  const release = new NavigatorReleaseExecutor({
-    store: input.releasePersistence,
+  const release = new NavigatorReleaseOperation({
     publishPullRequest: (request) => publishPluginNavigatorPullRequest(input.sdk, request),
     integrationWorktreeId: (jobId) => `env_${jobId}`,
-    clock: input.clock,
   });
   const skillAdapter: NavigatorEffectAdapter = {
     kind: "run_navigator_skill",
@@ -765,7 +755,7 @@ export function createNavigatorRuntime(input: Readonly<{
       if (context.kind !== "run_navigator_skill") {
         return { outcome: "permanent", reason: "Navigator skill adapter received another effect kind" };
       }
-      const run = await skillRunner.run(context.attempt, { bindResource: async () => undefined }, context.signal);
+      const run = await skillRunner.run(context.attempt, { bindResource: context.bindResource }, context.signal);
       return {
         outcome: "completed",
         receipt: {
@@ -789,7 +779,7 @@ export function createNavigatorRuntime(input: Readonly<{
         createNavigatorReleaseEffectAdapter(release),
       ],
     }),
-    navigator,
+    planning,
     implementation,
     release,
   };
