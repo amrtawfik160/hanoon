@@ -270,6 +270,10 @@ it("registers ingress, execution, and memory backfill services with all enqueue-
     "thread.archived": 1,
     "thread.deleted": 1,
   });
+  expect(harness.registrations.rpcMethods).toEqual(expect.arrayContaining([
+    "managed_automation_standing_policy",
+    "managed_automation_automation_triggered",
+  ]));
 
   const store = openStore(bb.storage);
   const job = store.createJob({ id: "abcdefghijklmnopqrstuv", sourceUpdateId: 1, requestText: "work", now: 1_000 });

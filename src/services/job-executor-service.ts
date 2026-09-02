@@ -120,6 +120,9 @@ export type JobExecutorDependencies = {
   automations?: {
     processDue(now: number, signal: AbortSignal | undefined, fence: EffectFence): Promise<boolean>;
   };
+  managedAutomationIntents?: {
+    processDue(now: number, signal: AbortSignal | undefined, fence: EffectFence): Promise<boolean>;
+  };
   presence?: {
     pulse(now: number, signal: AbortSignal): Promise<number | null>;
     reset(): void;
@@ -995,6 +998,13 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // Idempotent, and deliberately not a one-shot at activation: pairing
         // can happen long after the executor starts.
         await deps.systemMonitors?.install(effectFence);
+        if (deps.managedAutomationIntents) {
+          didWork = await deps.managedAutomationIntents.processDue(
+            deps.clock.now(),
+            workAbort.signal,
+            effectFence,
+          ) || didWork;
+        }
         if (deps.automations) {
           didWork = await deps.automations.processDue(deps.clock.now(), workAbort.signal, effectFence) || didWork;
         }

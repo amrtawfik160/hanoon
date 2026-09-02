@@ -143,9 +143,14 @@ import {
   type ManagedAutomationCapabilityOperation,
 } from "./services/managed-automation-service";
 import {
+  ManagedAutomationIntentDispatcher,
+  registerManagedAutomationIntentRpc,
+} from "./services/managed-automation-intents";
+import {
   managedAutomationDigest,
   type ManagedAutomationBinding,
 } from "./storage/managed-automation-repository";
+import { ManagedAutomationIntentRepository } from "./storage/managed-automation-intent-repository";
 import { ProductionHealthService } from "./services/production-health-service";
 import { RegressionWatchService } from "./services/regression-watch-service";
 import { FailureLoopService } from "./services/failure-loop-service";
@@ -730,6 +735,15 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
     (binding, operation) => managedAutomationCapabilityIsCurrent(store, binding, operation),
   );
+  const managedAutomationIntentDispatcher = new ManagedAutomationIntentDispatcher({
+    repository: new ManagedAutomationIntentRepository(bb.storage.database()),
+    service: managedAutomations,
+    store,
+    clock: { now: clock },
+    onWorkAvailable: () => executorNudge.notify(),
+    warn: (message) => bb.log.warn(message),
+  });
+  registerManagedAutomationIntentRpc(bb, managedAutomationIntentDispatcher);
   const managedAutomationReconciler = new ManagedAutomationReconciler({
     repository: managedAutomationPersistence,
     service: managedAutomations,
@@ -2470,6 +2484,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       workspaceHousekeeping,
       audits,
       systemMonitors,
+      managedAutomationIntents: managedAutomationIntentDispatcher,
       automations: managedAutomationReconciler,
       presence,
       laneSnapshots,

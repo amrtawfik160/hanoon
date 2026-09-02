@@ -19,6 +19,11 @@ import {
   type ManagedAutomationMutation,
   type ManagedAutomationAdapter,
 } from "../src/services/managed-automation-service";
+import {
+  ManagedAutomationIntentDispatcher,
+  registerManagedAutomationIntentRpc,
+} from "../src/services/managed-automation-intents";
+import { ManagedAutomationIntentRepository } from "../src/storage/managed-automation-intent-repository";
 import { ManagedAutomationRepository, type ManagedAutomationBinding } from "../src/storage/managed-automation-repository";
 import { openStore, type MonitorRecord, type TelegramAgentStore } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
@@ -165,10 +170,10 @@ function runEvidence(overrides: Partial<BbAutomationRun> = {}): BbAutomationRun 
 }
 
 function fixture() {
-  const { bb } = createFakePluginHost({ pluginId: `managed-automation-${fixtureNumber++}` });
+  const { bb, harness } = createFakePluginHost({ pluginId: `managed-automation-${fixtureNumber++}` });
   const store = openStore(bb.storage, bb.storage.kv, () => NOW);
   const repository = new ManagedAutomationRepository(bb.storage.database());
-  return { bb, store, repository };
+  return { bb, harness, store, repository };
 }
 
 function fakeAdapter(runClock = NOW) {
@@ -229,6 +234,7 @@ function fakeAdapter(runClock = NOW) {
       const previous = (runs.get(automationId) ?? []).find((candidate) => candidate.idempotencyKey === idempotencyKey);
       if (previous) return previous;
       const run = runEvidence({
+        id: `run_${runs.size + 1}`,
         automationId,
         trigger: "manual",
         idempotencyKey,
@@ -438,6 +444,76 @@ async function settledRunNowFixture() {
     operationId: submitted.lastOperationId!,
     database: bb.storage.database(),
   };
+}
+
+async function productionRecursiveIntentFixture() {
+  const { bb, harness, store, repository } = fixture();
+  store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW);
+  const fake = fakeAdapter();
+  const service = new ManagedAutomationService(
+    repository,
+    fake.adapter,
+    () => true,
+    (binding, operation) => managedAutomationCapabilityIsCurrent(store, binding, operation),
+  );
+  const setupLease = store.acquireExecutorLease("production-intent-setup", NOW, 120_000);
+  if (!setupLease.acquired) throw new Error("missing production intent setup lease");
+  const mutate = executorMutation(store, "production-intent-setup", setupLease.generation);
+  const scope = { kind: "host", hostId: "host_owner", cwd: null } as const;
+  const parent = await service.intentAdapters.standingPolicy.create({
+    scope,
+    controllerKey: "owner-7-controller",
+    sourceKey: "production-parent",
+    definition,
+    hostId: "host_owner",
+    notificationPolicy: "material",
+    now: NOW,
+    mutate,
+  });
+  const child = await service.intentAdapters.standingPolicy.create({
+    scope,
+    controllerKey: "owner-7-controller",
+    sourceKey: "production-child",
+    definition: { ...definition, name: "Child automation" },
+    hostId: "host_owner",
+    notificationPolicy: "material",
+    now: NOW,
+    mutate,
+  });
+  const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+  const setupSignal = new AbortController().signal;
+  await reconciler.processDue(NOW + 1, setupSignal, {
+    ownerId: "production-intent-setup",
+    generation: setupLease.generation,
+    signal: setupSignal,
+  });
+  const parentRun = service.intentAdapters.standingPolicy.submit({
+    id: parent.id,
+    operationClass: "run_now",
+    desiredState: "enabled",
+    intentKey: "production-parent-run",
+    now: NOW + 2,
+    mutate,
+  });
+  await reconciler.processDue(NOW + 3, setupSignal, {
+    ownerId: "production-intent-setup",
+    generation: setupLease.generation,
+    signal: setupSignal,
+  });
+  if (!store.releaseExecutorLease("production-intent-setup", setupLease.generation, NOW + 4)) {
+    throw new Error("production intent setup lease could not be released");
+  }
+  vi.clearAllMocks();
+
+  const intents = new ManagedAutomationIntentRepository(bb.storage.database());
+  const dispatcher = new ManagedAutomationIntentDispatcher({
+    repository: intents,
+    service,
+    store,
+    clock: { now: () => NOW + 5 },
+  });
+  registerManagedAutomationIntentRpc(bb, dispatcher);
+  return { bb, harness, store, repository, fake, service, reconciler, intents, dispatcher, parent, child, parentRun };
 }
 
 describe("managed BB automations", () => {
@@ -3826,16 +3902,257 @@ describe("managed BB automations", () => {
     expect(fake.adapter.runNow).toHaveBeenCalledTimes(1);
   });
 
-  it("registers standing, recursive, and system intent producers as production adapters", () => {
-    const { repository } = fixture();
-    const service = new ManagedAutomationService(repository, fakeAdapter().adapter, () => true);
-    const adapters = Reflect.get(service, "intentAdapters") as Record<string, unknown> | undefined;
+  it("routes a standing-policy intent through the production dispatcher and executor", async () => {
+    const controllerFixture = submittedControllerFixture({ releaseLease: true });
+    try {
+      controllerFixture.store.upsertProjectPolicy(policyFixture(), 2_000);
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const intents = new ManagedAutomationIntentRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(
+        repository,
+        fake.adapter,
+        () => true,
+        (binding, operation) => managedAutomationCapabilityIsCurrent(controllerFixture.store, binding, operation),
+      );
+      const dispatcher = new ManagedAutomationIntentDispatcher({
+        repository: intents,
+        service,
+        store: controllerFixture.store,
+        clock: { now: () => 2_001 },
+      });
+      registerManagedAutomationIntentRpc(controllerFixture.bb, dispatcher);
+      const queued = await controllerFixture.harness.behavior.callRpc(
+        "managed_automation_standing_policy",
+        {
+          kind: "create",
+          requestId: "standing-production-create",
+          sourceKey: "production-standing",
+          definition: { ...definition, projectId: "proj_1" },
+          notificationPolicy: "material",
+        },
+      ) as { intentId: string; state: string };
+      expect(queued.state).toBe("pending");
 
-    expect(adapters).toBeDefined();
-    expect(adapters?.standingPolicy).toBeDefined();
-    expect(adapters?.automationTriggered).toBeDefined();
-    expect(adapters?.systemMaintenance).toBeDefined();
+      const reconciler = new ManagedAutomationReconciler({
+        repository,
+        service,
+        store: controllerFixture.store,
+        notify: vi.fn(),
+      });
+      const stop = new AbortController();
+      await runJobExecutorService({
+        store: controllerFixture.store,
+        clock: { now: () => 2_001 },
+        managedAutomationIntents: dispatcher,
+        automations: reconciler,
+        releaseOnShutdown: true,
+        sleep: async () => stop.abort(),
+      }, stop.signal);
+
+      const binding = repository.getBySource(controllerFixture.turn.controllerKey, "production-standing");
+      expect(binding).toMatchObject({
+        state: "active",
+        authority: { origin: "standing-policy" },
+        lastOperationOutcome: "succeeded",
+      });
+      expect(intents.get(queued.intentId)).toMatchObject({ state: "succeeded" });
+      expect(repository.getOperation(binding!.lastOperationId!)).toMatchObject({
+        operationClass: "create",
+        state: "succeeded",
+        outcome: { kind: "settled", outcome: "succeeded" },
+      });
+      expect(repository.getProvenanceRepository().getAdmission(binding!.capabilityEvidence!.profileId)).toMatchObject({
+        profile: { origin: "standing-policy", projectId: "proj_1", hostId: "host_1" },
+        receipt: { eventType: "selected" },
+      });
+      expect(fake.create).toHaveBeenCalledOnce();
+    } finally {
+      await controllerFixture.dispose();
+    }
   });
+
+  it("routes an automation-triggered intent through the production dispatcher and executor", async () => {
+    const production = await productionRecursiveIntentFixture();
+    const queued = await production.harness.behavior.callRpc(
+      "managed_automation_automation_triggered",
+      {
+        requestId: "automation-production-run",
+        id: production.child.id,
+        operationClass: "run_now",
+        desiredState: "enabled",
+        parentOperationId: production.parentRun.lastOperationId,
+      },
+    ) as { intentId: string; state: string };
+    expect(queued.state).toBe("pending");
+
+    const stop = new AbortController();
+    await runJobExecutorService({
+      store: production.store,
+      clock: { now: () => NOW + 5 },
+      managedAutomationIntents: production.dispatcher,
+      automations: production.reconciler,
+      releaseOnShutdown: true,
+      sleep: async () => stop.abort(),
+    }, stop.signal);
+
+    const binding = production.repository.get(production.child.id);
+    expect(binding).toMatchObject({
+      state: "active",
+      authority: { origin: "automation-triggered" },
+      lastOperationOutcome: "succeeded",
+    });
+    expect(production.intents.get(queued.intentId)).toMatchObject({ state: "succeeded" });
+    expect(production.repository.getOperation(binding!.lastOperationId!)).toMatchObject({
+      operationClass: "run_now",
+      state: "succeeded",
+      authority: { origin: "automation-triggered" },
+      outcome: {
+        kind: "settled",
+        outcome: "succeeded",
+        runReceipt: expect.objectContaining({ outcomeClass: "succeeded" }),
+      },
+    });
+    expect(production.fake.adapter.runNow).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed through the registered standing-policy path when durable policy provenance is missing", async () => {
+    const controllerFixture = submittedControllerFixture({ releaseLease: true });
+    try {
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const intents = new ManagedAutomationIntentRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      const dispatcher = new ManagedAutomationIntentDispatcher({
+        repository: intents,
+        service,
+        store: controllerFixture.store,
+        clock: { now: () => 2_001 },
+      });
+      registerManagedAutomationIntentRpc(controllerFixture.bb, dispatcher);
+      const queued = await controllerFixture.harness.behavior.callRpc(
+        "managed_automation_standing_policy",
+        {
+          kind: "create",
+          requestId: "standing-missing-policy",
+          sourceKey: "standing-missing-policy",
+          definition: { ...definition, projectId: "proj_1" },
+          notificationPolicy: "material",
+        },
+      ) as { intentId: string; state: string };
+
+      const stop = new AbortController();
+      await runJobExecutorService({
+        store: controllerFixture.store,
+        clock: { now: () => 2_001 },
+        managedAutomationIntents: dispatcher,
+        releaseOnShutdown: true,
+        sleep: async () => stop.abort(),
+      }, stop.signal);
+
+      expect(fake.create).not.toHaveBeenCalled();
+      expect(intents.get(queued.intentId)).toMatchObject({
+        state: "failed",
+        lastError: expect.stringContaining("project policy"),
+      });
+      expect(repository.list(controllerFixture.turn.controllerKey, true)).toEqual([]);
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it("fails closed through the registered standing-policy path when caller project provenance conflicts with the controller", async () => {
+    const controllerFixture = submittedControllerFixture({ releaseLease: true });
+    try {
+      controllerFixture.store.upsertProjectPolicy(policyFixture({ projectId: "proj_other", alias: "other" }), 2_000);
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const intents = new ManagedAutomationIntentRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      const dispatcher = new ManagedAutomationIntentDispatcher({
+        repository: intents,
+        service,
+        store: controllerFixture.store,
+        clock: { now: () => 2_001 },
+      });
+      registerManagedAutomationIntentRpc(controllerFixture.bb, dispatcher);
+      const queued = await controllerFixture.harness.behavior.callRpc(
+        "managed_automation_standing_policy",
+        {
+          kind: "create",
+          requestId: "standing-invalid-project",
+          sourceKey: "standing-invalid-project",
+          definition: { ...definition, projectId: "proj_other" },
+          notificationPolicy: "material",
+        },
+      ) as { intentId: string; state: string };
+
+      const stop = new AbortController();
+      await runJobExecutorService({
+        store: controllerFixture.store,
+        clock: { now: () => 2_001 },
+        managedAutomationIntents: dispatcher,
+        releaseOnShutdown: true,
+        sleep: async () => stop.abort(),
+      }, stop.signal);
+
+      expect(fake.create).not.toHaveBeenCalled();
+      expect(intents.get(queued.intentId)).toMatchObject({
+        state: "failed",
+        lastError: expect.stringContaining("does not match"),
+      });
+      expect(repository.list(controllerFixture.turn.controllerKey, true)).toEqual([]);
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it.each([
+    ["missing", "missing-parent-operation"],
+    ["stale", "stale-parent-operation"],
+  ] as const)(
+    "fails closed through the registered automation-triggered path for %s parent provenance",
+    async (provenance, parentOperationId) => {
+      const production = await productionRecursiveIntentFixture();
+      if (provenance === "stale") {
+        production.bb.storage.database().prepare(
+          "UPDATE managed_automation_operations SET outcome_json = NULL WHERE id = ?",
+        ).run(production.parentRun.lastOperationId);
+      }
+      const queued = await production.harness.behavior.callRpc(
+        "managed_automation_automation_triggered",
+        {
+          requestId: `automation-${provenance}-parent`,
+          id: production.child.id,
+          operationClass: "run_now",
+          desiredState: "enabled",
+          parentOperationId: provenance === "stale"
+            ? production.parentRun.lastOperationId
+            : parentOperationId,
+        },
+      ) as { intentId: string; state: string };
+
+      const stop = new AbortController();
+      await runJobExecutorService({
+        store: production.store,
+        clock: { now: () => NOW + 5 },
+        managedAutomationIntents: production.dispatcher,
+        automations: production.reconciler,
+        releaseOnShutdown: true,
+        sleep: async () => stop.abort(),
+      }, stop.signal);
+
+      expect(production.fake.adapter.runNow).not.toHaveBeenCalled();
+      expect(production.intents.get(queued.intentId)).toMatchObject({
+        state: "failed",
+        lastError: expect.stringMatching(/parent|authoritative|receipt/i),
+      });
+      expect(production.repository.get(production.child.id)).toMatchObject({
+        state: "active",
+        lastOperationOutcome: "succeeded",
+      });
+    },
+  );
 
   it("does not expose the concrete managed-automation repository through the store facade", () => {
     const { store } = fixture();

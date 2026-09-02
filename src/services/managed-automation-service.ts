@@ -370,7 +370,7 @@ export class ManagedAutomationAdmissionResolver {
   }
 }
 
-function executorMutation(
+export function managedAutomationExecutorMutation(
   store: Pick<TelegramAgentStore, "runExecutorMutation">,
   fence: EffectFence,
 ): ManagedAutomationMutation {
@@ -1617,7 +1617,7 @@ export class ManagedAutomationReconciler {
       didWork = await this.processExistingBindings(
         now,
         operationSignal,
-        executorMutation(this.dependencies.store, fence),
+        managedAutomationExecutorMutation(this.dependencies.store, fence),
       ) || didWork;
       if (!fence.signal.aborted && !signal?.aborted && didWork) {
         didWork = await this.processDurableOperations(now, fence, signal) || didWork;
@@ -1626,7 +1626,7 @@ export class ManagedAutomationReconciler {
     return this.enqueuePendingNotifications(
       now,
       didWork,
-      executorMutation(this.dependencies.store, fence),
+      managedAutomationExecutorMutation(this.dependencies.store, fence),
     );
   }
 

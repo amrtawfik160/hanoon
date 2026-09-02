@@ -4777,6 +4777,26 @@ BEGIN SELECT RAISE(ABORT, 'managed automation capability receipts are append-onl
 CREATE TRIGGER managed_automation_capability_receipts_append_only_delete
 BEFORE DELETE ON managed_automation_capability_receipts
 BEGIN SELECT RAISE(ABORT, 'managed automation capability receipts are append-only'); END;
+`, String.raw`
+CREATE TABLE managed_automation_intents (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  origin TEXT NOT NULL CHECK (origin IN ('standing-policy', 'automation-triggered')),
+  input_json TEXT NOT NULL CHECK (json_valid(input_json)),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'succeeded', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 1),
+  lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  CHECK (
+    (state = 'leased' AND lease_owner IS NOT NULL AND lease_generation IS NOT NULL AND lease_expires_at IS NOT NULL) OR
+    (state <> 'leased' AND lease_owner IS NULL AND lease_generation IS NULL AND lease_expires_at IS NULL)
+  )
+);
+CREATE INDEX managed_automation_intents_due
+  ON managed_automation_intents(state, lease_expires_at, created_at);
 `] as const;
 
 export const ALL_MIGRATIONS = [
