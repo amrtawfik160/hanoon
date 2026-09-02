@@ -322,6 +322,7 @@ import {
 } from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
 import { NavigatorRepository } from "../navigator/repository";
+import type { NavigatorTicketWorkerOutcome } from "../navigator/implementation-executor";
 import type {
   NavigatorArtifactBinding,
   NavigatorInferenceObservation,
@@ -341,6 +342,16 @@ import {
   type NavigatorReleaseIncidentPhase,
   type NavigatorReleaseRollbackOutcome,
 } from "../navigator/release-contracts";
+import type {
+  NavigatorCapabilityAssignment,
+  NavigatorCapabilityEvidence,
+  NavigatorCapabilityOperation,
+  NavigatorReleaseReceipt,
+  NavigatorTicketAttemptContext,
+  NavigatorTicketSettlementInput,
+  NavigatorSkillReceipt,
+} from "../navigator/effect-contracts";
+import { navigatorReleaseReceiptSchema } from "../navigator/effect-contracts";
 
 /**
  * A tapped controller button. `replayed` is a Telegram redelivery of a callback
@@ -872,6 +883,28 @@ export type ExecutorEventInput = ExecutorFence & Readonly<{
   event: JobEvent;
   nativeAdapter?: NativeAdapterTransitionEnvelope;
 }>;
+
+export type NavigatorReleaseEffectSettlementInput = ExecutorFence & Readonly<{
+  effectIdempotencyKey: string;
+  number: number;
+  url: string;
+  environmentId: string;
+  receipt?: NavigatorReleaseReceipt;
+}>;
+
+type NavigatorTicketSettlementHandler = (input: NavigatorTicketSettlementInput) => NavigatorTicketWorkerOutcome | null;
+
+function navigatorReleaseStartedEvent(
+  input: NavigatorReleaseEffectSettlementInput,
+  url: string,
+): Extract<JobEvent, { type: "RELEASE_STARTED" }> {
+  return {
+    type: "RELEASE_STARTED",
+    number: input.number,
+    url,
+    environmentId: input.environmentId,
+  };
+}
 
 export type ExecutorAttemptInput = ExecutorFence & Readonly<{
   id: string;
@@ -4103,8 +4136,47 @@ export interface TelegramAgentStore {
     now: number;
   }): NavigatorProposalDecision;
   getNavigatorProposal(id: string): NavigatorProposalRecord | null;
+  getNavigatorProposalDecision(id: string): NavigatorProposalDecision | null;
   getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null;
   getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
+  recordNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    operation: NavigatorCapabilityOperation;
+    profileId: string;
+    profileRevision: number;
+    assignments: readonly NavigatorCapabilityAssignment[];
+    now: number;
+  }): void;
+  getNavigatorCapabilityEvidence(effectIdempotencyKey: string): readonly NavigatorCapabilityEvidence[];
+  admitNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): boolean;
+  reauthorizeNavigatorCompatibilityEffect(input: {
+    effectIdempotencyKey: string;
+    attemptId: string;
+    profileId: string;
+    profileRevision: number;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): boolean;
+  getNavigatorTicketAttemptContext(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorTicketAttemptContext | null;
+  registerNavigatorTicketSettlement(handler: NavigatorTicketSettlementHandler): void;
+  settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
     attemptId: string;
@@ -4117,6 +4189,13 @@ export interface TelegramAgentStore {
   }): NavigatorPlanningResultRecord | null;
   getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null;
   getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null;
+  leaseNavigatorEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null;
+  settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean;
   leaseNavigatorSkillEffect(input: {
     ownerId: string;
     generation: number;
@@ -4158,6 +4237,7 @@ export interface TelegramAgentStore {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    receipt?: NavigatorSkillReceipt;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
     reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
@@ -5774,6 +5854,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
   private readonly navigatorRepository: NavigatorRepository;
+  private navigatorTicketSettlementHandler: NavigatorTicketSettlementHandler | null = null;
   private readonly taskAuthorityRepository: TaskAuthorityRepository;
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
@@ -13168,12 +13249,75 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.getProposal(id);
   }
 
+  public getNavigatorProposalDecision(id: string): NavigatorProposalDecision | null {
+    return this.navigatorRepository.getProposalDecision(id);
+  }
+
   public getNavigatorWorkflowStep(id: string): NavigatorWorkflowStep | null {
     return this.navigatorRepository.getWorkflowStep(id);
   }
 
   public getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null {
     return this.navigatorRepository.getAttempt(id);
+  }
+
+  public recordNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    operation: NavigatorCapabilityOperation;
+    profileId: string;
+    profileRevision: number;
+    assignments: readonly NavigatorCapabilityAssignment[];
+    now: number;
+  }): void {
+    this.navigatorRepository.recordNavigatorCapabilityEvidence(input);
+  }
+
+  public getNavigatorCapabilityEvidence(effectIdempotencyKey: string): readonly NavigatorCapabilityEvidence[] {
+    return this.navigatorRepository.getNavigatorCapabilityEvidence(effectIdempotencyKey);
+  }
+
+  public admitNavigatorCapabilityEvidence(input: {
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): boolean {
+    return this.navigatorRepository.admitNavigatorCapabilityEvidence(input);
+  }
+
+  public reauthorizeNavigatorCompatibilityEffect(input: {
+    effectIdempotencyKey: string;
+    attemptId: string;
+    profileId: string;
+    profileRevision: number;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): boolean {
+    return this.navigatorRepository.reauthorizeNavigatorCompatibilityEffect(input);
+  }
+
+  public getNavigatorTicketAttemptContext(input: {
+    attemptId: string;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }): NavigatorTicketAttemptContext | null {
+    return this.navigatorRepository.getNavigatorTicketAttemptContext(input);
+  }
+
+  public registerNavigatorTicketSettlement(handler: NavigatorTicketSettlementHandler): void {
+    this.navigatorTicketSettlementHandler = handler;
+  }
+
+  public settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null {
+    return this.navigatorTicketSettlementHandler?.(input) ?? null;
   }
 
   public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {
@@ -13198,6 +13342,146 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getNavigatorRoutingDecision(decisionDigest: string): NavigatorRoutingDecision | null {
     return this.navigatorRepository.getRoutingDecision(decisionDigest);
+  }
+
+  public leaseNavigatorEffect(input: {
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }): StoredEffect | null {
+    return this.navigatorRepository.leaseEffect(input);
+  }
+
+  public settleNavigatorReleaseEffect(input: NavigatorReleaseEffectSettlementInput): boolean {
+    this.assertExecutorFence(input);
+    if (!input.effectIdempotencyKey) throw new TypeError("navigator release effect identity is required");
+    if (!Number.isSafeInteger(input.number) || input.number < 1) throw new TypeError("release pull request number is invalid");
+    const url = assertSafeExternalHttpsUrl(input.url, "navigator release pull request URL");
+    if (!input.environmentId) throw new TypeError("navigator release environment identity is required");
+    const parsedReceipt = navigatorReleaseReceiptSchema.safeParse(input.receipt);
+    if (!parsedReceipt.success) return false;
+    const receipt = parsedReceipt.data;
+    const settle = this.db.transaction((): boolean => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const effectRow = this.effectByKey(input.effectIdempotencyKey);
+      if (!effectRow || !this.navigatorReleaseEffectIsCurrent(effectRow, input)) return false;
+      if (!this.releaseReceiptMatches(receipt, effectRow, input, url)) return false;
+      const current = this.readJobById(effectRow.job_id);
+      if (!current || current.cancelRequestedAt !== null || current.state === "cancelled") return false;
+      if (current.state === "implementing" && !this.applyNavigatorReleaseStart(current, input, url)) return false;
+      this.recordNavigatorReleaseReceipt(receipt, effectRow.job_id, input);
+      const completed = this.completeNavigatorReleaseEffect(effectRow, input);
+      if (!completed) throw new Error("navigator release effect lease changed before receipt settlement");
+      return completed;
+    });
+    return settle.immediate();
+  }
+
+  private releaseReceiptMatches(
+    receipt: NavigatorReleaseReceipt,
+    effectRow: EffectRow,
+    input: NavigatorReleaseEffectSettlementInput,
+    url: string,
+  ): boolean {
+    const effect = parseEffect(effectRow);
+    const attemptId = typeof effect.payload.attemptId === "string" ? effect.payload.attemptId : null;
+    return receipt.effectIdempotencyKey === input.effectIdempotencyKey && receipt.attemptId === attemptId &&
+      receipt.number === input.number && receipt.url === url && receipt.environmentId === input.environmentId &&
+      receipt.resource.id === input.environmentId;
+  }
+
+  private recordNavigatorReleaseReceipt(
+    receipt: NavigatorReleaseReceipt,
+    jobId: string,
+    input: NavigatorReleaseEffectSettlementInput,
+  ): void {
+    const receiptJson = JSON.stringify(receipt);
+    this.db.prepare(
+      `INSERT INTO navigator_effect_receipts (
+         effect_idempotency_key, job_id, kind, receipt_json, receipt_digest,
+         owner_id, generation, recorded_at
+       ) VALUES (?, ?, 'run_navigator_release', ?, ?, ?, ?, ?)`,
+    ).run(
+      receipt.effectIdempotencyKey,
+      jobId,
+      receiptJson,
+      createHash("sha256").update(receiptJson, "utf8").digest("hex"),
+      input.ownerId,
+      input.generation,
+      input.now,
+    );
+  }
+
+  private navigatorReleaseEffectIsCurrent(
+    effect: EffectRow,
+    input: NavigatorReleaseEffectSettlementInput,
+  ): boolean {
+    if (effect.kind !== "run_navigator_release" ||
+      !this.effectLeaseIsActiveForRow(effect, input.ownerId, input.generation, input.now)) return false;
+    return (["commit", "push", "pull_request"] as const).every((authorityEffect) =>
+      this.taskAuthorityRepository.effectAdmissionIsCurrent(
+        effect.job_id,
+        input.effectIdempotencyKey,
+        authorityEffect,
+      ));
+  }
+
+  private applyNavigatorReleaseStart(
+    current: Job,
+    input: NavigatorReleaseEffectSettlementInput,
+    url: string,
+  ): boolean {
+    const event = navigatorReleaseStartedEvent(input, url);
+    const evidenceGate = this.executorEvidenceGate(current, event);
+    if (!evidenceGate.valid) return false;
+    const transitioned = transition(current, event, input.now);
+    this.persistNavigatorReleaseStart({ current, input, transitioned, event, evidenceGate });
+    return true;
+  }
+
+  private persistNavigatorReleaseStart(input: Readonly<{
+    current: Job;
+    input: NavigatorReleaseEffectSettlementInput;
+    transitioned: ReturnType<typeof transition>;
+    event: JobEvent;
+    evidenceGate: { valid: boolean; completeReviewAttemptIds: readonly string[] };
+  }>): void {
+    const { current, input: settlement, transitioned, event, evidenceGate } = input;
+    persistJobTransition(this.db, current.id, current.version, transitioned.job);
+    persistPendingEffects(this.db, transitioned.effects, settlement.now);
+    this.settleNavigatorReleaseReturn({
+      previous: current,
+      next: transitioned.job,
+      event,
+      now: settlement.now,
+      reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
+    });
+    this.enqueueFinishNoteInTransaction(current, transitioned.job, settlement.now);
+    this.markAdmissionDrainingForTerminal(transitioned.job, settlement.now);
+  }
+
+  private completeNavigatorReleaseEffect(
+    effect: EffectRow,
+    input: NavigatorReleaseEffectSettlementInput,
+  ): boolean {
+    return this.db.prepare(
+      `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL,
+          lease_expires_at = NULL, last_error = NULL, updated_at = ?
+        WHERE idempotency_key = ? AND status = 'leased' AND lease_owner = ?
+          AND lease_generation = ? AND lease_expires_at > ?
+          AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1 AND owner_id = ?
+            AND generation = ? AND lease_expires_at > ?)`,
+    ).run(
+      input.now,
+      effect.idempotency_key,
+      input.ownerId,
+      input.generation,
+      input.now,
+      input.ownerId,
+      input.generation,
+      input.now,
+    ).changes === 1;
   }
 
   public leaseNavigatorSkillEffect(input: {
@@ -13285,6 +13569,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    receipt?: NavigatorSkillReceipt;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
     reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
@@ -15387,6 +15672,13 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         effect.lease_generation !== input.generation || effect.lease_expires_at === null || effect.lease_expires_at <= input.now) {
         return false;
       }
+      const ticketClaim = effect.kind === "run_navigator_ticket_worker"
+        ? this.navigatorTicketClaimForFence(input.jobId, input.effectIdempotencyKey)
+        : null;
+      if (effect.kind === "run_navigator_ticket_worker" && (
+        ticketClaim === null || ticketClaim.state !== "held" || ticketClaim.owner_id !== input.ownerId ||
+        ticketClaim.generation !== input.generation || ticketClaim.lease_expires_at <= input.now
+      )) return false;
       if (effect.kind === "deploy_production" || effect.kind === "verify_production") {
         const job = this.readJobById(input.jobId);
         const admission = this.autonomyRepository.getAdmission(input.jobId);
@@ -15421,27 +15713,70 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           input.now,
         );
       if (updatedEffect.changes !== 1) return false;
-      if (claims.length === 0) return true;
-      const renewedClaims = this.db
-        .prepare(
-          `UPDATE job_resource_claims SET lease_expires_at = ?, renewed_at = ?
-             WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
-               AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-                 AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-        )
-        .run(
-          input.now + input.leaseMs,
-          input.now,
-          input.jobId,
-          input.ownerId,
-          input.generation,
-          input.ownerId,
-          input.generation,
-          input.now,
-        );
-      return renewedClaims.changes === claims.length;
+      if (claims.length > 0) {
+        const renewedClaims = this.db
+          .prepare(
+            `UPDATE job_resource_claims SET lease_expires_at = ?, renewed_at = ?
+               WHERE job_id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+                 AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
+                   AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
+          )
+          .run(
+            input.now + input.leaseMs,
+            input.now,
+            input.jobId,
+            input.ownerId,
+            input.generation,
+            input.ownerId,
+            input.generation,
+            input.now,
+          );
+        if (renewedClaims.changes !== claims.length) {
+          throw new Error("job resource claim changed during operation fence renewal");
+        }
+      }
+      if (ticketClaim !== null && this.db.prepare(
+        `UPDATE work_artifact_claims SET lease_expires_at = ?, renewed_at = ?
+           WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ? AND lease_expires_at > ?`,
+      ).run(
+        input.now + input.leaseMs,
+        input.now,
+        ticketClaim.claim_id,
+        input.ownerId,
+        input.generation,
+        input.now,
+      ).changes !== 1) {
+        throw new Error("ticket work-artifact claim changed during operation fence renewal");
+      }
+      return true;
     });
     return renew.immediate();
+  }
+
+  private navigatorTicketClaimForFence(
+    jobId: string,
+    effectIdempotencyKey: string,
+  ): Readonly<{
+    claim_id: number;
+    state: string;
+    owner_id: string;
+    generation: number;
+    lease_expires_at: number;
+  }> | null {
+    const row = this.db.prepare(
+      `SELECT claim.id AS claim_id, claim.state, claim.owner_id, claim.generation, claim.lease_expires_at
+         FROM navigator_ticket_worker_attempts AS attempt
+         JOIN navigator_ticket_slices AS slice ON slice.id = attempt.slice_id
+         JOIN work_artifact_claims AS claim ON claim.id = slice.claim_id
+        WHERE attempt.job_id = ? AND attempt.effect_idempotency_key = ?`,
+    ).get(jobId, effectIdempotencyKey) as Readonly<{
+      claim_id: number;
+      state: string;
+      owner_id: string;
+      generation: number;
+      lease_expires_at: number;
+    }> | undefined;
+    return row ?? null;
   }
 
   public assertProductionStageFence(input: ProductionStageFenceInput): boolean {

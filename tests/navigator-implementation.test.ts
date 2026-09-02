@@ -18,6 +18,12 @@ import {
   type NavigatorGitObserver,
   type NavigatorTicketWorkerRunner,
 } from "../src/navigator/implementation-executor";
+import {
+  NavigatorEffectProtocol,
+  type NavigatorEffectContext,
+  type NavigatorEffectOutcome,
+} from "../src/navigator/effect-protocol";
+import { createNavigatorTicketEffectAdapter } from "../src/navigator/plugin-runtime";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import {
   ALL_MIGRATIONS,
@@ -29,6 +35,7 @@ import {
   stableWorkArtifactId,
   type CaptureWorkArtifactInput,
 } from "../src/work-artifacts/repository";
+import { runJobExecutorService } from "../src/services/job-executor-service";
 import { policyFixture } from "./helpers";
 
 const SHA = {
@@ -335,6 +342,138 @@ function validGitObserver(): NavigatorGitObserver {
   };
 }
 
+function prepareTicketEffectForExecutor(value: Fixture, now: number) {
+  const executor = new NavigatorImplementationExecutor({
+    store: value.store,
+    database: value.database,
+    workerRunner: { run: vi.fn(), reconcileUnavailableResource: vi.fn() },
+    gitObserver: validGitObserver(),
+    pullRequests: { createOrRefresh: vi.fn() },
+    modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+    clock: { now: value.now },
+  });
+  executor.startIntegration({
+    jobId: value.jobId,
+    specificationArtifactId: value.specificationId,
+    implementationTicketIds: value.ticketIds,
+    baseBranch: "main",
+    integrationBranch: "hanoon/job-40",
+    worktreeId: "env_job_40",
+    baseHeadSha: SHA.base,
+    evidenceRefs: ["ticket:40"],
+  });
+  const claimId = value.claim(value.ticketIds[0]);
+  executor.beginClaimedTicket({
+    jobId: value.jobId,
+    ticketArtifactId: value.ticketIds[0],
+    claimId,
+    taskEvidence: ["behavioral-change"],
+    evidenceRefs: ["ticket:40:claim"],
+    ownerId: "executor-40",
+    generation: 1,
+  });
+  value.database.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+     ) VALUES (?, 'project:proj_40:pipeline', 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+  ).run(value.jobId, "executor-40", 1, now, now, now);
+  value.database.prepare("UPDATE work_artifact_claims SET lease_expires_at = ? WHERE id = ?")
+    .run(now, claimId);
+  value.database.prepare(
+    `UPDATE effects SET status = 'done', lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL
+      WHERE job_id = ? AND kind <> 'run_navigator_ticket_worker'`,
+  ).run(value.jobId);
+  value.database.prepare(
+    `UPDATE effects SET status = 'leased', lease_owner = 'executor-40', lease_generation = 1, lease_expires_at = ?
+      WHERE job_id = ? AND kind = 'run_navigator_ticket_worker'`,
+  ).run(now, value.jobId);
+  const effect = value.store.listEffectsForJob(value.jobId).find((candidate) =>
+    candidate.kind === "run_navigator_ticket_worker");
+  if (!effect) throw new Error("navigator ticket executor effect was not stored");
+  if (!value.store.releaseExecutorLease("executor-40", 1, now)) {
+    throw new Error("navigator ticket predecessor lease was not released");
+  }
+  return { executor, claimId, effect };
+}
+
+function completedTicketReceipt(context: NavigatorEffectContext): NavigatorEffectOutcome {
+  if (context.kind !== "run_navigator_ticket_worker") {
+    return { outcome: "permanent", reason: "ticket receipt received another effect kind" };
+  }
+  return {
+    outcome: "completed",
+    receipt: {
+      kind: "run_navigator_ticket_worker",
+      effectIdempotencyKey: context.effect.idempotencyKey,
+      attemptId: context.ticket.attempt.id,
+      resource: { kind: "bb_thread", id: "thr_ticket_receipt" },
+      exactHeadSha: SHA.base,
+      result: {},
+      gitObservation: null,
+    },
+  };
+}
+
+type ClaimCase = "empty" | "unrelated" | "wrong key" | "wrong kind" | "wrong owner" | "wrong generation" | "expired" | "valid exact";
+const CLAIM_CASES: readonly ClaimCase[] = [
+  "empty", "unrelated", "wrong key", "wrong kind", "wrong owner", "wrong generation", "expired", "valid exact",
+];
+
+function configureTicketClaimCase(
+  value: Fixture,
+  effect: Readonly<{ idempotencyKey: string }>,
+  claimId: number,
+  claimCase: ClaimCase,
+  now: number,
+): void {
+  const projectKey = "project:proj_40:pipeline";
+  if (claimCase !== "valid exact") {
+    value.database.prepare(
+      `UPDATE effects SET status = 'pending', lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL,
+          next_attempt_at = ? WHERE idempotency_key = ?`,
+    ).run(now, effect.idempotencyKey);
+  }
+  if (claimCase === "valid exact") {
+    value.database.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = 'ticket-matrix-predecessor',
+          lease_generation = 1, lease_expires_at = ? WHERE idempotency_key = ?`,
+    ).run(now, effect.idempotencyKey);
+    value.database.prepare(
+      `UPDATE job_resource_claims SET owner_id = 'ticket-matrix-predecessor', generation = 1,
+          lease_expires_at = ? WHERE job_id = ? AND resource_kind = 'project' AND resource_key = ?`,
+    ).run(now, value.jobId, projectKey);
+    value.database.prepare(
+      "UPDATE work_artifact_claims SET owner_id = 'ticket-matrix-predecessor', generation = 1, lease_expires_at = ? WHERE id = ?",
+    ).run(now, claimId);
+    return;
+  }
+  if (claimCase === "empty") {
+    value.database.prepare(
+      "UPDATE job_resource_claims SET state = 'released', released_at = ?, release_reason = 'claim matrix' WHERE job_id = ?",
+    ).run(now, value.jobId);
+    value.database.prepare(
+      "UPDATE work_artifact_claims SET state = 'released', released_at = ?, release_reason = 'claim matrix' WHERE id = ?",
+    ).run(now, claimId);
+    return;
+  }
+  if (claimCase === "unrelated") {
+    value.database.prepare(
+      "UPDATE job_resource_claims SET resource_key = 'project:unrelated:pipeline' WHERE job_id = ? AND resource_kind = 'project'",
+    ).run(value.jobId);
+    return;
+  }
+  const resourceKind = claimCase === "wrong kind" ? "repository_merge" : "project";
+  const resourceKey = claimCase === "wrong key" ? "project:proj_40:other" : projectKey;
+  const ownerId = claimCase === "wrong owner" ? "ticket-matrix-other" : "executor-40";
+  const generation = claimCase === "wrong generation" ? 2 : 1;
+  const expiresAt = claimCase === "expired" ? now : now + 30_000;
+  value.database.prepare(
+    `UPDATE job_resource_claims SET resource_key = ?, resource_kind = ?, owner_id = ?, generation = ?, lease_expires_at = ?
+      WHERE job_id = ?`,
+  ).run(resourceKey, resourceKind, ownerId, generation, expiresAt, value.jobId);
+}
+
 describe("navigator ticket integration executor", () => {
   it("classifies findings from the trusted capability registry, not reviewer-supplied severity", () => {
     const finding = {
@@ -512,7 +651,28 @@ describe("navigator ticket integration executor", () => {
       ownerId: "executor-40",
       generation: 1,
     });
-    await executor.processOne(
+    value.database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+       ) VALUES (?, 'project:proj_40:pipeline', 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).run(value.jobId, "executor-40", 1, 101_100, 1_100, 1_100);
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: value.now },
+      adapters: [
+        {
+          kind: "run_navigator_skill",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
+        },
+        createNavigatorTicketEffectAdapter(executor),
+        {
+          kind: "run_navigator_release",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused in this test" })),
+        },
+      ],
+    });
+    await protocol.processOne(
       { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },
       new AbortController().signal,
     );
@@ -522,6 +682,339 @@ describe("navigator ticket integration executor", () => {
         outcome: "policy_failure",
         reasonCode: "git_observation_rejected",
       })],
+    });
+  });
+
+  it("does not call a worker when the persisted ticket attempt context is stale", async () => {
+    const value = fixture();
+    const worker = vi.fn(async () => ({ outcome: "permanent" as const, reason: "not called" }));
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      database: value.database,
+      workerRunner: { run: vi.fn(), reconcileUnavailableResource: vi.fn() },
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    const slice = executor.beginClaimedTicket({
+      jobId: value.jobId,
+      ticketArtifactId: value.ticketIds[0],
+      claimId: value.claim(value.ticketIds[0]),
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:40:claim"],
+      ownerId: "executor-40",
+      generation: 1,
+    });
+    value.database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at, released_at, release_reason
+       ) VALUES (?, 'project:proj_40:pipeline', 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).run(value.jobId, "executor-40", 1, 101_100, 1_100, 1_100);
+    value.database.prepare("UPDATE navigator_ticket_slices SET state = 'invalidated' WHERE id = ?")
+      .run(slice.id);
+    const effect = value.store.listEffectsForJob(value.jobId).find((candidate) =>
+      candidate.kind === "run_navigator_ticket_worker");
+    if (!effect) throw new Error("navigator ticket worker effect was not stored");
+
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: value.now },
+      adapters: [
+        {
+          kind: "run_navigator_skill",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })),
+        },
+        {
+          kind: "run_navigator_ticket_worker",
+          execute: worker,
+        },
+        {
+          kind: "run_navigator_release",
+          execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })),
+        },
+      ],
+    });
+
+    await expect(protocol.processOne(
+      { ownerId: "executor-40", generation: 1, signal: new AbortController().signal },
+      new AbortController().signal,
+    )).resolves.toBe(true);
+
+    expect(worker).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.jobId, effect.idempotencyKey)).toMatchObject({ status: "dead" });
+  });
+
+  it("renews and adopts the ticket work-artifact claim through runJobExecutorService", async () => {
+    const value = fixture();
+    const now = { value: 1_110 };
+    const prepared = prepareTicketEffectForExecutor(value, now.value);
+    let started = false;
+    const abort = new AbortController();
+    const execute = vi.fn(async (context: NavigatorEffectContext) => {
+      if (context.kind !== "run_navigator_ticket_worker") throw new Error("wrong navigator effect context");
+      started = true;
+      setTimeout(() => { now.value = 1_125; }, 15);
+      await new Promise<void>((resolve) => setTimeout(resolve, 55));
+      return {
+        outcome: "completed" as const,
+        receipt: {
+          kind: "run_navigator_ticket_worker" as const,
+          effectIdempotencyKey: context.effect.idempotencyKey,
+          attemptId: context.ticket.attempt.id,
+          resource: { kind: "bb_thread" as const, id: "thr_ticket_executor" },
+          exactHeadSha: SHA.base,
+          result: {},
+          gitObservation: null,
+        },
+      };
+    });
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: () => now.value },
+      leaseMs: 30,
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute },
+        { kind: "run_navigator_release", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+      ],
+    });
+    const service = runJobExecutorService({
+      store: value.store,
+      clock: { now: () => now.value },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    const renewedClaim = value.store.getWorkArtifactClaim(prepared.claimId);
+    expect(started).toBe(true);
+    expect(renewedClaim).toMatchObject({
+      ownerId: expect.not.stringMatching("executor-40"),
+      generation: expect.any(Number),
+      leaseExpiresAt: expect.any(Number),
+    });
+    expect(renewedClaim!.leaseExpiresAt).toBeGreaterThan(now.value);
+    await service;
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "done" });
+  });
+
+  it("does not complete a ticket effect when the adapter omits its receipt", async () => {
+    const value = fixture();
+    const prepared = prepareTicketEffectForExecutor(value, 1_110);
+    const lease = value.store.acquireExecutorLease("ticket-receiptless", 1_110, 1_000);
+    if (!lease.acquired) throw new Error("ticket receiptless executor lease was unavailable");
+    const worker = vi.fn(async (): Promise<NavigatorEffectOutcome> => ({
+      outcome: "completed",
+      receipt: undefined as never,
+    }));
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: () => 1_110 },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: worker },
+        { kind: "run_navigator_release", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+      ],
+    });
+
+    await expect(protocol.processOne(
+      { ownerId: "ticket-receiptless", generation: lease.generation, signal: new AbortController().signal },
+      new AbortController().signal,
+    )).resolves.toBe(true);
+
+    expect(worker).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "dead" });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(prepared.effect.payload.attemptId)).toEqual({ count: 0 });
+  });
+
+  it("prevents a stale ticket worker from settling after a successor fence takeover", async () => {
+    const value = fixture();
+    const now = 1_110;
+    const prepared = prepareTicketEffectForExecutor(value, now);
+    const abort = new AbortController();
+    const execute = vi.fn(async (context: NavigatorEffectContext) => {
+      if (context.kind !== "run_navigator_ticket_worker") throw new Error("wrong navigator effect context");
+      const successorGeneration = context.fence.generation + 1;
+      value.database.prepare(
+        `UPDATE executor_lease SET owner_id = 'ticket-successor', generation = ?,
+            heartbeat_at = ?, lease_expires_at = ? WHERE singleton = 1`,
+      ).run(successorGeneration, now, now + 1_000);
+      value.database.prepare(
+        `UPDATE effects SET lease_owner = 'ticket-successor', lease_generation = ?, lease_expires_at = ?
+          WHERE idempotency_key = ?`,
+      ).run(successorGeneration, now + 1_000, prepared.effect.idempotencyKey);
+      value.database.prepare(
+        `UPDATE job_resource_claims SET owner_id = 'ticket-successor', generation = ?, lease_expires_at = ?
+          WHERE job_id = ? AND state = 'held'`,
+      ).run(successorGeneration, now + 1_000, value.jobId);
+      value.database.prepare(
+        `UPDATE work_artifact_claims SET owner_id = 'ticket-successor', generation = ?, lease_expires_at = ?
+          WHERE id = ? AND state = 'held'`,
+      ).run(successorGeneration, now + 1_000, prepared.claimId);
+      abort.abort();
+      return {
+        outcome: "completed" as const,
+        receipt: {
+          kind: "run_navigator_ticket_worker" as const,
+          effectIdempotencyKey: context.effect.idempotencyKey,
+          attemptId: context.ticket.attempt.id,
+          resource: { kind: "bb_thread" as const, id: "thr_stale_ticket" },
+          exactHeadSha: SHA.base,
+          result: {},
+          gitObservation: null,
+        },
+      };
+    });
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: () => now },
+      leaseMs: 30,
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute },
+        { kind: "run_navigator_release", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+      ],
+    });
+
+    const timeout = setTimeout(() => abort.abort(), 100);
+    await runJobExecutorService({
+      store: value.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+    clearTimeout(timeout);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({
+      status: "leased",
+      leaseOwner: "ticket-successor",
+      leaseGeneration: expect.any(Number),
+    });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(prepared.effect.payload.attemptId)).toEqual({ count: 0 });
+  });
+
+  it("rolls back a typed ticket receipt when workflow settlement fails", async () => {
+    const value = fixture();
+    const prepared = prepareTicketEffectForExecutor(value, 1_110);
+    const lease = value.store.acquireExecutorLease("ticket-rollback", 1_110, 1_000);
+    if (!lease.acquired) throw new Error("ticket rollback executor lease was unavailable");
+    value.database.exec(
+      `CREATE TRIGGER navigator_test_fail_ticket_settlement
+       BEFORE INSERT ON navigator_ticket_worker_outcomes
+       BEGIN SELECT RAISE(ABORT, 'ticket settlement fault'); END`,
+    );
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: () => 1_110 },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute: async (context) => completedTicketReceipt(context) },
+        { kind: "run_navigator_release", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+      ],
+    });
+
+    await expect(protocol.processOne(
+      { ownerId: "ticket-rollback", generation: lease.generation, signal: new AbortController().signal },
+      new AbortController().signal,
+    )).resolves.toBe(true);
+
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).not.toMatchObject({ status: "done" });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(prepared.effect.idempotencyKey)).toEqual({ count: 0 });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_outcomes WHERE attempt_id = ?",
+    ).get(prepared.effect.payload.attemptId)).toEqual({ count: 0 });
+  });
+
+  it("reconciles an ambiguous ticket outcome with a typed receipt", async () => {
+    const value = fixture();
+    const prepared = prepareTicketEffectForExecutor(value, 1_110);
+    const lease = value.store.acquireExecutorLease("ticket-reconcile", 1_110, 1_000);
+    if (!lease.acquired) throw new Error("ticket reconciliation executor lease was unavailable");
+    const execute = vi.fn(async () => ({ outcome: "ambiguous" as const, reason: "worker receipt was lost" }));
+    const reconcile = vi.fn(async (context: NavigatorEffectContext) => completedTicketReceipt(context));
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: () => 1_110 },
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute, reconcile },
+        { kind: "run_navigator_release", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+      ],
+    });
+
+    await expect(protocol.processOne(
+      { ownerId: "ticket-reconcile", generation: lease.generation, signal: new AbortController().signal },
+      new AbortController().signal,
+    )).resolves.toBe(true);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({ status: "done" });
+    expect(value.database.prepare(
+      "SELECT kind FROM navigator_effect_receipts WHERE effect_idempotency_key = ?",
+    ).get(prepared.effect.idempotencyKey)).toEqual({ kind: "run_navigator_ticket_worker" });
+  });
+
+  it.each(CLAIM_CASES)("runs the ticket executor only with the exact claim set (%s)", async (claimCase) => {
+    const value = fixture();
+    const now = 1_110;
+    const prepared = prepareTicketEffectForExecutor(value, now);
+    configureTicketClaimCase(value, prepared.effect, prepared.claimId, claimCase, now);
+    const execute = vi.fn(async (context: NavigatorEffectContext) => completedTicketReceipt(context));
+    const protocol = new NavigatorEffectProtocol({
+      store: value.store,
+      clock: { now: () => now },
+      leaseMs: 30,
+      adapters: [
+        { kind: "run_navigator_skill", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+        { kind: "run_navigator_ticket_worker", execute },
+        { kind: "run_navigator_release", execute: vi.fn(async () => ({ outcome: "permanent" as const, reason: "unused" })) },
+      ],
+    });
+    const abort = new AbortController();
+    await runJobExecutorService({
+      store: value.store,
+      clock: { now: () => now },
+      leaseMs: 1_000,
+      navigatorEffects: protocol,
+      effectRunnerFactory: () => ({ run: async () => undefined }),
+      waitForWork: async () => abort.abort(),
+      releaseOnShutdown: true,
+    }, abort.signal);
+
+    expect(execute).toHaveBeenCalledTimes(claimCase === "valid exact" ? 1 : 0);
+    expect(value.store.getEffect(value.jobId, prepared.effect.idempotencyKey)).toMatchObject({
+      status: claimCase === "valid exact" ? "done" : "pending",
+    });
+    expect(value.store.getWorkArtifactClaim(prepared.claimId)).toMatchObject({
+      state: claimCase === "empty" ? "released" : "held",
     });
   });
 

@@ -324,7 +324,11 @@ describe("managed BB automations", () => {
   // here left the owner with no schedule at all, upkeep included.
   it("asks BB for an agent schedule even though BB enforces none of the contract itself", async () => {
     const { repository } = fixture();
-    const run = vi.fn(async () => ({ outcome: "exited" as const, exitCode: 1, output: "boom" }));
+    const run = vi.fn(async (_input: { command: string }) => ({
+      outcome: "exited" as const,
+      exitCode: 1,
+      output: "boom",
+    }));
     const service = new ManagedAutomationService(
       repository,
       new TerminalBbAutomationAdapter({ run }),

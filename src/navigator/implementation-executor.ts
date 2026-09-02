@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { ModelRoute } from "../capabilities/models";
+import { CAPABILITY_GRAPH_DIGEST, CAPABILITY_REGISTRY_DIGEST } from "../capabilities/catalog";
 import type { StoredEffect } from "../domain/models";
 import type { EffectFence } from "../services/effect-runner";
 import type { TelegramAgentStore } from "../storage/store";
@@ -34,6 +35,11 @@ import {
   type NavigatorTicketWorkOrder,
 } from "./implementation-contracts";
 import { artifactBindingSchema, type NavigatorArtifactBinding } from "./models";
+import {
+  navigatorEffectReceiptSchema,
+  type NavigatorTicketReceipt,
+  type NavigatorTicketSettlementInput,
+} from "./effect-contracts";
 
 const GIT_SHA = /^[0-9a-f]{40}$/u;
 const IDENTIFIER = /^[A-Za-z0-9_.:/-]{1,256}$/u;
@@ -51,6 +57,8 @@ export type NavigatorTicketWorkerAttempt = Readonly<{
   profile: NavigatorTicketWorkerProfile;
   modelRoute: ModelRoute;
   resource: { kind: "bb_thread"; id: string } | null;
+  capabilityProfileId?: string | null;
+  capabilityProfileRevision?: number | null;
   createdAt: number;
   updatedAt: number;
 }>;
@@ -65,6 +73,24 @@ export type NavigatorTicketWorkerOutcome = Readonly<{
   resultDigest: string;
   gitObservation: NavigatorGitObservation | null;
   recordedAt: number;
+}>;
+
+export type NavigatorTicketWorkerExecution = Readonly<{
+  resource: { kind: "bb_thread"; id: string };
+  exactHeadSha: string;
+  result: unknown;
+  gitObservation: NavigatorGitObservation | null;
+}>;
+
+type NavigatorTicketSettlementRequest = Readonly<{
+  attemptId: string;
+  effectKey: string;
+  rawResult: unknown;
+  rawGitObservation: unknown;
+  fence: EffectFence;
+  now: number;
+  expectedHeadSha?: string;
+  receipt?: NavigatorTicketReceipt;
 }>;
 
 export type NavigatorIntegrationSnapshot = Readonly<{
@@ -190,6 +216,8 @@ type AttemptRow = Readonly<{
   resource_id: string | null;
   created_at: number;
   updated_at: number;
+  capability_profile_id: string | null;
+  capability_profile_revision: number | null;
 }>;
 
 type IntegrationRow = Readonly<{
@@ -427,6 +455,8 @@ function parseAttempt(row: AttemptRow): NavigatorTicketWorkerAttempt {
     profile,
     modelRoute: parseNavigatorTicketModelRoute(JSON.parse(row.model_route_json), row.kind),
     resource: row.resource_kind === null ? null : { kind: row.resource_kind, id: row.resource_id! },
+    capabilityProfileId: row.capability_profile_id,
+    capabilityProfileRevision: row.capability_profile_revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -484,6 +514,7 @@ export class NavigatorImplementationExecutor {
 
   public constructor(private readonly dependencies: NavigatorImplementationExecutorDependencies) {
     this.db = dependencies.database;
+    dependencies.store.registerNavigatorTicketSettlement((input) => this.settleNavigatorTicketWorkerAttempt(input));
   }
 
   public startIntegration(input: Readonly<{
@@ -875,6 +906,56 @@ export class NavigatorImplementationExecutor {
     const now = this.dependencies.clock.now();
     const effect = this.leaseEffect(fence, now);
     if (!effect) return false;
+    return this.processLeased(effect, fence, signal);
+  }
+
+  public async executeAttempt(
+    attempt: NavigatorTicketWorkerAttempt,
+    signal: AbortSignal,
+  ): Promise<NavigatorTicketWorkerExecution> {
+    const execution = await this.dependencies.workerRunner.run(attempt, { bindResource: async () => undefined }, signal);
+    const gitObservation = await this.observeAttemptGit(attempt, execution.result);
+    const parsedObservation = navigatorGitObservationSchema.safeParse(gitObservation);
+    const parsedResult = navigatorTicketWorkerResultSchema.safeParse(execution.result);
+    const exactHeadSha = parsedObservation.success
+      ? parsedObservation.data.headSha
+      : parsedResult.success && parsedResult.data.kind === "implementation_result"
+        ? parsedResult.data.headSha
+        : parsedResult.success && parsedResult.data.kind === "code_review_result"
+          ? parsedResult.data.reviewedHeadSha
+          : attempt.workOrder.baseHeadSha;
+    return {
+      resource: execution.resource,
+      exactHeadSha,
+      result: execution.result,
+      gitObservation: parsedObservation.success ? parsedObservation.data : null,
+    };
+  }
+
+  public settleNavigatorTicketWorkerAttempt(
+    input: NavigatorTicketSettlementInput,
+  ): NavigatorTicketWorkerOutcome | null {
+    const receipt = navigatorEffectReceiptSchema.safeParse(input.receipt);
+    if (!receipt.success || receipt.data.kind !== "run_navigator_ticket_worker") return null;
+    const fence: EffectFence = {
+      ownerId: input.ownerId,
+      generation: input.generation,
+      signal: new AbortController().signal,
+    };
+    return this.settleAttempt({
+      attemptId: input.attemptId,
+      effectKey: input.effectIdempotencyKey,
+      rawResult: receipt.data.result,
+      rawGitObservation: receipt.data.gitObservation,
+      fence,
+      now: input.now,
+      expectedHeadSha: receipt.data.exactHeadSha,
+      receipt: receipt.data,
+    });
+  }
+
+  public async processLeased(effect: StoredEffect, fence: EffectFence, signal: AbortSignal): Promise<boolean> {
+    const now = this.dependencies.clock.now();
     const attemptId = effectPayload(effect, "attemptId");
     const attempt = this.getAttempt(attemptId);
     if (!attempt || attempt.effectIdempotencyKey !== effect.idempotencyKey) {
@@ -939,14 +1020,32 @@ export class NavigatorImplementationExecutor {
         throw new Error("navigator ticket worker returned a different resource");
       }
       const gitObservation = await this.observeAttemptGit(attempt, run.result);
-      this.settleAttempt(
-        attempt.id,
-        effect.idempotencyKey,
-        run.result,
-        gitObservation,
-        fence,
-        this.dependencies.clock.now(),
-      );
+      const parsedObservation = navigatorGitObservationSchema.safeParse(gitObservation);
+      const parsedResult = navigatorTicketWorkerResultSchema.safeParse(run.result);
+      const exactHeadSha = parsedObservation.success
+        ? parsedObservation.data.headSha
+        : parsedResult.success && parsedResult.data.kind === "implementation_result"
+          ? parsedResult.data.headSha
+          : parsedResult.success && parsedResult.data.kind === "code_review_result"
+            ? parsedResult.data.reviewedHeadSha
+            : attempt.workOrder.baseHeadSha;
+      const settled = this.settleNavigatorTicketWorkerAttempt({
+        attemptId: attempt.id,
+        effectIdempotencyKey: effect.idempotencyKey,
+        receipt: {
+          kind: "run_navigator_ticket_worker",
+          effectIdempotencyKey: effect.idempotencyKey,
+          attemptId: attempt.id,
+          resource: run.resource,
+          exactHeadSha,
+          result: run.result,
+          gitObservation: parsedObservation.success ? parsedObservation.data : null,
+        },
+        ownerId: fence.ownerId,
+        generation: fence.generation,
+        now: this.dependencies.clock.now(),
+      });
+      if (settled === null) throw new Error("navigator ticket settlement fence was lost");
     } catch (error) {
       if (error instanceof NavigatorTicketWorkerUnavailableError) {
         try {
@@ -1537,6 +1636,26 @@ export class NavigatorImplementationExecutor {
     const route = parseNavigatorTicketModelRoute(this.dependencies.modelRoute(input.kind), input.kind);
     const attemptId = stableId("navworker", input.sliceId, input.kind, String(input.ordinal));
     const effectKey = `${input.integration.job_id}:navigator-ticket:${attemptId}`;
+    const capabilityProfile = this.dependencies.store.createCapabilityProfile({
+      subjectKind: "worker_attempt",
+      subjectId: attemptId,
+      threadId: null,
+      recipeId: "navigator-v1",
+      recipeVersion: 1,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST,
+      mode: "active",
+      model: route,
+      assignments: profile.assignments.map((assignment) => ({
+        capabilityId: assignment.capabilityId,
+        capabilityKind: "skill" as const,
+        descriptorDigest: assignment.descriptorDigest,
+        mandatory: assignment.mandatory,
+      })),
+      reasonCodes: ["navigator_effect_admission"],
+      traits: [],
+      now: input.now,
+    });
     this.db.prepare(
       `INSERT INTO effects (
          idempotency_key, job_id, kind, payload_json, status, attempts,
@@ -1556,8 +1675,8 @@ export class NavigatorImplementationExecutor {
          id, job_id, slice_id, kind, ordinal, effect_idempotency_key,
          work_order_json, work_order_digest, step_contract_id, step_contract_revision,
          step_contract_digest, step_contract_json, profile_json, profile_digest, model_route_json,
-         resource_kind, resource_id, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+         capability_profile_id, capability_profile_revision, resource_kind, resource_id, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
     ).run(
       attemptId,
       input.integration.job_id,
@@ -1574,9 +1693,25 @@ export class NavigatorImplementationExecutor {
       JSON.stringify(profile),
       profile.digest,
       JSON.stringify(route),
+      capabilityProfile.id,
+      capabilityProfile.revision,
       input.now,
       input.now,
     );
+    this.dependencies.store.recordNavigatorCapabilityEvidence({
+      effectIdempotencyKey: effectKey,
+      jobId: input.integration.job_id,
+      projectId: (JSON.parse(input.integration.project_policy_json) as { projectId: string }).projectId,
+      operation: "worktree_write",
+      profileId: capabilityProfile.id,
+      profileRevision: capabilityProfile.revision,
+      assignments: profile.assignments.map((assignment) => ({
+        capabilityId: assignment.capabilityId,
+        capabilityKind: "skill" as const,
+        descriptorDigest: assignment.descriptorDigest,
+      })),
+      now: input.now,
+    });
     return this.getAttempt(attemptId)!;
   }
 
@@ -1678,32 +1813,41 @@ export class NavigatorImplementationExecutor {
     }).immediate();
   }
 
-  private settleAttempt(
-    attemptId: string,
-    effectKey: string,
-    rawResult: unknown,
-    rawGitObservation: unknown,
-    fence: EffectFence,
-    now: number,
-  ): NavigatorTicketWorkerOutcome | null {
+  private settleAttempt(input: NavigatorTicketSettlementRequest): NavigatorTicketWorkerOutcome | null {
     return this.db.transaction(() => {
-      if (!this.effectLeaseCurrent(effectKey, fence, now)) return null;
-      const attempt = this.getAttempt(attemptId);
-      if (!attempt || attempt.effectIdempotencyKey !== effectKey || attempt.resource === null) return null;
-      const existing = this.getOutcome(attemptId);
+      if (!this.effectLeaseCurrent(input.effectKey, input.fence, input.now)) return null;
+      const attempt = this.getAttempt(input.attemptId);
+      if (!attempt || attempt.effectIdempotencyKey !== input.effectKey) return null;
+      if (input.receipt !== undefined && (
+        input.receipt.effectIdempotencyKey !== input.effectKey || input.receipt.attemptId !== attempt.id
+      )) return null;
+      const receiptResource = input.receipt?.resource ?? attempt.resource;
+      if (receiptResource === null) return null;
+      if (attempt.resource !== null && (
+        attempt.resource.kind !== receiptResource.kind || attempt.resource.id !== receiptResource.id
+      )) return null;
+      if (attempt.resource === null) {
+        const bound = this.db.prepare(
+          `UPDATE navigator_ticket_worker_attempts
+            SET resource_kind = 'bb_thread', resource_id = ?, updated_at = ?
+            WHERE id = ? AND effect_idempotency_key = ? AND resource_id IS NULL`,
+        ).run(receiptResource.id, input.now, attempt.id, input.effectKey);
+        if (bound.changes !== 1) return null;
+      }
+      const existing = this.getOutcome(input.attemptId);
       if (existing) return existing;
-      if (!this.claimFenceIsCurrent(attempt, fence, now)) {
+      if (!this.claimFenceIsCurrent(attempt, input.fence, input.now)) {
         const effect = this.parseEffect(this.db.prepare(
           "SELECT * FROM effects WHERE idempotency_key = ?",
-        ).get(effectKey) as Parameters<typeof this.parseEffect>[0]);
-        this.settleClaimFenceFailure(attempt, effect, fence, now);
+        ).get(input.effectKey) as Parameters<typeof this.parseEffect>[0]);
+        this.settleClaimFenceFailure(attempt, effect, input.fence, input.now);
         return this.getOutcome(attempt.id);
       }
-      const rawResultJson = JSON.stringify(rawResult);
+      const rawResultJson = JSON.stringify(input.rawResult);
       const resultTooLarge = rawResultJson !== undefined &&
         Buffer.byteLength(rawResultJson, "utf8") > attempt.stepContract.maximumResultBytes;
-      const parsed = navigatorTicketWorkerResultSchema.safeParse(resultTooLarge ? undefined : rawResult);
-      const parsedGit = navigatorGitObservationSchema.safeParse(rawGitObservation);
+      const parsed = navigatorTicketWorkerResultSchema.safeParse(resultTooLarge ? undefined : input.rawResult);
+      const parsedGit = navigatorGitObservationSchema.safeParse(input.rawGitObservation);
       const integration = this.integrationRow(attempt.jobId)!;
       let outcome: NavigatorTicketWorkerOutcome["outcome"] = "succeeded";
       let reasonCode = "accepted";
@@ -1759,7 +1903,7 @@ export class NavigatorImplementationExecutor {
           outcome = "policy_failure";
           reasonCode = "finding_verification_source_mismatch";
         } else {
-          const verified = this.recordFindingVerification(attempt, parsed.data, now);
+          const verified = this.recordFindingVerification(attempt, parsed.data, input.now);
           verifiedBlockingBurden = verified.blockingBurden;
           if (verified.policyFailureReason !== null) {
             outcome = "policy_failure";
@@ -1776,7 +1920,7 @@ export class NavigatorImplementationExecutor {
         outcome = "findings";
         reasonCode = "review_findings_unverified";
       } else {
-        const convergenceFailure = this.recordPassingReview(attempt, parsed.data, now);
+        const convergenceFailure = this.recordPassingReview(attempt, parsed.data, input.now);
         if (convergenceFailure !== null) {
           outcome = "policy_failure";
           reasonCode = convergenceFailure;
@@ -1790,6 +1934,10 @@ export class NavigatorImplementationExecutor {
           ? parsed.data.headSha
           : attempt.workOrder.baseHeadSha
       );
+      if (input.expectedHeadSha !== undefined && input.expectedHeadSha !== exactHeadSha) {
+        throw new Error("navigator ticket receipt head changed before settlement");
+      }
+      if (input.receipt !== undefined) this.recordTicketReceipt(input.receipt, attempt.jobId, input.fence, input.now);
       this.db.prepare(
         `INSERT INTO navigator_ticket_worker_outcomes (
            attempt_id, slice_id, outcome, reason_code, exact_head_sha,
@@ -1805,36 +1953,59 @@ export class NavigatorImplementationExecutor {
         resultDigest,
         gitObservation === null ? null : JSON.stringify(gitObservation),
         gitObservationDigest,
-        now,
+        input.now,
       );
       if (outcome === "policy_failure") {
-        this.invalidateIntegration(integration, reasonCode, now);
+        this.invalidateIntegration(integration, reasonCode, input.now);
       } else if (attempt.kind === "implementation") {
         const implementationResult = navigatorImplementationResultSchema.parse(result);
-        this.acceptImplementation(attempt, implementationResult.headSha, implementationResult.changedPaths, now);
+        this.acceptImplementation(attempt, implementationResult.headSha, implementationResult.changedPaths, input.now);
       } else if (
         outcome === "findings" && attempt.workOrder.verificationOf === undefined
       ) {
         const reviewResult = navigatorCodeReviewResultSchema.parse(result);
-        this.scheduleFindingVerification(attempt, reviewResult, resultDigest, now);
+        this.scheduleFindingVerification(attempt, reviewResult, resultDigest, input.now);
       } else if (outcome === "findings" && verifiedBlockingBurden !== null) {
         this.db.prepare(
           "UPDATE navigator_ticket_slices SET state = 'repair_pending', updated_at = ? WHERE id = ?",
-        ).run(now, attempt.sliceId);
+        ).run(input.now, attempt.sliceId);
       } else {
         navigatorCodeReviewResultSchema.parse(result);
         this.db.prepare(
           "UPDATE navigator_ticket_slices SET state = 'accepted', accepted_head_sha = ?, updated_at = ? WHERE id = ?",
-        ).run(exactHeadSha, now, attempt.sliceId);
+        ).run(exactHeadSha, input.now, attempt.sliceId);
         this.db.prepare(
           `UPDATE navigator_integration_tickets
               SET state = 'accepted', accepted_head_sha = ?
             WHERE job_id = ? AND artifact_id = ?`,
         ).run(exactHeadSha, attempt.jobId, attempt.workOrder.ticket.artifactId);
       }
-      this.finishEffectByKey(effectKey, fence, now, "done", null);
+      this.finishEffectByKey(input.effectKey, input.fence, input.now, "done", null);
       return this.getOutcome(attempt.id);
     }).immediate();
+  }
+
+  private recordTicketReceipt(
+    receipt: NavigatorTicketReceipt,
+    jobId: string,
+    fence: EffectFence,
+    now: number,
+  ): void {
+    const receiptJson = JSON.stringify(receipt);
+    this.db.prepare(
+      `INSERT INTO navigator_effect_receipts (
+         effect_idempotency_key, job_id, kind, receipt_json, receipt_digest,
+         owner_id, generation, recorded_at
+       ) VALUES (?, ?, 'run_navigator_ticket_worker', ?, ?, ?, ?, ?)`,
+    ).run(
+      receipt.effectIdempotencyKey,
+      jobId,
+      receiptJson,
+      createHash("sha256").update(receiptJson, "utf8").digest("hex"),
+      fence.ownerId,
+      fence.generation,
+      now,
+    );
   }
 
   private async observeAttemptGit(

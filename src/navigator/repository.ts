@@ -2,7 +2,34 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { modelRouteSchema, type ModelRoute } from "../capabilities/models";
 import type { Job, StoredEffect } from "../domain/models";
+import type { TaskAuthorityEffect } from "../domain/task-authority";
 import type { OwnerBoundaryDraft } from "../domain/owner-boundary";
+import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+} from "../capabilities/catalog";
+import {
+  CapabilityRepository,
+  type CapabilityProfile,
+} from "../storage/capability-repository";
+import { DEFAULT_MODEL_POOL_REGISTRY } from "../capabilities/models";
+import {
+  navigatorSkillReceiptSchema,
+  type NavigatorCapabilityAssignment,
+  type NavigatorCapabilityEvidence,
+  type NavigatorCapabilityOperation,
+  type NavigatorSkillReceipt,
+} from "./effect-contracts";
+import type { NavigatorTicketAttemptContext } from "./effect-contracts";
+import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
+import { navigatorClaimContract, type NavigatorClaimedEffectKind } from "./claim-contracts";
+import {
+  navigatorJsonDigest,
+  navigatorPersistedTicketStepContractSchema,
+  navigatorTicketWorkerProfileSchema,
+  navigatorTicketWorkOrderSchema,
+  parseNavigatorTicketModelRoute,
+} from "./implementation-contracts";
 import {
   type EffectRow,
   parseStoredEffect,
@@ -53,6 +80,58 @@ import { NAVIGATOR_RELEASE_STEP_SKILL_ID, type NavigatorReleaseAttempt } from ".
 
 type SqliteDatabase = Database.Database;
 
+type NavigatorLeaseClaimRow = Readonly<{
+  claim_id: number;
+  resource_key: string;
+  resource_kind: string;
+  state: string;
+  owner_id: string;
+  generation: number;
+  lease_expires_at: number;
+}>;
+
+type NavigatorTicketClaimRow = Readonly<{
+  claim_id: number;
+  artifact_id: string;
+  snapshot_id: string;
+  job_id: string;
+  state: string;
+  owner_id: string;
+  generation: number;
+  lease_expires_at: number;
+}>;
+
+type NavigatorLeaseClaimPlan = Readonly<{
+  jobClaimIds: readonly number[];
+  ticketClaim: NavigatorTicketClaimRow | null;
+}>;
+
+type NavigatorCompatibilityRow = Readonly<{
+  effect_idempotency_key: string;
+  job_id: string;
+  kind: NavigatorClaimedEffectKind;
+  attempt_id: string;
+  state: "pending";
+  profile_id?: string;
+  profile_revision?: number;
+  effect_status: string;
+  lease_expires_at: number | null;
+}>;
+
+type NavigatorCompatibilityEvidenceSeed = Readonly<{
+  operation: NavigatorCapabilityOperation;
+  capabilityId: string;
+  capabilityKind: string;
+  descriptorDigest: string;
+  receiptId: string;
+}>;
+
+class NavigatorLeaseConflictError extends Error {}
+
+function isNavigatorClaimedEffectKind(kind: StoredEffect["kind"]): kind is NavigatorClaimedEffectKind {
+  return kind === "run_navigator_skill" || kind === "run_navigator_ticket_worker" || kind === "run_navigator_release";
+}
+
 type SnapshotRow = Readonly<{
   id: string;
   job_id: string;
@@ -101,6 +180,47 @@ type AttemptRow = Readonly<{
   resource_id: string | null;
   created_at: number;
   updated_at: number;
+  capability_profile_id: string | null;
+  capability_profile_revision: number | null;
+}>;
+
+type NavigatorCapabilityEvidenceRow = Readonly<{
+  effect_idempotency_key: string;
+  job_id: string;
+  project_id: string;
+  operation: NavigatorCapabilityOperation;
+  profile_id: string;
+  profile_revision: number;
+  capability_id: string;
+  capability_kind: "skill" | "tool" | "bundle" | "native-adapter" | "model" | "connector" | "recipe";
+  descriptor_digest: string;
+  receipt_id: string;
+  owner_id: string | null;
+  generation: number | null;
+}>;
+
+type TicketAttemptRow = Readonly<{
+  id: string;
+  job_id: string;
+  slice_id: string;
+  kind: "implementation" | "review";
+  ordinal: number;
+  effect_idempotency_key: string;
+  work_order_json: string;
+  work_order_digest: string;
+  step_contract_id: string;
+  step_contract_revision: number;
+  step_contract_digest: string;
+  step_contract_json: string;
+  profile_json: string;
+  profile_digest: string;
+  model_route_json: string;
+  resource_kind: "bb_thread" | null;
+  resource_id: string | null;
+  created_at: number;
+  updated_at: number;
+  capability_profile_id: string | null;
+  capability_profile_revision: number | null;
 }>;
 
 function assertNonNegativeInteger(value: number, field: string): void {
@@ -140,6 +260,100 @@ function serializeNavigatorJson(value: unknown, field: string): string {
   }
   return json;
 }
+
+const NAVIGATOR_RELEASE_CAPABILITY_ID = "navigator-release";
+const NAVIGATOR_RELEASE_DESCRIPTOR_DIGEST = createHash("sha256")
+  .update("navigator-release:capability:v1", "utf8")
+  .digest("hex");
+
+function navigatorProfileModel(route: ModelRoute): ModelRoute {
+  return modelRouteSchema.parse(route);
+}
+
+const NAVIGATOR_EFFECT_LEASE_QUERY = `SELECT effect.*
+  FROM effects AS effect
+  JOIN jobs AS job ON job.id = effect.job_id
+ WHERE job.workflow_engine = 'navigator-v1' AND job.workflow_mode = 'deterministic'
+   AND job.state NOT IN ('merged', 'cancelled', 'blocked', 'complete', 'production_failed')
+   AND job.cancel_requested_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1
+       FROM navigator_effect_compatibility AS compatibility
+      WHERE compatibility.effect_idempotency_key = effect.idempotency_key
+        AND compatibility.state = 'pending'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM navigator_effect_compatibility_resolutions AS resolution
+           WHERE resolution.effect_idempotency_key = compatibility.effect_idempotency_key
+        )
+   )
+   AND (
+     (
+       effect.kind = 'run_navigator_skill'
+       AND EXISTS (
+         SELECT 1
+           FROM navigator_skill_attempts AS attempt
+           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
+          WHERE attempt.effect_idempotency_key = effect.idempotency_key
+            AND attempt.job_id = effect.job_id AND attempt.job_id = step.job_id
+            AND step.job_id = snapshot.job_id
+            AND attempt.job_version = step.job_version
+            AND step.job_version = snapshot.job_version
+            AND attempt.workflow_revision = step.workflow_revision
+            AND step.workflow_revision = snapshot.workflow_revision
+            AND attempt.snapshot_digest = snapshot.digest
+            AND job.workflow_revision = step.workflow_revision
+            AND job.current_workflow_step_id = attempt.workflow_step_id
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_step_outcomes AS outcome
+               WHERE outcome.workflow_step_id = attempt.workflow_step_id
+            )
+       )
+     )
+     OR (
+       effect.kind = 'run_navigator_ticket_worker'
+       AND EXISTS (
+         SELECT 1
+           FROM navigator_ticket_worker_attempts AS attempt
+           JOIN navigator_integrations AS integration ON integration.job_id = attempt.job_id
+          WHERE attempt.effect_idempotency_key = effect.idempotency_key
+            AND attempt.job_id = effect.job_id
+            AND integration.state = 'implementing'
+            AND NOT EXISTS (
+              SELECT 1 FROM navigator_ticket_worker_outcomes AS outcome
+               WHERE outcome.attempt_id = attempt.id
+            )
+       )
+     )
+     OR (
+       effect.kind = 'run_navigator_release'
+       AND EXISTS (
+         SELECT 1
+           FROM navigator_release_attempts AS attempt
+           JOIN workflow_steps AS step ON step.id = attempt.workflow_step_id
+           JOIN navigator_snapshots AS snapshot ON snapshot.id = step.snapshot_id
+          WHERE attempt.effect_idempotency_key = effect.idempotency_key
+            AND attempt.job_id = effect.job_id AND attempt.job_id = step.job_id
+            AND step.job_id = snapshot.job_id
+            AND attempt.job_version = step.job_version
+            AND step.job_version = snapshot.job_version
+            AND attempt.workflow_revision = step.workflow_revision
+            AND step.workflow_revision = snapshot.workflow_revision
+            AND attempt.snapshot_digest = snapshot.digest
+            AND job.workflow_revision = step.workflow_revision
+            AND job.current_workflow_step_id = attempt.workflow_step_id
+            AND NOT EXISTS (
+              SELECT 1 FROM navigator_release_outcomes AS outcome
+               WHERE outcome.attempt_id = attempt.id
+            )
+       )
+     )
+   )
+   AND ((effect.status IN ('pending', 'failed') AND effect.next_attempt_at <= ?)
+     OR (effect.status = 'leased' AND effect.lease_expires_at <= ?))
+ ORDER BY effect.created_at, effect.idempotency_key
+ LIMIT 1`;
 
 function parseSnapshot(row: SnapshotRow): NavigatorSnapshot {
   const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
@@ -236,6 +450,39 @@ function parseAttempt(row: AttemptRow): NavigatorSkillAttempt {
     jobVersion: row.job_version,
     workflowRevision: row.workflow_revision,
     resource,
+    capabilityProfileId: row.capability_profile_id,
+    capabilityProfileRevision: row.capability_profile_revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parseTicketAttempt(row: TicketAttemptRow): NavigatorTicketWorkerAttempt {
+  const workOrder = navigatorTicketWorkOrderSchema.parse(JSON.parse(row.work_order_json));
+  const profile = navigatorTicketWorkerProfileSchema.parse(JSON.parse(row.profile_json));
+  const stepContract = navigatorPersistedTicketStepContractSchema.parse(JSON.parse(row.step_contract_json));
+  const { digest: _digest, ...unsignedContract } = stepContract;
+  if (
+    navigatorJsonDigest(workOrder) !== row.work_order_digest ||
+    stepContract.id !== row.step_contract_id || stepContract.revision !== row.step_contract_revision ||
+    stepContract.digest !== row.step_contract_digest || navigatorJsonDigest(unsignedContract) !== stepContract.digest ||
+    profile.digest !== row.profile_digest
+  ) throw new Error(`navigator ticket attempt ${row.id} has invalid durable identity`);
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    sliceId: row.slice_id,
+    kind: row.kind,
+    ordinal: row.ordinal,
+    effectIdempotencyKey: row.effect_idempotency_key,
+    workOrder,
+    workOrderDigest: row.work_order_digest,
+    stepContract,
+    profile,
+    modelRoute: parseNavigatorTicketModelRoute(JSON.parse(row.model_route_json), row.kind),
+    resource: row.resource_kind === null ? null : { kind: row.resource_kind, id: row.resource_id! },
+    capabilityProfileId: row.capability_profile_id,
+    capabilityProfileRevision: row.capability_profile_revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -441,15 +688,531 @@ function proposalReason(
 
 export class NavigatorRepository {
   private readonly artifacts: WorkArtifactRepository;
+  private readonly capabilities: CapabilityRepository;
   private readonly taskAuthorities: TaskAuthorityRepository;
   private readonly releaseAuthorities: ReleaseAuthorityRepository;
   private readonly ownerBoundaries: OwnerBoundaryRepository;
 
   public constructor(private readonly db: SqliteDatabase) {
     this.artifacts = new WorkArtifactRepository(db);
+    this.capabilities = new CapabilityRepository(db);
     this.taskAuthorities = new TaskAuthorityRepository(db);
     this.releaseAuthorities = new ReleaseAuthorityRepository(db);
     this.ownerBoundaries = new OwnerBoundaryRepository(db);
+  }
+
+  private createNavigatorCapabilityProfile(input: Readonly<{
+    subjectId: string;
+    route: ModelRoute;
+    assignments: readonly NavigatorCapabilityAssignment[];
+    now: number;
+  }>): CapabilityProfile {
+    return this.capabilities.createProfile({
+      subjectKind: "worker_attempt",
+      subjectId: input.subjectId,
+      threadId: null,
+      recipeId: "navigator-v1",
+      recipeVersion: 1,
+      registryDigest: CAPABILITY_REGISTRY_DIGEST,
+      graphDigest: CAPABILITY_GRAPH_DIGEST,
+      mode: "active",
+      model: navigatorProfileModel(input.route),
+      assignments: input.assignments.map((assignment) => ({
+        ...assignment,
+        mandatory: true,
+      })),
+      reasonCodes: ["navigator_effect_admission"],
+      traits: [],
+      now: input.now,
+    });
+  }
+
+  public recordNavigatorCapabilityEvidence(input: Readonly<{
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    operation: NavigatorCapabilityOperation;
+    profileId: string;
+    profileRevision: number;
+    assignments: readonly NavigatorCapabilityAssignment[];
+    now: number;
+  }>): void {
+    const record = (): void => {
+      const profile = this.capabilities.getProfileById(input.profileId);
+      if (!profile || profile.subjectKind !== "worker_attempt" || profile.revision !== input.profileRevision) {
+        throw new TypeError("navigator capability profile identity is unavailable");
+      }
+      const selectedReceipt = this.db.prepare(
+        `SELECT id, capability_kind, descriptor_digest
+           FROM capability_receipts
+          WHERE profile_id = ? AND capability_id = ? AND event_type = 'selected'`,
+      );
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO navigator_effect_capability_evidence (
+           effect_idempotency_key, job_id, project_id, operation,
+           profile_id, profile_revision, capability_id, capability_kind,
+           descriptor_digest, receipt_id, owner_id, generation, admitted_at, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
+      );
+      for (const assignment of input.assignments) {
+        const receipt = selectedReceipt.get(input.profileId, assignment.capabilityId) as {
+          id: string;
+          capability_kind: string;
+          descriptor_digest: string;
+        } | undefined;
+        if (!receipt || receipt.capability_kind !== assignment.capabilityKind ||
+          receipt.descriptor_digest !== assignment.descriptorDigest) {
+          throw new TypeError("navigator capability selection receipt is not exact");
+        }
+        insert.run(
+          input.effectIdempotencyKey,
+          input.jobId,
+          input.projectId,
+          input.operation,
+          input.profileId,
+          input.profileRevision,
+          assignment.capabilityId,
+          assignment.capabilityKind,
+          assignment.descriptorDigest,
+          receipt.id,
+          input.now,
+        );
+      }
+      const rows = this.db.prepare(
+        `SELECT capability_id, capability_kind, descriptor_digest, profile_id, profile_revision,
+                project_id, job_id, operation
+           FROM navigator_effect_capability_evidence
+          WHERE effect_idempotency_key = ? AND operation = ?`,
+      ).all(input.effectIdempotencyKey, input.operation) as Array<{
+        capability_id: string;
+        capability_kind: string;
+        descriptor_digest: string;
+        profile_id: string;
+        profile_revision: number;
+        project_id: string;
+        job_id: string;
+        operation: string;
+      }>;
+      if (rows.length !== input.assignments.length || rows.some((row) =>
+        row.job_id !== input.jobId || row.project_id !== input.projectId || row.profile_id !== input.profileId ||
+        row.profile_revision !== input.profileRevision || !input.assignments.some((assignment) =>
+          assignment.capabilityId === row.capability_id && assignment.capabilityKind === row.capability_kind &&
+          assignment.descriptorDigest === row.descriptor_digest))) {
+        throw new TypeError("navigator capability evidence identity changed during replay");
+      }
+    };
+    if (this.db.inTransaction) record();
+    else this.db.transaction(record).immediate();
+  }
+
+  public getNavigatorCapabilityEvidence(effectIdempotencyKey: string): readonly NavigatorCapabilityEvidence[] {
+    assertIdentifier(effectIdempotencyKey, "effectIdempotencyKey");
+    const rows = this.db.prepare(
+      `SELECT effect_idempotency_key, job_id, project_id, operation, profile_id,
+              profile_revision, capability_id, capability_kind, descriptor_digest,
+              receipt_id, owner_id, generation
+         FROM navigator_effect_capability_evidence
+        WHERE effect_idempotency_key = ?
+        ORDER BY operation, capability_id`,
+    ).all(effectIdempotencyKey) as NavigatorCapabilityEvidenceRow[];
+    return rows.map((row) => ({
+      profileId: row.profile_id,
+      profileRevision: row.profile_revision,
+      receiptId: row.receipt_id,
+      capabilityId: row.capability_id,
+      capabilityKind: row.capability_kind,
+      descriptorDigest: row.descriptor_digest,
+      operation: row.operation,
+      projectId: row.project_id,
+      jobId: row.job_id,
+      ownerId: row.owner_id,
+      generation: row.generation,
+    }));
+  }
+
+  public admitNavigatorCapabilityEvidence(input: Readonly<{
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): boolean {
+    const rows = this.getNavigatorCapabilityEvidence(input.effectIdempotencyKey);
+    const effect = this.db.prepare(
+      `SELECT kind, payload_json, status, lease_owner, lease_generation, lease_expires_at
+         FROM effects WHERE idempotency_key = ? AND job_id = ?`,
+    ).get(input.effectIdempotencyKey, input.jobId) as {
+      kind: string;
+      payload_json: string;
+      status: string;
+      lease_owner: string | null;
+      lease_generation: number | null;
+      lease_expires_at: number | null;
+    } | undefined;
+    if (!effect || effect.status !== "leased" || effect.lease_owner !== input.ownerId ||
+      effect.lease_generation !== input.generation || effect.lease_expires_at === null ||
+      effect.lease_expires_at <= input.now || rows.length === 0 || rows.some((row) =>
+        row.jobId !== input.jobId || row.projectId !== input.projectId)) return false;
+
+    let payload: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(effect.payload_json);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+      payload = parsed as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+    const attemptId = typeof payload.attemptId === "string" ? payload.attemptId : null;
+    if (attemptId === null) return false;
+    const profileIdentity = effect.kind === "run_navigator_skill"
+      ? this.db.prepare(
+        `SELECT skill_id AS capability_id, descriptor_digest, capability_profile_id, capability_profile_revision
+           FROM navigator_skill_attempts WHERE id = ? AND effect_idempotency_key = ?`,
+      ).get(attemptId, input.effectIdempotencyKey) as {
+        capability_id: string;
+        descriptor_digest: string;
+        capability_profile_id: string | null;
+        capability_profile_revision: number | null;
+      } | undefined
+      : effect.kind === "run_navigator_release"
+        ? this.db.prepare(
+          `SELECT ? AS capability_id, ? AS descriptor_digest, capability_profile_id, capability_profile_revision
+             FROM navigator_release_attempts WHERE id = ? AND effect_idempotency_key = ?`,
+        ).get(NAVIGATOR_RELEASE_CAPABILITY_ID, NAVIGATOR_RELEASE_DESCRIPTOR_DIGEST, attemptId, input.effectIdempotencyKey) as {
+          capability_id: string;
+          descriptor_digest: string;
+          capability_profile_id: string | null;
+          capability_profile_revision: number | null;
+        } | undefined
+        : this.db.prepare(
+          `SELECT capability_profile_id, capability_profile_revision
+             FROM navigator_ticket_worker_attempts WHERE id = ? AND effect_idempotency_key = ?`,
+        ).get(attemptId, input.effectIdempotencyKey) as {
+          capability_profile_id: string | null;
+          capability_profile_revision: number | null;
+        } | undefined;
+    if (!profileIdentity || profileIdentity.capability_profile_id === null ||
+      profileIdentity.capability_profile_revision === null) return false;
+    const profile = this.capabilities.getProfileById(profileIdentity.capability_profile_id);
+    if (!profile || profile.subjectKind !== "worker_attempt" || profile.subjectId !== attemptId ||
+      profile.revision !== profileIdentity.capability_profile_revision || profile.mode !== "active" ||
+      profile.recipeId !== "navigator-v1" || profile.registryDigest !== CAPABILITY_REGISTRY_DIGEST ||
+      profile.graphDigest !== CAPABILITY_GRAPH_DIGEST) return false;
+    const assignments = new Map(profile.assignments.map((assignment) => [assignment.capabilityId, assignment]));
+    const expectedRows = effect.kind === "run_navigator_ticket_worker"
+      ? profile.assignments.length
+      : 1;
+    if (rows.length !== expectedRows || new Set(rows.map((row) => row.capabilityId)).size !== rows.length) return false;
+    const receipts = this.capabilities.listReceipts(profile.id, 512);
+    const receiptById = new Map(receipts.map((receipt) => [receipt.id, receipt]));
+    for (const row of rows) {
+      const assignment = assignments.get(row.capabilityId);
+      const receipt = receiptById.get(row.receiptId);
+      if (!assignment || row.profileId !== profile.id || row.profileRevision !== profile.revision ||
+        !receipt || receipt.eventType !== "selected" || receipt.profileRevision !== profile.revision ||
+        receipt.profileId !== profile.id || receipt.capabilityId !== row.capabilityId ||
+        receipt.capabilityKind !== row.capabilityKind || receipt.descriptorDigest !== row.descriptorDigest ||
+        assignment.capabilityKind !== row.capabilityKind || assignment.descriptorDigest !== row.descriptorDigest ||
+        receipts.some((candidate) => candidate.profileId === profile.id && candidate.capabilityId === row.capabilityId &&
+          candidate.eventType === "denied")) return false;
+    }
+    if (effect.kind === "run_navigator_skill") {
+      const skill = profileIdentity as {
+        capability_id: string;
+        descriptor_digest: string;
+        capability_profile_id: string | null;
+        capability_profile_revision: number | null;
+      };
+      const row = rows[0];
+      if (row?.operation !== (skill.capability_id === "prototype" ? "prototype_write" : "artifact_write") ||
+        row.capabilityId !== skill.capability_id || row.descriptorDigest !== skill.descriptor_digest) return false;
+    } else if (effect.kind === "run_navigator_release") {
+      const row = rows[0];
+      if (row?.operation !== "release_entry" || row.capabilityId !== NAVIGATOR_RELEASE_CAPABILITY_ID ||
+        row.descriptorDigest !== NAVIGATOR_RELEASE_DESCRIPTOR_DIGEST) return false;
+    } else if (rows.some((row) => row.operation !== "worktree_write")) {
+      return false;
+    }
+    const update = this.db.prepare(
+      `UPDATE navigator_effect_capability_evidence
+          SET owner_id = ?, generation = ?, admitted_at = ?
+        WHERE effect_idempotency_key = ?`,
+    ).run(input.ownerId, input.generation, input.now, input.effectIdempotencyKey);
+    if (update.changes !== 0 && update.changes !== rows.length) return false;
+    return this.db.prepare(
+      `SELECT 1 FROM navigator_effect_capability_evidence
+        WHERE effect_idempotency_key = ? AND owner_id = ? AND generation = ?`,
+    ).get(input.effectIdempotencyKey, input.ownerId, input.generation) !== undefined;
+  }
+
+  public reauthorizeNavigatorCompatibilityEffect(input: Readonly<{
+    effectIdempotencyKey: string;
+    attemptId: string;
+    profileId: string;
+    profileRevision: number;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): boolean {
+    assertIdentifier(input.effectIdempotencyKey, "effectIdempotencyKey");
+    assertIdentifier(input.attemptId, "attemptId");
+    assertIdentifier(input.profileId, "profileId");
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.profileRevision, "profileRevision");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    assertPositiveInteger(input.leaseMs, "leaseMs");
+    return this.db.transaction(() => this.reauthorizeNavigatorCompatibilityInTransaction(input)).immediate();
+  }
+
+  private reauthorizeNavigatorCompatibilityInTransaction(input: Readonly<{
+    effectIdempotencyKey: string;
+    attemptId: string;
+    profileId: string;
+    profileRevision: number;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): boolean {
+    if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return false;
+    const compatibility = this.compatibilityRow(input.effectIdempotencyKey, input.attemptId);
+    if (compatibility === null) return false;
+    const resolution = this.compatibilityResolution(input.effectIdempotencyKey);
+    if (resolution !== null) {
+      return resolution.profile_id === input.profileId && resolution.profile_revision === input.profileRevision;
+    }
+    if (!this.compatibilityEffectCanResume(compatibility, input.now)) return false;
+    const job = readJobById(this.db, compatibility.job_id);
+    const profile = this.compatibilityProfile(input, compatibility.attempt_id);
+    const evidence = job && profile ? this.compatibilityEvidence(compatibility, job, profile) : null;
+    if (!job || !profile || evidence === null || !this.adoptCompatibilityClaims(compatibility, job, input)) return false;
+    this.bindCompatibilityAttempt(compatibility, input);
+    this.insertCompatibilityEvidence(compatibility, job, profile, evidence, input);
+    this.db.prepare(
+      `INSERT INTO navigator_effect_compatibility_resolutions (
+         effect_idempotency_key, job_id, kind, attempt_id, profile_id, profile_revision,
+         owner_id, generation, resolved_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      compatibility.effect_idempotency_key,
+      compatibility.job_id,
+      compatibility.kind,
+      compatibility.attempt_id,
+      input.profileId,
+      input.profileRevision,
+      input.ownerId,
+      input.generation,
+      input.now,
+    );
+    this.resetExpiredCompatibilityEffect(compatibility, input.now);
+    return true;
+  }
+
+  private compatibilityRow(effectIdempotencyKey: string, attemptId: string): NavigatorCompatibilityRow | null {
+    const row = this.db.prepare(
+      `SELECT compatibility.effect_idempotency_key, compatibility.job_id, compatibility.kind,
+              compatibility.attempt_id, compatibility.state, effect.status AS effect_status,
+              effect.lease_expires_at
+         FROM navigator_effect_compatibility AS compatibility
+         JOIN effects AS effect ON effect.idempotency_key = compatibility.effect_idempotency_key
+        WHERE compatibility.effect_idempotency_key = ? AND compatibility.attempt_id = ?`,
+    ).get(effectIdempotencyKey, attemptId) as NavigatorCompatibilityRow | undefined;
+    return row ?? null;
+  }
+
+  private compatibilityResolution(effectIdempotencyKey: string): {
+    profile_id: string;
+    profile_revision: number;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT profile_id, profile_revision
+         FROM navigator_effect_compatibility_resolutions
+        WHERE effect_idempotency_key = ?`,
+    ).get(effectIdempotencyKey) as { profile_id: string; profile_revision: number } | undefined;
+    return row ?? null;
+  }
+
+  private compatibilityEffectCanResume(row: NavigatorCompatibilityRow, now: number): boolean {
+    return ["pending", "failed"].includes(row.effect_status) ||
+      row.effect_status === "leased" && row.lease_expires_at !== null && row.lease_expires_at <= now;
+  }
+
+  private compatibilityProfile(
+    input: Readonly<{ profileId: string; profileRevision: number }>,
+    attemptId: string,
+  ): CapabilityProfile | null {
+    const profile = this.capabilities.getProfileById(input.profileId);
+    const active = this.capabilities.getActiveProfile("worker_attempt", attemptId);
+    return profile && active?.id === profile.id && profile.revision === input.profileRevision &&
+      profile.subjectKind === "worker_attempt" && profile.subjectId === attemptId &&
+      profile.mode === "active" && profile.recipeId === "navigator-v1" &&
+      profile.registryDigest === CAPABILITY_REGISTRY_DIGEST && profile.graphDigest === CAPABILITY_GRAPH_DIGEST
+      ? profile
+      : null;
+  }
+
+  private compatibilityEvidence(
+    row: NavigatorCompatibilityRow,
+    job: Job,
+    profile: CapabilityProfile,
+  ): readonly NavigatorCompatibilityEvidenceSeed[] | null {
+    const assignments = this.compatibilityAssignments(row, profile);
+    if (assignments === null || job.projectId === null) return null;
+    const receipts = this.capabilities.listReceipts(profile.id, 512);
+    const selected = assignments.map((assignment) => {
+      const receipt = receipts.find((candidate) => candidate.capabilityId === assignment.capabilityId &&
+        candidate.eventType === "selected" && candidate.profileRevision === profile.revision &&
+        candidate.subjectKind === "worker_attempt" && candidate.subjectId === row.attempt_id &&
+        candidate.capabilityKind === assignment.capabilityKind &&
+        candidate.descriptorDigest === assignment.descriptorDigest);
+      const denied = receipts.some((candidate) => candidate.capabilityId === assignment.capabilityId &&
+        candidate.eventType === "denied");
+      return receipt && !denied ? {
+        operation: assignment.operation,
+        capabilityId: assignment.capabilityId,
+        capabilityKind: assignment.capabilityKind,
+        descriptorDigest: assignment.descriptorDigest,
+        receiptId: receipt.id,
+      } : null;
+    });
+    return selected.every((entry): entry is NavigatorCompatibilityEvidenceSeed => entry !== null) ? selected : null;
+  }
+
+  private compatibilityAssignments(
+    row: NavigatorCompatibilityRow,
+    profile: CapabilityProfile,
+  ): readonly (NavigatorCompatibilityEvidenceSeed & { operation: NavigatorCapabilityOperation })[] | null {
+    if (row.kind === "run_navigator_ticket_worker") {
+      return profile.assignments.map((assignment) => ({
+        operation: "worktree_write" as const,
+        capabilityId: assignment.capabilityId,
+        capabilityKind: assignment.capabilityKind,
+        descriptorDigest: assignment.descriptorDigest,
+        receiptId: "",
+      }));
+    }
+    const target = row.kind === "run_navigator_skill"
+      ? this.db.prepare(
+        `SELECT skill_id AS capability_id, descriptor_digest FROM navigator_skill_attempts
+          WHERE id = ? AND effect_idempotency_key = ?`,
+      ).get(row.attempt_id, row.effect_idempotency_key) as { capability_id: string; descriptor_digest: string } | undefined
+      : { capability_id: NAVIGATOR_RELEASE_CAPABILITY_ID, descriptor_digest: NAVIGATOR_RELEASE_DESCRIPTOR_DIGEST };
+    if (!target) return null;
+    const assignment = profile.assignments.find((candidate) => candidate.capabilityId === target.capability_id &&
+      candidate.descriptorDigest === target.descriptor_digest);
+    return assignment === undefined ? null : [{
+      operation: row.kind === "run_navigator_skill"
+        ? target.capability_id === "prototype" ? "prototype_write" as const : "artifact_write" as const
+        : "release_entry" as const,
+      capabilityId: assignment.capabilityId,
+      capabilityKind: assignment.capabilityKind,
+      descriptorDigest: assignment.descriptorDigest,
+      receiptId: "",
+    }];
+  }
+
+  private adoptCompatibilityClaims(
+    row: NavigatorCompatibilityRow,
+    job: Job,
+    input: Readonly<{ ownerId: string; generation: number; now: number; leaseMs: number }>,
+  ): boolean {
+    const contract = navigatorClaimContract(row.kind, job);
+    if (contract === null) return false;
+    const ticketClaim = contract.requiresTicketWorkArtifact
+      ? this.navigatorTicketClaimForCompatibility(row)
+      : null;
+    if (contract.requiresTicketWorkArtifact && !this.claimCanTransfer(ticketClaim, input, true)) return false;
+    const claims = this.db.prepare(
+      `SELECT claim_id, resource_key, resource_kind, state, owner_id, generation, lease_expires_at
+         FROM job_resource_claims WHERE job_id = ? AND state = 'held' ORDER BY claim_id`,
+    ).all(row.job_id) as NavigatorLeaseClaimRow[];
+    if (claims.length !== contract.resourceClaims.length || claims.some((claim) =>
+      !contract.resourceClaims.some((required) => required.resourceKind === claim.resource_kind &&
+        required.resourceKey === claim.resource_key) ||
+      !(claim.owner_id === input.ownerId && claim.generation === input.generation && claim.lease_expires_at > input.now ||
+        claim.lease_expires_at <= input.now))) return false;
+    const update = this.db.prepare(
+      `UPDATE job_resource_claims SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
+         WHERE claim_id = ? AND state = 'held'`,
+    );
+    for (const claim of claims) {
+      if (update.run(input.ownerId, input.generation, input.now + input.leaseMs, input.now, claim.claim_id).changes !== 1) {
+        return false;
+      }
+    }
+    if (ticketClaim !== null && this.db.prepare(
+      `UPDATE work_artifact_claims SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
+         WHERE id = ? AND state = 'held'`,
+    ).run(input.ownerId, input.generation, input.now + input.leaseMs, input.now, ticketClaim.claim_id).changes !== 1) {
+      return false;
+    }
+    return true;
+  }
+
+  private bindCompatibilityAttempt(
+    row: NavigatorCompatibilityRow,
+    input: Readonly<{ profileId: string; profileRevision: number }>,
+  ): void {
+    const table = row.kind === "run_navigator_skill"
+      ? "navigator_skill_attempts"
+      : row.kind === "run_navigator_ticket_worker"
+        ? "navigator_ticket_worker_attempts"
+        : "navigator_release_attempts";
+    const updated = this.db.prepare(
+      `UPDATE ${table}
+          SET capability_profile_id = ?, capability_profile_revision = ?
+        WHERE id = ? AND effect_idempotency_key = ?
+          AND capability_profile_id IS NULL AND capability_profile_revision IS NULL`,
+    ).run(input.profileId, input.profileRevision, row.attempt_id, row.effect_idempotency_key);
+    if (updated.changes !== 1) throw new Error("navigator compatibility attempt identity changed");
+  }
+
+  private insertCompatibilityEvidence(
+    row: NavigatorCompatibilityRow,
+    job: Job,
+    profile: CapabilityProfile,
+    evidence: readonly NavigatorCompatibilityEvidenceSeed[],
+    input: Readonly<{ ownerId: string; generation: number; now: number }>,
+  ): void {
+    const insert = this.db.prepare(
+      `INSERT INTO navigator_effect_capability_evidence (
+         effect_idempotency_key, job_id, project_id, operation, profile_id, profile_revision,
+         capability_id, capability_kind, descriptor_digest, receipt_id, owner_id, generation,
+         admitted_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const entry of evidence) {
+      const receipt = this.capabilities.listReceipts(profile.id, 512).find((candidate) =>
+        candidate.id === entry.receiptId);
+      if (!receipt) throw new Error("navigator compatibility receipt disappeared");
+      insert.run(
+        row.effect_idempotency_key,
+        row.job_id,
+        job.projectId,
+        entry.operation,
+        profile.id,
+        profile.revision,
+        entry.capabilityId,
+        entry.capabilityKind,
+        entry.descriptorDigest,
+        receipt.id,
+        input.ownerId,
+        input.generation,
+        input.now,
+        input.now,
+      );
+    }
+  }
+
+  private resetExpiredCompatibilityEffect(row: NavigatorCompatibilityRow, now: number): void {
+    if (row.effect_status !== "leased" || row.lease_expires_at === null || row.lease_expires_at > now) return;
+    this.db.prepare(
+      `UPDATE effects SET status = 'pending', lease_owner = NULL, lease_generation = NULL,
+          lease_expires_at = NULL, updated_at = ? WHERE idempotency_key = ? AND status = 'leased'`,
+    ).run(now, row.effect_idempotency_key);
   }
 
   private updateTaskAuthorityGraph(jobId: string, bindings: readonly NavigatorArtifactBinding[], now: number): void {
@@ -729,6 +1492,16 @@ export class NavigatorRepository {
         const stepId = digestId("wfstep", proposalId, digest);
         const attemptId = digestId("navrelease", stepId, NAVIGATOR_RELEASE_STEP_SKILL_ID);
         const effectKey = `${job.id}:navigator:${stepId}:run_release`;
+        const capabilityProfile = this.createNavigatorCapabilityProfile({
+          subjectId: attemptId,
+          route: { pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard },
+          assignments: [{
+            capabilityId: NAVIGATOR_RELEASE_CAPABILITY_ID,
+            capabilityKind: "native-adapter",
+            descriptorDigest: NAVIGATOR_RELEASE_DESCRIPTOR_DIGEST,
+          }],
+          now: input.now,
+        });
         this.db.prepare(
           `INSERT INTO workflow_steps (
              id, job_id, proposal_id, snapshot_id, skill_id, job_version, workflow_revision, accepted_at
@@ -763,8 +1536,9 @@ export class NavigatorRepository {
         this.db.prepare(
           `INSERT INTO navigator_release_attempts (
              id, job_id, workflow_step_id, effect_idempotency_key, implementation_ticket_ids_json,
-             snapshot_digest, job_version, workflow_revision, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             snapshot_digest, job_version, workflow_revision, capability_profile_id,
+             capability_profile_revision, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           attemptId,
           job.id,
@@ -774,9 +1548,25 @@ export class NavigatorRepository {
           snapshot.identity.digest,
           job.version,
           job.workflowRevision,
+          capabilityProfile.id,
+          capabilityProfile.revision,
           input.now,
           input.now,
         );
+        this.recordNavigatorCapabilityEvidence({
+          effectIdempotencyKey: effectKey,
+          jobId: job.id,
+          projectId: job.projectId!,
+          operation: "release_entry",
+          profileId: capabilityProfile.id,
+          profileRevision: capabilityProfile.revision,
+          assignments: [{
+            capabilityId: NAVIGATOR_RELEASE_CAPABILITY_ID,
+            capabilityKind: "native-adapter",
+            descriptorDigest: NAVIGATOR_RELEASE_DESCRIPTOR_DIGEST,
+          }],
+          now: input.now,
+        });
         const updated = this.db.prepare(
           `UPDATE jobs SET current_workflow_step_id = ?, version = version + 1, updated_at = ?
             WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
@@ -851,6 +1641,16 @@ export class NavigatorRepository {
       const stepId = digestId("wfstep", proposalId, digest);
       const attemptId = digestId("navattempt", stepId, skillId);
       const effectKey = `${job.id}:navigator:${stepId}:run_skill`;
+      const capabilityProfile = this.createNavigatorCapabilityProfile({
+        subjectId: attemptId,
+        route,
+        assignments: [{
+          capabilityId: skillId,
+          capabilityKind: "skill",
+          descriptorDigest: catalogEntry.descriptorDigest,
+        }],
+        now: input.now,
+      });
       const contractJson = serializeNavigatorJson(contract, "navigator step contract");
       this.db.prepare(
         `INSERT OR IGNORE INTO workflow_step_contracts (
@@ -935,8 +1735,8 @@ export class NavigatorRepository {
            skill_source_digest, descriptor_digest, step_contract_id, step_contract_revision,
            step_contract_digest, catalog_digest, step_input_json, step_input_digest,
            model_route_json, artifact_bindings_json, snapshot_digest, job_version,
-           workflow_revision, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           workflow_revision, capability_profile_id, capability_profile_revision, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         attemptId,
         job.id,
@@ -957,9 +1757,25 @@ export class NavigatorRepository {
         snapshot.identity.digest,
         job.version,
         job.workflowRevision,
+        capabilityProfile.id,
+        capabilityProfile.revision,
         input.now,
         input.now,
       );
+      this.recordNavigatorCapabilityEvidence({
+        effectIdempotencyKey: effectKey,
+        jobId: job.id,
+        projectId: job.projectId!,
+        operation: skillId === "prototype" ? "prototype_write" : "artifact_write",
+        profileId: capabilityProfile.id,
+        profileRevision: capabilityProfile.revision,
+        assignments: [{
+          capabilityId: skillId,
+          capabilityKind: "skill",
+          descriptorDigest: catalogEntry.descriptorDigest,
+        }],
+        now: input.now,
+      });
       const updated = this.db.prepare(
         `UPDATE jobs SET current_workflow_step_id = ?, version = version + 1, updated_at = ?
           WHERE id = ? AND version = ? AND current_workflow_step_id IS NULL`,
@@ -980,6 +1796,11 @@ export class NavigatorRepository {
   public getProposal(id: string): NavigatorProposalRecord | null {
     const row = this.db.prepare("SELECT * FROM navigator_proposals WHERE id = ?").get(id) as ProposalRow | undefined;
     return row ? parseProposal(row) : null;
+  }
+
+  public getProposalDecision(id: string): NavigatorProposalDecision | null {
+    assertIdentifier(id, "proposalId");
+    return this.decisionForProposal(id);
   }
 
   public getWorkflowStep(id: string): NavigatorWorkflowStep | null {
@@ -1008,6 +1829,99 @@ export class NavigatorRepository {
   public getAttempt(id: string): NavigatorSkillAttempt | null {
     const row = this.db.prepare("SELECT * FROM navigator_skill_attempts WHERE id = ?").get(id) as AttemptRow | undefined;
     return row ? parseAttempt(row) : null;
+  }
+
+  public getNavigatorTicketAttemptContext(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): NavigatorTicketAttemptContext | null {
+    assertIdentifier(input.attemptId, "attemptId");
+    assertIdentifier(input.effectIdempotencyKey, "effectIdempotencyKey");
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    const row = this.db.prepare(
+      "SELECT * FROM navigator_ticket_worker_attempts WHERE id = ? AND effect_idempotency_key = ?",
+    ).get(input.attemptId, input.effectIdempotencyKey) as TicketAttemptRow | undefined;
+    if (!row) return null;
+    const attempt = parseTicketAttempt(row);
+    const integration = this.db.prepare(
+      `SELECT job_id, worktree_id, integration_branch, current_head_sha, state, active_slice_id
+         FROM navigator_integrations WHERE job_id = ?`,
+    ).get(row.job_id) as {
+      job_id: string;
+      worktree_id: string;
+      integration_branch: string;
+      current_head_sha: string;
+      state: string;
+      active_slice_id: string | null;
+    } | undefined;
+    const slice = this.db.prepare(
+      `SELECT id, job_id, ticket_artifact_id, claim_id, state, accepted_head_sha,
+              ticket_snapshot_id, ticket_snapshot_digest
+         FROM navigator_ticket_slices WHERE id = ?`,
+    ).get(row.slice_id) as {
+      id: string;
+      job_id: string;
+      ticket_artifact_id: string;
+      claim_id: number;
+      state: string;
+      accepted_head_sha: string | null;
+      ticket_snapshot_id: string;
+      ticket_snapshot_digest: string;
+    } | undefined;
+    if (!integration || !slice || integration.job_id !== row.job_id || slice.job_id !== row.job_id ||
+      integration.state !== "implementing" || integration.active_slice_id !== slice.id ||
+      !["implementation_pending", "implementation_running", "review_pending", "review_running", "repair_pending"]
+        .includes(slice.state)) return null;
+    const ticket = this.db.prepare(
+      `SELECT artifact_id, snapshot_id, snapshot_digest
+         FROM navigator_integration_tickets WHERE job_id = ? AND artifact_id = ?`,
+    ).get(row.job_id, slice.ticket_artifact_id) as {
+      artifact_id: string;
+      snapshot_id: string;
+      snapshot_digest: string;
+    } | undefined;
+    if (!ticket || ticket.snapshot_id !== slice.ticket_snapshot_id || ticket.snapshot_digest !== slice.ticket_snapshot_digest ||
+      attempt.workOrder.jobId !== row.job_id || attempt.workOrder.ticket.artifactId !== ticket.artifact_id ||
+      attempt.workOrder.ticket.snapshotId !== ticket.snapshot_id || attempt.workOrder.ticket.snapshotDigest !== ticket.snapshot_digest ||
+      attempt.workOrder.worktreeId !== integration.worktree_id || attempt.workOrder.integrationBranch !== integration.integration_branch) return null;
+    const claim = this.artifacts.getClaim(slice.claim_id);
+    const ticketSnapshot = this.artifacts.getSnapshot(ticket.snapshot_id);
+    const specificationSnapshot = this.artifacts.getSnapshot(attempt.workOrder.specification.snapshotId);
+    if (!claim || claim.state !== "held" || claim.jobId !== row.job_id || claim.artifactId !== ticket.artifact_id ||
+      claim.snapshotId !== ticket.snapshot_id || claim.ownerId !== input.ownerId || claim.generation !== input.generation ||
+      claim.leaseExpiresAt <= input.now || ticketSnapshot === null || specificationSnapshot === null ||
+      !this.artifacts.isSnapshotValid(ticketSnapshot.id) || !this.artifacts.isSnapshotValid(specificationSnapshot.id) ||
+      ticketSnapshot.snapshotDigest !== ticket.snapshot_digest ||
+      specificationSnapshot.artifactId !== attempt.workOrder.specification.artifactId ||
+      specificationSnapshot.snapshotDigest !== attempt.workOrder.specification.snapshotDigest ||
+      this.artifacts.getArtifact(ticket.artifact_id)?.projectId !==
+        this.artifacts.getArtifact(attempt.workOrder.specification.artifactId)?.projectId) return null;
+    return {
+      attempt,
+      integration: {
+        jobId: integration.job_id,
+        worktreeId: integration.worktree_id,
+        integrationBranch: integration.integration_branch,
+        currentHeadSha: integration.current_head_sha,
+        state: integration.state,
+        activeSliceId: integration.active_slice_id,
+      },
+      activeSlice: {
+        id: slice.id,
+        ticketArtifactId: slice.ticket_artifact_id,
+        claimId: slice.claim_id,
+        state: slice.state,
+        acceptedHeadSha: slice.accepted_head_sha,
+      },
+      claim,
+      specificationSnapshot,
+      ticketSnapshot,
+    };
   }
 
   public getOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {
@@ -1220,6 +2134,188 @@ export class NavigatorRepository {
       implementationTicketIds.some((artifactId) => !ticketIds.has(artifactId));
   }
 
+  public leaseEffect(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null {
+    assertIdentifier(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    assertPositiveInteger(input.leaseMs, "leaseMs");
+    try {
+      return this.db.transaction(() => this.leaseEffectInTransaction(input)).immediate();
+    } catch (error) {
+      if (error instanceof NavigatorLeaseConflictError) return null;
+      throw error;
+    }
+  }
+
+  private leaseEffectInTransaction(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null {
+    if (!this.executorLeaseCurrent(input.ownerId, input.generation, input.now)) return null;
+    const row = this.db.prepare(NAVIGATOR_EFFECT_LEASE_QUERY)
+      .get(input.now, input.now) as EffectRow | undefined;
+    if (!row) return null;
+    const effect = parseStoredEffect(row);
+    return this.admitAndLeaseEffect(effect, input);
+  }
+
+  private admitAndLeaseEffect(
+    effect: StoredEffect,
+    input: Readonly<{
+      ownerId: string;
+      generation: number;
+      now: number;
+      leaseMs: number;
+    }>,
+  ): StoredEffect | null {
+    if (!this.navigatorAuthorityCanBeAdmitted(effect, input.now)) return null;
+    const claimPlan = this.navigatorLeaseClaimPlan(effect, input);
+    if (claimPlan === null) return null;
+    if (!this.updateNavigatorEffectLease(effect, input)) return null;
+    this.commitNavigatorLeaseClaims(claimPlan, input);
+    return parseStoredEffect(this.db.prepare("SELECT * FROM effects WHERE idempotency_key = ?")
+      .get(effect.idempotencyKey) as EffectRow);
+  }
+
+  private navigatorLeaseClaimPlan(
+    effect: StoredEffect,
+    input: Readonly<{ ownerId: string; generation: number; now: number; leaseMs: number }>,
+  ): NavigatorLeaseClaimPlan | null {
+    const job = readJobById(this.db, effect.jobId);
+    if (!job || !isNavigatorClaimedEffectKind(effect.kind)) return null;
+    const contract = navigatorClaimContract(effect.kind, job);
+    if (contract === null) return null;
+    const claims = this.db.prepare(
+      `SELECT claim_id, resource_key, resource_kind, state, owner_id, generation, lease_expires_at
+         FROM job_resource_claims WHERE job_id = ? AND state = 'held' ORDER BY claim_id`,
+    ).all(effect.jobId) as NavigatorLeaseClaimRow[];
+    if (claims.length !== contract.resourceClaims.length || claims.some((claim) => !contract.resourceClaims.some((requirement) =>
+      claim.resource_kind === requirement.resourceKind && claim.resource_key === requirement.resourceKey))) return null;
+    const ticketClaim = contract.requiresTicketWorkArtifact
+      ? this.navigatorTicketClaimForEffect(effect)
+      : null;
+    const allowExpiredTransfer = effect.status === "leased" && effect.leaseExpiresAt !== null &&
+      effect.leaseExpiresAt <= input.now;
+    if (contract.requiresTicketWorkArtifact && !this.claimCanTransfer(ticketClaim, input, allowExpiredTransfer)) return null;
+    if (!claims.every((claim) => this.claimCanTransfer(claim, input, allowExpiredTransfer))) return null;
+    return {
+      jobClaimIds: claims.map((claim) => claim.claim_id),
+      ticketClaim,
+    };
+  }
+
+  private claimCanTransfer(
+    claim: NavigatorLeaseClaimRow | NavigatorTicketClaimRow | null,
+    input: Readonly<{ ownerId: string; generation: number; now: number }>,
+    allowExpiredTransfer: boolean,
+  ): boolean {
+    return claim !== null && claim.state === "held" &&
+      (claim.owner_id === input.ownerId && claim.generation === input.generation &&
+        claim.lease_expires_at > input.now ||
+        allowExpiredTransfer && claim.lease_expires_at <= input.now);
+  }
+
+  private navigatorTicketClaimForEffect(effect: StoredEffect): NavigatorTicketClaimRow | null {
+    const attemptId = typeof effect.payload.attemptId === "string" ? effect.payload.attemptId : null;
+    if (attemptId === null) return null;
+    return this.navigatorTicketClaimForIdentity(effect.idempotencyKey, effect.jobId, attemptId);
+  }
+
+  private navigatorTicketClaimForCompatibility(row: NavigatorCompatibilityRow): NavigatorTicketClaimRow | null {
+    return this.navigatorTicketClaimForIdentity(row.effect_idempotency_key, row.job_id, row.attempt_id);
+  }
+
+  private navigatorTicketClaimForIdentity(
+    effectIdempotencyKey: string,
+    jobId: string,
+    attemptId: string,
+  ): NavigatorTicketClaimRow | null {
+    return this.db.prepare(
+      `SELECT slice.claim_id, slice.ticket_artifact_id AS artifact_id, slice.ticket_snapshot_id AS snapshot_id,
+              slice.job_id, claim.state, claim.owner_id, claim.generation, claim.lease_expires_at
+         FROM navigator_ticket_worker_attempts AS attempt
+         JOIN navigator_ticket_slices AS slice ON slice.id = attempt.slice_id
+         JOIN work_artifact_claims AS claim ON claim.id = slice.claim_id
+        WHERE attempt.id = ? AND attempt.effect_idempotency_key = ? AND attempt.job_id = ?`,
+    ).get(attemptId, effectIdempotencyKey, jobId) as NavigatorTicketClaimRow | undefined ?? null;
+  }
+
+  private commitNavigatorLeaseClaims(
+    plan: NavigatorLeaseClaimPlan,
+    input: Readonly<{ ownerId: string; generation: number; now: number; leaseMs: number }>,
+  ): void {
+    const expiry = input.now + input.leaseMs;
+    const updateJobClaims = this.db.prepare(
+      `UPDATE job_resource_claims SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
+         WHERE claim_id = ? AND state = 'held'`,
+    );
+    for (const claimId of plan.jobClaimIds) {
+      if (updateJobClaims.run(input.ownerId, input.generation, expiry, input.now, claimId).changes !== 1) {
+        throw new NavigatorLeaseConflictError("navigator job resource claim changed during effect lease");
+      }
+    }
+    if (plan.ticketClaim !== null && this.db.prepare(
+      `UPDATE work_artifact_claims SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
+         WHERE id = ? AND state = 'held'`,
+    ).run(input.ownerId, input.generation, expiry, input.now, plan.ticketClaim.claim_id).changes !== 1) {
+      throw new NavigatorLeaseConflictError("navigator ticket claim changed during effect lease");
+    }
+  }
+
+  private navigatorAuthorityCanBeAdmitted(effect: StoredEffect, now: number): boolean {
+    return this.navigatorEffectAuthorityEffects(effect).every((authorityEffect) => this.taskAuthorities.admitEffect(
+      effect.jobId,
+      effect.idempotencyKey,
+      authorityEffect,
+      now,
+    ));
+  }
+
+  private updateNavigatorEffectLease(
+    effect: StoredEffect,
+    input: Readonly<{
+      ownerId: string;
+      generation: number;
+      now: number;
+      leaseMs: number;
+    }>,
+  ): boolean {
+    return this.db.prepare(
+      `UPDATE effects SET status = 'leased', lease_owner = ?, lease_generation = ?,
+           lease_expires_at = ?, attempts = attempts + 1, updated_at = ?
+        WHERE idempotency_key = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+          OR (status = 'leased' AND lease_expires_at <= ?))`,
+    ).run(
+      input.ownerId,
+      input.generation,
+      input.now + input.leaseMs,
+      input.now,
+      effect.idempotencyKey,
+      input.now,
+      input.now,
+    ).changes === 1;
+  }
+
+  private navigatorEffectAuthorityEffects(effect: StoredEffect): readonly TaskAuthorityEffect[] {
+    if (effect.kind === "run_navigator_ticket_worker") {
+      return ["worktree_write", "commit", "push", "pull_request"];
+    }
+    if (effect.kind === "run_navigator_release") return ["commit", "push", "pull_request"];
+    const attemptId = effect.payload.attemptId;
+    const attempt = typeof attemptId === "string"
+      ? this.db.prepare("SELECT skill_id FROM navigator_skill_attempts WHERE id = ?")
+        .get(attemptId) as { skill_id: string } | undefined
+      : undefined;
+    return [attempt?.skill_id === "prototype" ? "prototype_write" : "artifact_write"];
+  }
+
   public leaseSkillEffect(input: Readonly<{
     ownerId: string;
     generation: number;
@@ -1369,6 +2465,8 @@ export class NavigatorRepository {
       snapshot_digest: string;
       job_version: number;
       workflow_revision: number;
+      capability_profile_id: string | null;
+      capability_profile_revision: number | null;
     } | undefined;
     if (!row) return null;
     return {
@@ -1380,6 +2478,8 @@ export class NavigatorRepository {
       snapshotDigest: row.snapshot_digest,
       jobVersion: row.job_version,
       workflowRevision: row.workflow_revision,
+      capabilityProfileId: row.capability_profile_id,
+      capabilityProfileRevision: row.capability_profile_revision,
     };
   }
 
@@ -1415,6 +2515,7 @@ export class NavigatorRepository {
     effectIdempotencyKey: string;
     observedExternalStateDigest: string;
     result: unknown;
+    receipt?: NavigatorSkillReceipt;
     publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
     reconciledArtifactIds?: readonly string[];
     policyFailureReason?: string;
@@ -1428,10 +2529,30 @@ export class NavigatorRepository {
     assertPositiveInteger(input.generation, "generation");
     assertNonNegativeInteger(input.now, "now");
     if (input.policyFailureReason !== undefined) assertIdentifier(input.policyFailureReason, "policyFailureReason");
+    if (input.policyFailureReason === undefined && input.receipt === undefined) return null;
+    const parsedReceipt = input.receipt === undefined ? undefined : navigatorSkillReceiptSchema.safeParse(input.receipt);
+    if (parsedReceipt !== undefined && !parsedReceipt.success) return null;
+    const receipt = parsedReceipt?.data;
     return this.db.transaction((): NavigatorWorkflowStepOutcome | null => {
       if (!this.effectLeaseCurrent(input.effectIdempotencyKey, input.ownerId, input.generation, input.now)) return null;
       const attempt = this.getAttempt(input.attemptId);
-      if (!attempt || attempt.effectIdempotencyKey !== input.effectIdempotencyKey || attempt.resource === null) return null;
+      if (!attempt || attempt.effectIdempotencyKey !== input.effectIdempotencyKey) return null;
+      if (receipt !== undefined && (
+        receipt.effectIdempotencyKey !== input.effectIdempotencyKey ||
+        receipt.attemptId !== attempt.id || receipt.observedExternalStateDigest !== input.observedExternalStateDigest
+      )) return null;
+      const receiptResource = receipt?.resource ?? attempt.resource;
+      if (receiptResource === null) return null;
+      if (attempt.resource !== null && (
+        attempt.resource.kind !== receiptResource.kind || attempt.resource.id !== receiptResource.id
+      )) return null;
+      if (attempt.resource === null) {
+        const bound = this.db.prepare(
+          `UPDATE navigator_skill_attempts SET resource_kind = 'bb_thread', resource_id = ?, updated_at = ?
+            WHERE id = ? AND effect_idempotency_key = ? AND resource_kind IS NULL AND resource_id IS NULL`,
+        ).run(receiptResource.id, input.now, attempt.id, input.effectIdempotencyKey);
+        if (bound.changes !== 1) return null;
+      }
       const existing = this.getOutcome(attempt.workflowStepId);
       if (existing) return existing;
       const snapshotRow = this.db.prepare(
@@ -1550,6 +2671,23 @@ export class NavigatorRepository {
         "navigator skill result",
       );
       const resultDigest = createHash("sha256").update(resultJson, "utf8").digest("hex");
+      if (receipt !== undefined) {
+        const receiptJson = JSON.stringify(receipt);
+        this.db.prepare(
+          `INSERT INTO navigator_effect_receipts (
+             effect_idempotency_key, job_id, kind, receipt_json, receipt_digest,
+             owner_id, generation, recorded_at
+           ) VALUES (?, ?, 'run_navigator_skill', ?, ?, ?, ?, ?)`,
+        ).run(
+          input.effectIdempotencyKey,
+          attempt.jobId,
+          receiptJson,
+          createHash("sha256").update(receiptJson, "utf8").digest("hex"),
+          input.ownerId,
+          input.generation,
+          input.now,
+        );
+      }
       this.db.prepare(
         `INSERT INTO workflow_step_outcomes (
            workflow_step_id, attempt_id, outcome, reason_code, summary,
