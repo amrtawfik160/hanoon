@@ -1,16 +1,34 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
-import type { BbAutomationDefinition, BbAutomationRun } from "../src/bb/automation";
+import type {
+  BbAutomation,
+  BbAutomationDefinition,
+  BbAutomationRun,
+} from "../src/bb/automation";
+import {
+  assertAutomationMatches,
+  BbAutomationNotFoundError,
+  TerminalBbAutomationAdapter,
+} from "../src/bb/automation";
 import {
   ManagedAutomationReconciler,
   ManagedAutomationService,
   managedAutomationAuthorityIsCurrent,
   migrateLegacyClockMonitor,
+  type ManagedAutomationAdapter,
 } from "../src/services/managed-automation-service";
 import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
 import { openStore, type MonitorRecord, type TelegramAgentStore } from "../src/storage/store";
+import { runJobExecutorService } from "../src/services/job-executor-service";
 import { hashSecret } from "../src/crypto";
+import { registerControllerTools } from "../src/controller/tools";
 import { policyFixture } from "./helpers";
+import { submittedControllerFixture } from "./support/controller-trust-fixtures";
+import type {
+  ManagedAutomationCreateReceipt,
+  ManagedAutomationObservation,
+  ManagedAutomationProviderIdentity,
+} from "../src/domain/managed-automation";
 import { createFakeBbAutomationAdapter, observedBbAutomation } from "./support/fake-bb-automation-adapter";
 
 const NOW = 1_800_000_000_000;
@@ -30,6 +48,88 @@ const definition: BbAutomationDefinition = {
   timeoutMs: 900_000,
   resultContract: { kind: "bounded-text", maximumBytes: 32_768 },
 };
+
+function automation(
+  value: BbAutomationDefinition = definition,
+  overrides: Partial<BbAutomation> = {},
+): BbAutomation {
+  return {
+    id: "auto_1",
+    projectId: value.projectId,
+    name: value.name,
+    enabled: true,
+    trigger: value.trigger.kind === "cron"
+      ? { triggerType: "schedule", cron: value.trigger.cron, timezone: value.trigger.timezone }
+      : { triggerType: "once", runAt: NOW + 60_000 },
+    execution: value.mode === "agent"
+      ? {
+          mode: "agent",
+          prompt: value.prompt,
+          providerId: value.providerId,
+          model: value.model,
+          ...(value.reasoningLevel ? { reasoningLevel: value.reasoningLevel } : {}),
+          ...(value.serviceTier ? { serviceTier: value.serviceTier } : {}),
+          permissionMode: value.permissionMode,
+          environment: { type: "project-default" },
+        }
+      : {
+          mode: "script",
+          interpreter: value.interpreter,
+          timeoutMs: value.timeoutMs,
+          script: value.source.kind === "inline" ? value.source.script : "",
+          env: value.env,
+          storedScriptPath: "/managed/script.sh",
+        },
+    origin: "agent",
+    createdByThreadId: "thr_controller",
+    nextRunAt: NOW + 60_000,
+    lastRunAt: null,
+    runCount: 0,
+    lastRunStatus: null,
+    lastRunThreadId: null,
+    lastError: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  };
+}
+
+function providerName(name: string, identity?: ManagedAutomationProviderIdentity): string {
+  return identity ? `${name} [${identity.ownershipMarker}]` : name;
+}
+
+function managedObservation(
+  value: BbAutomation,
+  expectedDefinition?: BbAutomationDefinition,
+): ManagedAutomationObservation {
+  return {
+    providerAutomationId: value.id,
+    projectId: value.projectId,
+    name: expectedDefinition?.name ?? value.name,
+    enabled: value.enabled,
+    trigger: value.trigger.triggerType === "schedule"
+      ? { kind: "cron", cron: value.trigger.cron, timezone: value.trigger.timezone }
+      : { kind: "once", at: new Date(value.trigger.runAt).toISOString() },
+    mode: value.execution.mode,
+    target: value.execution.mode === "script"
+      ? null
+      : value.execution.targetThreadId
+        ? { kind: "target-thread", threadId: value.execution.targetThreadId }
+        : value.execution.environment.type === "project-default"
+          ? { kind: "project-default" }
+          : value.execution.environment.type === "reuse"
+            ? { kind: "environment", environmentId: value.execution.environment.environmentId }
+            : { kind: "new-worktree", baseBranch: value.execution.environment.workspace.baseBranch.name },
+    nextRunAt: value.nextRunAt,
+    lastRunAt: value.lastRunAt,
+    runCount: value.runCount,
+    lastRunStatus: value.lastRunStatus,
+    lastRunThreadId: value.lastRunThreadId,
+    lastError: value.lastError,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
 
 function runEvidence(overrides: Partial<BbAutomationRun> = {}): BbAutomationRun {
   return {
@@ -55,6 +155,80 @@ function fixture() {
   const store = openStore(bb.storage, bb.storage.kv, () => NOW);
   const repository = new ManagedAutomationRepository(bb.storage.database());
   return { bb, store, repository };
+}
+
+function fakeAdapter() {
+  const automations = new Map<string, BbAutomation>();
+  const runs = new Map<string, BbAutomationRun[]>();
+  const create = vi.fn(async ({ definition: value, identity }: {
+    definition: BbAutomationDefinition;
+    identity: ManagedAutomationProviderIdentity;
+  }): Promise<ManagedAutomationCreateReceipt> => {
+    const created = automation(value, {
+      id: `auto_${automations.size + 1}`,
+      name: providerName(value.name, identity),
+    });
+    automations.set(created.id, created);
+    return {
+      version: 1,
+      operationId: identity.operationId,
+      ownershipMarker: identity.ownershipMarker,
+      providerAutomationId: created.id,
+    };
+  });
+  const adapter: ManagedAutomationAdapter = {
+    agentAutomationCapabilities: {
+      executionTimeout: true,
+      resultContract: true,
+      preRunAuthority: true,
+    },
+    create,
+    update: vi.fn(async ({ automationId, definition: value, identity }) => {
+      const found = automations.get(automationId);
+      if (!found) throw new Error("missing automation");
+      const updated = automation(value, {
+        id: automationId,
+        name: providerName(value.name, identity),
+        enabled: found.enabled,
+        createdAt: found.createdAt,
+        updatedAt: NOW + 1,
+      });
+      automations.set(automationId, updated);
+      return managedObservation(updated, value);
+    }),
+    show: vi.fn(async ({ automationId, expectedDefinition, expectedEnabled, identity }) => {
+      const found = automations.get(automationId);
+      if (!found) throw new Error("missing automation");
+      if (expectedDefinition) {
+        assertAutomationMatches({ ...expectedDefinition, name: providerName(expectedDefinition.name, identity) }, found, expectedEnabled ?? true);
+      }
+      return managedObservation(found, expectedDefinition);
+    }),
+    setEnabled: vi.fn(async ({ automationId, enabled, expectedDefinition }) => {
+      const found = automations.get(automationId);
+      if (!found) throw new Error("missing automation");
+      const updated = { ...found, enabled, nextRunAt: enabled ? NOW + 60_000 : null };
+      automations.set(automationId, updated);
+      return managedObservation(updated, expectedDefinition);
+    }),
+    runNow: vi.fn(async ({ automationId }) => runEvidence({ automationId, trigger: "manual" })),
+    runs: vi.fn(async ({ automationId }) => runs.get(automationId) ?? []),
+    delete: vi.fn(async ({ automationId }) => {
+      if (!automations.delete(automationId)) throw new BbAutomationNotFoundError();
+    }),
+    findByDefinition: vi.fn(async ({ definition: requested, identity }) => {
+      const found = [...automations.values()].find((candidate) => {
+        try {
+          assertAutomationMatches({ ...requested, name: providerName(requested.name, identity) }, candidate);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      return found ? managedObservation(found, requested) : null;
+    }),
+  };
+  return { adapter, automations, runs, create };
 }
 
 /** A paired owner whose controller row exists, so the reconciler has a current controller key. */
@@ -116,7 +290,697 @@ function createInput() {
   };
 }
 
+function versionedOwnerAuthority(turnId = "turn_owner"): Record<string, unknown> {
+  return {
+    version: 1,
+    origin: "owner",
+    controllerKey: "owner-7-controller",
+    projectId: "proj_owner",
+    hostId: "host_owner",
+    taskAuthority: {
+      version: 1,
+      kind: "controller-turn",
+      turnId,
+      revision: 1,
+    },
+    standingAuthority: null,
+    capabilityEvidence: {
+      version: 1,
+      profileId: "profile_owner",
+      profileRevision: 1,
+      capabilityId: "telegram_agent_watch",
+      descriptorVersion: "1",
+      descriptorDigest: "a".repeat(64),
+      evidenceRefs: ["capability-profile:profile_owner:1"],
+    },
+    mayWidenAutomation: false,
+  };
+}
+
 describe("managed BB automations", () => {
+  // BB natively enforces neither the wall-clock timeout, the result bound, nor
+  // pre-run authority, and Hanoon enforces all three itself around each run.
+  // An agent schedule is therefore never refused before BB is asked: refusing
+  // here left the owner with no schedule at all, upkeep included.
+  it("asks BB for an agent schedule even though BB enforces none of the contract itself", async () => {
+    const { repository } = fixture();
+    const run = vi.fn(async () => ({ outcome: "exited" as const, exitCode: 1, output: "boom" }));
+    const service = new ManagedAutomationService(
+      repository,
+      new TerminalBbAutomationAdapter({ run }),
+      () => true,
+    );
+
+    await expect(service.create(createInput())).rejects.toThrow();
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[0]).toMatchObject({
+      command: expect.stringContaining("bb automation create"),
+    });
+  });
+
+  it("records an owner tool request as pending durable state before the executor can call BB", async () => {
+    const controllerFixture = submittedControllerFixture();
+    try {
+      const controller = controllerFixture.store.getControllerForOwner("7", "7");
+      if (!controller?.threadId || !controller.projectId || !controller.hostId) {
+        throw new Error("controller fixture is incomplete");
+      }
+      controllerFixture.store.upsertProjectPolicy(policyFixture(), 2_000);
+      if (!controllerFixture.turn.capabilityProfileId) throw new Error("controller profile is missing");
+      expect(controllerFixture.store.requestControllerCapabilityExpansion({
+        controllerKey: controller.controllerKey,
+        turnId: controllerFixture.turn.id,
+        expectedProfileId: controllerFixture.turn.capabilityProfileId,
+        bundleIds: ["monitoring"],
+        now: 2_000,
+      }).outcome).toBe("resume_required");
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      registerControllerTools(controllerFixture.bb, {
+        store: controllerFixture.store,
+        sdk: controllerFixture.bb.sdk,
+        threadOperations: { request: vi.fn() },
+        health: () => ({ ok: true }),
+        notify: vi.fn(),
+        now: () => 2_000,
+        controllerProviderId: () => "codex-provider",
+        controllerExecution: () => ({
+          model: "gpt-5.6-sol",
+          reasoningLevel: "high",
+          serviceTier: "default",
+          permissionMode: "auto",
+        }),
+        automations: service,
+      });
+
+      const result = await controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+        { threadId: controller.threadId, projectId: controller.projectId, signal: new AbortController().signal },
+      );
+      const projection = (typeof result === "string" ? JSON.parse(result) : result) as {
+        watching: { id: string; state: string; nextDueAt: number | null; observed: unknown };
+        _hanoonEvidence?: { outcome: string; proofKinds: string[] };
+      };
+      if (!projection.watching) throw new Error(`owner watch result was ${JSON.stringify(result)}`);
+      expect(projection.watching).toMatchObject({ state: "pending", nextDueAt: null, observed: null });
+      expect(projection._hanoonEvidence).toMatchObject({
+        outcome: "observed",
+        proofKinds: ["monitor_state", "obligation"],
+      });
+      expect(fake.create).not.toHaveBeenCalled();
+
+      const binding = repository.get(projection.watching.id);
+      expect(binding).toMatchObject({ state: "pending", bbAutomationId: null, lastOperationOutcome: "pending" });
+      const operation = repository.getOperation(binding!.lastOperationId!);
+      expect(operation).toMatchObject({
+        operationClass: "create",
+        state: "pending",
+        targetProjectId: controller.projectId,
+        definitionRevision: 1,
+        controllerFence: {
+          ownerId: controllerFixture.fence.ownerId,
+          generation: controllerFixture.fence.generation,
+          turnId: controllerFixture.turn.id,
+        },
+      });
+      expect(controllerFixture.bb.storage.database().prepare(
+        `SELECT controller_owner_id, controller_generation, controller_turn_id
+           FROM managed_automation_operations WHERE id = ?`,
+      ).get(operation!.id)).toEqual({
+        controller_owner_id: controllerFixture.fence.ownerId,
+        controller_generation: controllerFixture.fence.generation,
+        controller_turn_id: controllerFixture.turn.id,
+      });
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it("refuses an owner schedule when its profile has no assignment or selected receipt", async () => {
+    const controllerFixture = submittedControllerFixture();
+    try {
+      const controller = controllerFixture.store.getControllerForOwner("7", "7");
+      if (!controller?.threadId || !controller.projectId || !controller.hostId) {
+        throw new Error("controller fixture is incomplete");
+      }
+      controllerFixture.store.upsertProjectPolicy(policyFixture(), 2_000);
+      const repository = new ManagedAutomationRepository(controllerFixture.bb.storage.database());
+      const fake = fakeAdapter();
+      const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+      registerControllerTools(controllerFixture.bb, {
+        store: controllerFixture.store,
+        sdk: controllerFixture.bb.sdk,
+        threadOperations: { request: vi.fn() },
+        health: () => ({ ok: true }),
+        notify: vi.fn(),
+        now: () => 2_000,
+        controllerProviderId: () => "codex-provider",
+        controllerExecution: () => ({
+          model: "gpt-5.6-sol",
+          reasoningLevel: "high",
+          serviceTier: "default",
+          permissionMode: "auto",
+        }),
+        automations: service,
+      });
+
+      await expect(controllerFixture.harness.behavior.callAgentTool(
+        "telegram_agent_watch",
+        { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+        { threadId: controller.threadId, projectId: controller.projectId, signal: new AbortController().signal },
+      )).rejects.toThrow("does not authorize BB schedule management");
+
+      expect(fake.create).not.toHaveBeenCalled();
+      expect(repository.list(controller.controllerKey)).toEqual([]);
+    } finally {
+      await controllerFixture.dispose();
+    }
+  });
+
+  it.each([
+    ["malformed", { version: 1, value: { mode: "agent" } }],
+    ["unknown-versioned", { version: 2, value: definition }],
+  ])("fails closed when a %s current definition crosses the store boundary", async (_label, serialized) => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    bb.storage.database().prepare(
+      "UPDATE managed_automations SET definition_json = ? WHERE id = ?",
+    ).run(JSON.stringify(serialized), binding.id);
+
+    expect(() => repository.get(binding.id)).toThrow();
+  });
+
+  it("keeps an immediately preceding legacy definition readable", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    bb.storage.database().prepare(
+      "UPDATE managed_automations SET definition_json = ? WHERE id = ?",
+    ).run(JSON.stringify(definition), binding.id);
+
+    expect(repository.get(binding.id)).toMatchObject({ id: binding.id, definition });
+  });
+
+  it.each([
+    ["malformed", { version: 1, value: { providerAutomationId: "auto_1" } }],
+    ["unknown-versioned", { version: 2, value: { providerAutomationId: "auto_1" } }],
+  ])("fails closed when a %s current observation crosses the store boundary", async (_label, serialized) => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    bb.storage.database().prepare(
+      "UPDATE managed_automations SET observed_json = ? WHERE id = ?",
+    ).run(JSON.stringify(serialized), binding.id);
+
+    expect(() => repository.get(binding.id)).toThrow();
+  });
+
+  it("fails closed on an unknown current operation outcome while preserving a legacy outcome", async () => {
+    const { bb, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const operationId = pending.lastOperationId!;
+    const db = bb.storage.database();
+
+    db.prepare("UPDATE managed_automation_operations SET outcome_json = ? WHERE id = ?")
+      .run(JSON.stringify({ version: 2, kind: "settled" }), operationId);
+    expect(() => repository.getOperation(operationId)).toThrow();
+
+    db.prepare("UPDATE managed_automation_operations SET outcome_json = ? WHERE id = ?")
+      .run(JSON.stringify({ legacy: true }), operationId);
+    expect(repository.getOperation(operationId)).toMatchObject({ outcome: { legacy: true } });
+  });
+
+  it("reserves before the executor creates BB state and settles one durable outcome", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+
+    expect(pending.state).toBe("pending");
+    expect(pending.bbAutomationId).toBeNull();
+    expect(fake.create).not.toHaveBeenCalled();
+
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 1, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    const settled = service.get(pending.id);
+    expect(settled).toMatchObject({
+      state: "active",
+      bbAutomationId: "auto_1",
+      lastOperationOutcome: "succeeded",
+    });
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({
+      state: "succeeded",
+      providerAutomationId: "auto_1",
+    });
+    expect(fake.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the durable automation through the primary executor seam and converges after lease loss", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    let now = NOW;
+    const firstExecutorAbort = new AbortController();
+    let stolenGeneration: number | null = null;
+    let providerSawAbort = false;
+    let firstProviderCall = true;
+    const originalCreate = fake.adapter.create;
+    const providerCreate = vi.spyOn(fake.adapter, "create").mockImplementation(async (
+      input: Parameters<ManagedAutomationAdapter["create"]>[0],
+    ) => {
+      if (!firstProviderCall) throw new Error("unexpected duplicate provider create");
+      firstProviderCall = false;
+      const receipt = await originalCreate(input);
+      now = NOW + 30_001;
+      const stolen = store.acquireExecutorLease("lease-successor", now, 30_000);
+      if (!stolen.acquired) throw new Error("could not take over the executor lease");
+      stolenGeneration = stolen.generation;
+      const aborted = new Promise<void>((resolve) => {
+        if (input.signal?.aborted) {
+          providerSawAbort = true;
+          resolve();
+          return;
+        }
+        input.signal?.addEventListener("abort", () => {
+          providerSawAbort = true;
+          resolve();
+        }, { once: true });
+      });
+      firstExecutorAbort.abort(new Error("test executor lease lost"));
+      await aborted;
+      return receipt;
+    });
+
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      automations: reconciler,
+      releaseOnShutdown: true,
+      sleep: async () => firstExecutorAbort.abort(),
+    }, firstExecutorAbort.signal);
+
+    expect(providerSawAbort).toBe(true);
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+    expect(fake.adapter.delete).not.toHaveBeenCalled();
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({
+      state: "leased",
+      providerAutomationId: null,
+    });
+    if (stolenGeneration === null) throw new Error("missing stolen executor lease");
+    expect(store.releaseExecutorLease("lease-successor", stolenGeneration, now)).toBe(true);
+
+    fake.automations.set("auto_unrelated", automation(definition, { id: "auto_unrelated" }));
+    now = NOW + 120_002;
+    const successorAbort = new AbortController();
+    await runJobExecutorService({
+      store,
+      clock: { now: () => now },
+      automations: reconciler,
+      releaseOnShutdown: true,
+      sleep: async () => successorAbort.abort(),
+    }, successorAbort.signal);
+
+    const settled = repository.get(pending.id);
+    const operation = repository.getOperation(pending.lastOperationId!);
+    expect(settled).toMatchObject({
+      state: "active",
+      bbAutomationId: "auto_1",
+      observed: { providerAutomationId: "auto_1" },
+      lastOperationOutcome: "succeeded",
+    });
+    expect(operation).toMatchObject({
+      state: "succeeded",
+      providerAutomationId: "auto_1",
+      outcome: { version: 1, kind: "settled", outcome: "succeeded" },
+    });
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+    expect(fake.adapter.findByDefinition).toHaveBeenCalledTimes(1);
+    expect(fake.adapter.delete).not.toHaveBeenCalled();
+    expect(fake.automations.size).toBe(2);
+  });
+
+  it("blocks a current owner operation before the provider when its capability receipt is stale", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(
+      repository,
+      fake.adapter,
+      () => true,
+      (_binding, operation) => operation.capabilityEvidence?.evidenceRefs.some((ref) => ref.startsWith("capability-receipt:")) === true,
+    );
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const abort = new AbortController();
+    await runJobExecutorService({
+      store,
+      clock: { now: () => NOW },
+      automations: reconciler,
+      releaseOnShutdown: true,
+      sleep: async () => abort.abort(),
+    }, abort.signal);
+
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(repository.get(pending.id)).toMatchObject({ state: "failed", bbAutomationId: null });
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({ state: "failed" });
+  });
+
+  it("reconciles a provider success after executor restart without creating a duplicate", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const firstLease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!firstLease.acquired) throw new Error("missing first executor lease");
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const operation = repository.claimOperation({
+      operationId: pending.lastOperationId!,
+      ownerId: "automation-executor",
+      generation: firstLease.generation,
+      now: NOW + 1,
+      leaseMs: 120_000,
+    });
+    if (!operation) throw new Error("missing claimed automation operation");
+    await service.executeClaimedOperation({
+      binding: pending,
+      operation,
+      scope: SCOPE,
+    });
+    expect(store.releaseExecutorLease("automation-executor", firstLease.generation, NOW + 2)).toBe(true);
+
+    const secondLease = store.acquireExecutorLease("automation-restart", NOW + 120_002, 120_000);
+    if (!secondLease.acquired) throw new Error("missing replacement executor lease");
+    const restarted = new ManagedAutomationReconciler({
+      repository,
+      service: new ManagedAutomationService(repository, fake.adapter, () => true),
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+    await restarted.processDue(NOW + 120_002, signal, {
+      ownerId: "automation-restart",
+      generation: secondLease.generation,
+      signal,
+    });
+
+    expect(service.get(pending.id)).toMatchObject({
+      state: "active",
+      bbAutomationId: "auto_1",
+      lastOperationOutcome: "succeeded",
+    });
+    expect(fake.create).toHaveBeenCalledTimes(1);
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({ state: "succeeded" });
+  });
+
+  it("does not call BB when current capability evidence denies the operation", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true, () => false);
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 1, signal, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal,
+    });
+
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(service.get(pending.id)).toMatchObject({
+      state: "failed",
+      lastError: "managed_automation_capability_evidence_stale",
+    });
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({ state: "failed" });
+  });
+
+  it("rejects a stale executor settlement and lets the successor reconcile the same operation", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const firstLease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!firstLease.acquired) throw new Error("missing first executor lease");
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const claimed = repository.claimOperation({
+      operationId: pending.lastOperationId!,
+      ownerId: "automation-executor",
+      generation: firstLease.generation,
+      now: NOW + 1,
+      leaseMs: 120_000,
+    });
+    if (!claimed) throw new Error("missing claimed automation operation");
+    expect(store.releaseExecutorLease("automation-executor", firstLease.generation, NOW + 2)).toBe(true);
+
+    expect(repository.settleOperation({
+      operationId: claimed.id,
+      ownerId: "automation-executor",
+      generation: firstLease.generation,
+      now: NOW + 2,
+      outcome: "succeeded",
+      automation: managedObservation(automation()),
+    })).toBeNull();
+    expect(repository.getOperation(claimed.id)).toMatchObject({ state: "leased" });
+    expect(service.get(pending.id)).toMatchObject({ state: "pending", bbAutomationId: null });
+
+    const successor = store.acquireExecutorLease("automation-successor", NOW + 120_002, 120_000);
+    if (!successor.acquired) throw new Error("missing successor executor lease");
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+    await reconciler.processDue(NOW + 120_002, signal, {
+      ownerId: "automation-successor",
+      generation: successor.generation,
+      signal,
+    });
+
+    expect(service.get(pending.id)).toMatchObject({ state: "active", bbAutomationId: "auto_1" });
+    expect(repository.getOperation(claimed.id)).toMatchObject({ state: "succeeded" });
+    expect(fake.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts an in-flight provider call when the owning executor fence is lost", async () => {
+    const { store, repository } = fixture();
+    const fake = fakeAdapter();
+    let providerStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      providerStarted = resolve;
+    });
+    let providerAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => {
+      providerAborted = resolve;
+    });
+    const adapter: ManagedAutomationAdapter = {
+      ...fake.adapter,
+      create: vi.fn(async ({ signal }) => {
+        providerStarted();
+        await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            providerAborted();
+            reject(new Error("provider aborted"));
+          }, { once: true });
+        });
+        throw new Error("provider did not abort");
+      }),
+    };
+    const service = new ManagedAutomationService(repository, adapter, () => true);
+    const lease = store.acquireExecutorLease("automation-executor", NOW, 120_000);
+    if (!lease.acquired) throw new Error("missing automation executor lease");
+    const pending = await service.create({
+      ...createInput(),
+      authority: versionedOwnerAuthority(),
+      deferProvider: true,
+      operation: {
+        version: 1,
+        operationClass: "create",
+        targetProjectId: definition.projectId,
+        definitionRevision: 1,
+      },
+      controllerFence: {
+        ownerId: "controller-executor",
+        generation: 1,
+        turnId: "turn_owner",
+      },
+      mutate: (mutation) => mutation(),
+    });
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
+    const fenceAbort = new AbortController();
+    const run = reconciler.processDue(NOW + 1, undefined, {
+      ownerId: "automation-executor",
+      generation: lease.generation,
+      signal: fenceAbort.signal,
+    });
+    await started;
+    fenceAbort.abort(new Error("executor lease lost"));
+    await aborted;
+    await run;
+
+    expect(adapter.create).toHaveBeenCalledTimes(1);
+    expect(repository.getOperation(pending.lastOperationId!)).toMatchObject({ state: "leased" });
+    expect(service.get(pending.id)).toMatchObject({ state: "pending", bbAutomationId: null });
+  });
+
   it("restarts by reconciling the same durable BB id without creating a duplicate", async () => {
     const { repository } = fixture();
     const fake = createFakeBbAutomationAdapter(NOW);
@@ -133,45 +997,11 @@ describe("managed BB automations", () => {
     expect(fake.create).toHaveBeenCalledTimes(1);
   });
 
-  it("adopts an automation already carrying the binding's name instead of asking BB for a second one", async () => {
-    // BB's create has no idempotency key. If the acknowledgement never reached
-    // Hanoon, the schedule still exists under the deterministic name.
-    const { repository } = fixture();
-    const fake = createFakeBbAutomationAdapter(NOW);
-    const orphan = observedBbAutomation(definition, NOW, { id: "auto_orphan" });
-    fake.automations.set(orphan.id, orphan);
-    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-
-    const binding = await service.create(createInput());
-
-    expect(binding).toMatchObject({ state: "active", bbAutomationId: "auto_orphan" });
-    expect(fake.create).not.toHaveBeenCalled();
-    expect(fake.automations.size).toBe(1);
-  });
-
-  it("refuses to adopt a same-named automation whose definition differs and leaves it untouched", async () => {
-    const { repository } = fixture();
-    const fake = createFakeBbAutomationAdapter(NOW);
-    const stranger = observedBbAutomation(definition, NOW, {
-      id: "auto_stranger",
-      trigger: { triggerType: "schedule", cron: "*/5 * * * *", timezone: "Etc/UTC" },
-    });
-    fake.automations.set(stranger.id, stranger);
-    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
-
-    await expect(service.create(createInput())).rejects.toThrow("schedule did not reconcile");
-
-    expect(fake.create).not.toHaveBeenCalled();
-    expect(fake.adapter.delete).not.toHaveBeenCalled();
-    expect(fake.automations.get("auto_stranger")).toEqual(stranger);
-    expect(service.list("owner-7-controller")).toMatchObject([{
-      state: "failed",
-      lastError: "bb_automation_name_conflict",
-      bbAutomationId: "auto_stranger",
-    }]);
-  });
-
-  it("removes a schedule BB cannot read back exactly and starts clean on the next create", async () => {
+  // BB's create has no idempotency key, so a create it acknowledged is never
+  // compensated away: the binding keeps BB's id and the ownership marker, and
+  // reconciliation finishes the read-back rather than asking for a second
+  // schedule. A retried operation finds the marked automation instead.
+  it("keeps a schedule BB acknowledged but could not read back, then reconciles it", async () => {
     const { repository } = fixture();
     const fake = createFakeBbAutomationAdapter(NOW);
     vi.mocked(fake.adapter.show).mockRejectedValueOnce(new Error("BB read timed out"));
@@ -179,29 +1009,29 @@ describe("managed BB automations", () => {
 
     await expect(service.create(createInput())).rejects.toThrow("timed out");
 
-    // No hidden schedule survives an unverified create, and the binding no
-    // longer points at the deleted id.
-    expect(fake.automations.size).toBe(0);
-    expect(service.list("owner-7-controller")).toMatchObject([{
+    // The schedule BB created is still there and still Hanoon's, recorded
+    // rather than hidden or deleted.
+    expect(fake.automations.size).toBe(1);
+    const failed = service.get(service.list("owner-7-controller")[0]!.id)!;
+    expect(failed).toMatchObject({
       state: "failed",
-      lastError: "bb_automation_timeout",
-      bbAutomationId: null,
-    }]);
+      lastError: "bb_automation_provider_readback_failed",
+      bbAutomationId: "auto_1",
+    });
+    expect(fake.adapter.delete).not.toHaveBeenCalled();
+    expect(repository.listReconciliationCandidates(NOW + 1)).toMatchObject([{ id: failed.id }]);
 
-    const retried = await service.create({ ...createInput(), now: NOW + 1 });
+    await service.reconcile({ binding: failed, scope: SCOPE, now: NOW + 2 });
 
-    expect(retried).toMatchObject({ state: "active", bbAutomationId: "auto_1" });
-    expect(fake.create).toHaveBeenCalledTimes(2);
+    expect(service.get(failed.id)).toMatchObject({ state: "active", bbAutomationId: "auto_1" });
+    expect(fake.create).toHaveBeenCalledTimes(1);
     expect(fake.automations.size).toBe(1);
   });
 
-  it("keeps BB's id when a mismatched schedule cannot be deleted, so reconciliation retries the read-back", async () => {
+  it("keeps BB's id when the read-back shows a different schedule, so reconciliation retries it", async () => {
     const { repository } = fixture();
     const fake = createFakeBbAutomationAdapter(NOW);
-    vi.mocked(fake.adapter.show).mockResolvedValueOnce(observedBbAutomation(definition, NOW, {
-      trigger: { triggerType: "schedule", cron: "0 9 * * *", timezone: "Etc/UTC" },
-    }));
-    vi.mocked(fake.adapter.delete).mockRejectedValueOnce(new Error("Permission denied"));
+    vi.mocked(fake.adapter.show).mockRejectedValueOnce(new Error("BB automation schedule did not reconcile"));
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
 
     await expect(service.create(createInput())).rejects.toThrow("schedule did not reconcile");

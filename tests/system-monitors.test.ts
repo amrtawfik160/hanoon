@@ -1,4 +1,5 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { managedAutomationIsSystemOwned } from "../src/domain/managed-automation";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
@@ -99,7 +100,7 @@ it("installs every upkeep schedule as a BB agent automation once and stays idemp
   await expect(install(value)).resolves.toBe(SYSTEM_MONITORS.length);
   const first = value.service.list(CONTROLLER_KEY);
   expect(first).toHaveLength(SYSTEM_MONITORS.length);
-  expect(first.every((binding) => binding.state === "active" && binding.authority.source === "system")).toBe(true);
+  expect(first.every((binding) => binding.state === "active" && managedAutomationIsSystemOwned(binding.authority))).toBe(true);
   expect(first.map((binding) => binding.definition.mode)).toEqual(["agent", "agent", "agent"]);
 
   await expect(install(value, NOW + 60_000)).resolves.toBe(SYSTEM_MONITORS.length);
@@ -145,7 +146,7 @@ it("reinstalls upkeep after self-maintenance was switched off and on again", asy
   for (const binding of value.service.list(CONTROLLER_KEY)) {
     await value.service.retire({
       id: binding.id,
-      scope: { kind: "host_path", hostId: "host_a", cwd: null },
+      scope: { kind: "host", hostId: "host_a", cwd: null },
       now: NOW + 1,
     });
   }

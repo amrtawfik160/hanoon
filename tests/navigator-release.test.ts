@@ -507,15 +507,22 @@ async function runApproval(fixture: OwnedFixture, key: string): Promise<void> {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    // The burst migration is the newest tail; every shipped migration keeps
-    // its position ahead of it.
-    expect(ALL_MIGRATIONS.at(-1)).toBe(CONTROLLER_BURST_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-2)).toBe(MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-3)).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-4)).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-5)).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-6)).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-7)).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    // The burst migration is the newest tail; the managed-automation state
+    // upgrade sits immediately ahead of it and contributes several statements,
+    // so every earlier block is located by offset rather than a fixed index.
+    const burstOffset = CONTROLLER_BURST_MIGRATIONS.length;
+    [...CONTROLLER_BURST_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
+    });
+    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(burstOffset + index + 1))).toBe(migration);
+    });
+    const stateUpgradeOffset = burstOffset + MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");

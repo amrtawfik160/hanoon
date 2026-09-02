@@ -1,11 +1,16 @@
 import { vi } from "vitest";
 import {
   BbAutomationNotFoundError,
+  assertAutomationMatches,
   type BbAutomation,
   type BbAutomationDefinition,
   type BbAutomationRun,
 } from "../../src/bb/automation";
 import type { ManagedAutomationAdapter } from "../../src/services/managed-automation-service";
+import type {
+  ManagedAutomationObservation,
+  ManagedAutomationProviderIdentity,
+} from "../../src/domain/managed-automation";
 
 /**
  * What BB would read back for a definition it accepted exactly. Tests that
@@ -57,47 +62,123 @@ export function observedBbAutomation(
   };
 }
 
+/** BB's stored name for an automation Hanoon owns, carrying its ownership marker. */
+function providerName(name: string, identity?: ManagedAutomationProviderIdentity): string {
+  return identity ? `${name} [${identity.ownershipMarker}]` : name;
+}
+
+/** The provider-neutral projection the adapter hands the service. */
+export function bbAutomationObservation(
+  value: BbAutomation,
+  expectedDefinition?: BbAutomationDefinition,
+): ManagedAutomationObservation {
+  return {
+    providerAutomationId: value.id,
+    projectId: value.projectId,
+    name: expectedDefinition?.name ?? value.name,
+    enabled: value.enabled,
+    trigger: value.trigger.triggerType === "schedule"
+      ? { kind: "cron", cron: value.trigger.cron, timezone: value.trigger.timezone }
+      : { kind: "once", at: new Date(value.trigger.runAt).toISOString() },
+    mode: value.execution.mode,
+    target: value.execution.mode === "script"
+      ? null
+      : value.execution.targetThreadId
+        ? { kind: "target-thread", threadId: value.execution.targetThreadId }
+        : value.execution.environment.type === "project-default"
+          ? { kind: "project-default" }
+          : value.execution.environment.type === "reuse"
+            ? { kind: "environment", environmentId: value.execution.environment.environmentId }
+            : { kind: "new-worktree", baseBranch: value.execution.environment.workspace.baseBranch.name },
+    nextRunAt: value.nextRunAt,
+    lastRunAt: value.lastRunAt,
+    runCount: value.runCount,
+    lastRunStatus: value.lastRunStatus,
+    lastRunThreadId: value.lastRunThreadId,
+    lastError: value.lastError,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
 /**
  * An in-memory BB automation host at the terminal boundary. It behaves like
- * the real CLI where the service depends on it: create acknowledges, list and
- * show read back what is stored, delete of an absent id is BB's exact
- * not-found result.
+ * the real CLI where the service depends on it: create acknowledges with a
+ * receipt carrying the operation's ownership marker, show reads back what is
+ * stored, `findByDefinition` matches only an exact definition, and delete of an
+ * absent id is BB's exact not-found result.
  */
 export function createFakeBbAutomationAdapter(now: number) {
   const automations = new Map<string, BbAutomation>();
   const runs = new Map<string, BbAutomationRun[]>();
-  const create = vi.fn(async ({ definition: value }: { definition: BbAutomationDefinition }) => {
-    const created = observedBbAutomation(value, now, { id: `auto_${automations.size + 1}` });
+  const create = vi.fn(async ({ definition: value, identity }: {
+    definition: BbAutomationDefinition;
+    identity: ManagedAutomationProviderIdentity;
+  }) => {
+    const created = observedBbAutomation(value, now, {
+      id: `auto_${automations.size + 1}`,
+      name: providerName(value.name, identity),
+    });
     automations.set(created.id, created);
-    return created;
+    return {
+      version: 1 as const,
+      operationId: identity.operationId,
+      ownershipMarker: identity.ownershipMarker,
+      providerAutomationId: created.id,
+    };
   });
   const adapter: ManagedAutomationAdapter = {
+    agentAutomationCapabilities: {
+      executionTimeout: true,
+      resultContract: true,
+      preRunAuthority: true,
+    },
     create,
-    list: vi.fn(async ({ projectId }) =>
-      [...automations.values()].filter((automation) => automation.projectId === projectId)),
-    update: vi.fn(async ({ automationId, definition: value }) => {
+    update: vi.fn(async ({ automationId, definition: value, identity }) => {
       const found = automations.get(automationId);
       if (!found) throw new Error("missing automation");
       const updated = observedBbAutomation(value, now, {
         id: automationId,
+        name: providerName(value.name, identity),
         enabled: found.enabled,
         createdAt: found.createdAt,
         updatedAt: now + 1,
       });
       automations.set(automationId, updated);
-      return updated;
+      return bbAutomationObservation(updated, value);
     }),
-    show: vi.fn(async ({ automationId }) => {
+    show: vi.fn(async ({ automationId, expectedDefinition, expectedEnabled, identity }) => {
       const found = automations.get(automationId);
       if (!found) throw new Error("missing automation");
-      return found;
+      if (expectedDefinition) {
+        assertAutomationMatches(
+          { ...expectedDefinition, name: providerName(expectedDefinition.name, identity) },
+          found,
+          expectedEnabled ?? true,
+        );
+      }
+      return bbAutomationObservation(found, expectedDefinition);
     }),
-    setEnabled: vi.fn(async ({ automationId, enabled }) => {
+    setEnabled: vi.fn(async ({ automationId, enabled, expectedDefinition }) => {
       const found = automations.get(automationId);
       if (!found) throw new Error("missing automation");
       const updated = { ...found, enabled, nextRunAt: enabled ? now + 60_000 : null };
       automations.set(automationId, updated);
-      return updated;
+      return bbAutomationObservation(updated, expectedDefinition);
+    }),
+    findByDefinition: vi.fn(async ({ definition: requested, identity }) => {
+      const found = [...automations.values()].find((candidate) => {
+        try {
+          assertAutomationMatches(
+            { ...requested, name: providerName(requested.name, identity) },
+            candidate,
+          );
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      return found ? bbAutomationObservation(found, requested) : null;
     }),
     runNow: vi.fn(async ({ automationId }): Promise<BbAutomationRun> => ({
       id: "run_manual",

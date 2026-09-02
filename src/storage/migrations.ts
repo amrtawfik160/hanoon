@@ -4592,6 +4592,60 @@ BEFORE DELETE ON managed_automation_run_evidence
 BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
 CREATE INDEX managed_automation_notifications_state
   ON managed_automation_notifications(state, sequence);
+`,
+String.raw`
+
+ALTER TABLE managed_automations ADD COLUMN definition_revision INTEGER NOT NULL DEFAULT 1 CHECK (definition_revision >= 1);
+ALTER TABLE managed_automations ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0 CHECK (authority_version >= 0);
+ALTER TABLE managed_automations ADD COLUMN capability_profile_id TEXT;
+ALTER TABLE managed_automations ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+ALTER TABLE managed_automations ADD COLUMN capability_evidence_json TEXT;
+ALTER TABLE managed_automations ADD COLUMN last_operation_id TEXT;
+ALTER TABLE managed_automations ADD COLUMN last_operation_outcome TEXT CHECK (
+  last_operation_outcome IS NULL OR last_operation_outcome IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')
+);
+
+CREATE TABLE managed_automation_operations (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  operation_class TEXT NOT NULL CHECK (
+    operation_class IN ('create', 'update', 'enable', 'disable', 'run_now', 'retire', 'reconcile')
+  ),
+  operation_version INTEGER NOT NULL DEFAULT 1 CHECK (operation_version = 1),
+  target_project_id TEXT NOT NULL,
+  definition_revision INTEGER NOT NULL CHECK (definition_revision >= 1),
+  authority_json TEXT NOT NULL,
+  capability_evidence_json TEXT,
+  controller_owner_id TEXT,
+  controller_generation INTEGER CHECK (controller_generation IS NULL OR controller_generation >= 1),
+  controller_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 1),
+  lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+  provider_automation_id TEXT,
+  outcome_json TEXT,
+  last_error TEXT,
+  next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0),
+  UNIQUE(binding_id, definition_revision, operation_class)
+);
+CREATE INDEX managed_automation_operations_due
+  ON managed_automation_operations(state, next_attempt_at, created_at);
+CREATE INDEX managed_automation_operations_binding
+  ON managed_automation_operations(binding_id, created_at);
+`, String.raw`
+ALTER TABLE managed_automations ADD COLUMN provider_ownership_marker TEXT CHECK (
+  provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+);
+ALTER TABLE managed_automation_operations ADD COLUMN provider_ownership_marker TEXT CHECK (
+  provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+);
 `] as const;
 
 export const ALL_MIGRATIONS = [
