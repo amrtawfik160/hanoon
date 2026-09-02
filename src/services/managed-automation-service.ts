@@ -553,7 +553,7 @@ export class ManagedAutomationReconciler {
       try {
         if (binding.mode === "agent" && !managedAutomationAuthorityIsCurrent(
           binding,
-          controller?.controllerKey ?? null,
+          controller,
           this.dependencies.store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
         )) {
           await this.dependencies.service.pauseForStaleAuthority({
@@ -617,10 +617,16 @@ export class ManagedAutomationReconciler {
 
 export function managedAutomationAuthorityIsCurrent(
   binding: ManagedAutomationBinding,
-  currentControllerKey: string | null,
-  projectEnabled: boolean,
+  controller: Readonly<{ controllerKey: string; projectId: string | null }> | null,
+  projectPolicyEnabled: boolean,
 ): boolean {
-  return projectEnabled && currentControllerKey === binding.controllerKey &&
+  if (controller === null || controller.controllerKey !== binding.controllerKey) return false;
+  // The controller's own project needs no repository policy: upkeep and the
+  // owner's follow-up schedules run where the controller itself already runs.
+  // Any other project must still be an enabled Hanoon project.
+  const projectAuthorized = projectPolicyEnabled ||
+    (controller.projectId !== null && controller.projectId === binding.projectId);
+  return projectAuthorized &&
     binding.authority.controllerKey === binding.controllerKey &&
     binding.authority.projectId === binding.projectId &&
     typeof binding.authority.hostId === "string" &&

@@ -4,6 +4,7 @@ import type { BbAutomationDefinition, BbAutomationRun } from "../src/bb/automati
 import {
   ManagedAutomationReconciler,
   ManagedAutomationService,
+  managedAutomationAuthorityIsCurrent,
   migrateLegacyClockMonitor,
 } from "../src/services/managed-automation-service";
 import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
@@ -57,7 +58,10 @@ function fixture() {
 }
 
 /** A paired owner whose controller row exists, so the reconciler has a current controller key. */
-function pairOwner(store: TelegramAgentStore, options: { projectEnabled?: boolean } = {}) {
+function pairOwner(
+  store: TelegramAgentStore,
+  options: { projectEnabled?: boolean; repositoryPolicy?: boolean; controllerProjectId?: string } = {},
+) {
   store.createPairingCode(hashSecret("pair-automation"), NOW - 1_000, NOW + 10_000);
   expect(store.pairOwnerWithPrivateChatCode(hashSecret("pair-automation"), "7", "70", NOW - 500)).toEqual({ ok: true });
   store.enqueueControllerTurn({
@@ -68,11 +72,30 @@ function pairOwner(store: TelegramAgentStore, options: { projectEnabled?: boolea
     inputText: "Create the controller fixture.",
     now: NOW - 400,
   });
-  store.upsertProjectPolicy(policyFixture({
-    projectId: "proj_owner",
-    alias: "owner",
-    enabled: options.projectEnabled ?? true,
-  }), NOW - 300);
+  if (options.controllerProjectId) {
+    // The controller's project and host are recorded when its thread spawns.
+    const lease = store.acquireExecutorLease("executor", NOW - 350, 30_000);
+    if (!lease.acquired) throw new Error("missing executor lease");
+    const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: NOW - 350 });
+    if (!turn) throw new Error("missing controller turn");
+    expect(store.markControllerSpawned({
+      turnId: turn.id,
+      ownerId: "executor",
+      generation: lease.generation,
+      now: NOW - 350,
+      projectId: options.controllerProjectId,
+      hostId: "host_owner",
+      threadId: "thr_controller",
+    })).toBe(true);
+    expect(store.releaseExecutorLease("executor", lease.generation, NOW - 350)).toBe(true);
+  }
+  if (options.repositoryPolicy !== false) {
+    store.upsertProjectPolicy(policyFixture({
+      projectId: "proj_owner",
+      alias: "owner",
+      enabled: options.projectEnabled ?? true,
+    }), NOW - 300);
+  }
 }
 
 function createInput() {
@@ -407,6 +430,39 @@ describe("managed BB automations", () => {
       state: "paused",
       lastError: "managed_automation_authority_stale",
     });
+  });
+
+  it("treats the controller's own project as authorized without a repository policy", async () => {
+    // Production, 2026-09-02: the controller runs in BB's personal project,
+    // which never has a Hanoon repository policy, so every upkeep schedule
+    // failed its authority preflight before BB was ever asked.
+    const { store, repository } = fixture();
+    pairOwner(store, { repositoryPolicy: false, controllerProjectId: "proj_owner" });
+    const controller = store.getControllerForOwner("7", "70");
+    expect(controller?.projectId).toBe("proj_owner");
+    const authorityIsCurrent = (binding: Parameters<typeof managedAutomationAuthorityIsCurrent>[0]) =>
+      managedAutomationAuthorityIsCurrent(
+        binding,
+        store.getControllerForOwner("7", "70"),
+        store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
+      );
+    const fake = createFakeBbAutomationAdapter(NOW);
+    const service = new ManagedAutomationService(repository, fake.adapter, authorityIsCurrent);
+
+    const binding = await service.create(createInput());
+    expect(binding.state).toBe("active");
+    fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
+    const reconciler = new ManagedAutomationReconciler({ repository, service, store, notify: vi.fn() });
+    await reconciler.processDue(NOW + 60_001);
+
+    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
+    expect(service.get(binding.id)).toMatchObject({ state: "active", lastRunId: "run_1" });
+    // A schedule in any other project still needs an enabled repository policy.
+    expect(managedAutomationAuthorityIsCurrent(
+      { ...binding, projectId: "proj_other", authority: { ...binding.authority, projectId: "proj_other" } },
+      controller,
+      false,
+    )).toBe(false);
   });
 
   it("finishes an interrupted legacy handover on the next sweep, so one task never fires through two schedulers", async () => {

@@ -657,7 +657,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
       return managedAutomationAuthorityIsCurrent(
         binding,
-        controller?.controllerKey ?? null,
+        controller,
         store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
       );
     },
