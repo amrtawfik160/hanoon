@@ -150,18 +150,15 @@ export type BbScriptAutomationDefinition = Readonly<{
 
 export type BbAutomationDefinition = BbAgentAutomationDefinition | BbScriptAutomationDefinition;
 
-export type BbAgentAutomationCapabilities = Readonly<{
-  executionTimeout: boolean;
-  resultContract: boolean;
-  preRunAuthority: boolean;
-}>;
-
-export const INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES: BbAgentAutomationCapabilities = Object.freeze({
-  executionTimeout: false,
-  resultContract: false,
-  preRunAuthority: false,
-});
-
+/**
+ * BB runs an agent automation without a wall-clock bound or an output bound,
+ * and starts a scheduled run without asking Hanoon first. Hanoon therefore
+ * enforces the declared execution contract itself: every observed run is
+ * classified against `timeoutMs` and `resultContract` before its evidence or
+ * controller handoff is recorded, and a binding whose authority is no longer
+ * current is paused at the next reconciliation sweep. Neither is a claim that
+ * BB stopped the run; both are truthful classifications of what BB did.
+ */
 export type AutomationCommandRunner = Readonly<{
   run(input: {
     scope: TerminalScope;
@@ -251,6 +248,10 @@ export function buildShowAutomationCommand(projectId: string, automationId: stri
   return command("show", [shellSingleQuote(automationId), ...flag("project", projectId)]);
 }
 
+export function buildListAutomationsCommand(projectId: string): string {
+  return command("list", flag("project", projectId));
+}
+
 export function buildAutomationActionCommand(
   action: "pause" | "resume" | "delete",
   projectId: string,
@@ -298,8 +299,6 @@ export class BbAutomationNotFoundError extends Error {
 }
 
 export class TerminalBbAutomationAdapter {
-  public readonly agentAutomationCapabilities = INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES;
-
   public constructor(private readonly runner: AutomationCommandRunner) {}
 
   private async execute<T>(input: {
@@ -328,42 +327,41 @@ export class TerminalBbAutomationAdapter {
     return input.schema.parse(parseCommandJson<unknown>(result.output, input.title));
   }
 
-  public async create(input: {
+  /**
+   * Returns BB's create acknowledgement only. Acceptance is the service's job:
+   * it persists the returned id before the exact read-back, so a crash between
+   * the two cannot leave a live BB schedule that no binding knows about.
+   */
+  public create(input: {
     scope: TerminalScope;
     definition: BbAutomationDefinition;
     signal?: AbortSignal;
   }): Promise<BbAutomation> {
-    const created = await this.execute({
+    return this.execute({
       ...input,
       title: "Create BB automation",
       command: buildCreateAutomationCommand(input.definition),
       schema: bbAutomationSchema,
     });
-    try {
-      const observed = await this.show({
-        scope: input.scope,
-        projectId: input.definition.projectId,
-        automationId: created.id,
-        signal: input.signal,
-      });
-      assertAutomationMatches(input.definition, observed);
-      return observed;
-    } catch (error) {
-      // A create acknowledgement is not acceptance. Remove a definition BB
-      // cannot read back exactly so a hidden, untrusted schedule is not left.
-      try {
-        await this.delete({
-          scope: input.scope,
-          projectId: input.definition.projectId,
-          automationId: created.id,
-          signal: input.signal,
-        });
-      } catch {
-        // Preserve the mismatch as the primary failure; the service records a
-        // closed error class and reconciliation will keep the binding blocked.
-      }
-      throw error;
-    }
+  }
+
+  public async list(input: {
+    scope: TerminalScope;
+    projectId: string;
+    signal?: AbortSignal;
+  }): Promise<readonly BbAutomation[]> {
+    const rows = await this.execute({
+      ...input,
+      title: "List BB automations",
+      command: buildListAutomationsCommand(input.projectId),
+      schema: z.array(z.unknown()),
+    });
+    // BB keeps damaged records visible under a `problem` discriminator. A
+    // record Hanoon cannot read exactly is never a candidate for adoption.
+    return rows.flatMap((row) => {
+      const parsed = bbAutomationSchema.safeParse(row);
+      return parsed.success && !("problem" in parsed.data) ? [parsed.data] : [];
+    });
   }
 
   public async update(input: {

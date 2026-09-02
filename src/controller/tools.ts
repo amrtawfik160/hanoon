@@ -744,6 +744,16 @@ function monitorProjection(monitor: MonitorRecord) {
   };
 }
 
+/**
+ * The plugin's own upkeep schedules are installed under the controller key
+ * but are not the owner's to list, rewrite, or cancel: turning
+ * self-maintenance off retires them, and cancelling one here would only make
+ * the installer re-arm it.
+ */
+function ownerVisibleAutomation(binding: ManagedAutomationBinding): boolean {
+  return binding.authority.source !== "system";
+}
+
 function automationProjection(binding: ManagedAutomationBinding) {
   const definition = binding.definition;
   return {
@@ -774,57 +784,38 @@ const MONITOR_LIST_BUDGET_BYTES = 6_000;
 const LIVE_INSTRUCTION_CHARS = 400;
 const SETTLED_INSTRUCTION_CHARS = 120;
 
-function needsAttention(monitor: MonitorRecord): boolean {
-  return monitor.state === "armed" || monitor.state === "failed";
-}
-
 function clipInstruction(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit).trimEnd()}…`;
 }
 
-function packMonitorList(monitors: MonitorRecord[]) {
-  const ordered = [...monitors].sort((left, right) =>
-    Number(needsAttention(right)) - Number(needsAttention(left)) || right.createdAt - left.createdAt);
-  const packed: ReturnType<typeof monitorProjection>[] = [];
-  let bytes = 0;
-  for (const monitor of ordered) {
-    const row = {
-      ...monitorProjection(monitor),
-      instruction: clipInstruction(
-        monitor.instruction,
-        needsAttention(monitor) ? LIVE_INSTRUCTION_CHARS : SETTLED_INSTRUCTION_CHARS,
-      ),
-    };
-    const size = Buffer.byteLength(JSON.stringify(row), "utf8");
-    if (packed.length > 0 && bytes + size > MONITOR_LIST_BUDGET_BYTES) break;
-    packed.push(row);
-    bytes += size;
-  }
-  return { monitors: packed, omitted: ordered.length - packed.length };
-}
+type WatchRow = ReturnType<typeof monitorProjection> | ReturnType<typeof automationProjection>;
 
 function packWatchList(monitors: MonitorRecord[], automations: ManagedAutomationBinding[]) {
-  const local = packMonitorList(monitors);
-  const automated = automations.map(automationProjection);
-  const rows = [...automated, ...local.monitors];
-  const packed: typeof rows = [];
+  const rows: Array<{ row: WatchRow; live: boolean; createdAt: number }> = [
+    ...monitors.map((monitor) => ({
+      row: monitorProjection(monitor),
+      live: monitor.state === "armed" || monitor.state === "failed",
+      createdAt: monitor.createdAt,
+    })),
+    ...automations.map((binding) => ({
+      row: automationProjection(binding),
+      live: binding.state === "active" || binding.state === "failed",
+      createdAt: binding.createdAt,
+    })),
+  ].sort((left, right) => Number(right.live) - Number(left.live) || right.createdAt - left.createdAt);
+  const packed: WatchRow[] = [];
   let bytes = 0;
-  for (const row of rows) {
+  for (const { row, live } of rows) {
     const clipped = {
       ...row,
-      instruction: clipInstruction(
-        row.instruction,
-        row.state === "active" || row.state === "armed" || row.state === "failed"
-          ? LIVE_INSTRUCTION_CHARS
-          : SETTLED_INSTRUCTION_CHARS,
-      ),
+      instruction: clipInstruction(row.instruction, live ? LIVE_INSTRUCTION_CHARS : SETTLED_INSTRUCTION_CHARS),
     };
     const size = Buffer.byteLength(JSON.stringify(clipped), "utf8");
     if (packed.length > 0 && bytes + size > MONITOR_LIST_BUDGET_BYTES) break;
     packed.push(clipped);
     bytes += size;
   }
-  return { monitors: packed, omitted: automations.length + monitors.length - packed.length };
+  return { monitors: packed, omitted: rows.length - packed.length };
 }
 
 /**
@@ -1064,7 +1055,7 @@ async function resolveTrustedScope(
       if (params.kind === "update_schedule") {
         const id = String(params.id);
         const binding = dependencies.automations?.get(id) ?? null;
-        const ownsAutomation = binding !== null &&
+        const ownsAutomation = binding !== null && ownerVisibleAutomation(binding) &&
           binding.controllerKey === authorized.controller.controllerKey &&
           binding.projectId === context.projectId &&
           binding.definition.mode === "agent" && binding.definition.trigger.kind === "cron" &&
@@ -1087,7 +1078,7 @@ async function resolveTrustedScope(
       const id = String(params.id);
       const monitor = dependencies.store.getControllerMonitor(authorized.controller.controllerKey, id);
       const automation = dependencies.automations?.get(id) ?? null;
-      const ownsAutomation = automation !== null &&
+      const ownsAutomation = automation !== null && ownerVisibleAutomation(automation) &&
         automation.controllerKey === authorized.controller.controllerKey &&
         automation.state !== "retired";
       return exactScope([`monitor:${id}`], monitor !== null || ownsAutomation, {
@@ -2325,6 +2316,13 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
     ]),
     execute: async (params, context, resolution, authorized) => {
       const controller = authorizedController(dependencies.store, context);
+      if (params.kind !== "thread_idle" && authorized.turn.origin !== "owner") {
+        // A scheduled or system turn acting on a schedule is the recursion
+        // the design forbids: a run may not grant itself new clock authority.
+        throw new Error(
+          "A clock schedule can be created or changed only in a turn the owner sent; a scheduled or system turn cannot widen automations.",
+        );
+      }
       if (params.kind === "schedule" && isLiveWorkPollingSchedule(params.instruction)) {
         throw new Error(
           "A repeating schedule cannot poll live work. Watch the worker BB thread with thread_idle; job progress is already event-driven.",
@@ -2354,7 +2352,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         if (!automations) throw new Error("BB Automations is not configured for this controller");
         if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
         const binding = automations.get(params.id);
-        if (!binding || binding.controllerKey !== controller.controllerKey ||
+        if (!binding || !ownerVisibleAutomation(binding) || binding.controllerKey !== controller.controllerKey ||
           binding.projectId !== context.projectId || binding.definition.mode !== "agent" ||
           binding.definition.trigger.kind !== "cron") {
           throw new Error("That managed BB schedule is unavailable");
@@ -2440,7 +2438,8 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       const controller = authorizedController(dependencies.store, context);
       return packWatchList(
         dependencies.store.listMonitors(controller.controllerKey, params.includeFinished),
-        dependencies.automations?.list(controller.controllerKey, params.includeFinished) ?? [],
+        (dependencies.automations?.list(controller.controllerKey, params.includeFinished) ?? [])
+          .filter(ownerVisibleAutomation),
       );
     },
   });

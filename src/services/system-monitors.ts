@@ -1,4 +1,3 @@
-import { nextCronOccurrence } from "./monitor-service";
 import type { TelegramAgentStore } from "../storage/store";
 import {
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
@@ -48,47 +47,6 @@ export const SYSTEM_MONITORS: readonly SystemMonitorDefinition[] = Object.freeze
 
 export function systemAutomationInstallationComplete(installed: number): boolean {
   return installed === SYSTEM_MONITORS.length;
-}
-
-export type SystemMonitorInstaller = {
-  store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "ensureSystemMonitor">;
-  clock: { now(): number };
-  warn?: (message: string) => void;
-};
-
-/**
- * Installs on the first pass that finds a paired owner, and stays idempotent
- * afterwards: pairing can happen long after the plugin starts, so this cannot
- * be a one-shot at activation.
- */
-export function installSystemMonitors(dependencies: SystemMonitorInstaller): number {
-  const owner = dependencies.store.getOwner();
-  if (!owner) return 0;
-  const controller = dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
-  if (!controller) return 0;
-  const now = dependencies.clock.now();
-  let installed = 0;
-  for (const definition of SYSTEM_MONITORS) {
-    const dueAt = nextCronOccurrence(definition.cron, now);
-    if (dueAt === null) {
-      dependencies.warn?.(`System monitor ${definition.systemKey} has an unusable schedule`);
-      continue;
-    }
-    try {
-      dependencies.store.ensureSystemMonitor({
-        systemKey: definition.systemKey,
-        controllerKey: controller.controllerKey,
-        cron: definition.cron,
-        instruction: definition.instruction,
-        dueAt,
-        now,
-      });
-      installed += 1;
-    } catch (error) {
-      dependencies.warn?.(`System monitor ${definition.systemKey} could not be installed`);
-    }
-  }
-  return installed;
 }
 
 export type SystemAutomationInstaller = Readonly<{

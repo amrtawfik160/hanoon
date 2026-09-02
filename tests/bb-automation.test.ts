@@ -3,6 +3,7 @@ import {
   assertAutomationMatches,
   buildAutomationRunsCommand,
   buildCreateAutomationCommand,
+  buildListAutomationsCommand,
   buildUpdateAutomationCommand,
   BbAutomationNotFoundError,
   TerminalBbAutomationAdapter,
@@ -72,11 +73,8 @@ describe("BB automation adapter", () => {
     expect(command.endsWith("--json")).toBe(true);
     expect(buildAutomationRunsCommand("proj_owner", "auto_1", 20))
       .toBe("bb automation runs 'auto_1' --project 'proj_owner' --limit '20' --json");
-    expect(new TerminalBbAutomationAdapter({ run: vi.fn() }).agentAutomationCapabilities).toEqual({
-      executionTimeout: false,
-      resultContract: false,
-      preRunAuthority: false,
-    });
+    expect(buildListAutomationsCommand("proj_owner"))
+      .toBe("bb automation list --project 'proj_owner' --json");
   });
 
   it("builds a complete project-bound definition update", () => {
@@ -93,12 +91,14 @@ describe("BB automation adapter", () => {
     expect(command.endsWith("--json")).toBe(true);
   });
 
-  it("does not accept create success until an exact show read-back passes", async () => {
-    const results: CommandResult[] = [
-      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
-      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
-    ];
-    const run = vi.fn(async (_input: unknown) => results.shift()!);
+  it("returns BB's create acknowledgement and leaves acceptance to the service", async () => {
+    // The service persists the returned id before the exact read-back, so the
+    // adapter must not hide a second command inside create.
+    const run = vi.fn(async (_input: unknown): Promise<CommandResult> => ({
+      outcome: "exited",
+      exitCode: 0,
+      output: JSON.stringify(observed()),
+    }));
     const adapter = new TerminalBbAutomationAdapter({ run });
 
     await expect(adapter.create({
@@ -106,24 +106,27 @@ describe("BB automation adapter", () => {
       definition,
     })).resolves.toMatchObject({ id: "auto_1", enabled: true });
 
-    expect(run).toHaveBeenCalledTimes(2);
-    expect((run.mock.calls[1]?.[0] as { command: string } | undefined)?.command)
-      .toBe("bb automation show 'auto_1' --project 'proj_owner' --json");
+    expect(run).toHaveBeenCalledTimes(1);
+    expect((run.mock.calls[0]?.[0] as { command: string } | undefined)?.command)
+      .toContain("bb automation create");
   });
 
-  it("fails closed when BB reads back a different schedule", async () => {
-    const results: CommandResult[] = [
-      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed()) },
-      { outcome: "exited", exitCode: 0, output: JSON.stringify(observed({
-        trigger: { triggerType: "schedule", cron: "0 10 * * *", timezone: "Etc/UTC" },
-      })) },
-    ];
-    const adapter = new TerminalBbAutomationAdapter({ run: async () => results.shift()! });
+  it("lists only automations it can read exactly, so a damaged record is never adopted", async () => {
+    const adapter = new TerminalBbAutomationAdapter({
+      run: async () => ({
+        outcome: "exited",
+        exitCode: 0,
+        output: JSON.stringify([
+          observed(),
+          { id: "auto_broken", projectId: "proj_owner", name: definition.name, problem: "invalid-stored-data" },
+        ]),
+      }),
+    });
 
-    await expect(adapter.create({
+    await expect(adapter.list({
       scope: { kind: "environment", environmentId: "env_owner" },
-      definition,
-    })).rejects.toThrow("schedule did not reconcile");
+      projectId: "proj_owner",
+    })).resolves.toEqual([observed()]);
   });
 
   it("can reconcile an intentionally paused automation without treating it as drift", () => {

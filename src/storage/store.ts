@@ -2958,6 +2958,49 @@ function hasMigration(db: SqliteDatabase, migrationId: number): boolean {
   return db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(migrationId) !== undefined;
 }
 
+const LEGACY_UNKNOWN_MIGRATION_HASH = "legacy-unknown";
+
+/**
+ * BB records a hash for every applied migration and refuses a statement whose
+ * hash differs from the recorded one. It also adopts rows that predate hash
+ * tracking, but only with the statements handed to that particular call.
+ * Because this store applies prefixes of ALL_MIGRATIONS before the full list,
+ * a host upgrade would adopt every row past the first prefix as
+ * "legacy-unknown", after which the full list could never match again
+ * (production, 2026-09-02). Recording the hashes from the complete list first,
+ * for rows that carry none, keeps the host's own check meaningful. A row whose
+ * recorded hash already disagrees is left alone so the host still refuses it.
+ */
+function adoptRecordedMigrationHashes(db: SqliteDatabase): void {
+  const table = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_bb_migrations'",
+  ).get();
+  if (table === undefined) return;
+  const columns = db.prepare("PRAGMA table_info(_bb_migrations)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "statement_hash")) {
+    db.exec("ALTER TABLE _bb_migrations ADD COLUMN statement_hash TEXT");
+  }
+  const unhashed = db.prepare(
+    "SELECT id FROM _bb_migrations WHERE statement_hash IS NULL OR statement_hash = ? ORDER BY id",
+  ).all(LEGACY_UNKNOWN_MIGRATION_HASH) as Array<{ id: number }>;
+  if (unhashed.length === 0) return;
+  const adopt = db.prepare(
+    `UPDATE _bb_migrations SET statement_hash = ?
+      WHERE id = ? AND (statement_hash IS NULL OR statement_hash = ?)`,
+  );
+  db.transaction(() => {
+    for (const row of unhashed) {
+      const statement = ALL_MIGRATIONS[row.id];
+      if (statement === undefined) continue;
+      adopt.run(
+        createHash("sha256").update(statement).digest("hex"),
+        row.id,
+        LEGACY_UNKNOWN_MIGRATION_HASH,
+      );
+    }
+  })();
+}
+
 type OpenControllerGenerationRow = Readonly<{
   id: string;
   controller_key: string;
@@ -3128,23 +3171,29 @@ export function migrateControllerInteractionStorage(
   assertNonNegativeInteger(now, "controller generation migration time");
   const db = storage.database();
   registerWorkArtifactRelationshipValidation(db);
-  storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
+  // Every prefix call must see a fully hashed ledger, or the host adopts the
+  // rows beyond that prefix as unknown and rejects the full list afterwards.
+  const migrate = (statements: readonly string[]): void => {
+    adoptRecordedMigrationHashes(db);
+    storage.migrate(db, [...statements]);
+  };
+  migrate(ALL_MIGRATIONS.slice(0, CONTROLLER_INTERACTION_TAIL_ID));
   if (hasMigration(db, CONTROLLER_INTERACTION_TAIL_ID)) {
-    storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
+    migrate(ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
     db.transaction(() => {
       restoreQuarantinedInteractions(db);
       preflightControllerGenerationConstraint(db, now);
-      storage.migrate(db, [...ALL_MIGRATIONS]);
+      migrate(ALL_MIGRATIONS);
     }).immediate();
     return;
   }
   db.transaction(() => {
     const legacy = validateLegacyControllerQuestions(db);
-    storage.migrate(db, ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
+    migrate(ALL_MIGRATIONS.slice(0, CONTROLLER_GENERATION_CONSTRAINT_ID));
     quarantineLegacyControllerQuestions(db, legacy.invalid);
     restoreQuarantinedInteractions(db);
     preflightControllerGenerationConstraint(db, now);
-    storage.migrate(db, [...ALL_MIGRATIONS]);
+    migrate(ALL_MIGRATIONS);
   }).immediate();
 }
 

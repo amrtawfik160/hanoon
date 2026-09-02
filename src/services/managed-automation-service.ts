@@ -5,7 +5,6 @@ import {
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
   type BbAutomation,
-  type BbAgentAutomationCapabilities,
   type BbAutomationDefinition,
   type BbAutomationRun,
   type BbAutomationTarget,
@@ -17,12 +16,16 @@ import {
 } from "../storage/managed-automation-repository";
 
 export type ManagedAutomationAdapter = Readonly<{
-  agentAutomationCapabilities: BbAgentAutomationCapabilities;
   create(input: {
     scope: TerminalScope;
     definition: BbAutomationDefinition;
     signal?: AbortSignal;
   }): Promise<BbAutomation>;
+  list(input: {
+    scope: TerminalScope;
+    projectId: string;
+    signal?: AbortSignal;
+  }): Promise<readonly BbAutomation[]>;
   update(input: {
     scope: TerminalScope;
     definition: BbAutomationDefinition;
@@ -65,15 +68,6 @@ export type ManagedAutomationAdapter = Readonly<{
   }): Promise<void>;
 }>;
 
-export class ManagedAgentExecutionContractUnsupportedError extends Error {
-  public readonly code = "BB_AGENT_EXECUTION_CONTRACT_UNSUPPORTED";
-
-  public constructor() {
-    super("BB cannot enforce this agent automation's execution contract");
-    this.name = "ManagedAgentExecutionContractUnsupportedError";
-  }
-}
-
 export type CreateManagedAutomationInput = Readonly<{
   scope: TerminalScope;
   controllerKey: string;
@@ -91,15 +85,6 @@ export type ManagedAutomationMutation = <T>(mutation: () => T) => T;
 
 function applyMutation<T>(mutate: ManagedAutomationMutation | undefined, mutation: () => T): T {
   return mutate ? mutate(mutation) : mutation();
-}
-
-function agentExecutionContractIsSupported(adapter: ManagedAutomationAdapter): boolean {
-  const support = adapter.agentAutomationCapabilities;
-  return support.executionTimeout && support.resultContract && support.preRunAuthority;
-}
-
-function assertAgentExecutionContractSupported(adapter: ManagedAutomationAdapter): void {
-  if (!agentExecutionContractIsSupported(adapter)) throw new ManagedAgentExecutionContractUnsupportedError();
 }
 
 async function deleteAutomationForRetirement(
@@ -129,7 +114,6 @@ export class ManagedAutomationService {
   }
 
   public async create(input: CreateManagedAutomationInput): Promise<ManagedAutomationBinding> {
-    if (input.definition.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     const reserved = applyMutation(input.mutate, () => this.repository.reserve({
       controllerKey: input.controllerKey,
       sourceKey: input.sourceKey,
@@ -167,37 +151,65 @@ export class ManagedAutomationService {
         signal: input.signal,
       });
     }
-    let automation: BbAutomation | null = null;
+    return this.createOnBb(reserved, input);
+  }
+
+  /**
+   * BB's create has no idempotency key, so the durable order is: adopt an
+   * automation already carrying this binding's deterministic name, else ask
+   * BB for one; persist the id; read it back exactly; only then activate.
+   * A crash anywhere in between is finished by reconciliation or by the next
+   * create, never by a second BB schedule.
+   */
+  private async createOnBb(
+    reserved: ManagedAutomationBinding,
+    input: CreateManagedAutomationInput,
+  ): Promise<ManagedAutomationBinding> {
+    const scope = { scope: input.scope, projectId: input.definition.projectId, signal: input.signal };
+    let attachedId: string | null = null;
+    let adopted = false;
     try {
-      automation = await this.adapter.create({
+      const orphan = (await this.adapter.list(scope))
+        .find((candidate) => candidate.name === input.definition.name) ?? null;
+      adopted = orphan !== null;
+      const created = orphan ?? await this.adapter.create({
         scope: input.scope,
         definition: input.definition,
         signal: input.signal,
       });
+      applyMutation(input.mutate, () => this.repository.attach({
+        id: reserved.id,
+        automationId: created.id,
+        now: input.now,
+      }));
+      attachedId = created.id;
+      const observed = await this.adapter.show({ ...scope, automationId: created.id });
+      assertAutomationMatches(input.definition, observed, adopted ? observed.enabled : true);
       return applyMutation(input.mutate, () => this.repository.activate({
         id: reserved.id,
-        automation: automation!,
+        automation: observed,
         now: input.now,
       }));
     } catch (error) {
-      if (automation !== null) {
+      let detach = false;
+      if (attachedId !== null && !adopted) {
+        // Hanoon asked for this automation and BB could not read it back
+        // exactly. Remove it so no hidden, untrusted schedule is left. An
+        // automation adopted by name is not Hanoon's to delete.
         try {
-          await this.adapter.delete({
-            scope: input.scope,
-            projectId: input.definition.projectId,
-            automationId: automation.id,
-            signal: input.signal,
-          });
+          await deleteAutomationForRetirement(this.adapter, { ...scope, automationId: attachedId });
+          detach = true;
         } catch {
-          // The durable binding remains pending/failed and cannot be reported
-          // as active. A later reconciliation must resolve this closed state.
+          // The binding keeps BB's id in a failed state, so reconciliation
+          // retries the exact read-back instead of creating a second schedule.
         }
       }
       try {
         applyMutation(input.mutate, () => this.repository.fail(
           reserved.id,
-          automationErrorClass(error),
+          adopted ? "bb_automation_name_conflict" : automationErrorClass(error),
           input.now,
+          { detach },
         ));
       } catch {
         // A stale controller fence is the primary failure and must not be
@@ -223,14 +235,6 @@ export class ManagedAutomationService {
         signal: input.signal,
       });
       return applyMutation(input.mutate, () => this.repository.retire(input.binding.id, input.now));
-    }
-    if (input.binding.mode === "agent" && !agentExecutionContractIsSupported(this.adapter)) {
-      return this.pauseForUnsupportedAgentExecution({
-        binding: input.binding,
-        scope: input.scope,
-        now: input.now,
-        signal: input.signal,
-      });
     }
     if (input.binding.mode === "agent" && !this.authorityIsCurrent(input.binding)) {
       return this.pauseForStaleAuthority({
@@ -300,7 +304,6 @@ export class ManagedAutomationService {
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
     const binding = requireActiveBinding(this.repository, input.id);
-    if (input.enabled && binding.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     if (input.enabled && binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
       throw new Error("managed automation authority is not current");
     }
@@ -322,7 +325,6 @@ export class ManagedAutomationService {
     mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
-    if (input.definition.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     const updating = applyMutation(input.mutate, () => this.repository.beginUpdate({
       id: input.id,
       definition: input.definition,
@@ -381,26 +383,6 @@ export class ManagedAutomationService {
     return this.repository.markPolicyBlocked(binding.id, input.now);
   }
 
-  public async pauseForUnsupportedAgentExecution(input: {
-    binding: ManagedAutomationBinding;
-    scope: TerminalScope;
-    now: number;
-    signal?: AbortSignal;
-  }): Promise<ManagedAutomationBinding> {
-    let binding = input.binding;
-    if (binding.observed?.enabled !== false) {
-      const paused = await this.adapter.setEnabled({
-        scope: input.scope,
-        projectId: binding.projectId,
-        automationId: binding.bbAutomationId!,
-        enabled: false,
-        signal: input.signal,
-      });
-      binding = this.repository.activate({ id: binding.id, automation: paused, now: input.now });
-    }
-    return this.repository.markExecutionContractBlocked(binding.id, input.now);
-  }
-
   public async runNow(input: {
     id: string;
     scope: TerminalScope;
@@ -409,7 +391,6 @@ export class ManagedAutomationService {
     signal?: AbortSignal;
   }): Promise<BbAutomationRun> {
     const binding = requireActiveBinding(this.repository, input.id);
-    if (binding.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     if (binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
       throw new Error("managed automation authority is not current");
     }
@@ -543,7 +524,10 @@ export class ManagedAutomationReconciler {
   public constructor(private readonly dependencies: Readonly<{
     repository: ManagedAutomationRepository;
     service: ManagedAutomationService;
-    store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "getProjectPolicy" | "enqueueControllerTurn">;
+    store: Pick<
+      TelegramAgentStore,
+      "getOwner" | "getControllerForOwner" | "getProjectPolicy" | "enqueueControllerTurn" | "cancelMonitor"
+    >;
     notify(): void;
     warn?(message: string): void;
   }>) {}
@@ -591,12 +575,18 @@ export class ManagedAutomationReconciler {
               signal,
             })
           : binding;
-        await this.dependencies.service.reconcile({
+        const reconciled = await this.dependencies.service.reconcile({
           binding: current,
           scope: { kind: "host_path", hostId, cwd: null },
           now,
           signal,
         });
+        if (reconciled.legacyMonitorId !== null &&
+          this.dependencies.store.cancelMonitor(reconciled.legacyMonitorId, now)) {
+          // The handover to BB was interrupted after BB had read the schedule
+          // back. Finishing it here keeps one task out of two schedulers.
+          this.dependencies.warn?.(`Managed automation ${binding.id} cancelled its leftover legacy schedule`);
+        }
         didWork = true;
       } catch {
         this.dependencies.warn?.(`Managed automation ${binding.id} could not be reconciled`);

@@ -58,6 +58,7 @@ function visibleThread(overrides: Partial<ThreadListEntry> = {}): ThreadListEntr
     },
     pinSortKey: null,
     hasPendingInteraction: false,
+    queuedWork: "none",
     environmentHostId: "host_cyndra",
     environmentName: "Cyndra worktree",
     environmentBranchName: "feature/billing",
@@ -1535,6 +1536,39 @@ it("rejects repeating schedules that poll live work", async () => {
     controllerToolContext,
   )).resolves.toContain('"kind":"schedule"');
   expect(automations.create).toHaveBeenCalledOnce();
+});
+
+it("refuses to create a clock schedule from a system-origin turn, so a scheduled run cannot widen automations", async () => {
+  const { bb, harness, store } = fixture({
+    active: true,
+    controllerTools: "all-tools",
+    origin: "system",
+    inputText: "A BB Automation run finished. Treat this as a scheduled system handoff, not a new owner request.",
+  });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )).rejects.toThrow(/turn the owner sent/i);
+  expect(automations.create).not.toHaveBeenCalled();
 });
 
 it("updates an owned BB schedule through the governed controller seam without widening its execution", async () => {

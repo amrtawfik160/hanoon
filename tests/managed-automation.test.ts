@@ -1,22 +1,16 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
-import type {
-  BbAutomation,
-  BbAutomationDefinition,
-  BbAutomationRun,
-} from "../src/bb/automation";
-import { BbAutomationNotFoundError, TerminalBbAutomationAdapter } from "../src/bb/automation";
+import type { BbAutomationDefinition, BbAutomationRun } from "../src/bb/automation";
 import {
   ManagedAutomationReconciler,
-  ManagedAgentExecutionContractUnsupportedError,
   ManagedAutomationService,
   migrateLegacyClockMonitor,
-  type ManagedAutomationAdapter,
 } from "../src/services/managed-automation-service";
 import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
-import { openStore, type MonitorRecord } from "../src/storage/store";
+import { openStore, type MonitorRecord, type TelegramAgentStore } from "../src/storage/store";
 import { hashSecret } from "../src/crypto";
 import { policyFixture } from "./helpers";
+import { createFakeBbAutomationAdapter, observedBbAutomation } from "./support/fake-bb-automation-adapter";
 
 const NOW = 1_800_000_000_000;
 const SCOPE = { kind: "environment", environmentId: "env_owner" } as const;
@@ -35,51 +29,6 @@ const definition: BbAutomationDefinition = {
   timeoutMs: 900_000,
   resultContract: { kind: "bounded-text", maximumBytes: 32_768 },
 };
-
-function automation(
-  value: BbAutomationDefinition = definition,
-  overrides: Partial<BbAutomation> = {},
-): BbAutomation {
-  return {
-    id: "auto_1",
-    projectId: value.projectId,
-    name: value.name,
-    enabled: true,
-    trigger: value.trigger.kind === "cron"
-      ? { triggerType: "schedule", cron: value.trigger.cron, timezone: value.trigger.timezone }
-      : { triggerType: "once", runAt: NOW + 60_000 },
-    execution: value.mode === "agent"
-      ? {
-          mode: "agent",
-          prompt: value.prompt,
-          providerId: value.providerId,
-          model: value.model,
-          ...(value.reasoningLevel ? { reasoningLevel: value.reasoningLevel } : {}),
-          ...(value.serviceTier ? { serviceTier: value.serviceTier } : {}),
-          permissionMode: value.permissionMode,
-          environment: { type: "project-default" },
-        }
-      : {
-          mode: "script",
-          interpreter: value.interpreter,
-          timeoutMs: value.timeoutMs,
-          script: value.source.kind === "inline" ? value.source.script : "",
-          env: value.env,
-          storedScriptPath: "/managed/script.sh",
-        },
-    origin: "agent",
-    createdByThreadId: "thr_controller",
-    nextRunAt: NOW + 60_000,
-    lastRunAt: null,
-    runCount: 0,
-    lastRunStatus: null,
-    lastRunThreadId: null,
-    lastError: null,
-    createdAt: NOW,
-    updatedAt: NOW,
-    ...overrides,
-  };
-}
 
 function runEvidence(overrides: Partial<BbAutomationRun> = {}): BbAutomationRun {
   return {
@@ -107,52 +56,23 @@ function fixture() {
   return { bb, store, repository };
 }
 
-function fakeAdapter() {
-  const automations = new Map<string, BbAutomation>();
-  const runs = new Map<string, BbAutomationRun[]>();
-  const create = vi.fn(async ({ definition: value }: { definition: BbAutomationDefinition }) => {
-    const created = automation(value, { id: `auto_${automations.size + 1}` });
-    automations.set(created.id, created);
-    return created;
+/** A paired owner whose controller row exists, so the reconciler has a current controller key. */
+function pairOwner(store: TelegramAgentStore, options: { projectEnabled?: boolean } = {}) {
+  store.createPairingCode(hashSecret("pair-automation"), NOW - 1_000, NOW + 10_000);
+  expect(store.pairOwnerWithPrivateChatCode(hashSecret("pair-automation"), "7", "70", NOW - 500)).toEqual({ ok: true });
+  store.enqueueControllerTurn({
+    controllerKey: "owner-7-controller",
+    telegramUserId: "7",
+    telegramChatId: "70",
+    updateId: 1,
+    inputText: "Create the controller fixture.",
+    now: NOW - 400,
   });
-  const adapter: ManagedAutomationAdapter = {
-    agentAutomationCapabilities: {
-      executionTimeout: true,
-      resultContract: true,
-      preRunAuthority: true,
-    },
-    create,
-    update: vi.fn(async ({ automationId, definition: value }) => {
-      const found = automations.get(automationId);
-      if (!found) throw new Error("missing automation");
-      const updated = automation(value, {
-        id: automationId,
-        enabled: found.enabled,
-        createdAt: found.createdAt,
-        updatedAt: NOW + 1,
-      });
-      automations.set(automationId, updated);
-      return updated;
-    }),
-    show: vi.fn(async ({ automationId }) => {
-      const found = automations.get(automationId);
-      if (!found) throw new Error("missing automation");
-      return found;
-    }),
-    setEnabled: vi.fn(async ({ automationId, enabled }) => {
-      const found = automations.get(automationId);
-      if (!found) throw new Error("missing automation");
-      const updated = { ...found, enabled, nextRunAt: enabled ? NOW + 60_000 : null };
-      automations.set(automationId, updated);
-      return updated;
-    }),
-    runNow: vi.fn(async ({ automationId }) => runEvidence({ automationId, trigger: "manual" })),
-    runs: vi.fn(async ({ automationId }) => runs.get(automationId) ?? []),
-    delete: vi.fn(async ({ automationId }) => {
-      if (!automations.delete(automationId)) throw new BbAutomationNotFoundError();
-    }),
-  };
-  return { adapter, automations, runs, create };
+  store.upsertProjectPolicy(policyFixture({
+    projectId: "proj_owner",
+    alias: "owner",
+    enabled: options.projectEnabled ?? true,
+  }), NOW - 300);
 }
 
 function createInput() {
@@ -174,26 +94,9 @@ function createInput() {
 }
 
 describe("managed BB automations", () => {
-  it("refuses an agent schedule before invoking BB when the installed contract cannot enforce its boundaries", async () => {
-    const { repository } = fixture();
-    const run = vi.fn();
-    const service = new ManagedAutomationService(
-      repository,
-      new TerminalBbAutomationAdapter({ run }),
-      () => true,
-    );
-
-    await expect(service.create(createInput())).rejects.toMatchObject({
-      code: "BB_AGENT_EXECUTION_CONTRACT_UNSUPPORTED",
-    });
-
-    expect(run).not.toHaveBeenCalled();
-    expect(service.list("owner-7-controller")).toEqual([]);
-  });
-
   it("restarts by reconciling the same durable BB id without creating a duplicate", async () => {
     const { repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const firstService = new ManagedAutomationService(repository, fake.adapter, () => true);
     const created = await firstService.create(createInput());
     fake.runs.set(created.bbAutomationId!, [runEvidence({ automationId: created.bbAutomationId! })]);
@@ -207,9 +110,92 @@ describe("managed BB automations", () => {
     expect(fake.create).toHaveBeenCalledTimes(1);
   });
 
+  it("adopts an automation already carrying the binding's name instead of asking BB for a second one", async () => {
+    // BB's create has no idempotency key. If the acknowledgement never reached
+    // Hanoon, the schedule still exists under the deterministic name.
+    const { repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    const orphan = observedBbAutomation(definition, NOW, { id: "auto_orphan" });
+    fake.automations.set(orphan.id, orphan);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+
+    const binding = await service.create(createInput());
+
+    expect(binding).toMatchObject({ state: "active", bbAutomationId: "auto_orphan" });
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(fake.automations.size).toBe(1);
+  });
+
+  it("refuses to adopt a same-named automation whose definition differs and leaves it untouched", async () => {
+    const { repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    const stranger = observedBbAutomation(definition, NOW, {
+      id: "auto_stranger",
+      trigger: { triggerType: "schedule", cron: "*/5 * * * *", timezone: "Etc/UTC" },
+    });
+    fake.automations.set(stranger.id, stranger);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+
+    await expect(service.create(createInput())).rejects.toThrow("schedule did not reconcile");
+
+    expect(fake.create).not.toHaveBeenCalled();
+    expect(fake.adapter.delete).not.toHaveBeenCalled();
+    expect(fake.automations.get("auto_stranger")).toEqual(stranger);
+    expect(service.list("owner-7-controller")).toMatchObject([{
+      state: "failed",
+      lastError: "bb_automation_name_conflict",
+      bbAutomationId: "auto_stranger",
+    }]);
+  });
+
+  it("removes a schedule BB cannot read back exactly and starts clean on the next create", async () => {
+    const { repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    vi.mocked(fake.adapter.show).mockRejectedValueOnce(new Error("BB read timed out"));
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+
+    await expect(service.create(createInput())).rejects.toThrow("timed out");
+
+    // No hidden schedule survives an unverified create, and the binding no
+    // longer points at the deleted id.
+    expect(fake.automations.size).toBe(0);
+    expect(service.list("owner-7-controller")).toMatchObject([{
+      state: "failed",
+      lastError: "bb_automation_timeout",
+      bbAutomationId: null,
+    }]);
+
+    const retried = await service.create({ ...createInput(), now: NOW + 1 });
+
+    expect(retried).toMatchObject({ state: "active", bbAutomationId: "auto_1" });
+    expect(fake.create).toHaveBeenCalledTimes(2);
+    expect(fake.automations.size).toBe(1);
+  });
+
+  it("keeps BB's id when a mismatched schedule cannot be deleted, so reconciliation retries the read-back", async () => {
+    const { repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    vi.mocked(fake.adapter.show).mockResolvedValueOnce(observedBbAutomation(definition, NOW, {
+      trigger: { triggerType: "schedule", cron: "0 9 * * *", timezone: "Etc/UTC" },
+    }));
+    vi.mocked(fake.adapter.delete).mockRejectedValueOnce(new Error("Permission denied"));
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+
+    await expect(service.create(createInput())).rejects.toThrow("schedule did not reconcile");
+
+    const failed = service.get(service.list("owner-7-controller")[0]!.id)!;
+    expect(failed).toMatchObject({ state: "failed", bbAutomationId: "auto_1" });
+    expect(repository.listReconciliationCandidates(NOW + 1)).toMatchObject([{ id: failed.id }]);
+
+    await service.reconcile({ binding: failed, scope: SCOPE, now: NOW + 2 });
+
+    expect(service.get(failed.id)).toMatchObject({ state: "active", bbAutomationId: "auto_1" });
+    expect(fake.create).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps run evidence append-only and de-duplicates a repeated observation", async () => {
     const { bb, repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     const run = runEvidence({ automationId: binding.bbAutomationId! });
@@ -223,7 +209,7 @@ describe("managed BB automations", () => {
 
   it("screens worker output and errors before durable evidence or controller handoff", async () => {
     const { bb, repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     const privateOutput = "deployment token: telegram-worker-output-secret";
@@ -251,7 +237,7 @@ describe("managed BB automations", () => {
 
   it("fails closed when an agent result exceeds its declared result contract", async () => {
     const { bb, repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
 
@@ -273,9 +259,26 @@ describe("managed BB automations", () => {
     });
   });
 
+  it("classifies a run that outlived its declared timeout instead of claiming BB stopped it", async () => {
+    const { bb, repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+
+    repository.recordRun(binding.id, runEvidence({
+      automationId: binding.bbAutomationId!,
+      startedAt: NOW,
+      finishedAt: NOW + definition.timeoutMs + 1,
+    }), NOW + definition.timeoutMs + 2);
+
+    expect(bb.storage.database().prepare(
+      `SELECT error_class FROM managed_automation_run_evidence WHERE bb_run_id = 'run_1'`,
+    ).get()).toEqual({ error_class: "bb_automation_timeout_contract_violated" });
+  });
+
   it("persists retirement intent before deleting and reconciles an interrupted retirement", async () => {
     const { repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     let mutationCount = 0;
@@ -298,9 +301,26 @@ describe("managed BB automations", () => {
     expect(fake.adapter.delete).toHaveBeenCalledTimes(2);
   });
 
+  it("re-arms a retired source when it is created again, instead of rejecting the source forever", async () => {
+    // Self-maintenance toggled off retires the upkeep bindings; toggled back
+    // on, the same source keys must be installable again.
+    const { repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    const binding = await service.create(createInput());
+    await service.retire({ id: binding.id, scope: SCOPE, now: NOW + 1 });
+    expect(service.get(binding.id)?.state).toBe("retired");
+
+    const rearmed = await service.create({ ...createInput(), now: NOW + 2 });
+
+    expect(rearmed).toMatchObject({ id: binding.id, state: "active" });
+    expect(rearmed.bbAutomationId).not.toBeNull();
+    expect(fake.create).toHaveBeenCalledTimes(2);
+  });
+
   it("reconciles an interrupted governed definition update from durable intent", async () => {
     const { repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     const updatedDefinition: BbAutomationDefinition = {
@@ -331,23 +351,8 @@ describe("managed BB automations", () => {
 
   it("records running and terminal states once, then hands the terminal result to the controller exactly once", async () => {
     const { bb, store, repository } = fixture();
-    store.createPairingCode(hashSecret("pair-automation"), NOW - 1_000, NOW + 10_000);
-    expect(store.pairOwnerWithPrivateChatCode(
-      hashSecret("pair-automation"),
-      "7",
-      "70",
-      NOW - 500,
-    )).toEqual({ ok: true });
-    store.enqueueControllerTurn({
-      controllerKey: "owner-7-controller",
-      telegramUserId: "7",
-      telegramChatId: "70",
-      updateId: 1,
-      inputText: "Create the controller fixture.",
-      now: NOW - 400,
-    });
-    store.upsertProjectPolicy(policyFixture({ projectId: "proj_owner", alias: "owner" }), NOW - 300);
-    const fake = fakeAdapter();
+    pairOwner(store);
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     fake.runs.set(binding.bbAutomationId!, [
@@ -382,27 +387,8 @@ describe("managed BB automations", () => {
 
   it("pauses a scheduled agent before reading runs when its stored authority is no longer current", async () => {
     const { store, repository } = fixture();
-    store.createPairingCode(hashSecret("pair-policy-gate"), NOW - 1_000, NOW + 10_000);
-    expect(store.pairOwnerWithPrivateChatCode(
-      hashSecret("pair-policy-gate"),
-      "7",
-      "70",
-      NOW - 500,
-    )).toEqual({ ok: true });
-    store.enqueueControllerTurn({
-      controllerKey: "owner-7-controller",
-      telegramUserId: "7",
-      telegramChatId: "70",
-      updateId: 1,
-      inputText: "Create the controller fixture.",
-      now: NOW - 400,
-    });
-    store.upsertProjectPolicy(policyFixture({
-      projectId: "proj_owner",
-      alias: "owner",
-      enabled: false,
-    }), NOW - 300);
-    const fake = fakeAdapter();
+    pairOwner(store, { projectEnabled: false });
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const binding = await service.create(createInput());
     fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
@@ -423,72 +409,40 @@ describe("managed BB automations", () => {
     });
   });
 
-  it("pauses an existing agent schedule before reading runs when BB cannot enforce its execution contract", async () => {
-    const { repository } = fixture();
-    const fake = fakeAdapter();
-    const supportedService = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await supportedService.create(createInput());
-    fake.runs.set(binding.bbAutomationId!, [runEvidence({ automationId: binding.bbAutomationId! })]);
-    const service = new ManagedAutomationService(repository, {
-      ...fake.adapter,
-      agentAutomationCapabilities: {
-        executionTimeout: false,
-        resultContract: false,
-        preRunAuthority: false,
-      },
-    }, () => true);
-
-    await service.reconcile({ binding, scope: SCOPE, now: NOW + 1 });
-
-    expect(fake.adapter.setEnabled).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
-    expect(fake.adapter.runs).not.toHaveBeenCalled();
-    expect(service.get(binding.id)).toMatchObject({
-      state: "paused",
-      lastError: "bb_agent_execution_contract_unsupported",
+  it("finishes an interrupted legacy handover on the next sweep, so one task never fires through two schedulers", async () => {
+    const { store, repository } = fixture();
+    pairOwner(store);
+    const legacy = store.createMonitor({
+      controllerKey: "owner-7-controller",
+      kind: "schedule",
+      cron: definition.trigger.kind === "cron" ? definition.trigger.cron : "0 8 * * *",
+      instruction: definition.prompt,
+      dueAt: NOW + 60_000,
+      now: NOW,
     });
-  });
+    const fake = createFakeBbAutomationAdapter(NOW);
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    // BB has read the schedule back and the binding is active, but the process
+    // died before the local clock row was cancelled.
+    const binding = await service.create({ ...createInput(), legacyMonitorId: legacy.id });
+    expect(binding.state).toBe("active");
+    expect(store.listArmedMonitors(10)).toMatchObject([{ id: legacy.id, state: "armed" }]);
+    const reconciler = new ManagedAutomationReconciler({
+      repository,
+      service,
+      store,
+      notify: vi.fn(),
+    });
 
-  it("refuses resume, update, and manual execution when an agent contract is unsupported", async () => {
-    const { repository } = fixture();
-    const fake = fakeAdapter();
-    const supportedService = new ManagedAutomationService(repository, fake.adapter, () => true);
-    const binding = await supportedService.create(createInput());
-    const adapter: ManagedAutomationAdapter = {
-      ...fake.adapter,
-      agentAutomationCapabilities: {
-        executionTimeout: false,
-        resultContract: false,
-        preRunAuthority: false,
-      },
-    };
-    const service = new ManagedAutomationService(repository, adapter, () => true);
-    vi.mocked(fake.adapter.setEnabled).mockClear();
-    vi.mocked(fake.adapter.update).mockClear();
-    vi.mocked(fake.adapter.runNow).mockClear();
+    await reconciler.processDue(NOW + 60_001);
 
-    await expect(service.setEnabled({ id: binding.id, scope: SCOPE, enabled: true, now: NOW + 1 }))
-      .rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
-    await expect(service.update({
-      id: binding.id,
-      scope: SCOPE,
-      definition: { ...definition, prompt: "Updated prompt" },
-      now: NOW + 1,
-    })).rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
-    await expect(service.runNow({
-      id: binding.id,
-      scope: SCOPE,
-      idempotencyKey: "manual-unsupported",
-      now: NOW + 1,
-    })).rejects.toBeInstanceOf(ManagedAgentExecutionContractUnsupportedError);
-
-    expect(fake.adapter.setEnabled).not.toHaveBeenCalled();
-    expect(fake.adapter.update).not.toHaveBeenCalled();
-    expect(fake.adapter.runNow).not.toHaveBeenCalled();
+    expect(store.listMonitors("owner-7-controller", true)).toMatchObject([{ id: legacy.id, state: "cancelled" }]);
+    expect(service.get(binding.id)?.state).toBe("active");
   });
 
   it("does not create a scheduled agent when its current authority preflight fails", async () => {
     const { repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => false);
 
     await expect(service.create(createInput())).rejects.toThrow("authority is not current");
@@ -510,7 +464,7 @@ describe("managed BB automations", () => {
       dueAt: NOW + 60_000,
       now: NOW,
     });
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
 
     const binding = await migrateLegacyClockMonitor({
@@ -541,7 +495,7 @@ describe("managed BB automations", () => {
       dueAt: NOW + 60_000,
       now: NOW,
     });
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, {
       ...fake.adapter,
       create: vi.fn(async () => { throw new Error("BB read-back mismatch"); }),
@@ -565,7 +519,7 @@ describe("managed BB automations", () => {
 
   it("pauses BB if the local disable fence is lost, so two schedulers cannot stay active", async () => {
     const { repository } = fixture();
-    const fake = fakeAdapter();
+    const fake = createFakeBbAutomationAdapter(NOW);
     const service = new ManagedAutomationService(repository, fake.adapter, () => true);
     const monitor: MonitorRecord = {
       id: "mon_legacy",

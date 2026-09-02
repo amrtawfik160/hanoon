@@ -257,10 +257,6 @@ const PLAIN_JOB_STATE: Readonly<Record<JobState, string>> = Object.freeze({
   merged: "merged",
 });
 
-function plainJobState(state: JobState): string {
-  return PLAIN_JOB_STATE[state];
-}
-
 function html(value: unknown, maxLength: number): string {
   const source = redact(typeof value === "string" ? value : String(value ?? ""));
   let result = "";
@@ -650,7 +646,7 @@ export function renderJobStatus(
     `Project: <code>${html(policy?.alias ?? job.projectId ?? "unselected", 80)}</code>`,
   ];
   if (policy) lines.push(`Base: <code>${html(policy.baseBranch, 120)}</code>`);
-  lines.push(`Status: ${html(queuedConfirmed ? "waiting for a free slot" : plainJobState(job.state), 80)}`);
+  lines.push(`Status: ${html(queuedConfirmed ? "waiting for a free slot" : PLAIN_JOB_STATE[job.state], 80)}`);
   lines.push(`Delivery: ${html(deliveryState(job), 80)}`);
   // Whoever reads this card should never have to wonder whether they asked for
   // this, so a job nobody asked for says so before it says anything else about

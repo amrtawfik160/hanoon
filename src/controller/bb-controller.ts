@@ -25,6 +25,8 @@ export type ControllerLocation = {
 export type ControllerStatus =
   | "idle"
   | "active"
+  /** BB has accepted the thread but has not started its provider session yet. */
+  | "pending"
   | "starting"
   | "stopping"
   | "error"

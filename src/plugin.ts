@@ -1424,6 +1424,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     warn: (message) => bb.log.warn(message),
   });
   let systemMonitorsInstalled = false;
+  let nextSystemAutomationAttemptAt = 0;
   const systemMonitors = {
     install: async () => {
       // Turning the setting off has to retire what is already armed, or the
@@ -1451,6 +1452,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       }
       if (systemMonitorsInstalled) return;
       if (!config.ok) return;
+      // Installing goes through `bb automation` commands. A BB outage must not
+      // turn every executor pass into a burst of failed commands, so a partial
+      // install is retried about once a minute rather than on every pass.
+      const attemptAt = clock();
+      if (attemptAt < nextSystemAutomationAttemptAt) return;
+      nextSystemAutomationAttemptAt = attemptAt + 60_000;
       const execution = controllerExecutionProfile(config.value);
       const installed = await installSystemAutomations({
         store,

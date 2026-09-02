@@ -426,7 +426,7 @@ export class LunaControllerService {
       );
       return true;
     }
-    if (status === "active" || status === "starting" || status === "stopping") {
+    if (status === "active" || status === "pending" || status === "starting" || status === "stopping") {
       if (!accepted) {
         this.dependencies.store.refreshControllerDraft({
           ...fenceAt(fence, refreshedAt),
