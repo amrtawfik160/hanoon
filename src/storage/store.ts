@@ -323,7 +323,6 @@ import {
   createNavigatorCoordinatorPersistence,
   type NavigatorCoordinatorPersistence,
 } from "../navigator/coordinator-persistence";
-import type { NavigatorTicketWorkerOutcome } from "../navigator/ticket-settlement-repository";
 import { NavigatorFindingLedger } from "../navigator/finding-ledger";
 import { NavigatorFindingLedgerRepository } from "../navigator/finding-ledger-repository";
 import {
@@ -354,9 +353,6 @@ import type {
   NavigatorCapabilityEvidence,
   NavigatorCapabilityOperation,
   NavigatorTicketAttemptContext,
-  NavigatorTicketSettlementInput,
-  NavigatorTicketWorkerResourceBindingInput,
-  NavigatorSkillReceipt,
 } from "../navigator/effect-contracts";
 
 /**
@@ -4047,8 +4043,6 @@ export interface TelegramAgentStore {
     generation: number;
     now: number;
   }): NavigatorTicketAttemptContext | null;
-  bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean;
-  settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
     attemptId: string;
@@ -12709,14 +12703,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number;
   }): NavigatorTicketAttemptContext | null {
     return this.navigatorRepository.getNavigatorTicketAttemptContext(input);
-  }
-
-  public bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
-    return this.navigatorRepository.bindNavigatorTicketWorkerResource(input);
-  }
-
-  public settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null {
-    return this.navigatorRepository.settleNavigatorTicketWorkerAttempt(input);
   }
 
   public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {

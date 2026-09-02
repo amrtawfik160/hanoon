@@ -16,6 +16,12 @@ import { hashSecret } from "../src/crypto";
 import { classifyTaskTraits } from "../src/capabilities/routing";
 import { selectControllerCapabilityProfile } from "../src/capabilities/controller-bundles";
 import { DualEngineCoordinator, DualEngineContractionError } from "../src/navigator/coordinator";
+import type { NavigatorEffectPersistence } from "../src/navigator/effect-persistence";
+import {
+  NAVIGATOR_EFFECT_KINDS,
+  type NavigatorEffectKind,
+  type NavigatorEffectProtocolDependencies,
+} from "../src/navigator/effect-protocol";
 import { workflowIdentityForNewAdmission } from "../src/navigator/promotion";
 import { transition } from "../src/domain/state-machine";
 import { openStore, openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
@@ -25,6 +31,30 @@ import { completeTurnThroughFinalization } from "./support/controller-trust-fixt
 const REPOSITORY_ROOT = new URL("..", import.meta.url).pathname;
 const DUAL_ENGINE_HEAD = "0fa9d232eef21ff33d34de86011ea3c8cddf6192";
 const HISTORICAL_RECEIPT_DIGEST = "a".repeat(64);
+
+type TypeAssertion<Condition extends true> = Condition;
+type NavigatorProtocolPersistence = NavigatorEffectProtocolDependencies["store"];
+type NavigatorSettlementMethodByKind = {
+  run_navigator_skill: "settleNavigatorSkillAttempt";
+  run_navigator_ticket_worker: "settleNavigatorTicketWorkerAttempt";
+  run_navigator_release: "settleNavigatorReleaseEffect";
+};
+type NavigatorKindsWithOwnedSettlement = {
+  [Kind in NavigatorEffectKind]: NavigatorSettlementMethodByKind[Kind] extends keyof NavigatorProtocolPersistence
+    ? true
+    : false;
+}[NavigatorEffectKind];
+
+type _BroadStoreCannotBindTicketWorkerResource = TypeAssertion<
+  "bindNavigatorTicketWorkerResource" extends keyof TelegramAgentStore ? false : true
+>;
+type _BroadStoreCannotSettleTicketWorkerAttempt = TypeAssertion<
+  "settleNavigatorTicketWorkerAttempt" extends keyof TelegramAgentStore ? false : true
+>;
+type _ProtocolUsesOwnedNavigatorPersistence = TypeAssertion<
+  NavigatorProtocolPersistence extends NavigatorEffectPersistence ? true : false
+>;
+type _EveryNavigatorKindHasOwnedSettlement = TypeAssertion<NavigatorKindsWithOwnedSettlement>;
 
 let fixtureSequence = 0;
 
@@ -245,6 +275,40 @@ describe("contracted new-work admission", () => {
     expect(copy.traits).toEqual([]);
     expect(migrate.traits).toEqual([]);
     expect(copy.reasonCodes.every((code) => code.startsWith("controller_bundle:"))).toBe(true);
+  });
+});
+
+describe("Navigator effect persistence contraction", () => {
+  it("keeps ticket worker transitions off the broad store and on the shared protocol seam", () => {
+    const broadStoreSource = readFileSync(join(REPOSITORY_ROOT, "src/storage/store.ts"), "utf8");
+    const ownedPersistenceSource = readFileSync(join(REPOSITORY_ROOT, "src/navigator/effect-persistence.ts"), "utf8");
+    const protocolSource = readFileSync(join(REPOSITORY_ROOT, "src/navigator/effect-protocol.ts"), "utf8");
+    const facadeStart = broadStoreSource.indexOf("export interface TelegramAgentStore");
+    const ownedCompositionStart = broadStoreSource.indexOf("function createNavigatorEffectPersistence");
+    expect(facadeStart).toBeGreaterThanOrEqual(0);
+    expect(ownedCompositionStart).toBeGreaterThan(facadeStart);
+    const broadFacadeSource = broadStoreSource.slice(facadeStart, ownedCompositionStart);
+    const ownedCompositionSource = broadStoreSource.slice(ownedCompositionStart);
+
+    expect(broadFacadeSource).not.toContain("bindNavigatorTicketWorkerResource");
+    expect(broadFacadeSource).not.toContain("settleNavigatorTicketWorkerAttempt");
+    expect(ownedPersistenceSource).toContain("bindNavigatorTicketWorkerResource");
+    expect(ownedPersistenceSource).toContain("settleNavigatorTicketWorkerAttempt");
+    expect(ownedCompositionSource).toContain("bindNavigatorTicketWorkerResource: (input) => navigatorRepository.bindNavigatorTicketWorkerResource(input)");
+    expect(ownedCompositionSource).toContain("settleNavigatorTicketWorkerAttempt: (input) => navigatorRepository.settleNavigatorTicketWorkerAttempt(input)");
+    expect(NAVIGATOR_EFFECT_KINDS).toEqual([
+      "run_navigator_skill",
+      "run_navigator_ticket_worker",
+      "run_navigator_release",
+    ]);
+    for (const method of [
+      "this.dependencies.store.leaseNavigatorEffect",
+      "this.dependencies.store.settleNavigatorSkillAttempt",
+      "this.dependencies.store.settleNavigatorTicketWorkerAttempt",
+      "this.dependencies.store.settleNavigatorReleaseEffect",
+    ]) {
+      expect(protocolSource).toContain(method);
+    }
   });
 });
 
