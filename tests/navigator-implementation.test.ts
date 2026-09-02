@@ -912,7 +912,7 @@ describe("navigator ticket integration executor", () => {
     });
   });
 
-  it("appends a checked root-cause correction without rewriting the prior finding fact", async () => {
+  it("ticket #64 keeps a confirmed root current until a correction is independently confirmed", async () => {
     const value = fixture();
     const { executor } = prepareTicketEffectForProtocol(value, 1_110);
     const proposedRoot = {
@@ -975,6 +975,60 @@ describe("navigator ticket integration executor", () => {
       expect.objectContaining({ rootCauseId: "root-cause-a", state: "open", occurrence: 1 }),
     ]);
 
+    const confirmed = executor.snapshot(value.jobId);
+    const sourceAttempt = confirmed.attempts.find((attempt) =>
+      attempt.kind === "review" && attempt.workOrder.verificationOf === undefined);
+    const sourceOutcome = sourceAttempt === undefined
+      ? undefined
+      : confirmed.outcomes.find((outcome) => outcome.attemptId === sourceAttempt.id);
+    const implementationAttempt = confirmed.attempts.find((attempt) => attempt.kind === "implementation");
+    const guard = sourceAttempt?.profile.assignments.find(({ capabilityId }) => capabilityId === "clean-code-guard");
+    if (!confirmed.activeSlice || !sourceAttempt || !sourceOutcome || !implementationAttempt || !guard) {
+      throw new Error("ticket #64 fixture did not produce a confirmed root-a review");
+    }
+    const sliceId = confirmed.activeSlice.id;
+    const ledger = new NavigatorFindingLedger(new NavigatorFindingLedgerRepository(value.database));
+    const assessRootB = (
+      verificationAttemptId: string,
+      verificationAttemptDigest: string,
+      confirmedFindings: readonly NavigatorReviewFinding[],
+    ) => ledger.assess({
+      jobId: value.jobId,
+      sliceId,
+      sourceReviewAttemptId: sourceAttempt.id,
+      verificationAttemptId,
+      sourceAttemptDigest: sourceOutcome.resultDigest,
+      verificationAttemptDigest,
+      exactHeadSha: SHA.ticketOne,
+      artifactSnapshotId: sourceAttempt.workOrder.ticket.snapshotId,
+      artifactSnapshotDigest: sourceAttempt.workOrder.ticket.snapshotDigest,
+      specificationSnapshotId: sourceAttempt.workOrder.specification.snapshotId,
+      specificationSnapshotDigest: sourceAttempt.workOrder.specification.snapshotDigest,
+      selectedGuards: [{ capabilityId: guard.capabilityId, descriptorDigest: guard.descriptorDigest }],
+      requirementIds: [],
+      proposedFindings: [correctedRoot],
+      confirmedFindings,
+      evidenceRefs: [`verification:${verificationAttemptId}`],
+      now: value.now(),
+      maxReviewCycles: 3,
+    });
+
+    const unconfirmedDecision = assessRootB(implementationAttempt.id, "b".repeat(64), []);
+    expect(unconfirmedDecision.entries).toEqual([
+      expect.objectContaining({
+        rootCauseId: "root-cause-a",
+        state: "open",
+        disposition: "must_fix",
+        blockingBurden: 1,
+      }),
+    ]);
+    expect(unconfirmedDecision).toMatchObject({
+      allowedNextAction: "repair",
+      blockingBurden: 1,
+      burdenDelta: 0,
+    });
+    expect(executor.snapshot(value.jobId).activeSlice?.state).toBe("repair_pending");
+
     const repairSnapshot = executor.prepareRepairNavigation({
       jobId: value.jobId,
       ticketArtifactId: value.ticketIds[0],
@@ -1000,16 +1054,52 @@ describe("navigator ticket integration executor", () => {
     await protocol.processOne(fence, new AbortController().signal);
     await protocol.processOne(fence, new AbortController().signal);
 
-    expect(executor.snapshot(value.jobId).findingLedger).toEqual([
-      expect.objectContaining({ rootCauseId: "root-cause-b", state: "open", occurrence: 2 }),
+    const corrected = executor.snapshot(value.jobId);
+    expect(corrected.findingLedger).toEqual([
+      expect.objectContaining({
+        rootCauseId: "root-cause-b",
+        state: "open",
+        occurrence: 2,
+        supersedesRootCauseId: "root-cause-a",
+      }),
     ]);
-    expect(value.database.prepare(
-      `SELECT event, root_cause_id, fingerprint, occurrence
+    const events = value.database.prepare(
+      `SELECT event, root_cause_id, fingerprint, occurrence, blocking_burden,
+              root_cause_confirmed, supersedes_root_cause_id
          FROM navigator_review_finding_events
         WHERE slice_id = ? ORDER BY sequence`,
-    ).all(repairSnapshot.sliceId)).toEqual([
+    ).all(sliceId) as Array<{
+      event: string;
+      root_cause_id: string;
+      fingerprint: string;
+      occurrence: number;
+      blocking_burden: number;
+      root_cause_confirmed: number;
+      supersedes_root_cause_id: string | null;
+    }>;
+    expect(events).toEqual([
       expect.objectContaining({ event: "opened", root_cause_id: "root-cause-a", occurrence: 1 }),
-      expect.objectContaining({ event: "corrected", root_cause_id: "root-cause-b", occurrence: 2 }),
+      expect.objectContaining({
+        event: "disputed",
+        root_cause_id: "root-cause-b",
+        occurrence: 1,
+        blocking_burden: 1,
+        root_cause_confirmed: 0,
+        supersedes_root_cause_id: null,
+      }),
+      expect.objectContaining({
+        event: "corrected",
+        root_cause_id: "root-cause-b",
+        occurrence: 2,
+        blocking_burden: 1,
+        root_cause_confirmed: 1,
+        supersedes_root_cause_id: "root-cause-a",
+      }),
+    ]);
+    expect(events.map((event) => event.fingerprint)).toEqual([
+      events[0]?.fingerprint,
+      events[0]?.fingerprint,
+      events[0]?.fingerprint,
     ]);
   });
 

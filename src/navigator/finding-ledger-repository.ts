@@ -132,6 +132,10 @@ function stateFor(event: FindingEvent, rootCauseConfirmed = true): NavigatorFind
   return event === "resolved" ? "resolved" : "disputed";
 }
 
+function rootCauseWasConfirmed(row: FindingEventRow): boolean {
+  return row.root_cause_confirmed !== 0 || ["opened", "reobserved", "resolved"].includes(row.event);
+}
+
 function identityFor(row: FindingEventRow): string {
   return row.fingerprint && row.fingerprint.length === 64 ? row.fingerprint : `legacy:${row.root_cause_id}`;
 }
@@ -312,9 +316,7 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     }
     const sourceKeys = new Set(input.findings.map(({ fingerprint }) => fingerprint));
     const priorByKey = new Map(priorRows.map((row) => [identityFor(row), row]));
-    const burden = new Set(input.findings
-      .filter(({ confirmed, disposition }) => confirmed && disposition === "must_fix")
-      .map(({ proposed }) => proposed.rootCauseId)).size;
+    const burden = this.assessmentBlockingBurden(input.findings, priorRows);
     this.writeAssessmentEvents(input, priorByKey, burden);
     this.resolveMissingRoots(input, priorRows, sourceKeys, burden);
     const reasonCode = this.updateConvergence(input.input, burden, convergence);
@@ -405,7 +407,7 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
     for (const fact of facts.findings) {
       const prior = priorByKey.get(fact.fingerprint);
       const occurrence = fact.confirmed ? Math.min(3, (prior?.occurrence ?? 0) + 1) : (prior?.occurrence ?? 0);
-      const corrected = prior !== undefined && prior.root_cause_id !== fact.proposed.rootCauseId;
+      const corrected = fact.confirmed && prior !== undefined && prior.root_cause_id !== fact.proposed.rootCauseId;
       const priorState = prior === undefined ? null : stateFor(prior.event, prior.root_cause_confirmed !== 0);
       const event: FindingEvent = corrected
         ? "corrected"
@@ -424,6 +426,24 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
         supersedesRootCauseId: corrected ? prior.root_cause_id : null,
       });
     }
+  }
+
+  private assessmentBlockingBurden(
+    facts: readonly NavigatorFindingAssessmentFact[],
+    priorRows: readonly FindingEventRow[],
+  ): number {
+    const priorByKey = new Map(priorRows.map((row) => [identityFor(row), row]));
+    const blockingRoots = new Set<string>();
+    for (const fact of facts) {
+      if (fact.confirmed) {
+        if (fact.disposition === "must_fix") blockingRoots.add(fact.proposed.rootCauseId);
+        continue;
+      }
+      const prior = priorByKey.get(fact.fingerprint);
+      if (prior && rootCauseWasConfirmed(prior) && stateFor(prior.event, prior.root_cause_confirmed !== 0) === "open" &&
+        prior.disposition === "must_fix") blockingRoots.add(prior.root_cause_id);
+    }
+    return blockingRoots.size;
   }
 
   private resolveMissingRoots(
@@ -535,6 +555,17 @@ export class NavigatorFindingLedgerRepository implements NavigatorFindingLedgerP
              WHERE newest.slice_id = event.slice_id
                AND COALESCE(NULLIF(newest.fingerprint, ''), 'legacy:' || newest.root_cause_id) =
                    COALESCE(NULLIF(event.fingerprint, ''), 'legacy:' || event.root_cause_id)
+               AND NOT (
+                 (newest.event = 'disputed' OR (newest.event = 'corrected' AND newest.root_cause_confirmed = 0))
+                 AND EXISTS (
+                   SELECT 1 FROM navigator_review_finding_events AS confirmed
+                    WHERE confirmed.slice_id = newest.slice_id
+                      AND COALESCE(NULLIF(confirmed.fingerprint, ''), 'legacy:' || confirmed.root_cause_id) =
+                          COALESCE(NULLIF(newest.fingerprint, ''), 'legacy:' || newest.root_cause_id)
+                      AND confirmed.sequence < newest.sequence
+                      AND (confirmed.root_cause_confirmed = 1 OR confirmed.event IN ('opened', 'reobserved', 'resolved'))
+                 )
+               )
           )
         ORDER BY event.slice_id, COALESCE(NULLIF(event.fingerprint, ''), 'legacy:' || event.root_cause_id)`,
     ).all(jobId, sliceId ?? null, sliceId ?? null) as FindingEventRow[];
