@@ -1,3 +1,4 @@
+import { redactError } from "../errors";
 import type { TelegramAgentStore } from "../storage/store";
 import {
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
@@ -138,8 +139,10 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
         });
       }
       installed += 1;
-    } catch {
-      dependencies.warn?.(`System automation ${definition.systemKey} could not be installed`);
+    } catch (error) {
+      dependencies.warn?.(
+        `System automation ${definition.systemKey} could not be installed: ${redactError(error).slice(0, 200)}`,
+      );
     }
   }
   return installed;

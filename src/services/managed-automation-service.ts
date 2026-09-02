@@ -1,4 +1,5 @@
 import type { TerminalScope } from "../bb/terminal-command";
+import { redactError } from "../errors";
 import {
   assertAutomationMatches,
   BbAutomationNotFoundError,
@@ -588,8 +589,10 @@ export class ManagedAutomationReconciler {
           this.dependencies.warn?.(`Managed automation ${binding.id} cancelled its leftover legacy schedule`);
         }
         didWork = true;
-      } catch {
-        this.dependencies.warn?.(`Managed automation ${binding.id} could not be reconciled`);
+      } catch (error) {
+        this.dependencies.warn?.(
+          `Managed automation ${binding.id} could not be reconciled: ${redactError(error).slice(0, 200)}`,
+        );
       }
     }
 
