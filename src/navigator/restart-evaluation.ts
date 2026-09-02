@@ -1,10 +1,8 @@
-import type Database from "better-sqlite3";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../capabilities/models";
 import type { ProjectPolicy } from "../domain/models";
-import { productionResourceKey, projectResourceKey } from "../autonomy/models";
-import { EffectRunner } from "../services/effect-runner";
-import type { ProductionStageSnapshot } from "../services/production-runner";
-import type { TelegramAgentStore } from "../storage/store";
+import type { NavigatorEffectPersistence } from "./effect-persistence";
+import type { NavigatorEvaluationPersistence } from "./evaluation-persistence";
+import type { NavigatorImplementationPersistence } from "./implementation-persistence";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../work-artifacts/repository";
 import { trackerCreateDigest } from "../work-artifacts/tracker";
 import { navigatorAcceptanceCriteria } from "./implementation-contracts";
@@ -161,8 +159,7 @@ function resultFromDuplicates(duplicateMutations: number): NavigatorRestartPoint
 }
 
 function openRestartJob(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  evaluation: NavigatorEvaluationPersistence,
   sequence: number,
   now: () => number,
 ): Readonly<{
@@ -174,7 +171,7 @@ function openRestartJob(
   const projectId = `proj_rst_${sequence}`;
   const specificationId = stableWorkArtifactId(projectId, `restart-spec-${sequence}`);
   const ticketId = stableWorkArtifactId(projectId, `restart-ticket-${sequence}`);
-  const specification = store.captureWorkArtifact(artifactInput({
+  const specification = evaluation.captureWorkArtifact(artifactInput({
     projectId,
     artifactId: specificationId,
     operationId: `restart-spec-${sequence}`,
@@ -182,7 +179,7 @@ function openRestartJob(
     title: "Restart specification",
     trackerOrder: 0,
   }));
-  const ticket = store.captureWorkArtifact({
+  const ticket = evaluation.captureWorkArtifact({
     ...artifactInput({
       projectId,
       artifactId: ticketId,
@@ -199,20 +196,20 @@ function openRestartJob(
       targetRef: `artifact:${specificationId}`,
     }],
   });
-  const draft = store.createJob({
+  const draft = evaluation.createJob({
     id: `job_restart_${sequence}`,
     sourceUpdateId: 91_000 + sequence,
     requestText: "Measure dual-engine restart safety.",
     workflow: { engine: "navigator-v1", mode: "deterministic" },
     now: now(),
   });
-  const selected = store.applyJobEvent(draft.id, draft.version, {
+  const selected = evaluation.applyJobEvent(draft.id, draft.version, {
     type: "PROJECT_SELECTED",
     projectId,
     policyVersion: 1,
     policy: restartPolicyFor(projectId),
   }, now());
-  store.bindNavigatorJobArtifacts({
+  evaluation.bindNavigatorJobArtifacts({
     jobId: selected.id,
     expectedVersion: selected.version,
     artifactBindings: [specification, ticket].map(({ artifact, snapshot }) => ({
@@ -222,31 +219,37 @@ function openRestartJob(
     })),
     now: now(),
   });
-  database.prepare("UPDATE jobs SET task_outcome = ?, task_constraints_json = ?, state = 'implementing' WHERE id = ?")
-    .run("shipped_change", JSON.stringify([]), selected.id);
-  const lease = store.acquireExecutorLease(`restart-exec-${sequence}`, now(), 120_000);
+  evaluation.setEvaluationJobFacts({
+    jobId: selected.id,
+    taskOutcome: "shipped_change",
+    state: "implementing",
+  });
+  const ownerId = `restart-exec-${sequence}`;
+  const lease = evaluation.acquireExecutorLease(ownerId, now(), 120_000);
   if (!lease.acquired) throw new Error("restart evaluation lease was unavailable");
-  database.prepare(
-    `INSERT INTO job_resource_claims (
-       job_id, resource_key, resource_kind, state, owner_id, generation,
-       lease_expires_at, acquired_at, renewed_at, released_at, release_reason
-     ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?, NULL, NULL)`,
-  ).run(selected.id, projectResourceKey(projectId), `restart-exec-${sequence}`, lease.generation, now() + 100_000, now(), now());
+  evaluation.holdEvaluationProjectClaim({
+    jobId: selected.id,
+    projectId,
+    ownerId,
+    generation: lease.generation,
+    now: now(),
+    leaseMs: 100_000,
+  });
   return { jobId: selected.id, specificationId, ticketId, leaseGeneration: lease.generation };
 }
 
 function claimTicket(
-  store: TelegramAgentStore,
+  evaluation: NavigatorEvaluationPersistence,
   ticketId: string,
   jobId: string,
   ownerId: string,
   generation: number,
   now: () => number,
 ) {
-  const artifact = store.getWorkArtifact(ticketId);
-  const snapshot = store.getCurrentWorkArtifactSnapshot(ticketId);
+  const artifact = evaluation.getWorkArtifact(ticketId);
+  const snapshot = evaluation.getCurrentWorkArtifactSnapshot(ticketId);
   if (!artifact || !snapshot) throw new Error("restart ticket is missing");
-  store.observeWorkArtifact({
+  evaluation.observeWorkArtifact({
     artifactId: ticketId,
     expectedExternalRevision: artifact.externalRevision,
     externalRevision: `${artifact.externalRevision}:claimed`,
@@ -258,7 +261,7 @@ function claimTicket(
     relationships: snapshot.relationships,
     observedAt: now(),
   });
-  return store.claimWorkArtifact({
+  return evaluation.claimWorkArtifact({
     artifactId: ticketId,
     workflowStepId: `implement:${ticketId}`,
     jobId,
@@ -272,12 +275,13 @@ function claimTicket(
 }
 
 function implementationExecutor(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  store: NavigatorEvaluationPersistence,
+  persistence: NavigatorImplementationPersistence,
   now: () => number,
 ) {
   return new NavigatorImplementationExecutor({
     store,
+    persistence,
     gitObserver: { observe: async (request) => gitObservation(request) },
     pullRequests: {
       createOrRefresh: async (request) => ({
@@ -308,12 +312,12 @@ function ticketOperation(): NavigatorTicketWorkerOperation {
 }
 
 function navigatorEffects(
-  store: TelegramAgentStore,
+  persistence: NavigatorEffectPersistence,
   now: () => number,
 ): NavigatorEffectProtocol {
   const unused = async () => ({ outcome: "permanent" as const, reason: "unused restart evaluation adapter" });
   return new NavigatorEffectProtocol({
-    store,
+    store: persistence,
     clock: { now },
     adapters: [
       { kind: "run_navigator_skill", execute: unused },
@@ -323,132 +327,50 @@ function navigatorEffects(
   });
 }
 
-function uniqueEffectCount(store: TelegramAgentStore, jobId: string, kind: string): number {
-  const effects = store.listEffectsForJob(jobId).filter((effect) => effect.kind === kind);
+function uniqueEffectCount(evaluation: NavigatorEvaluationPersistence, jobId: string, kind: string): number {
+  const effects = evaluation.listEffectsForJob(jobId).filter((effect) => effect.kind === kind);
   return effects.length - new Set(effects.map((effect) => effect.idempotencyKey)).size;
 }
 
-function countRows(
-  database: Database.Database,
-  sql: string,
-  params: readonly unknown[],
-): number {
-  const row = database.prepare(sql).get(...params) as { count: number } | undefined;
-  return row?.count ?? 0;
-}
-
 function driveToMergeCall(
-  store: TelegramAgentStore,
+  evaluation: NavigatorEvaluationPersistence,
   jobId: string,
   now: () => number,
 ): void {
-  const start = store.getJob(jobId)!;
-  const released = store.applyJobEvent(start.id, start.version, {
+  const start = evaluation.getJob(jobId)!;
+  const released = evaluation.applyJobEvent(start.id, start.version, {
     type: "RELEASE_STARTED",
     number: 43,
     url: "https://github.com/acme/eval/pull/43",
     environmentId: "env_eval_restart",
   }, now());
-  const headed = store.applyJobEvent(released.id, released.version, {
+  const headed = evaluation.applyJobEvent(released.id, released.version, {
     type: "PR_HEAD_RESOLVED",
     headSha: NEXT_HEAD,
   }, now());
-  const validated = store.applyJobEvent(headed.id, headed.version, {
+  const validated = evaluation.applyJobEvent(headed.id, headed.version, {
     type: "VALIDATION_PASSED",
     headSha: NEXT_HEAD,
   }, now());
-  const reviewed = store.applyJobEvent(validated.id, validated.version, {
+  const reviewed = evaluation.applyJobEvent(validated.id, validated.version, {
     type: "REVIEW_PASSED",
     headSha: NEXT_HEAD,
   }, now());
-  store.applyJobEvent(reviewed.id, reviewed.version, {
+  evaluation.applyJobEvent(reviewed.id, reviewed.version, {
     type: "APPROVAL_ACCEPTED",
     headSha: NEXT_HEAD,
   }, now());
 }
 
 function seedProductionSeam(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  evaluation: NavigatorEvaluationPersistence,
   jobId: string,
   ownerId: string,
   generation: number,
   now: () => number,
   state: "deploying" | "verifying_production",
 ): void {
-  const job = store.getJob(jobId);
-  if (!job?.policy || !job.projectId) throw new Error("restart production job is missing");
-  database.prepare(
-    `UPDATE jobs SET state = ?, environment_id = 'env_eval_restart', pr_number = 43,
-       pr_url = 'https://github.com/acme/eval/pull/43', pr_head_sha = ?,
-       merge_message = 'Merged pull request #43', merge_commit_sha = ?,
-       merged_at = '2026-08-10T00:00:00.000Z', version = version + 1
-     WHERE id = ?`,
-  ).run(state, NEXT_HEAD, "d".repeat(40), jobId);
-  database.prepare("UPDATE effects SET status = 'done' WHERE job_id = ?").run(jobId);
-  database.prepare(
-    `UPDATE job_admissions SET project_id = ?, state = 'admitted', admitted_at = ? WHERE job_id = ?`,
-  ).run(job.projectId, now(), jobId);
-  const held = database.prepare(
-    "SELECT 1 FROM job_resource_claims WHERE job_id = ? AND state = 'held' LIMIT 1",
-  ).get(jobId);
-  if (!held) {
-    const insertClaim = database.prepare(
-      `INSERT INTO job_resource_claims (
-         job_id, resource_key, resource_kind, state, owner_id, generation,
-         lease_expires_at, acquired_at, renewed_at
-       ) VALUES (?, ?, ?, 'held', ?, ?, 130000, 10100, 10100)`,
-    );
-    insertClaim.run(jobId, projectResourceKey(job.projectId), "project", ownerId, generation);
-    insertClaim.run(jobId, productionResourceKey(job.policy), "production_target", ownerId, generation);
-  }
-  const current = store.getJob(jobId);
-  if (!current) throw new Error("restart production job disappeared");
-  const kind = state === "deploying" ? "deploy_production" : "verify_production";
-  const key = `${current.id}:${current.version + 1}:${kind}`;
-  database.prepare(
-    `INSERT INTO effects (
-       idempotency_key, job_id, kind, payload_json, status, attempts,
-       next_attempt_at, created_at, updated_at
-     ) VALUES (?, ?, ?, '{}', 'pending', 0, ?, ?, ?)`,
-  ).run(key, current.id, kind, now(), now(), now());
-}
-
-async function runNextProductionEffect(
-  store: TelegramAgentStore,
-  jobId: string,
-  ownerId: string,
-  generation: number,
-  now: () => number,
-  runProductionStage: () => Promise<ProductionStageSnapshot>,
-): Promise<void> {
-  const fence = { ownerId, generation, signal: new AbortController().signal };
-  const lease = () => store.leaseNextJobEffect({
-    jobId,
-    ownerId,
-    generation,
-    now: now(),
-    leaseMs: 30_000,
-  });
-  let claimed = lease();
-  while (claimed?.kind === "render_status") {
-    store.completeEffect(claimed.idempotencyKey, ownerId, generation, now());
-    claimed = lease();
-  }
-  if (!claimed) return;
-  const firstKey = claimed.idempotencyKey;
-  const firstKind = claimed.kind;
-  await new EffectRunner({ store, fence, now, runProductionStage }).run(claimed);
-  store.completeEffect(claimed.idempotencyKey, ownerId, generation, now());
-  let replay = lease();
-  while (replay?.kind === "render_status") {
-    store.completeEffect(replay.idempotencyKey, ownerId, generation, now());
-    replay = lease();
-  }
-  if (replay && replay.kind === firstKind && replay.idempotencyKey !== firstKey) {
-    await new EffectRunner({ store, fence, now, runProductionStage }).run(replay);
-    store.completeEffect(replay.idempotencyKey, ownerId, generation, now());
-  }
+  evaluation.seedNavigatorProductionState({ jobId, ownerId, generation, now: now(), state });
 }
 
 function passingStage(phase: "deploy" | "canary") {
@@ -489,8 +411,9 @@ function failedStage(phase: "deploy" | "canary") {
 }
 
 async function measureWorkerSeamOnJob(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  evaluation: NavigatorEvaluationPersistence,
+  implementationPersistence: NavigatorImplementationPersistence,
+  effectPersistence: NavigatorEffectPersistence,
   opened: Readonly<{
     jobId: string;
     specificationId: string;
@@ -501,8 +424,8 @@ async function measureWorkerSeamOnJob(
   now: () => number,
   point: Extract<DualEngineRestartPoint, "worker_dispatch" | "result_storage" | "head_change">,
 ): Promise<NavigatorRestartPointResult> {
-  const executor = implementationExecutor(store, database, now);
-  const effects = navigatorEffects(store, now);
+  const executor = implementationExecutor(evaluation, implementationPersistence, now);
+  const effects = navigatorEffects(effectPersistence, now);
   executor.startIntegration({
     jobId: opened.jobId,
     specificationArtifactId: opened.specificationId,
@@ -513,8 +436,8 @@ async function measureWorkerSeamOnJob(
     baseHeadSha: BASE_HEAD,
     evidenceRefs: ["eval:restart"],
   });
-  const firstClaim = claimTicket(store, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
-  const replayClaim = claimTicket(store, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
+  const firstClaim = claimTicket(evaluation, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
+  const replayClaim = claimTicket(evaluation, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
   if (!firstClaim || !replayClaim || firstClaim.id !== replayClaim.id) {
     return resultFromDuplicates(1);
   }
@@ -543,27 +466,12 @@ async function measureWorkerSeamOnJob(
   };
   await effects.processOne(fence, new AbortController().signal);
   await effects.processOne(fence, new AbortController().signal);
-  const workerEffects = store.listEffectsForJob(opened.jobId)
+  const workerEffects = evaluation.listEffectsForJob(opened.jobId)
     .filter((effect) => effect.kind === "run_navigator_ticket_worker");
   const duplicateEffects = workerEffects.length - new Set(workerEffects.map((effect) => effect.idempotencyKey)).size;
-  const implementationAttempts = countRows(
-    database,
-    "SELECT COUNT(*) AS count FROM navigator_ticket_worker_attempts WHERE job_id = ? AND kind = 'implementation'",
-    [opened.jobId],
-  );
-  const implementationOutcomes = countRows(
-    database,
-    `SELECT COUNT(*) AS count
-       FROM navigator_ticket_worker_outcomes AS outcome
-       JOIN navigator_ticket_worker_attempts AS attempt ON attempt.id = outcome.attempt_id
-      WHERE attempt.job_id = ? AND attempt.kind = 'implementation'`,
-    [opened.jobId],
-  );
-  const heads = countRows(
-    database,
-    "SELECT COUNT(DISTINCT current_head_sha) AS count FROM navigator_integrations WHERE job_id = ?",
-    [opened.jobId],
-  );
+  const implementationAttempts = evaluation.countNavigatorImplementationAttempts(opened.jobId);
+  const implementationOutcomes = evaluation.countNavigatorImplementationOutcomes(opened.jobId);
+  const heads = evaluation.countNavigatorIntegrationHeads(opened.jobId);
   if (point === "worker_dispatch") {
     return resultFromDuplicates(duplicateEffects + Math.max(0, implementationAttempts - 1));
   }
@@ -574,7 +482,7 @@ async function measureWorkerSeamOnJob(
 }
 
 async function withRestartLease<T>(
-  store: TelegramAgentStore,
+  evaluation: NavigatorEvaluationPersistence,
   sequence: number,
   generation: number,
   now: () => number,
@@ -583,13 +491,16 @@ async function withRestartLease<T>(
   try {
     return await run();
   } finally {
-    store.releaseExecutorLease(`restart-exec-${sequence}`, generation, now());
+    evaluation.releaseExecutorLease(`restart-exec-${sequence}`, generation, now());
   }
 }
 
 export async function measureNavigatorRestartPoint(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  evaluation: NavigatorEvaluationPersistence,
+  persistence: Readonly<{
+    effectPersistence: NavigatorEffectPersistence;
+    implementationPersistence: NavigatorImplementationPersistence;
+  }>,
   evaluationCase: NavigatorEvaluationCase,
   sequence: number,
 ): Promise<NavigatorRestartPointResult> {
@@ -597,10 +508,10 @@ export async function measureNavigatorRestartPoint(
   if (!point) return resultFromDuplicates(1);
   let currentTime = 50_000 + sequence * 100;
   const now = () => currentTime++;
-  const opened = openRestartJob(store, database, sequence, now);
-  return withRestartLease(store, sequence, opened.leaseGeneration, now, async () => {
+  const opened = openRestartJob(evaluation, sequence, now);
+  return withRestartLease(evaluation, sequence, opened.leaseGeneration, now, async () => {
     if (point === "proposal") {
-      const snapshot = store.createNavigatorSnapshot({
+      const snapshot = evaluation.createNavigatorSnapshot({
         jobId: opened.jobId,
         externalStateDigest: EXTERNAL_DIGEST,
         evidenceRefs: ["eval:restart"],
@@ -620,35 +531,31 @@ export async function measureNavigatorRestartPoint(
         dynamicEffectToolIds: [] as const,
         externalStateDigest: EXTERNAL_DIGEST,
       };
-      const first = store.recordNavigatorProposal({
+      const first = evaluation.recordNavigatorProposal({
         snapshotId: snapshot.snapshotId,
         rawProposal: proposal,
         observation,
         selectModelRoute: proposalModelRoute,
         now: now(),
       });
-      const replay = store.recordNavigatorProposal({
+      const replay = evaluation.recordNavigatorProposal({
         snapshotId: snapshot.snapshotId,
         rawProposal: proposal,
         observation,
         selectModelRoute: proposalModelRoute,
         now: now(),
       });
-      const proposals = countRows(database, "SELECT COUNT(*) AS count FROM navigator_proposals WHERE job_id = ?", [opened.jobId]);
-      const extraEffects = uniqueEffectCount(store, opened.jobId, "run_navigator_skill");
+      const proposals = evaluation.countNavigatorProposals(opened.jobId);
+      const extraEffects = uniqueEffectCount(evaluation, opened.jobId, "run_navigator_skill");
       const duplicates = (replay.proposalId === first.proposalId ? 0 : 1) + Math.max(0, proposals - 1) + extraEffects;
       return resultFromDuplicates(duplicates);
     }
 
     const ownerId = `restart-exec-${sequence}`;
     if (point === "claim") {
-      const first = claimTicket(store, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
-      const replay = claimTicket(store, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
-      const claims = countRows(
-        database,
-        "SELECT COUNT(*) AS count FROM work_artifact_claims WHERE artifact_id = ?",
-        [opened.ticketId],
-      );
+      const first = claimTicket(evaluation, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
+      const replay = claimTicket(evaluation, opened.ticketId, opened.jobId, ownerId, opened.leaseGeneration, now);
+      const claims = evaluation.countWorkArtifactClaims(opened.ticketId);
       const duplicates = (!first || !replay || first.id !== replay.id ? 1 : 0) + Math.max(0, claims - 1);
       return resultFromDuplicates(duplicates);
     }
@@ -675,48 +582,64 @@ export async function measureNavigatorRestartPoint(
         generation: opened.leaseGeneration,
         now: now(),
       };
-      const first = store.prepareWorkArtifactCreateIntent(intentInput);
-      const replay = store.prepareWorkArtifactCreateIntent(intentInput);
-      const intents = countRows(
-        database,
-        "SELECT COUNT(*) AS count FROM work_artifact_create_intents WHERE operation_id = ?",
-        [createInput.operationId],
-      );
+      const first = evaluation.prepareWorkArtifactCreateIntent(intentInput);
+      const replay = evaluation.prepareWorkArtifactCreateIntent(intentInput);
+      const intents = evaluation.countWorkArtifactCreateIntents(createInput.operationId);
       const duplicates = (first.artifactId === replay.artifactId ? 0 : 1) + Math.max(0, intents - 1);
       return resultFromDuplicates(duplicates);
     }
 
     if (point === "worker_dispatch" || point === "result_storage" || point === "head_change") {
-      return measureWorkerSeamOnJob(store, database, opened, ownerId, now, point);
+      return measureWorkerSeamOnJob(
+        evaluation,
+        persistence.implementationPersistence,
+        persistence.effectPersistence,
+        opened,
+        ownerId,
+        now,
+        point,
+      );
     }
 
     if (point === "merge_call_start") {
-      driveToMergeCall(store, opened.jobId, now);
-      const firstCount = store.listEffectsForJob(opened.jobId).filter((effect) => effect.kind === "merge_pr").length;
+      driveToMergeCall(evaluation, opened.jobId, now);
+      const firstCount = evaluation.listEffectsForJob(opened.jobId).filter((effect) => effect.kind === "merge_pr").length;
       try {
-        const current = store.getJob(opened.jobId)!;
-        store.applyJobEvent(current.id, current.version, {
+        const current = evaluation.getJob(opened.jobId)!;
+        evaluation.applyJobEvent(current.id, current.version, {
           type: "APPROVAL_ACCEPTED",
           headSha: NEXT_HEAD,
         }, now());
       } catch {
         // Replay of merge-call start must not create a second merge effect.
       }
-      const mergeEffects = store.listEffectsForJob(opened.jobId).filter((effect) => effect.kind === "merge_pr");
+      const mergeEffects = evaluation.listEffectsForJob(opened.jobId).filter((effect) => effect.kind === "merge_pr");
       return resultFromDuplicates(Math.max(0, mergeEffects.length - 1) + Math.max(0, firstCount - 1));
     }
 
     const productionState = point === "canary" ? "verifying_production" as const : "deploying" as const;
-    seedProductionSeam(store, database, opened.jobId, ownerId, opened.leaseGeneration, now, productionState);
+    seedProductionSeam(evaluation, opened.jobId, ownerId, opened.leaseGeneration, now, productionState);
 
     if (point === "deploy") {
-      await runNextProductionEffect(store, opened.jobId, ownerId, opened.leaseGeneration, now, async () => passingStage("deploy"));
-      return resultFromDuplicates(uniqueEffectCount(store, opened.jobId, "deploy_production"));
+      await evaluation.runNavigatorProductionEffect({
+        jobId: opened.jobId,
+        ownerId,
+        generation: opened.leaseGeneration,
+        now,
+        runProductionStage: async () => passingStage("deploy"),
+      });
+      return resultFromDuplicates(uniqueEffectCount(evaluation, opened.jobId, "deploy_production"));
     }
 
     if (point === "rollback") {
-      await runNextProductionEffect(store, opened.jobId, ownerId, opened.leaseGeneration, now, async () => failedStage("deploy"));
-      const incidents = store.countNavigatorReleaseIncidents({
+      await evaluation.runNavigatorProductionEffect({
+        jobId: opened.jobId,
+        ownerId,
+        generation: opened.leaseGeneration,
+        now,
+        runProductionStage: async () => failedStage("deploy"),
+      });
+      const incidents = evaluation.countNavigatorReleaseIncidents({
         jobId: opened.jobId,
         phase: "deploy",
         failureSignature: "deploy",
@@ -725,12 +648,14 @@ export async function measureNavigatorRestartPoint(
       return resultFromDuplicates(Math.max(0, incidents - 1));
     }
 
-    await runNextProductionEffect(store, opened.jobId, ownerId, opened.leaseGeneration, now, async () => failedStage("canary"));
-    const canaryIncidents = countRows(
-      database,
-      "SELECT COUNT(*) AS count FROM navigator_release_incidents WHERE job_id = ? AND phase = 'canary'",
-      [opened.jobId],
-    );
-    return resultFromDuplicates(Math.max(0, canaryIncidents - 1) + uniqueEffectCount(store, opened.jobId, "verify_production"));
+    await evaluation.runNavigatorProductionEffect({
+      jobId: opened.jobId,
+      ownerId,
+      generation: opened.leaseGeneration,
+      now,
+      runProductionStage: async () => failedStage("canary"),
+    });
+    const canaryIncidents = evaluation.countNavigatorReleaseIncidentsByPhase(opened.jobId, "canary");
+    return resultFromDuplicates(Math.max(0, canaryIncidents - 1) + uniqueEffectCount(evaluation, opened.jobId, "verify_production"));
   });
 }

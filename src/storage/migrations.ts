@@ -4869,6 +4869,64 @@ ALTER TABLE managed_automations ADD COLUMN provider_ownership_marker TEXT CHECK 
 ALTER TABLE managed_automation_operations ADD COLUMN provider_ownership_marker TEXT CHECK (
   provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
 );
+`, String.raw`
+DROP INDEX IF EXISTS managed_automation_operations_due;
+DROP INDEX IF EXISTS managed_automation_operations_binding;
+
+CREATE TABLE managed_automation_operations_v2 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  operation_key TEXT NOT NULL CHECK (length(operation_key) BETWEEN 1 AND 256),
+  operation_class TEXT NOT NULL CHECK (
+    operation_class IN ('create', 'update', 'enable', 'disable', 'run_now', 'retire', 'reconcile')
+  ),
+  operation_version INTEGER NOT NULL DEFAULT 1 CHECK (operation_version = 1),
+  target_project_id TEXT NOT NULL,
+  definition_revision INTEGER NOT NULL CHECK (definition_revision >= 1),
+  authority_json TEXT NOT NULL,
+  capability_evidence_json TEXT,
+  controller_owner_id TEXT,
+  controller_generation INTEGER CHECK (controller_generation IS NULL OR controller_generation >= 1),
+  controller_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 1),
+  lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+  provider_automation_id TEXT,
+  provider_ownership_marker TEXT CHECK (
+    provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+  ),
+  outcome_json TEXT,
+  last_error TEXT,
+  next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0),
+  UNIQUE(binding_id, operation_key)
+);
+
+INSERT INTO managed_automation_operations_v2 (
+  id, binding_id, operation_key, operation_class, operation_version, target_project_id,
+  definition_revision, authority_json, capability_evidence_json, controller_owner_id,
+  controller_generation, controller_turn_id, state, attempts, lease_owner, lease_generation,
+  lease_expires_at, provider_automation_id, provider_ownership_marker, outcome_json, last_error,
+  next_attempt_at, created_at, updated_at, settled_at
+)
+SELECT id, binding_id, id, operation_class, operation_version, target_project_id,
+       definition_revision, authority_json, capability_evidence_json, controller_owner_id,
+       controller_generation, controller_turn_id, state, attempts, lease_owner, lease_generation,
+       lease_expires_at, provider_automation_id, provider_ownership_marker, outcome_json, last_error,
+       next_attempt_at, created_at, updated_at, settled_at
+  FROM managed_automation_operations;
+
+DROP TABLE managed_automation_operations;
+ALTER TABLE managed_automation_operations_v2 RENAME TO managed_automation_operations;
+
+CREATE INDEX managed_automation_operations_due
+  ON managed_automation_operations(state, next_attempt_at, created_at);
+CREATE INDEX managed_automation_operations_binding
+  ON managed_automation_operations(binding_id, created_at);
 `] as const;
 
 export const ALL_MIGRATIONS = [

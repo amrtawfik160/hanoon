@@ -5,6 +5,7 @@ import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { SKILL_ADMISSION_CATALOG } from "../src/capabilities/catalog";
 import {
   assessGuardEnvelope,
+  evaluateFindingDisposition,
   guardRequirementBindings,
   type GuardAssessmentPolicy,
 } from "../src/capabilities/guards";
@@ -18,7 +19,6 @@ import {
 } from "../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
-  navigatorFindingDisposition,
   type NavigatorTicketWorkerAttempt,
 } from "../src/navigator/implementation-executor";
 import {
@@ -42,7 +42,7 @@ import {
   type NavigatorEffectOutcome,
 } from "../src/navigator/effect-protocol";
 import { createNavigatorTicketEffectAdapter } from "../src/navigator/plugin-runtime";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import {
   ALL_MIGRATIONS,
   NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
@@ -83,6 +83,8 @@ let fixtureSequence = 0;
 
 type Fixture = Readonly<{
   store: TelegramAgentStore;
+  implementationPersistence: import("../src/navigator/implementation-persistence").NavigatorImplementationPersistence;
+  findingLedger: NavigatorFindingLedger;
   database: Database.Database;
   jobId: string;
   specificationId: string;
@@ -135,7 +137,8 @@ function fixture(
     bb.storage.migrate(bb.storage.database(), [...ALL_MIGRATIONS].slice(0, migrationCount));
   }
   beforeOpen?.(bb.storage.database());
-  const store = openStore(bb.storage, bb.storage.kv, () => 1_000);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, () => 1_000);
+  const store = composition.store;
   let currentTime = 1_100;
   const now = () => currentTime++;
   const specificationId = stableWorkArtifactId("proj_40", "specification-35");
@@ -295,6 +298,8 @@ function fixture(
 
   return {
     store,
+    implementationPersistence: composition.navigatorImplementation,
+    findingLedger: composition.findingLedger,
     database: bb.storage.database(),
     jobId: draft.id,
     specificationId,
@@ -522,6 +527,7 @@ function validGitObserver(): NavigatorGitObserver {
 function prepareTicketEffectForExecutor(value: Fixture, now: number) {
   const executor = new NavigatorImplementationExecutor({
     store: value.store,
+    persistence: value.implementationPersistence,
     gitObserver: validGitObserver(),
     pullRequests: { createOrRefresh: vi.fn() },
     modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -762,7 +768,7 @@ describe("navigator ticket integration executor", () => {
     await protocol.processOne(fence, new AbortController().signal);
     await protocol.processOne(fence, new AbortController().signal);
 
-    const decision = value.store.getNavigatorFindingLedgerDecision(value.jobId);
+    const decision = value.findingLedger.currentDecision({ jobId: value.jobId });
     const entry = decision.entries[0]!;
     expect(decision).toMatchObject({
       outcome: "accepted",
@@ -806,7 +812,7 @@ describe("navigator ticket integration executor", () => {
 
     value.database.prepare("UPDATE navigator_integrations SET current_head_sha = ? WHERE job_id = ?")
       .run(SHA.repair, value.jobId);
-    const stale = value.store.getNavigatorFindingLedgerDecision(value.jobId);
+    const stale = value.findingLedger.currentDecision({ jobId: value.jobId });
     expect(stale).toMatchObject({ allowedNextAction: "recheck", blockingBurden: 0, reasonCode: "stale_evidence" });
     expect(stale.entries[0]).toMatchObject({ state: "stale", headSha: SHA.ticketOne });
     expect(stale.staleEvidence).toEqual([{
@@ -1253,14 +1259,23 @@ describe("navigator ticket integration executor", () => {
       evidenceRefs: ["review:spoofed"],
     };
 
-    expect(navigatorFindingDisposition(finding)).toBeNull();
-    expect(navigatorFindingDisposition({
+    expect(evaluateFindingDisposition(finding, {
+      defaultDisposition: "advisory",
+      mustFixRuleIds: [],
+      advisoryRuleIds: [],
+      requirementIds: [],
+    })).toBeNull();
+    expect(evaluateFindingDisposition({
       ...finding,
-      capabilityId: "code-review",
       ruleId: "requirement.behavior",
       severity: "low",
       requirementId: null,
       evidenceClass: "review",
+    }, {
+      defaultDisposition: "advisory",
+      mustFixRuleIds: [],
+      advisoryRuleIds: [],
+      requirementIds: [],
     })).toBe("advisory");
   });
 
@@ -1364,10 +1379,11 @@ describe("navigator ticket integration executor", () => {
     expect(guardAssessment).toMatchObject({ outcome: expected === "must_fix" ? "changes_requested" : "pass_with_advisories" });
     expect(guardAssessment.findings[0]?.disposition).toBe(expected);
     expect(recorded.facts?.findings[0]?.disposition).toBe(expected);
-    expect(navigatorFindingDisposition({
-      ...finding,
-      descriptorDigest,
-      requirementIds: [requirementId],
+    expect(evaluateFindingDisposition(finding, {
+      defaultDisposition: "advisory",
+      mustFixRuleIds: guardPolicy.mustFixRuleIds,
+      advisoryRuleIds: guardPolicy.advisoryRuleIds,
+      requirementIds: guardPolicy.requirementIds,
     })).toBe(expected);
   });
 
@@ -1592,7 +1608,7 @@ describe("navigator ticket integration executor", () => {
     expect(findingUpgradeId).toBeGreaterThan(0);
     const value = fixture(findingUpgradeId, seedPreFindingLedgerSchema);
 
-    const readable = value.store.getNavigatorFindingLedgerDecision("legacy-ledger-job");
+    const readable = value.findingLedger.currentDecision({ jobId: "legacy-ledger-job" });
     expect(readable).toMatchObject({
       outcome: "accepted",
       allowedNextAction: "repair",
@@ -1670,6 +1686,7 @@ describe("navigator ticket integration executor", () => {
     });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver,
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -1738,6 +1755,7 @@ describe("navigator ticket integration executor", () => {
     }));
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2460,7 +2478,7 @@ describe("navigator ticket integration executor", () => {
     ).get(value.jobId, value.ticketIds[0])).toEqual(before.ticket);
     expect(value.database.prepare("SELECT state, accepted_head_sha FROM navigator_ticket_slices WHERE id = ?")
       .get(prepared.effect.payload.sliceId)).toEqual(before.slice);
-    expect(value.store.getNavigatorFindingLedgerDecision(value.jobId)).toMatchObject({
+    expect(value.findingLedger.currentDecision({ jobId: value.jobId })).toMatchObject({
       blockingBurden: 0,
       entries: [],
       allowedNextAction: "accept",
@@ -2544,6 +2562,7 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2600,6 +2619,7 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2665,6 +2685,7 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2732,6 +2753,7 @@ describe("navigator ticket integration executor", () => {
     const value = fixture();
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2827,6 +2849,7 @@ describe("navigator ticket integration executor", () => {
     });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
@@ -2873,6 +2896,64 @@ describe("navigator ticket integration executor", () => {
     });
     expect(value.store.getEffect(value.jobId, executor.snapshot(value.jobId).attempts[0]!.effectIdempotencyKey))
       .toMatchObject({ status: "failed" });
+  });
+
+  it("rolls back claim adoption when the first slice write faults", () => {
+    const value = fixture();
+    const claimId = value.claim(value.ticketIds[0]);
+    value.database.prepare(
+      "UPDATE work_artifact_claims SET owner_id = 'retired-executor', generation = 99, lease_expires_at = 0 WHERE id = ?",
+    ).run(claimId);
+    const executor = new NavigatorImplementationExecutor({
+      store: value.store,
+      persistence: value.implementationPersistence,
+      gitObserver: validGitObserver(),
+      pullRequests: { createOrRefresh: vi.fn() },
+      modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),
+      clock: { now: value.now },
+    });
+    executor.startIntegration({
+      jobId: value.jobId,
+      specificationArtifactId: value.specificationId,
+      implementationTicketIds: value.ticketIds,
+      baseBranch: "main",
+      integrationBranch: "hanoon/job-40",
+      worktreeId: "env_job_40",
+      baseHeadSha: SHA.base,
+      evidenceRefs: ["ticket:40"],
+    });
+    value.database.prepare(
+      `CREATE TRIGGER ticket_65_claim_adoption_fault
+       BEFORE INSERT ON navigator_ticket_slices
+       BEGIN SELECT RAISE(ABORT, 'ticket-65 claim adoption fault'); END`,
+    ).run();
+    try {
+      expect(() => executor.beginClaimedTicket({
+        jobId: value.jobId,
+        ticketArtifactId: value.ticketIds[0],
+        claimId,
+        taskEvidence: ["behavioral-change"],
+        evidenceRefs: ["ticket:40:claim"],
+        ownerId: "executor-40",
+        generation: 1,
+      })).toThrow("ticket-65 claim adoption fault");
+    } finally {
+      value.database.prepare("DROP TRIGGER ticket_65_claim_adoption_fault").run();
+    }
+
+    expect(value.store.getWorkArtifactClaim(claimId)).toMatchObject({
+      ownerId: "retired-executor",
+      generation: 99,
+      leaseExpiresAt: 0,
+    });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_slices WHERE job_id = ?",
+    ).get(value.jobId)).toEqual({ count: 0 });
+    expect(value.database.prepare(
+      "SELECT COUNT(*) AS count FROM navigator_ticket_worker_attempts WHERE job_id = ?",
+    ).get(value.jobId)).toEqual({ count: 0 });
+    expect(value.store.listEffectsForJob(value.jobId)
+      .filter((effect) => effect.kind === "run_navigator_ticket_worker")).toEqual([]);
   });
 
   it("sequentially integrates fresh ticket workers, repairs review findings, and publishes one pull request", async () => {
@@ -2946,6 +3027,7 @@ describe("navigator ticket integration executor", () => {
     };
     const newExecutor = () => new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests,
       modelRoute: (kind) => ({
@@ -3153,6 +3235,7 @@ describe("navigator ticket integration executor", () => {
     });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: (kind) => kind === "implementation"
@@ -3247,6 +3330,7 @@ describe("navigator ticket integration executor", () => {
       });
     const executor = new NavigatorImplementationExecutor({
       store: value.store,
+      persistence: value.implementationPersistence,
       gitObserver: validGitObserver(),
       pullRequests: { createOrRefresh: vi.fn() },
       modelRoute: () => ({ pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard }),

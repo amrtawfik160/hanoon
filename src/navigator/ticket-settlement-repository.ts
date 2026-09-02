@@ -41,7 +41,6 @@ import {
 } from "./implementation-contracts";
 
 export type { NavigatorFindingLedgerEntry } from "./finding-ledger";
-export { compatibilityCapabilityFindingDisposition as navigatorFindingDisposition } from "../capabilities/catalog";
 
 export type NavigatorTicketWorkerOutcome = Readonly<{
   attemptId: string;

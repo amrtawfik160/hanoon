@@ -1,5 +1,5 @@
 import { nextCronOccurrence } from "./monitor-service";
-import type { TelegramAgentStore } from "../storage/store";
+import type { MonitorRecord } from "../storage/store";
 import {
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
@@ -8,6 +8,10 @@ import {
   ManagedAutomationService,
   migrateLegacyClockMonitor,
 } from "./managed-automation-service";
+import type {
+  ManagedAutomationExecutorFence,
+} from "../storage/managed-automation-repository";
+import { capabilityDescriptorById } from "../capabilities/catalog";
 
 /**
  * Monitors the plugin sets for itself. The agent already knows how to act on a
@@ -50,8 +54,21 @@ export function systemAutomationInstallationComplete(installed: number): boolean
   return installed === SYSTEM_MONITORS.length;
 }
 
+type LegacySystemMonitorStore = Readonly<{
+  getOwner(): Readonly<{ userId: string; chatId: string }> | null;
+  getControllerForOwner(userId: string, chatId: string): Readonly<{ controllerKey: string }> | null;
+  ensureSystemMonitor(input: Readonly<{
+    systemKey: string;
+    controllerKey: string;
+    cron: string;
+    instruction: string;
+    dueAt: number;
+    now: number;
+  }>): MonitorRecord;
+}>;
+
 export type SystemMonitorInstaller = {
-  store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "ensureSystemMonitor">;
+  store: LegacySystemMonitorStore;
   clock: { now(): number };
   warn?: (message: string) => void;
 };
@@ -92,10 +109,16 @@ export function installSystemMonitors(dependencies: SystemMonitorInstaller): num
 }
 
 export type SystemAutomationInstaller = Readonly<{
-  store: Pick<
-    TelegramAgentStore,
-    "getOwner" | "getControllerForOwner" | "listSystemMonitors" | "cancelMonitor"
-  >;
+  store: Readonly<{
+    getOwner(): Readonly<{ userId: string; chatId: string }> | null;
+    getControllerForOwner(userId: string, chatId: string): Readonly<{
+      controllerKey: string;
+      projectId: string | null;
+      hostId: string | null;
+    }> | null;
+    listSystemMonitors(): MonitorRecord[];
+    cancelMonitor(id: string, now: number): boolean;
+  }>;
   service: ManagedAutomationService;
   providerId: string;
   execution: Readonly<{
@@ -104,10 +127,49 @@ export type SystemAutomationInstaller = Readonly<{
     serviceTier?: "default" | "fast";
     permissionMode: "accept-edits" | "auto" | "full";
   }>;
+  fence: ManagedAutomationExecutorFence;
   clock: { now(): number };
   signal?: AbortSignal;
   warn?: (message: string) => void;
 }>;
+
+export function systemAutomationCapabilityEvidence(systemKey: string) {
+  const descriptor = capabilityDescriptorById("telegram_agent_watch");
+  if (!descriptor) throw new Error("BB schedule capability is not registered");
+  return {
+    version: 1 as const,
+    profileId: `system-maintenance:${systemKey}`,
+    profileRevision: 1,
+    capabilityId: descriptor.id,
+    descriptorVersion: descriptor.version,
+    descriptorDigest: descriptor.digest,
+    evidenceRefs: [`system-maintenance:${systemKey}`],
+  };
+}
+
+export function systemAutomationAuthority(input: Readonly<{
+  systemKey: string;
+  controllerKey: string;
+  projectId: string;
+  hostId: string;
+}>) {
+  return {
+    version: 1 as const,
+    origin: "system-maintenance" as const,
+    controllerKey: input.controllerKey,
+    projectId: input.projectId,
+    hostId: input.hostId,
+    taskAuthority: null,
+    standingAuthority: {
+      version: 1 as const,
+      kind: "system-maintenance" as const,
+      systemKey: input.systemKey,
+      revision: 1,
+    },
+    capabilityEvidence: systemAutomationCapabilityEvidence(input.systemKey),
+    mayWidenAutomation: false as const,
+  };
+}
 
 /**
  * Installs reasoning-based upkeep in BB's scheduler. Existing plugin-local
@@ -141,6 +203,7 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
           permissionMode: dependencies.execution.permissionMode,
           hostId: controller.hostId,
           now,
+          fence: { kind: "executor", value: dependencies.fence },
           signal: dependencies.signal,
         });
       } else {
@@ -167,16 +230,23 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
             timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
             resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
           },
-          authority: {
-            source: "system",
+          authority: systemAutomationAuthority({
+            systemKey: definition.systemKey,
             controllerKey: controller.controllerKey,
             projectId: controller.projectId,
             hostId: controller.hostId,
-            mayWidenAutomation: false,
-          },
+          }),
           notificationPolicy: "material",
           now,
           signal: dependencies.signal,
+          fence: { kind: "executor", value: dependencies.fence },
+          deferProvider: true,
+          operation: {
+            version: 1,
+            operationClass: "create",
+            targetProjectId: controller.projectId,
+            definitionRevision: 1,
+          },
         });
       }
       installed += 1;

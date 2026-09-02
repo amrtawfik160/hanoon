@@ -1,5 +1,4 @@
 import type { Job } from "../domain/models";
-import type { TelegramAgentStore } from "../storage/store";
 import {
   WorkArtifactCoordinator,
   type CreateCoordinatedArtifactInput,
@@ -11,13 +10,9 @@ import {
   navigatorPlanningResultSchema,
   type NavigatorPlanningResult,
 } from "./planning-contracts";
+import type { NavigatorImplementationReadStore } from "./implementation-executor";
 
-type PlanningPublisherStore = Pick<TelegramAgentStore,
-  | "getJob"
-  | "getWorkArtifact"
-  | "getCurrentWorkArtifactSnapshot"
-  | "isWorkArtifactSnapshotValid"
->;
+type PlanningPublisherStore = NavigatorImplementationReadStore;
 
 export type NavigatorPlanningPublication = Readonly<{
   artifactBindings: readonly NavigatorArtifactBinding[];

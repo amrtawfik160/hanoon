@@ -17,6 +17,7 @@ import {
   managedAutomationObservationSchema,
   managedAutomationOutcomeReceiptSchema,
   managedAutomationOperationRequestSchema,
+  managedAutomationRunSchema,
   managedAutomationStoredOutcomeSchema,
   isCurrentManagedAutomationAuthority,
   parseManagedAutomationAuthority,
@@ -72,9 +73,15 @@ export type ManagedAutomationControllerFence = Readonly<{
   turnId: string;
 }>;
 
+export type ManagedAutomationMutationFence = Readonly<
+  | { kind: "controller"; value: ManagedAutomationControllerFence }
+  | { kind: "executor"; value: ManagedAutomationExecutorFence }
+>;
+
 export type ManagedAutomationOperation = Readonly<{
   id: string;
   bindingId: string;
+  operationKey: string;
   operationClass: ManagedAutomationOperationClass;
   version: 1;
   targetProjectId: string;
@@ -106,6 +113,93 @@ export type ManagedAutomationNotification = Readonly<{
   inputText: string;
   createdAt: number;
 }>;
+
+export type ManagedAutomationNotificationHandoff = Readonly<{
+  sequence: number;
+  controllerKey: string;
+  telegramUserId: string;
+  telegramChatId: string;
+  updateId: number;
+  inputText: string;
+  ownerId: string;
+  generation: number;
+  now: number;
+}>;
+
+export type ManagedAutomationReserveInput = Readonly<{
+  controllerKey: string;
+  sourceKey: string;
+  projectId: string;
+  name: string;
+  definition: ManagedAutomationDefinition;
+  authority: StoredManagedAutomationAuthority;
+  notificationPolicy: "material" | "always" | "silent";
+  legacyMonitorId: string | null;
+  now: number;
+  definitionRevision: number;
+  operation?: ManagedAutomationOperationRequest;
+  fence: ManagedAutomationMutationFence;
+}>;
+
+export interface ManagedAutomationPersistence {
+  get(id: string): ManagedAutomationBinding | null;
+  list(controllerKey: string, includeRetired?: boolean): ManagedAutomationBinding[];
+  listReconciliationCandidates(before: number, limit?: number): ManagedAutomationBinding[];
+  getOperation(id: string): ManagedAutomationOperation | null;
+  listDueOperations(now: number, limit?: number): ManagedAutomationOperation[];
+  claimOperation(input: ManagedAutomationExecutorFence & { operationId: string; now: number; leaseMs: number }): ManagedAutomationOperation | null;
+  renewOperationLease(input: ManagedAutomationExecutorFence & { operationId: string; now: number; leaseMs: number }): boolean;
+  acknowledgeOperation(input: Readonly<{
+    operationId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+    receipt: ManagedAutomationCreateReceipt;
+  }>): boolean;
+  settleOperation(input: Readonly<{
+    operationId: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+    outcome: "succeeded" | "failed" | "ambiguous";
+    automation?: ManagedAutomationObservation | null;
+    run?: ManagedAutomationRun | null;
+    providerAutomationId?: string | null;
+    errorClass?: string | null;
+    outcomeEvidence?: Readonly<Record<string, unknown>> | null;
+  }>): ManagedAutomationBinding | null;
+  reserve(input: ManagedAutomationReserveInput): ManagedAutomationBinding;
+  activate(input: Readonly<{ id: string; automation: ManagedAutomationObservation; now: number; fence: ManagedAutomationMutationFence }>): ManagedAutomationBinding;
+  setProviderOwnershipMarker(input: Readonly<{ id: string; ownershipMarker: string; now: number; fence: ManagedAutomationMutationFence }>): ManagedAutomationBinding;
+  attachProviderAutomation(input: Readonly<{
+    id: string;
+    providerAutomationId: string;
+    ownershipMarker: string;
+    now: number;
+    fence: ManagedAutomationMutationFence;
+  }>): ManagedAutomationBinding;
+  fail(id: string, errorClass: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
+  beginUpdate(input: Readonly<{ id: string; definition: ManagedAutomationDefinition; now: number; fence: ManagedAutomationMutationFence }>): ManagedAutomationBinding;
+  beginEnabledChange(input: Readonly<{
+    id: string;
+    enabled: boolean;
+    now: number;
+    fence: ManagedAutomationMutationFence;
+  }>): ManagedAutomationBinding;
+  beginRunNow(input: Readonly<{
+    id: string;
+    idempotencyKey: string;
+    now: number;
+    fence: ManagedAutomationMutationFence;
+  }>): ManagedAutomationBinding;
+  markPolicyBlocked(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
+  markExecutionContractBlocked(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
+  beginRetirement(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
+  retire(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding;
+  recordRun(bindingId: string, run: ManagedAutomationRun, now: number, fence: ManagedAutomationMutationFence): boolean;
+  listPendingNotifications(limit?: number): ManagedAutomationNotification[];
+  markNotificationEnqueued(sequence: number, now: number): boolean;
+}
 
 type ManagedAutomationRow = Readonly<{
   id: string;
@@ -142,6 +236,7 @@ type ManagedAutomationRow = Readonly<{
 type ManagedAutomationOperationRow = Readonly<{
   id: string;
   binding_id: string;
+  operation_key: string;
   operation_class: string;
   operation_version: number;
   target_project_id: string;
@@ -166,6 +261,20 @@ type ManagedAutomationOperationRow = Readonly<{
   settled_at: number | null;
 }>;
 
+const controllerFenceSchema = z.object({
+  ownerId: z.string().min(1).max(256),
+  generation: z.number().int().positive().safe(),
+  turnId: z.string().min(1).max(256),
+}).strict();
+const executorFenceSchema = z.object({
+  ownerId: z.string().min(1).max(256),
+  generation: z.number().int().positive().safe(),
+}).strict();
+const mutationFenceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("controller"), value: controllerFenceSchema }).strict(),
+  z.object({ kind: z.literal("executor"), value: executorFenceSchema }).strict(),
+]);
+
 const reserveSchema = z.object({
   controllerKey: z.string().min(1).max(256),
   sourceKey: z.string().min(1).max(256),
@@ -178,11 +287,7 @@ const reserveSchema = z.object({
   now: z.number().int().nonnegative().safe(),
   definitionRevision: z.number().int().positive().safe().default(1),
   operation: managedAutomationOperationRequestSchema.optional(),
-  controllerFence: z.object({
-    ownerId: z.string().min(1).max(256),
-    generation: z.number().int().positive().safe(),
-    turnId: z.string().min(1).max(256),
-  }).strict().optional(),
+  fence: mutationFenceSchema,
 }).strict();
 
 const operationStateSchema = z.enum(["pending", "leased", "succeeded", "failed", "ambiguous"]);
@@ -457,8 +562,8 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
         generation: z.number().int().positive().safe().parse(row.controller_generation),
         turnId: z.string().min(1).max(256).parse(row.controller_turn_id),
       };
-  if (isCurrentManagedAutomationAuthority(authority) && (!controllerFence ||
-    (authority.origin === "owner" && authority.taskAuthority.turnId !== controllerFence.turnId))) {
+  if (isCurrentManagedAutomationAuthority(authority) && authority.origin === "owner" &&
+    (!controllerFence || authority.taskAuthority.turnId !== controllerFence.turnId)) {
     throw new Error("Managed automation operation authority does not match its controller fence");
   }
   const rawOutcome = row.outcome_json === null ? null : JSON.parse(row.outcome_json);
@@ -479,6 +584,7 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
   return {
     id: row.id,
     bindingId: row.binding_id,
+    operationKey: z.string().min(1).max(256).parse(row.operation_key),
     operationClass,
     version,
     targetProjectId,
@@ -503,11 +609,30 @@ function parseOperation(row: ManagedAutomationOperationRow): ManagedAutomationOp
 }
 
 function operationIdFor(bindingId: string, operation: ManagedAutomationOperationRequest): string {
+  // Requests without an explicit idempotency key retain the operation identity
+  // used by the preceding schema. This makes the additive operation-key
+  // migration restart-safe for in-flight historical operations.
+  const identity = operation.idempotencyKey === undefined
+    ? {
+        bindingId,
+        operationClass: operation.operationClass,
+        definitionRevision: operation.definitionRevision,
+      }
+    : {
+        bindingId,
+        operationClass: operation.operationClass,
+        definitionRevision: operation.definitionRevision,
+        idempotencyKey: operation.idempotencyKey,
+      };
   return "managed-automation-operation-" + managedAutomationDigest({
-    bindingId,
-    operationClass: operation.operationClass,
-    definitionRevision: operation.definitionRevision,
+    ...identity,
   }).slice(0, 48);
+}
+
+function operationKeyFor(bindingId: string, operation: ManagedAutomationOperationRequest): string {
+  return operation.idempotencyKey === undefined
+    ? operationIdFor(bindingId, operation)
+    : `idempotency:${operation.idempotencyKey}`;
 }
 
 function ownershipMarkerFor(operationId: string): string {
@@ -517,7 +642,7 @@ function ownershipMarkerFor(operationId: string): string {
 function assertCurrentOperationInput(
   authority: StoredManagedAutomationAuthority,
   operation: ManagedAutomationOperationRequest,
-  controllerFence: ManagedAutomationControllerFence | undefined,
+  fence: ManagedAutomationMutationFence,
   controllerKey: string,
   projectId: string,
   definitionRevision: number,
@@ -530,16 +655,17 @@ function assertCurrentOperationInput(
     operation.targetProjectId !== projectId || operation.definitionRevision !== definitionRevision) {
     throw new TypeError("managed automation operation does not match its binding");
   }
-  if (!controllerFence) {
-    throw new TypeError("managed automation operation requires its controller fence");
-  }
-  if (authority.origin === "owner" && (authority.taskAuthority.kind !== "controller-turn" ||
-    authority.taskAuthority.turnId !== controllerFence.turnId)) {
+  if (authority.origin === "owner" && (fence.kind !== "controller" ||
+    authority.taskAuthority.kind !== "controller-turn" ||
+    authority.taskAuthority.turnId !== fence.value.turnId)) {
     throw new TypeError("owner managed automation operation requires its controller fence");
+  }
+  if (authority.origin !== "owner" && fence.kind !== "executor") {
+    throw new TypeError("non-owner managed automation operation requires its executor fence");
   }
 }
 
-export class ManagedAutomationRepository {
+export class ManagedAutomationRepository implements ManagedAutomationPersistence {
   public constructor(private readonly db: SqliteDatabase) {}
 
   public get(id: string): ManagedAutomationBinding | null {
@@ -737,6 +863,7 @@ export class ManagedAutomationRepository {
     now: number;
     outcome: "succeeded" | "failed" | "ambiguous";
     automation?: ManagedAutomationObservation | null;
+    run?: ManagedAutomationRun | null;
     providerAutomationId?: string | null;
     errorClass?: string | null;
     outcomeEvidence?: Readonly<Record<string, unknown>> | null;
@@ -757,9 +884,9 @@ export class ManagedAutomationRepository {
     const observation = input.automation === undefined || input.automation === null
       ? null
       : managedAutomationObservationSchema.parse(input.automation);
-    if (outcome === "succeeded" && !observation) {
-      throw new TypeError("successful managed automation settlement needs provider state");
-    }
+    const run = input.run === undefined || input.run === null
+      ? null
+      : managedAutomationRunSchema.parse(input.run);
     return this.db.transaction((): ManagedAutomationBinding | null => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return null;
       const operation = this.getOperation(input.operationId);
@@ -769,6 +896,12 @@ export class ManagedAutomationRepository {
       const binding = this.get(operation.bindingId);
       if (!binding || binding.definitionRevision !== operation.definitionRevision ||
         binding.projectId !== operation.targetProjectId) return null;
+      if (outcome === "succeeded" && operation.operationClass !== "retire" && !observation) {
+        throw new TypeError("successful managed automation settlement needs provider state");
+      }
+      if (run !== null && operation.operationClass !== "run_now") {
+        throw new TypeError("managed automation run evidence belongs to a run-now operation");
+      }
       if (managedAutomationDigest(operation.authority) !== managedAutomationDigest(binding.authority) ||
         managedAutomationDigest(operation.capabilityEvidence) !== managedAutomationDigest(binding.capabilityEvidence)) {
         return null;
@@ -781,6 +914,12 @@ export class ManagedAutomationRepository {
       );
       if (observation && providerAutomationId !== observation.providerAutomationId) {
         throw new TypeError("provider automation identity does not match its observation");
+      }
+      if (run !== null && run.automationId !== providerAutomationId) {
+        throw new TypeError("managed automation run does not match its provider identity");
+      }
+      if (operation.operationClass === "run_now" && outcome === "succeeded" && run === null) {
+        throw new TypeError("successful managed automation run-now settlement needs run evidence");
       }
       if (operation.providerAutomationId !== null && providerAutomationId !== operation.providerAutomationId) {
         throw new TypeError("provider automation identity does not match its operation");
@@ -827,8 +966,17 @@ export class ManagedAutomationRepository {
         input.generation,
       );
       if (operationUpdate.changes !== 1) return null;
-      if (outcome === "succeeded") {
+      if (outcome === "succeeded" && operation.operationClass === "retire") {
+        const bindingUpdate = this.db.prepare(
+          `UPDATE managed_automations
+              SET state = 'retired', last_error = NULL, last_reconciled_at = ?,
+                  last_operation_id = ?, last_operation_outcome = 'succeeded', updated_at = ?
+            WHERE id = ? AND state = 'retiring'`,
+        ).run(input.now, input.operationId, input.now, binding.id);
+        if (bindingUpdate.changes !== 1) throw new Error("managed automation retirement settlement could not update its binding");
+      } else if (outcome === "succeeded") {
         const automation = input.automation!;
+        if (run !== null) this.recordRunInTransaction(binding, run, input.now);
         const bindingUpdate = this.db.prepare(
           `UPDATE managed_automations
               SET bb_automation_id = ?, provider_ownership_marker = COALESCE(provider_ownership_marker, ?),
@@ -877,7 +1025,72 @@ export class ManagedAutomationRepository {
       row.lease_expires_at !== null && row.lease_expires_at > now;
   }
 
-  public reserve(raw: z.input<typeof reserveSchema>): ManagedAutomationBinding {
+  private controllerFenceIsCurrent(
+    fence: ManagedAutomationControllerFence,
+    controllerKey: string,
+    now: number,
+  ): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 FROM controller_turns AS turn
+         JOIN controller_threads AS controller ON controller.controller_key = turn.controller_key
+        WHERE turn.id = ? AND turn.controller_key = ? AND turn.state = 'submitted'
+          AND turn.lease_owner = ? AND turn.lease_generation = ?
+          AND turn.accepted_finalization_id IS NULL
+          AND turn.steer_reservation_turn_id IS NULL
+          AND controller.state = 'active'
+          AND EXISTS (
+            SELECT 1 FROM executor_lease
+             WHERE singleton = 1 AND owner_id = ? AND generation = ?
+               AND lease_expires_at > ?
+          )`,
+    ).get(
+      fence.turnId,
+      controllerKey,
+      fence.ownerId,
+      fence.generation,
+      fence.ownerId,
+      fence.generation,
+      now,
+    );
+    return row !== undefined;
+  }
+
+  private mutationFenceIsCurrent(
+    fence: ManagedAutomationMutationFence,
+    bindingId: string,
+    now: number,
+  ): boolean {
+    if (fence.kind === "executor") return this.executorLeaseIsCurrent(fence.value.ownerId, fence.value.generation, now);
+    const binding = this.db.prepare(
+      "SELECT controller_key FROM managed_automations WHERE id = ?",
+    ).get(bindingId) as { controller_key: string } | undefined;
+    return binding !== undefined && this.controllerFenceIsCurrent(fence.value, binding.controller_key, now);
+  }
+
+  private assertMutationFence(
+    fence: ManagedAutomationMutationFence,
+    bindingId: string,
+    now: number,
+  ): void {
+    mutationFenceSchema.parse(fence);
+    if (!this.mutationFenceIsCurrent(fence, bindingId, now)) {
+      throw new Error(`managed automation ${fence.kind} fence was lost`);
+    }
+  }
+
+  private assertReserveFence(
+    fence: ManagedAutomationMutationFence,
+    controllerKey: string,
+    now: number,
+  ): void {
+    mutationFenceSchema.parse(fence);
+    const current = fence.kind === "executor"
+      ? this.executorLeaseIsCurrent(fence.value.ownerId, fence.value.generation, now)
+      : this.controllerFenceIsCurrent(fence.value, controllerKey, now);
+    if (!current) throw new Error(`managed automation ${fence.kind} fence was lost`);
+  }
+
+  public reserve(raw: ManagedAutomationReserveInput): ManagedAutomationBinding {
     const input = reserveSchema.parse(raw);
     const definition = managedAutomationDefinitionSchema.parse(input.definition);
     if (definition.projectId !== input.projectId || definition.name !== input.name) {
@@ -887,18 +1100,24 @@ export class ManagedAutomationRepository {
     const definitionRevision = input.operation?.definitionRevision ?? input.definitionRevision;
     const currentAuthority = input.operation && isCurrentManagedAutomationAuthority(authority) ? authority : null;
     if (input.operation) {
-      assertCurrentOperationInput(authority, input.operation, input.controllerFence, input.controllerKey, input.projectId, definitionRevision);
+      assertCurrentOperationInput(authority, input.operation, input.fence, input.controllerKey, input.projectId, definitionRevision);
     }
     const definitionJson = canonical({ version: 1, value: definition });
     const authorityJson = canonical(authority);
     const definitionSha256 = managedAutomationDigest(definition);
     return this.db.transaction(() => {
+      this.assertReserveFence(input.fence, input.controllerKey, input.now);
       const existing = this.getBySource(input.controllerKey, input.sourceKey);
       if (existing) {
         if (existing.definitionSha256 !== definitionSha256 || existing.state === "retired") {
           throw new Error("managed automation source already has a different durable definition");
         }
-        if (input.operation) this.ensureOperation(existing, input.operation, currentAuthority!, input.controllerFence!);
+        if (input.operation) this.ensureOperation(
+          existing,
+          input.operation,
+          currentAuthority!,
+          input.fence.kind === "controller" ? input.fence.value : null,
+        );
         return input.operation ? this.get(existing.id)! : existing;
       }
       const id = "automation-binding-" + managedAutomationDigest({
@@ -936,7 +1155,13 @@ export class ManagedAutomationRepository {
         input.now,
         input.now,
       );
-      if (input.operation) this.insertOperation(id, input.operation, currentAuthority!, input.controllerFence!, input.now);
+      if (input.operation) this.insertOperation(
+        id,
+        input.operation,
+        currentAuthority!,
+        input.fence.kind === "controller" ? input.fence.value : null,
+        input.now,
+      );
       return this.get(id)!;
     }).immediate();
   }
@@ -945,7 +1170,7 @@ export class ManagedAutomationRepository {
     binding: ManagedAutomationBinding,
     request: ManagedAutomationOperationRequest,
     authority: ManagedAutomationAuthority,
-    controllerFence: ManagedAutomationControllerFence,
+    controllerFence: ManagedAutomationControllerFence | null,
   ): void {
     if (binding.definitionRevision !== request.definitionRevision) {
       throw new Error("managed automation operation revision does not match its binding");
@@ -955,7 +1180,8 @@ export class ManagedAutomationRepository {
     if (existing) {
       if (existing.bindingId !== binding.id || existing.operationClass !== request.operationClass ||
         existing.version !== request.version || existing.targetProjectId !== request.targetProjectId ||
-        existing.definitionRevision !== request.definitionRevision) {
+        existing.definitionRevision !== request.definitionRevision ||
+        existing.operationKey !== operationKeyFor(binding.id, request)) {
         throw new Error("managed automation operation identity does not match its binding");
       }
       return;
@@ -965,7 +1191,15 @@ export class ManagedAutomationRepository {
       managedAutomationDigest(binding.capabilityEvidence) !== managedAutomationDigest(authority.capabilityEvidence)) {
       throw new Error("managed automation operation authority does not match its binding");
     }
-    this.insertOperation(binding.id, request, authority, controllerFence, binding.updatedAt);
+    this.insertOperation(
+      binding.id,
+      request,
+      authority,
+      controllerFence,
+      binding.updatedAt,
+      binding.bbAutomationId,
+      binding.providerOwnershipMarker,
+    );
     this.db.prepare(
       `UPDATE managed_automations
           SET last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
@@ -977,31 +1211,35 @@ export class ManagedAutomationRepository {
     bindingId: string,
     request: ManagedAutomationOperationRequest,
     authority: ManagedAutomationAuthority,
-    controllerFence: ManagedAutomationControllerFence,
+    controllerFence: ManagedAutomationControllerFence | null,
     now: number,
+    providerAutomationId: string | null = null,
+    providerOwnershipMarker: string | null = null,
   ): void {
     const id = operationIdFor(bindingId, request);
     this.db.prepare(
       `INSERT INTO managed_automation_operations (
-         id, binding_id, operation_class, operation_version, target_project_id, definition_revision,
+         id, binding_id, operation_key, operation_class, operation_version, target_project_id, definition_revision,
          authority_json, capability_evidence_json, controller_owner_id,
          controller_generation, controller_turn_id, state, attempts,
          lease_owner, lease_generation, lease_expires_at, provider_automation_id, provider_ownership_marker,
          outcome_json, last_error, next_attempt_at, created_at, updated_at, settled_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?, NULL)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, NULL)`,
     ).run(
       id,
       bindingId,
+      operationKeyFor(bindingId, request),
       request.operationClass,
       request.version,
       request.targetProjectId,
       request.definitionRevision,
       canonical(authority),
       canonical(authority.capabilityEvidence),
-      controllerFence.ownerId,
-      controllerFence.generation,
-      controllerFence.turnId,
-      ownershipMarkerFor(id),
+      controllerFence?.ownerId ?? null,
+      controllerFence?.generation ?? null,
+      controllerFence?.turnId ?? null,
+      providerAutomationId,
+      providerOwnershipMarker ?? ownershipMarkerFor(id),
       now,
       now,
       now,
@@ -1012,35 +1250,43 @@ export class ManagedAutomationRepository {
     id: string;
     automation: ManagedAutomationObservation;
     now: number;
+    fence: ManagedAutomationMutationFence;
   }): ManagedAutomationBinding {
     const observation = managedAutomationObservationSchema.parse(input.automation);
     const observedJson = canonical({ version: 1, value: observation });
     const observedSha256 = managedAutomationDigest(observation);
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET bb_automation_id = ?, observed_json = ?, observed_sha256 = ?,
-              state = CASE WHEN ? THEN 'active' ELSE 'paused' END,
-              last_reconciled_at = ?, last_error = NULL, updated_at = ?
-        WHERE id = ? AND state IN ('pending', 'active', 'paused', 'updating', 'failed')`,
-    ).run(observation.providerAutomationId, observedJson, observedSha256, observation.enabled ? 1 : 0, input.now, input.now, input.id);
-    if (result.changes !== 1) throw new Error("managed automation activation fence was lost");
-    return this.get(input.id)!;
+    return this.db.transaction(() => {
+      this.assertMutationFence(input.fence, input.id, input.now);
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET bb_automation_id = ?, observed_json = ?, observed_sha256 = ?,
+                state = CASE WHEN ? THEN 'active' ELSE 'paused' END,
+                last_reconciled_at = ?, last_error = NULL, updated_at = ?
+          WHERE id = ? AND state IN ('pending', 'active', 'paused', 'updating', 'failed')`,
+      ).run(observation.providerAutomationId, observedJson, observedSha256, observation.enabled ? 1 : 0, input.now, input.now, input.id);
+      if (result.changes !== 1) throw new Error("managed automation activation fence was lost");
+      return this.get(input.id)!;
+    }).immediate();
   }
 
   public setProviderOwnershipMarker(input: {
     id: string;
     ownershipMarker: string;
     now: number;
+    fence: ManagedAutomationMutationFence;
   }): ManagedAutomationBinding {
     const ownershipMarker = providerOwnershipMarkerSchema.parse(input.ownershipMarker);
     if (ownershipMarker === null) throw new TypeError("managed automation ownership marker is required");
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET provider_ownership_marker = ?, updated_at = ?
-        WHERE id = ? AND (provider_ownership_marker IS NULL OR provider_ownership_marker = ?)`,
-    ).run(ownershipMarker, input.now, input.id, ownershipMarker);
-    if (result.changes !== 1) throw new Error("managed automation ownership marker fence was lost");
-    return this.get(input.id)!;
+    return this.db.transaction(() => {
+      this.assertMutationFence(input.fence, input.id, input.now);
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET provider_ownership_marker = ?, updated_at = ?
+          WHERE id = ? AND (provider_ownership_marker IS NULL OR provider_ownership_marker = ?)`,
+      ).run(ownershipMarker, input.now, input.id, ownershipMarker);
+      if (result.changes !== 1) throw new Error("managed automation ownership marker fence was lost");
+      return this.get(input.id)!;
+    }).immediate();
   }
 
   public attachProviderAutomation(input: {
@@ -1048,179 +1294,426 @@ export class ManagedAutomationRepository {
     providerAutomationId: string;
     ownershipMarker: string;
     now: number;
+    fence: ManagedAutomationMutationFence;
   }): ManagedAutomationBinding {
     const providerAutomationId = providerAutomationIdSchema.parse(input.providerAutomationId);
     const ownershipMarker = providerOwnershipMarkerSchema.parse(input.ownershipMarker);
     if (providerAutomationId === null || ownershipMarker === null) {
       throw new TypeError("managed automation provider acknowledgement is incomplete");
     }
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET bb_automation_id = ?, provider_ownership_marker = ?, last_operation_outcome = NULL, updated_at = ?
-        WHERE id = ? AND (bb_automation_id IS NULL OR bb_automation_id = ?)
-          AND (provider_ownership_marker IS NULL OR provider_ownership_marker = ?)`,
-    ).run(providerAutomationId, ownershipMarker, input.now, input.id, providerAutomationId, ownershipMarker);
-    if (result.changes !== 1) throw new Error("managed automation provider acknowledgement fence was lost");
-    return this.get(input.id)!;
+    return this.db.transaction(() => {
+      this.assertMutationFence(input.fence, input.id, input.now);
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET bb_automation_id = ?, provider_ownership_marker = ?, last_operation_outcome = NULL, updated_at = ?
+          WHERE id = ? AND (bb_automation_id IS NULL OR bb_automation_id = ?)
+            AND (provider_ownership_marker IS NULL OR provider_ownership_marker = ?)`,
+      ).run(providerAutomationId, ownershipMarker, input.now, input.id, providerAutomationId, ownershipMarker);
+      if (result.changes !== 1) throw new Error("managed automation provider acknowledgement fence was lost");
+      return this.get(input.id)!;
+    }).immediate();
   }
 
-  public fail(id: string, errorClass: string, now: number): ManagedAutomationBinding {
-    const result = this.db.prepare(
-      `UPDATE managed_automations SET state = 'failed', last_error = ?, updated_at = ?
-        WHERE id = ? AND state NOT IN ('updating', 'retiring', 'retired')`,
-    ).run(errorClass.slice(0, 256), now, id);
-    if (result.changes !== 1) throw new Error("managed automation failure fence was lost");
-    return this.get(id)!;
+  public fail(id: string, errorClass: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding {
+    return this.db.transaction(() => {
+      this.assertMutationFence(fence, id, now);
+      const result = this.db.prepare(
+        `UPDATE managed_automations SET state = 'failed', last_error = ?, updated_at = ?
+          WHERE id = ? AND state NOT IN ('updating', 'retiring', 'retired')`,
+      ).run(errorClass.slice(0, 256), now, id);
+      if (result.changes !== 1) throw new Error("managed automation failure fence was lost");
+      return this.get(id)!;
+    }).immediate();
   }
 
   public beginUpdate(input: {
     id: string;
     definition: ManagedAutomationDefinition;
     now: number;
+    fence: ManagedAutomationMutationFence;
   }): ManagedAutomationBinding {
     const definition = managedAutomationDefinitionSchema.parse(input.definition);
-    const existing = this.get(input.id);
-    if (!existing || existing.bbAutomationId === null || existing.projectId !== definition.projectId) {
-      throw new Error("managed automation update identity is invalid");
-    }
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET name = ?, mode = ?, definition_json = ?, definition_sha256 = ?,
-              state = 'updating', last_error = NULL, updated_at = ?
-        WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
-    ).run(
-      definition.name,
-      definition.mode,
-      canonical({ version: 1, value: definition }),
-      managedAutomationDigest(definition),
-      input.now,
-      input.id,
-    );
-    if (result.changes !== 1) throw new Error("managed automation update intent fence was lost");
-    return this.get(input.id)!;
-  }
-
-  public markPolicyBlocked(id: string, now: number): ManagedAutomationBinding {
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET state = 'paused', last_error = 'managed_automation_authority_stale',
-              last_reconciled_at = ?, updated_at = ?
-        WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
-    ).run(now, now, id);
-    if (result.changes !== 1) throw new Error("managed automation policy block fence was lost");
-    return this.get(id)!;
-  }
-
-  public markExecutionContractBlocked(id: string, now: number): ManagedAutomationBinding {
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET state = 'paused', last_error = 'bb_agent_execution_contract_unsupported',
-              last_reconciled_at = ?, updated_at = ?
-        WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
-    ).run(now, now, id);
-    if (result.changes !== 1) throw new Error("managed automation execution contract block fence was lost");
-    return this.get(id)!;
-  }
-
-  public beginRetirement(id: string, now: number): ManagedAutomationBinding {
-    const result = this.db.prepare(
-      `UPDATE managed_automations SET state = 'retiring', last_error = NULL, updated_at = ?
-        WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
-    ).run(now, id);
-    if (result.changes !== 1) throw new Error("managed automation retirement intent fence was lost");
-    return this.get(id)!;
-  }
-
-  public retire(id: string, now: number): ManagedAutomationBinding {
-    const existing = this.get(id);
-    if (existing?.state === "retired") return existing;
-    const result = this.db.prepare(
-      `UPDATE managed_automations SET state = 'retired', updated_at = ?
-        WHERE id = ? AND state = 'retiring'`,
-    ).run(now, id);
-    if (result.changes !== 1) throw new Error("managed automation retirement fence was lost");
-    return this.get(id)!;
-  }
-
-  public recordRun(bindingId: string, run: ManagedAutomationRun, now: number): boolean {
+    const definitionSha256 = managedAutomationDigest(definition);
     return this.db.transaction(() => {
-      const binding = this.get(bindingId);
-      if (!binding || binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
-        throw new Error("managed automation run does not match its active binding");
+      this.assertMutationFence(input.fence, input.id, input.now);
+      const existing = this.get(input.id);
+      if (!existing || existing.bbAutomationId === null || existing.projectId !== definition.projectId) {
+        throw new Error("managed automation update identity is invalid");
       }
-      const outputSha256 = run.output === null ? null : managedAutomationDigest(run.output);
-      const contract = managedAutomationRunContract(binding, run);
-      const errorClass = contract.errorClass ?? (run.error === null ? null : "bb_automation_run_failed");
-      const evidenceJson = canonical({
-        automationId: run.automationId,
-        authority: binding.authority,
-        capabilityEvidence: binding.capabilityEvidence,
-        contractOutcome: contract.outcome,
-        definitionRevision: binding.definitionRevision,
-        errorClass,
-        exitCode: run.exitCode,
-        finishedAt: run.finishedAt,
-        id: run.id,
-        initiatingOperationId: binding.lastOperationId,
-        output: outputSha256 === null ? null : { screened: true, sha256: outputSha256 },
-        runMode: run.runMode,
-        scheduledFor: run.scheduledFor,
-        skipReason: run.skipReason,
-        startedAt: run.startedAt,
-        status: run.status,
-        threadId: run.threadId,
-        trigger: run.trigger,
-      });
-      const inserted = this.db.prepare(
-        `INSERT OR IGNORE INTO managed_automation_run_evidence (
-           binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
-           thread_id, output_sha256, error_class, scheduled_for, started_at,
-           finished_at, observed_at, evidence_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        bindingId,
-        run.id,
-        run.automationId,
-        run.status,
-        run.runMode,
-        run.trigger,
-        run.threadId,
-        outputSha256,
-        errorClass,
-        run.scheduledFor,
-        run.startedAt,
-        run.finishedAt,
-        now,
-        evidenceJson,
+      if (existing.state === "updating") {
+        const operation = existing.lastOperationId ? this.getOperation(existing.lastOperationId) : null;
+        if (existing.definitionSha256 === definitionSha256 && operation?.operationClass === "update" &&
+          operation.definitionRevision === existing.definitionRevision) return existing;
+        throw new Error("managed automation update is already pending");
+      }
+      if (!["active", "paused", "failed"].includes(existing.state)) {
+        throw new Error("managed automation update lifecycle is invalid");
+      }
+      const definitionRevision = existing.definitionRevision + 1;
+      const request: ManagedAutomationOperationRequest = {
+        version: 1,
+        operationClass: "update",
+        targetProjectId: existing.projectId,
+        definitionRevision,
+      };
+      const authority = existing.authority;
+      assertCurrentOperationInput(
+        authority,
+        request,
+        input.fence,
+        existing.controllerKey,
+        existing.projectId,
+        definitionRevision,
       );
-      if (inserted.changes === 0) return false;
-      this.db.prepare(
+      this.insertOperation(
+        existing.id,
+        request,
+        authority,
+        input.fence.kind === "controller" ? input.fence.value : null,
+        input.now,
+        existing.bbAutomationId,
+        existing.providerOwnershipMarker,
+      );
+      const result = this.db.prepare(
         `UPDATE managed_automations
-            SET last_run_id = ?, last_run_status = ?, updated_at = ?
-          WHERE id = ?`,
-      ).run(run.id, run.status, now, bindingId);
-      if (run.status !== "running" && binding.notificationPolicy !== "silent") {
-        const notification = this.db.prepare(
-          `INSERT OR IGNORE INTO managed_automation_notifications (
-             bb_run_id, binding_id, controller_key, update_id, input_text,
-             state, created_at, enqueued_at
-           ) VALUES (?, ?, ?, NULL, ?, 'pending', ?, NULL)`,
-        ).run(
-          run.id,
-          bindingId,
-          binding.controllerKey,
-          managedAutomationNotificationText(binding, run),
-          now,
-        );
-        if (notification.changes === 1) {
-          const sequence = Number(notification.lastInsertRowid);
-          this.db.prepare(
-            "UPDATE managed_automation_notifications SET update_id = ? WHERE sequence = ? AND update_id IS NULL",
-          ).run(7_000_000_000_000 + sequence, sequence);
-        }
-      }
-      return true;
+            SET name = ?, mode = ?, definition_json = ?, definition_sha256 = ?,
+                definition_revision = ?, state = 'updating', last_error = NULL,
+                last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
+          WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
+      ).run(
+        definition.name,
+        definition.mode,
+        canonical({ version: 1, value: definition }),
+        definitionSha256,
+        definitionRevision,
+        operationIdFor(existing.id, request),
+        input.now,
+        input.id,
+      );
+      if (result.changes !== 1) throw new Error("managed automation update intent fence was lost");
+      return this.get(input.id)!;
     }).immediate();
+  }
+
+  public beginEnabledChange(input: {
+    id: string;
+    enabled: boolean;
+    now: number;
+    fence: ManagedAutomationMutationFence;
+  }): ManagedAutomationBinding {
+    return this.db.transaction(() => {
+      this.assertMutationFence(input.fence, input.id, input.now);
+      const existing = this.get(input.id);
+      if (!existing || existing.bbAutomationId === null ||
+        !["active", "paused", "failed", "updating"].includes(existing.state)) {
+        throw new Error("managed automation enablement lifecycle is invalid");
+      }
+      const operationClass = input.enabled ? "enable" : "disable";
+      if (existing.state === "updating") {
+        const operation = existing.lastOperationId ? this.getOperation(existing.lastOperationId) : null;
+        if (operation?.operationClass === operationClass && operation.definitionRevision === existing.definitionRevision) {
+          return existing;
+        }
+        throw new Error("managed automation enablement is already pending");
+      }
+      const definitionRevision = existing.definitionRevision + 1;
+      const request: ManagedAutomationOperationRequest = {
+        version: 1,
+        operationClass,
+        targetProjectId: existing.projectId,
+        definitionRevision,
+      };
+      const authority = existing.authority;
+      assertCurrentOperationInput(
+        authority,
+        request,
+        input.fence,
+        existing.controllerKey,
+        existing.projectId,
+        definitionRevision,
+      );
+      this.insertOperation(
+        existing.id,
+        request,
+        authority,
+        input.fence.kind === "controller" ? input.fence.value : null,
+        input.now,
+        existing.bbAutomationId,
+        existing.providerOwnershipMarker,
+      );
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET definition_revision = ?, state = 'updating', last_error = NULL,
+                last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
+          WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
+      ).run(
+        definitionRevision,
+        operationIdFor(existing.id, request),
+        input.now,
+        input.id,
+      );
+      if (result.changes !== 1) throw new Error("managed automation enablement intent fence was lost");
+      return this.get(input.id)!;
+    }).immediate();
+  }
+
+  public beginRunNow(input: {
+    id: string;
+    idempotencyKey: string;
+    now: number;
+    fence: ManagedAutomationMutationFence;
+  }): ManagedAutomationBinding {
+    const idempotencyKey = z.string().min(1).max(256).parse(input.idempotencyKey);
+    return this.db.transaction(() => {
+      this.assertMutationFence(input.fence, input.id, input.now);
+      const existing = this.get(input.id);
+      if (!existing || existing.bbAutomationId === null ||
+        !["active", "paused", "failed"].includes(existing.state)) {
+        throw new Error("managed automation run-now lifecycle is invalid");
+      }
+      const request: ManagedAutomationOperationRequest = {
+        version: 1,
+        operationClass: "run_now",
+        targetProjectId: existing.projectId,
+        definitionRevision: existing.definitionRevision,
+        idempotencyKey,
+      };
+      const authority = existing.authority;
+      assertCurrentOperationInput(
+        authority,
+        request,
+        input.fence,
+        existing.controllerKey,
+        existing.projectId,
+        existing.definitionRevision,
+      );
+      const id = operationIdFor(existing.id, request);
+      const current = this.getOperation(id);
+      if (current) {
+        if (current.bindingId !== existing.id || current.operationKey !== operationKeyFor(existing.id, request)) {
+          throw new Error("managed automation run-now idempotency identity conflict");
+        }
+        if (current.state === "succeeded") return existing;
+        if (current.state === "pending" || current.state === "leased") return existing;
+        const requeued = this.db.prepare(
+          `UPDATE managed_automation_operations
+              SET state = 'pending', lease_owner = NULL, lease_generation = NULL,
+                  lease_expires_at = NULL, outcome_json = NULL, last_error = NULL,
+                  next_attempt_at = ?, updated_at = ?, settled_at = NULL
+            WHERE id = ? AND state IN ('failed', 'ambiguous')`,
+        ).run(input.now, input.now, id);
+        if (requeued.changes !== 1) throw new Error("managed automation run-now retry fence was lost");
+      } else {
+        const last = existing.lastOperationId ? this.getOperation(existing.lastOperationId) : null;
+        if (last && ["pending", "leased"].includes(last.state)) {
+          throw new Error("managed automation operation is already pending");
+        }
+        this.insertOperation(
+          existing.id,
+          request,
+          authority,
+          input.fence.kind === "controller" ? input.fence.value : null,
+          input.now,
+          existing.bbAutomationId,
+          existing.providerOwnershipMarker,
+        );
+      }
+      const bindingUpdate = this.db.prepare(
+        `UPDATE managed_automations
+            SET last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
+          WHERE id = ? AND state IN ('active', 'paused', 'failed')`,
+      ).run(id, input.now, input.id);
+      if (bindingUpdate.changes !== 1) throw new Error("managed automation run-now intent fence was lost");
+      return this.get(input.id)!;
+    }).immediate();
+  }
+
+  public markPolicyBlocked(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding {
+    return this.db.transaction(() => {
+      this.assertMutationFence(fence, id, now);
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET state = 'paused', last_error = 'managed_automation_authority_stale',
+                last_reconciled_at = ?, updated_at = ?
+          WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
+      ).run(now, now, id);
+      if (result.changes !== 1) throw new Error("managed automation policy block fence was lost");
+      return this.get(id)!;
+    }).immediate();
+  }
+
+  public markExecutionContractBlocked(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding {
+    return this.db.transaction(() => {
+      this.assertMutationFence(fence, id, now);
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET state = 'paused', last_error = 'bb_agent_execution_contract_unsupported',
+                last_reconciled_at = ?, updated_at = ?
+          WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
+      ).run(now, now, id);
+      if (result.changes !== 1) throw new Error("managed automation execution contract block fence was lost");
+      return this.get(id)!;
+    }).immediate();
+  }
+
+  public beginRetirement(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding {
+    return this.db.transaction(() => {
+      this.assertMutationFence(fence, id, now);
+      const existing = this.get(id);
+      if (!existing || existing.state === "retired") {
+        if (existing?.state === "retired") return existing;
+        throw new Error("managed automation retirement identity is invalid");
+      }
+      if (existing.state === "retiring") {
+        const operation = existing.lastOperationId ? this.getOperation(existing.lastOperationId) : null;
+        if (operation?.operationClass === "retire" && operation.definitionRevision === existing.definitionRevision) {
+          return existing;
+        }
+        throw new Error("managed automation retirement is already pending");
+      }
+      if (!["pending", "active", "paused", "failed"].includes(existing.state)) {
+        throw new Error("managed automation retirement lifecycle is invalid");
+      }
+      const definitionRevision = existing.definitionRevision + 1;
+      const request: ManagedAutomationOperationRequest = {
+        version: 1,
+        operationClass: "retire",
+        targetProjectId: existing.projectId,
+        definitionRevision,
+      };
+      const authority = existing.authority;
+      assertCurrentOperationInput(
+        authority,
+        request,
+        fence,
+        existing.controllerKey,
+        existing.projectId,
+        definitionRevision,
+      );
+      this.insertOperation(
+        existing.id,
+        request,
+        authority,
+        fence.kind === "controller" ? fence.value : null,
+        now,
+        existing.bbAutomationId,
+        existing.providerOwnershipMarker,
+      );
+      const result = this.db.prepare(
+        `UPDATE managed_automations
+            SET definition_revision = ?, state = 'retiring', last_error = NULL,
+                last_operation_id = ?, last_operation_outcome = 'pending', updated_at = ?
+          WHERE id = ? AND state IN ('pending', 'active', 'paused', 'failed')`,
+      ).run(definitionRevision, operationIdFor(existing.id, request), now, id);
+      if (result.changes !== 1) throw new Error("managed automation retirement intent fence was lost");
+      return this.get(id)!;
+    }).immediate();
+  }
+
+  public retire(id: string, now: number, fence: ManagedAutomationMutationFence): ManagedAutomationBinding {
+    return this.db.transaction(() => {
+      this.assertMutationFence(fence, id, now);
+      const existing = this.get(id);
+      if (existing?.state === "retired") return existing;
+      const result = this.db.prepare(
+        `UPDATE managed_automations SET state = 'retired', updated_at = ?
+          WHERE id = ? AND state = 'retiring'`,
+      ).run(now, id);
+      if (result.changes !== 1) throw new Error("managed automation retirement fence was lost");
+      return this.get(id)!;
+    }).immediate();
+  }
+
+  public recordRun(bindingId: string, run: ManagedAutomationRun, now: number, fence: ManagedAutomationMutationFence): boolean {
+    return this.db.transaction(() => {
+      this.assertMutationFence(fence, bindingId, now);
+      const binding = this.get(bindingId);
+      if (!binding) throw new Error("managed automation run binding is missing");
+      return this.recordRunInTransaction(binding, run, now);
+    }).immediate();
+  }
+
+  private recordRunInTransaction(
+    binding: ManagedAutomationBinding,
+    rawRun: ManagedAutomationRun,
+    now: number,
+  ): boolean {
+    const run = managedAutomationRunSchema.parse(rawRun);
+    if (binding.bbAutomationId !== run.automationId || ["retiring", "retired"].includes(binding.state)) {
+      throw new Error("managed automation run does not match its active binding");
+    }
+    const outputSha256 = run.output === null ? null : managedAutomationDigest(run.output);
+    const contract = managedAutomationRunContract(binding, run);
+    const errorClass = contract.errorClass ?? (run.error === null ? null : "bb_automation_run_failed");
+    const evidenceJson = canonical({
+      automationId: run.automationId,
+      authority: binding.authority,
+      capabilityEvidence: binding.capabilityEvidence,
+      contractOutcome: contract.outcome,
+      definitionRevision: binding.definitionRevision,
+      errorClass,
+      exitCode: run.exitCode,
+      finishedAt: run.finishedAt,
+      id: run.id,
+      initiatingOperationId: binding.lastOperationId,
+      output: outputSha256 === null ? null : { screened: true, sha256: outputSha256 },
+      runMode: run.runMode,
+      scheduledFor: run.scheduledFor,
+      skipReason: run.skipReason,
+      startedAt: run.startedAt,
+      status: run.status,
+      threadId: run.threadId,
+      trigger: run.trigger,
+    });
+    const inserted = this.db.prepare(
+      `INSERT OR IGNORE INTO managed_automation_run_evidence (
+         binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+         thread_id, output_sha256, error_class, scheduled_for, started_at,
+         finished_at, observed_at, evidence_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      binding.id,
+      run.id,
+      run.automationId,
+      run.status,
+      run.runMode,
+      run.trigger,
+      run.threadId,
+      outputSha256,
+      errorClass,
+      run.scheduledFor,
+      run.startedAt,
+      run.finishedAt,
+      now,
+      evidenceJson,
+    );
+    if (inserted.changes === 0) return false;
+    this.db.prepare(
+      `UPDATE managed_automations
+          SET last_run_id = ?, last_run_status = ?, updated_at = ?
+        WHERE id = ?`,
+    ).run(run.id, run.status, now, binding.id);
+    if (run.status !== "running" && binding.notificationPolicy !== "silent") {
+      const notification = this.db.prepare(
+        `INSERT OR IGNORE INTO managed_automation_notifications (
+           bb_run_id, binding_id, controller_key, update_id, input_text,
+           state, created_at, enqueued_at
+         ) VALUES (?, ?, ?, NULL, ?, 'pending', ?, NULL)`,
+      ).run(
+        run.id,
+        binding.id,
+        binding.controllerKey,
+        managedAutomationNotificationText(binding, run),
+        now,
+      );
+      if (notification.changes === 1) {
+        const sequence = Number(notification.lastInsertRowid);
+        this.db.prepare(
+          "UPDATE managed_automation_notifications SET update_id = ? WHERE sequence = ? AND update_id IS NULL",
+        ).run(7_000_000_000_000 + sequence, sequence);
+      }
+    }
+    return true;
   }
 
   public listPendingNotifications(limit = 20): ManagedAutomationNotification[] {

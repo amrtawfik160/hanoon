@@ -312,8 +312,28 @@ import {
   NavigatorImplementationRepository,
   type NavigatorImplementationPersistence,
 } from "../navigator/implementation-persistence";
+import type {
+  NavigatorEffectPersistence,
+  NavigatorReleasePersistence,
+} from "../navigator/effect-persistence";
+import type { NavigatorImplementationReadStore } from "../navigator/implementation-executor";
+import type { NavigatorWorkflowPersistence } from "../navigator/executor";
+import {
+  createNavigatorEvaluationPersistence,
+  type NavigatorEvaluationPersistence,
+} from "../navigator/evaluation-persistence";
+import {
+  createNavigatorCoordinatorPersistence,
+  type NavigatorCoordinatorPersistence,
+} from "../navigator/coordinator-persistence";
 import type { NavigatorTicketWorkerOutcome } from "../navigator/ticket-settlement-repository";
-import type { NavigatorFindingLedgerDecision } from "../navigator/finding-ledger";
+import { NavigatorFindingLedger } from "../navigator/finding-ledger";
+import { NavigatorFindingLedgerRepository } from "../navigator/finding-ledger-repository";
+import {
+  ManagedAutomationRepository,
+  type ManagedAutomationPersistence,
+  type ManagedAutomationNotificationHandoff,
+} from "./managed-automation-repository";
 import type {
   NavigatorArtifactBinding,
   NavigatorInferenceObservation,
@@ -3387,6 +3407,7 @@ export interface TelegramAgentStore {
     threadFollowUp?: ThreadFollowUp;
     now: number;
   }): ControllerTurnRecord;
+  enqueueManagedAutomationNotification(input: ManagedAutomationNotificationHandoff): boolean;
   getControllerByThreadId(threadId: string): ControllerThreadRecord | null;
   getControllerForPendingSpawn(input: {
     controllerKey: string;
@@ -4062,16 +4083,6 @@ export interface TelegramAgentStore {
     generation: number;
     now: number;
   }): boolean;
-  reauthorizeNavigatorCompatibilityEffect(input: {
-    effectIdempotencyKey: string;
-    attemptId: string;
-    profileId: string;
-    profileRevision: number;
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): boolean;
   getNavigatorTicketAttemptContext(input: {
     attemptId: string;
     effectIdempotencyKey: string;
@@ -4081,8 +4092,6 @@ export interface TelegramAgentStore {
   }): NavigatorTicketAttemptContext | null;
   bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean;
   settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
-  getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision;
-  getNavigatorImplementationPersistence(): NavigatorImplementationPersistence;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
     attemptId: string;
@@ -5654,7 +5663,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
   private readonly navigatorRepository: NavigatorRepository;
-  private readonly navigatorImplementationRepository: NavigatorImplementationRepository;
   private readonly taskAuthorityRepository: TaskAuthorityRepository;
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
@@ -5666,6 +5674,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     private readonly clock: () => number,
     private readonly controllerModelRoute: () => ModelRoute = () => DEFAULT_CONTROLLER_CAPABILITY_MODEL,
     private readonly capabilityDispatchSettings: () => CapabilityDispatchSettings = () => DEFAULT_CAPABILITY_DISPATCH_SETTINGS,
+    navigatorRepository: NavigatorRepository,
   ) {
     this.autonomyRepository = new AutonomyRepository(db);
     this.capabilityRepository = new CapabilityRepository(db);
@@ -5675,8 +5684,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.stageExecutionRepository = new StageExecutionRepository(db);
     this.referenceRepository = new ReferenceRepository(db);
     this.workArtifactRepository = new WorkArtifactRepository(db);
-    this.navigatorRepository = new NavigatorRepository(db);
-    this.navigatorImplementationRepository = new NavigatorImplementationRepository(db, this);
+    this.navigatorRepository = navigatorRepository;
     this.taskAuthorityRepository = new TaskAuthorityRepository(db);
     this.releaseAuthorityRepository = new ReleaseAuthorityRepository(db);
     this.ownerBoundaryRepository = new OwnerBoundaryRepository(db);
@@ -6689,6 +6697,44 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       ).run(profile.id, profile.revision, id);
       const stored = this.db.prepare("SELECT * FROM controller_turns WHERE id = ?").get(id) as ControllerTurnRow;
       return parseControllerTurn(stored);
+    }).immediate();
+  }
+
+  public enqueueManagedAutomationNotification(input: ManagedAutomationNotificationHandoff): boolean {
+    assertControllerKey(input.controllerKey);
+    assertCanonicalPositiveDecimal(input.telegramUserId, "telegramUserId");
+    assertCanonicalPositiveDecimal(input.telegramChatId, "telegramChatId");
+    assertNonNegativeInteger(input.updateId, "updateId");
+    assertControllerText(input.inputText, "controller input");
+    assertBoundedString(input.ownerId, "ownerId");
+    assertPositiveInteger(input.generation, "generation");
+    assertNonNegativeInteger(input.now, "now");
+    assertPositiveInteger(input.sequence, "sequence");
+    return this.db.transaction(() => {
+      if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
+      const pending = this.db.prepare(
+        `SELECT controller_key, update_id, state FROM managed_automation_notifications
+          WHERE sequence = ?`,
+      ).get(input.sequence) as {
+        controller_key: string;
+        update_id: number | null;
+        state: string;
+      } | undefined;
+      if (!pending || pending.state !== "pending" || pending.controller_key !== input.controllerKey ||
+        pending.update_id !== input.updateId) return false;
+      this.enqueueControllerTurn({
+        controllerKey: input.controllerKey,
+        telegramUserId: input.telegramUserId,
+        telegramChatId: input.telegramChatId,
+        updateId: input.updateId,
+        inputText: input.inputText,
+        origin: "system",
+        now: input.now,
+      });
+      return this.db.prepare(
+        `UPDATE managed_automation_notifications SET state = 'enqueued', enqueued_at = ?
+          WHERE sequence = ? AND state = 'pending'`,
+      ).run(input.now, input.sequence).changes === 1;
     }).immediate();
   }
 
@@ -12738,19 +12784,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.admitNavigatorCapabilityEvidence(input);
   }
 
-  public reauthorizeNavigatorCompatibilityEffect(input: {
-    effectIdempotencyKey: string;
-    attemptId: string;
-    profileId: string;
-    profileRevision: number;
-    ownerId: string;
-    generation: number;
-    now: number;
-    leaseMs: number;
-  }): boolean {
-    return this.navigatorRepository.reauthorizeNavigatorCompatibilityEffect(input);
-  }
-
   public getNavigatorTicketAttemptContext(input: {
     attemptId: string;
     effectIdempotencyKey: string;
@@ -12767,14 +12800,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null {
     return this.navigatorRepository.settleNavigatorTicketWorkerAttempt(input);
-  }
-
-  public getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision {
-    return this.navigatorRepository.getNavigatorFindingLedgerDecision(jobId);
-  }
-
-  public getNavigatorImplementationPersistence(): NavigatorImplementationPersistence {
-    return this.navigatorImplementationRepository;
   }
 
   public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {
@@ -19042,8 +19067,129 @@ export function openStore(
   controllerModelRoute: () => ModelRoute = () => DEFAULT_CONTROLLER_CAPABILITY_MODEL,
   capabilityDispatchSettings: () => CapabilityDispatchSettings = () => DEFAULT_CAPABILITY_DISPATCH_SETTINGS,
 ): TelegramAgentStore {
+  return openStoreComposition(
+    storage,
+    kv,
+    now,
+    controllerModelRoute,
+    capabilityDispatchSettings,
+  ).store;
+}
+
+export type StoreComposition = Readonly<{
+  store: TelegramAgentStore;
+  navigatorCoordinator: NavigatorCoordinatorPersistence;
+  navigatorEvaluation: NavigatorEvaluationPersistence;
+  navigatorEffects: NavigatorEffectPersistence;
+  navigatorWorkflow: NavigatorWorkflowPersistence;
+  navigatorImplementationRead: NavigatorImplementationReadStore;
+  navigatorImplementation: NavigatorImplementationPersistence;
+  navigatorRelease: NavigatorReleasePersistence;
+  findingLedger: NavigatorFindingLedger;
+  managedAutomation: ManagedAutomationPersistence;
+}>;
+
+function createNavigatorEffectPersistence(store: TelegramAgentStore): NavigatorEffectPersistence {
+  return {
+    leaseNavigatorEffect: (input) => store.leaseNavigatorEffect(input),
+    isExecutorLeaseCurrent: (ownerId, generation, now) => store.isExecutorLeaseCurrent(ownerId, generation, now),
+    getEffect: (jobId, idempotencyKey) => store.getEffect(jobId, idempotencyKey),
+    getJob: (jobId) => store.getJob(jobId),
+    getNavigatorWorkflowStep: (id) => store.getNavigatorWorkflowStep(id),
+    getNavigatorProposal: (id) => store.getNavigatorProposal(id),
+    getNavigatorProposalDecision: (id) => store.getNavigatorProposalDecision(id),
+    getNavigatorSkillAttempt: (id) => store.getNavigatorSkillAttempt(id),
+    getNavigatorReleaseAttempt: (id) => store.getNavigatorReleaseAttempt(id),
+    getNavigatorCapabilityEvidence: (effectIdempotencyKey) => store.getNavigatorCapabilityEvidence(effectIdempotencyKey),
+    admitNavigatorCapabilityEvidence: (input) => store.admitNavigatorCapabilityEvidence(input),
+    getNavigatorTicketAttemptContext: (input) => store.getNavigatorTicketAttemptContext(input),
+    bindNavigatorTicketWorkerResource: (input) => store.bindNavigatorTicketWorkerResource(input),
+    getCurrentWorkArtifactSnapshot: (artifactId) => store.getCurrentWorkArtifactSnapshot(artifactId),
+    isWorkArtifactSnapshotValid: (snapshotId) => store.isWorkArtifactSnapshotValid(snapshotId),
+    listCurrentHeldResourceClaims: (jobId, limit) => store.listCurrentHeldResourceClaims(jobId, limit),
+    taskAuthorityOperationIsCurrent: (effect, operation) => store.taskAuthorityOperationIsCurrent(effect, operation),
+    renewJobOperationFences: (input) => store.renewJobOperationFences(input),
+    settleNavigatorSkillAttempt: (input) => store.settleNavigatorSkillAttempt(input),
+    settleNavigatorTicketWorkerAttempt: (input) => store.settleNavigatorTicketWorkerAttempt(input),
+    settleNavigatorReleaseEffect: (input) => store.settleNavigatorReleaseEffect(input),
+    completeEffect: (key, ownerId, generation, now) => store.completeEffect(key, ownerId, generation, now),
+    failEffect: (key, ownerId, generation, error, nextAttemptAt, now) =>
+      store.failEffect(key, ownerId, generation, error, nextAttemptAt, now),
+    deadLetterEffect: (key, ownerId, generation, error, now) =>
+      store.deadLetterEffect(key, ownerId, generation, error, now),
+  };
+}
+
+function createNavigatorWorkflowPersistence(store: TelegramAgentStore): NavigatorWorkflowPersistence {
+  return {
+    createNavigatorSnapshot: (input) => store.createNavigatorSnapshot(input),
+    recordNavigatorProposal: (input) => store.recordNavigatorProposal(input),
+    leaseNavigatorSkillEffect: (input) => store.leaseNavigatorSkillEffect(input),
+    getNavigatorSkillAttempt: (id) => store.getNavigatorSkillAttempt(id),
+    taskAuthorityOperationIsCurrent: (effect, operation) => store.taskAuthorityOperationIsCurrent(effect, operation),
+    renewJobOperationFences: (input) => store.renewJobOperationFences(input),
+    bindNavigatorSkillAttemptResource: (input) => store.bindNavigatorSkillAttemptResource(input),
+    getNavigatorPlanningResult: (attemptId) => store.getNavigatorPlanningResult(attemptId),
+    recordNavigatorPlanningResult: (input) => store.recordNavigatorPlanningResult(input),
+    settleNavigatorSkillAttempt: (input) => store.settleNavigatorSkillAttempt(input),
+    failEffect: (key, ownerId, generation, error, nextAttemptAt, now) =>
+      store.failEffect(key, ownerId, generation, error, nextAttemptAt, now),
+    deadLetterEffect: (key, ownerId, generation, error, now) =>
+      store.deadLetterEffect(key, ownerId, generation, error, now),
+  };
+}
+
+function createNavigatorImplementationReadStore(store: TelegramAgentStore): NavigatorImplementationReadStore {
+  return {
+    getJob: (jobId) => store.getJob(jobId),
+    getWorkArtifact: (id) => store.getWorkArtifact(id),
+    getCurrentWorkArtifactSnapshot: (artifactId) => store.getCurrentWorkArtifactSnapshot(artifactId),
+    isWorkArtifactSnapshotValid: (snapshotId) => store.isWorkArtifactSnapshotValid(snapshotId),
+  };
+}
+
+function createNavigatorReleasePersistence(store: TelegramAgentStore): NavigatorReleasePersistence {
+  return {
+    leaseNavigatorReleaseEffect: (input) => store.leaseNavigatorReleaseEffect(input),
+    getNavigatorReleaseAttempt: (id) => store.getNavigatorReleaseAttempt(id),
+    getJob: (jobId) => store.getJob(jobId),
+    taskAuthorityOperationIsCurrent: (effect, operation) => store.taskAuthorityOperationIsCurrent(effect, operation),
+    deadLetterEffect: (key, ownerId, generation, error, now) =>
+      store.deadLetterEffect(key, ownerId, generation, error, now),
+    settleNavigatorReleaseEffect: (input) => store.settleNavigatorReleaseEffect(input),
+  };
+}
+
+export function openStoreComposition(
+  storage: PluginStorage,
+  kv: PluginKv = storage.kv,
+  now: () => number = () => Date.now(),
+  controllerModelRoute: () => ModelRoute = () => DEFAULT_CONTROLLER_CAPABILITY_MODEL,
+  capabilityDispatchSettings: () => CapabilityDispatchSettings = () => DEFAULT_CAPABILITY_DISPATCH_SETTINGS,
+): StoreComposition {
   migrateControllerInteractionStorage(storage, now());
   const db = storage.database();
   ensureApprovalOwnershipColumns(db);
-  return new SqliteTelegramAgentStore(db, kv, now, controllerModelRoute, capabilityDispatchSettings);
+  const findingLedger = new NavigatorFindingLedger(new NavigatorFindingLedgerRepository(db));
+  const navigatorEffects = new NavigatorRepository(db, findingLedger);
+  const store = new SqliteTelegramAgentStore(
+    db,
+    kv,
+    now,
+    controllerModelRoute,
+    capabilityDispatchSettings,
+    navigatorEffects,
+  );
+  return {
+    store,
+    navigatorCoordinator: createNavigatorCoordinatorPersistence(store),
+    navigatorEvaluation: createNavigatorEvaluationPersistence(store, db),
+    navigatorEffects: createNavigatorEffectPersistence(store),
+    navigatorWorkflow: createNavigatorWorkflowPersistence(store),
+    navigatorImplementationRead: createNavigatorImplementationReadStore(store),
+    navigatorImplementation: new NavigatorImplementationRepository(db, store, findingLedger),
+    navigatorRelease: createNavigatorReleasePersistence(store),
+    findingLedger,
+    managedAutomation: new ManagedAutomationRepository(db),
+  };
 }

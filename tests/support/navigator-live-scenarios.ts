@@ -7,6 +7,7 @@ import { navigatorAcceptanceCriteria } from "../../src/navigator/implementation-
 import {
   NavigatorImplementationExecutor,
 } from "../../src/navigator/implementation-executor";
+import type { NavigatorImplementationPersistence } from "../../src/navigator/implementation-persistence";
 import {
   createNavigatorTicketEffectAdapter,
   type NavigatorTicketWorkerInput,
@@ -14,6 +15,7 @@ import {
 } from "../../src/navigator/ticket-adapter";
 import { NavigatorEffectProtocol } from "../../src/navigator/effect-protocol";
 import { assertNavigatorLiveScenarioEvidence } from "../../src/navigator/live-evidence";
+import type { NavigatorEvaluationPersistence } from "../../src/navigator/evaluation-persistence";
 import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/navigator/promotion";
 import { NavigatorReleaseExecutor } from "../../src/navigator/release-executor";
 import { EffectRunner } from "../../src/services/effect-runner";
@@ -243,7 +245,7 @@ function claimProjectResource(
 
 function implementationExecutor(
   store: TelegramAgentStore,
-  database: Database.Database,
+  persistence: NavigatorImplementationPersistence,
   now: () => number,
   options: Readonly<{ staleHead: boolean; findingsOnFirstReview: boolean }>,
 ) {
@@ -339,6 +341,7 @@ function implementationExecutor(
   };
   const executor = new NavigatorImplementationExecutor({
     store,
+    persistence,
     gitObserver,
     pullRequests: {
       createOrRefresh: vi.fn(async (request) => ({
@@ -405,6 +408,7 @@ async function processUntilOutcome(
 
 async function runImplementation(
   store: TelegramAgentStore,
+  persistence: NavigatorImplementationPersistence,
   database: Database.Database,
   now: () => number,
   opened: Readonly<{ jobId: string; specificationId: string; ticketId: string }>,
@@ -413,7 +417,7 @@ async function runImplementation(
   options: Readonly<{ staleHead: boolean; findingsOnFirstReview: boolean }>,
 ) {
   isolateLiveIntegration(database, opened.jobId);
-  const running = implementationExecutor(store, database, now, options);
+  const running = implementationExecutor(store, persistence, now, options);
   const executor = running.executor;
   executor.startIntegration({
     jobId: opened.jobId,
@@ -714,12 +718,13 @@ async function runNextProductionEffect(
 
 function startResolvedIntegration(
   store: TelegramAgentStore,
+  persistence: NavigatorImplementationPersistence,
   database: Database.Database,
   now: () => number,
   opened: Readonly<{ jobId: string; specificationId: string; ticketId: string }>,
 ): void {
   isolateLiveIntegration(database, opened.jobId);
-  const running = implementationExecutor(store, database, now, {
+  const running = implementationExecutor(store, persistence, now, {
     staleHead: false,
     findingsOnFirstReview: false,
   });
@@ -745,6 +750,8 @@ function startResolvedIntegration(
 
 export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
   store: TelegramAgentStore;
+  implementationPersistence: NavigatorImplementationPersistence;
+  evaluationPersistence: NavigatorEvaluationPersistence;
   database: Database.Database;
   now: () => number;
   sequence: number;
@@ -784,28 +791,28 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
         input.store.prepareWorkArtifactCreateIntent(intent);
         input.store.prepareWorkArtifactCreateIntent(intent);
         cancelJob(input.store, opened.jobId, input.now);
-        runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "cancelled"));
+        runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "cancelled"));
         continue;
       }
 
       if (scenario === "stale_head") {
         await runImplementation(
-          input.store, input.database, input.now, opened, ownerId, lease.generation,
+          input.store, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
           { staleHead: true, findingsOnFirstReview: false },
         );
         cancelJob(input.store, opened.jobId, input.now);
-        runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "cancelled"));
+        runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "cancelled"));
         continue;
       }
 
       if (scenario === "repair") {
         const running = await runImplementation(
-          input.store, input.database, input.now, opened, ownerId, lease.generation,
+          input.store, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
           { staleHead: false, findingsOnFirstReview: true },
         );
         await repairAndAccept(running, opened);
         cancelJob(input.store, opened.jobId, input.now);
-        runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "cancelled"));
+        runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "cancelled"));
         continue;
       }
 
@@ -836,7 +843,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
           input.now(),
         );
         cancelJob(input.store, opened.jobId, input.now);
-        runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "cancelled"));
+        runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "cancelled"));
         continue;
       }
 
@@ -852,12 +859,12 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
         );
         cancelJob(input.store, opened.jobId, input.now);
         releaseHeldClaims(input.database, input.now());
-        runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "cancelled"));
+        runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "cancelled"));
         continue;
       }
 
       if (scenario === "re_release") {
-        startResolvedIntegration(input.store, input.database, input.now, opened);
+        startResolvedIntegration(input.store, input.implementationPersistence, input.database, input.now, opened);
         markShippedChange(input.database, opened.jobId);
         propose(input.store, opened.jobId, input.now, {
           kind: "start_release",
@@ -884,12 +891,12 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
           implementationTicketIds: [opened.ticketId],
         });
         cancelJob(input.store, opened.jobId, input.now);
-        runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "cancelled"));
+        runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "cancelled"));
         continue;
       }
 
       const running = await runImplementation(
-        input.store, input.database, input.now, opened, ownerId, lease.generation,
+        input.store, input.implementationPersistence, input.database, input.now, opened, ownerId, lease.generation,
         { staleHead: false, findingsOnFirstReview: true },
       );
       await repairAndAccept(running, opened);
@@ -934,7 +941,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
         async () => passingStage("canary"),
       );
       releaseHeldClaims(input.database, input.now());
-      runs.push(finishRun(input.store, input.database, scenario, opened.jobId, "complete"));
+      runs.push(finishRun(input.store, input.evaluationPersistence, scenario, opened.jobId, "complete"));
     }
   } finally {
     input.store.releaseExecutorLease(ownerId, lease.generation, input.now());
@@ -944,7 +951,7 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
 
 function finishRun(
   store: TelegramAgentStore,
-  database: Database.Database,
+  evaluationPersistence: NavigatorEvaluationPersistence,
   scenario: NavigatorLiveScenario,
   jobId: string,
   expected: "complete" | "cancelled",
@@ -956,6 +963,6 @@ function finishRun(
     terminalState,
     evidenceDigest: digest(`${scenario}:${jobId}`),
   };
-  assertNavigatorLiveScenarioEvidence(store, database, run);
+  assertNavigatorLiveScenarioEvidence(evaluationPersistence, run);
   return run;
 }

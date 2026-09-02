@@ -58,7 +58,7 @@ import { TelegramIngress } from "./telegram/ingress";
 import { transcribeWithBb } from "./telegram/voice";
 import { referenceBriefingFor } from "./reference/briefing";
 import { DualEngineCoordinator } from "./navigator/coordinator";
-import { openStore, type TelegramAgentStore } from "./storage/store";
+import { openStoreComposition, type TelegramAgentStore } from "./storage/store";
 import { AutonomyRepository } from "./storage/autonomy-repository";
 import { DEFAULT_MAX_CONCURRENT_JOBS } from "./autonomy/models";
 import { AutonomyScheduler } from "./autonomy/scheduler";
@@ -138,7 +138,6 @@ import {
   ManagedAutomationService,
   managedAutomationAuthorityIsCurrent,
 } from "./services/managed-automation-service";
-import { ManagedAutomationRepository } from "./storage/managed-automation-repository";
 import { ProductionHealthService } from "./services/production-health-service";
 import { RegressionWatchService } from "./services/regression-watch-service";
 import { FailureLoopService } from "./services/failure-loop-service";
@@ -519,7 +518,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
   });
   let config = parseGlobalConfig(await settings.get());
-  const store = openStore(
+  const composition = openStoreComposition(
     bb.storage,
     bb.storage.kv,
     clock,
@@ -530,9 +529,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       workflowEngineGraph: "adaptive",
     },
   );
+  const store = composition.store;
   const engineCoordinator = new DualEngineCoordinator({
-    store,
-    database: bb.storage.database(),
+    persistence: composition.navigatorCoordinator,
+    evaluation: composition.navigatorEvaluation,
+    navigatorEffects: composition.navigatorEffects,
+    navigatorImplementation: composition.navigatorImplementation,
     now: clock,
   });
   engineCoordinator.assertContractionAllowed();
@@ -554,8 +556,11 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     now: clock,
   });
   const navigatorRuntime = createNavigatorRuntime({
-    store,
-    database: bb.storage.database(),
+    effectPersistence: composition.navigatorEffects,
+    workflowPersistence: composition.navigatorWorkflow,
+    implementationRead: composition.navigatorImplementationRead,
+    implementationPersistence: composition.navigatorImplementation,
+    releasePersistence: composition.navigatorRelease,
     sdk: bb.sdk,
     modelRoute: () => {
       if (!config.ok) throw new Error(config.message);
@@ -671,9 +676,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     hanoonToolNames: [...CONTROLLER_TOOL_NAMES, "telegram_agent_respond"],
   });
   const terminal = new TerminalCommandRunner(bb.sdk);
-  const managedAutomationRepository = new ManagedAutomationRepository(bb.storage.database());
   const managedAutomations = new ManagedAutomationService(
-    managedAutomationRepository,
+    composition.managedAutomation,
     new TerminalBbAutomationAdapter(terminal),
     (binding) => {
       const owner = store.getOwner();
@@ -687,17 +691,25 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       if (isCurrentManagedAutomationAuthority(binding.authority)) {
         return binding.authority.hostId === controller.hostId;
       }
-      // Legacy bindings remain readable and reconcilable for migration. They
-      // cannot submit a new durable operation because the repository requires
-      // current versioned authority for that path.
-      return true;
+      // Legacy bindings remain readable for rollback and migration only. They
+      // cannot authorize a new provider mutation.
+      return false;
     },
     (binding, operation) => {
       const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
       const evidence = binding.capabilityEvidence;
-      if (!authority || authority.origin !== "owner" || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
-        operation.operationClass !== "create" || operation.targetProjectId !== binding.projectId ||
-        authority.taskAuthority.kind !== "controller-turn" || authority.taskAuthority.turnId === "") return false;
+      if (!authority || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
+        !["create", "update", "enable", "disable", "run_now", "retire"].includes(operation.operationClass) ||
+        operation.targetProjectId !== binding.projectId) return false;
+      if (authority.origin === "system-maintenance") {
+        const descriptor = capabilityDescriptorById(evidence.capabilityId, evidence.descriptorDigest);
+        return descriptor !== undefined && descriptor.version === evidence.descriptorVersion &&
+          evidence.profileId === `system-maintenance:${authority.standingAuthority.systemKey}` &&
+          evidence.evidenceRefs.length === 1 &&
+          evidence.evidenceRefs[0] === `system-maintenance:${authority.standingAuthority.systemKey}`;
+      }
+      if (authority.origin !== "owner" || authority.taskAuthority.kind !== "controller-turn" ||
+        authority.taskAuthority.turnId === "") return false;
       const profile = store.getCapabilityProfileById(evidence.profileId);
       if (!profile || profile.mode !== "active" || profile.subjectKind !== "controller_turn" ||
         profile.subjectId !== authority.taskAuthority.turnId || profile.revision !== evidence.profileRevision ||
@@ -717,9 +729,10 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         receipt.capabilityId === evidence.capabilityId && receipt.descriptorDigest === evidence.descriptorDigest &&
         receipt.profileRevision === evidence.profileRevision);
     },
+    { now: clock },
   );
   const managedAutomationReconciler = new ManagedAutomationReconciler({
-    repository: managedAutomationRepository,
+    repository: composition.managedAutomation,
     service: managedAutomations,
     store,
     notify: () => executorNudge.notify(),
@@ -1482,7 +1495,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   });
   let systemMonitorsInstalled = false;
   const systemMonitors = {
-    install: async () => {
+    install: async (fence: EffectFence) => {
       // Turning the setting off has to retire what is already armed, or the
       // owner keeps getting the daily sweep they just switched off.
       if (config.ok && !systemUpkeepEnabled(config.value)) {
@@ -1500,6 +1513,10 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
                 id: binding.id,
                 scope: { kind: "host", hostId: controller.hostId, cwd: null },
                 now: clock(),
+                fence: {
+                  kind: "executor",
+                  value: { ownerId: fence.ownerId, generation: fence.generation },
+                },
               });
               systemMonitorsInstalled = false;
             } catch {
@@ -1517,6 +1534,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         service: managedAutomations,
         providerId: controllerProviderFor(execution.model),
         execution,
+        fence: { ownerId: fence.ownerId, generation: fence.generation },
         clock: { now: clock },
         warn: (message) => bb.log.warn(message),
       });

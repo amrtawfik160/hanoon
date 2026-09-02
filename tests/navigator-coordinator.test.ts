@@ -31,7 +31,7 @@ import {
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import { EffectRunner } from "../src/services/effect-runner";
 import { productionResourceKey, projectResourceKey } from "../src/autonomy/models";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture, productionPolicyFixture, sha } from "./helpers";
 import { runRequiredNavigatorLiveScenarios } from "./support/navigator-live-scenarios";
@@ -96,7 +96,8 @@ function openCoordinatorFixture() {
   const { bb } = createFakePluginHost({ pluginId: `navigator-coordinator-${fixtureSequence}` });
   let currentTime = 20_000;
   const now = () => currentTime++;
-  const store = openStore(bb.storage, bb.storage.kv, now);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, now);
+  const store = composition.store;
   store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
   if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) throw new Error("owner pairing failed");
   store.upsertProjectPolicy(policyFixture({
@@ -106,11 +107,22 @@ function openCoordinatorFixture() {
     },
   }), 1_002);
   const coordinator = new DualEngineCoordinator({
-    store,
-    database: bb.storage.database(),
+    persistence: composition.navigatorCoordinator,
+    evaluation: composition.navigatorEvaluation,
+    navigatorEffects: composition.navigatorEffects,
+    navigatorImplementation: composition.navigatorImplementation,
     now,
   });
-  return { bb, store, database: bb.storage.database(), now, coordinator };
+  return {
+    bb,
+    store,
+    database: bb.storage.database(),
+    navigatorEffects: composition.navigatorEffects,
+    navigatorImplementation: composition.navigatorImplementation,
+    navigatorEvaluation: composition.navigatorEvaluation,
+    now,
+    coordinator,
+  };
 }
 
 function seedTrials(store: TelegramAgentStore, now: () => number) {
@@ -228,7 +240,7 @@ function confirmNavigatorAdmission(
 
 describe("dual-engine coordinator", () => {
   it("refuses live evidence that is only a SQL-stamped terminal job", async () => {
-    const { store, database, now, coordinator } = openCoordinatorFixture();
+    const { store, database, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
     const corpus = await coordinator.evaluateCorpus();
     const liveRuns = NAVIGATOR_LIVE_SCENARIOS.map((scenario) => {
       const live = createLiveJob(store, database, scenario, now);
@@ -252,12 +264,12 @@ describe("dual-engine coordinator", () => {
   });
 
   it("evaluates the fixed corpus, persists reviewed evidence, and admits navigator-v1", async () => {
-    const { store, database, now, coordinator } = openCoordinatorFixture();
+    const { store, database, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
     const corpus = await coordinator.evaluateCorpus();
     expect(corpus).toMatchObject({ total: 58, correct: 58, unauthorizedEffects: 0 });
 
     const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store, database, now, sequence: fixtureSequence,
+      store, implementationPersistence: navigatorImplementation, evaluationPersistence: navigatorEvaluation, database, now, sequence: fixtureSequence,
     });
     const trials = seedTrials(store, now);
     coordinator.persistEvaluationEvidence({
@@ -297,10 +309,10 @@ describe("dual-engine coordinator", () => {
   });
 
   it("does not persist restart as passed or safety zeros unless those were measured", async () => {
-    const { store, database, now, coordinator } = openCoordinatorFixture();
+    const { store, database, navigatorImplementation, navigatorEvaluation, now, coordinator } = openCoordinatorFixture();
     const corpus = await coordinator.evaluateCorpus();
     const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store, database, now, sequence: fixtureSequence,
+      store, implementationPersistence: navigatorImplementation, evaluationPersistence: navigatorEvaluation, database, now, sequence: fixtureSequence,
     });
     const trials = seedTrials(store, now);
     coordinator.persistEvaluationEvidence({
@@ -333,7 +345,7 @@ describe("dual-engine coordinator", () => {
 
 describe("disposable navigator live path", () => {
   it("creates tickets, implements them sequentially with one repair, opens one pull request, and deploys", async () => {
-    const { store, database, now } = openCoordinatorFixture();
+    const { store, database, now, navigatorImplementation } = openCoordinatorFixture();
     const specificationId = stableWorkArtifactId("proj_1", `spec-dual-${fixtureSequence}`);
     const firstTicketId = stableWorkArtifactId("proj_1", `ticket-dual-1-${fixtureSequence}`);
     const secondTicketId = stableWorkArtifactId("proj_1", `ticket-dual-2-${fixtureSequence}`);
@@ -492,7 +504,8 @@ describe("disposable navigator live path", () => {
     };
     const executor = new NavigatorImplementationExecutor({
       store,
-      gitObserver: {
+      persistence: navigatorImplementation,
+    gitObserver: {
         observe: async (request) => ({
           kind: "navigator_git_observation",
           worktreeId: request.worktreeId,

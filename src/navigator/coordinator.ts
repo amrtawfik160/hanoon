@@ -1,7 +1,9 @@
-import type Database from "better-sqlite3";
 import { IllegalTransitionError } from "../domain/state-machine";
 import type { Job } from "../domain/models";
-import type { TelegramAgentStore } from "../storage/store";
+import type { NavigatorCoordinatorPersistence } from "./coordinator-persistence";
+import type { NavigatorEffectPersistence } from "./effect-persistence";
+import type { NavigatorEvaluationPersistence } from "./evaluation-persistence";
+import type { NavigatorImplementationPersistence } from "./implementation-persistence";
 import { DualEngineContractionError, type WorkflowEngineContraction } from "../storage/workflow-engine-repository";
 import { evaluateNavigatorCorpus, type NavigatorCorpusEvaluationResult } from "./evaluation";
 import {
@@ -20,26 +22,34 @@ export type { DualEngineRestartPoint };
 
 export class DualEngineCoordinator {
   public constructor(private readonly dependencies: Readonly<{
-    store: TelegramAgentStore;
-    database: Database.Database;
+    persistence: NavigatorCoordinatorPersistence;
+    evaluation: NavigatorEvaluationPersistence;
+    navigatorEffects: NavigatorEffectPersistence;
+    navigatorImplementation: NavigatorImplementationPersistence;
     now: () => number;
   }>) {}
 
   public async evaluateCorpus(): Promise<NavigatorCorpusEvaluationResult> {
-    return evaluateNavigatorCorpus(this.dependencies.store, this.dependencies.database);
+    return evaluateNavigatorCorpus(
+      this.dependencies.evaluation,
+      {
+        effectPersistence: this.dependencies.navigatorEffects,
+        implementationPersistence: this.dependencies.navigatorImplementation,
+      },
+    );
   }
 
   public listNonterminalRecipeJobs(): Job[] {
-    return this.dependencies.store.listNonterminalRecipeJobs();
+    return this.dependencies.persistence.listNonterminalRecipeJobs();
   }
 
   public drainRecipeJobs(): Readonly<{ cancelled: readonly string[]; remaining: readonly string[] }> {
     const cancelled: string[] = [];
     const remaining: string[] = [];
     for (const job of this.listNonterminalRecipeJobs()) {
-      const workers = this.dependencies.store.getCurrentWorkerLiveness(job.id) ?? [];
+      const workers = this.dependencies.persistence.getCurrentWorkerLiveness(job.id) ?? [];
       try {
-        const next = this.dependencies.store.applyJobEvent(
+        const next = this.dependencies.persistence.applyJobEvent(
           job.id,
           job.version,
           { type: "CANCEL_REQUESTED", activeWorker: workers[0] ?? null, activeWorkers: workers },
@@ -67,7 +77,7 @@ export class DualEngineCoordinator {
     if (drain.remaining.length > 0) {
       throw new DualEngineContractionError(drain.remaining);
     }
-    return this.dependencies.store.contractRecipeEngine(this.dependencies.now());
+    return this.dependencies.persistence.contractRecipeEngine(this.dependencies.now());
   }
 
   public persistEvaluationEvidence(input: Readonly<{
@@ -88,12 +98,12 @@ export class DualEngineCoordinator {
       throw new TypeError("Navigator live evidence is missing a required disposable scenario");
     }
     for (const run of input.liveRuns) {
-      assertNavigatorLiveScenarioEvidence(this.dependencies.store, this.dependencies.database, run);
+      assertNavigatorLiveScenarioEvidence(this.dependencies.evaluation, run);
     }
     const now = this.dependencies.now();
     const artifactDigest = input.corpus.resultDigest;
     const deterministicIds = NAVIGATOR_DETERMINISTIC_CATEGORIES.map((category) =>
-      this.dependencies.store.recordNavigatorDeterministicEvidence({
+      this.dependencies.persistence.recordNavigatorDeterministicEvidence({
         category,
         suiteId: `suite-${category}`,
         runId: `deterministic-${category}`,
@@ -101,7 +111,7 @@ export class DualEngineCoordinator {
         outcome: deterministicCategoryOutcome(input.corpus, category),
         now,
       }));
-    const corpusId = this.dependencies.store.recordNavigatorCorpusEvidence({
+    const corpusId = this.dependencies.persistence.recordNavigatorCorpusEvidence({
       corpusDigest: input.corpus.corpusDigest,
       runId: "corpus-navigator",
       resultDigest: input.corpus.resultDigest,
@@ -110,7 +120,7 @@ export class DualEngineCoordinator {
       unauthorizedEffects: input.corpus.unauthorizedEffects,
       now,
     });
-    const liveRunIds = input.liveRuns.map((run) => this.dependencies.store.recordNavigatorLiveEvidence({
+    const liveRunIds = input.liveRuns.map((run) => this.dependencies.persistence.recordNavigatorLiveEvidence({
       runId: `live-${run.scenario}`,
       jobId: run.jobId,
       scenario: run.scenario,
@@ -119,7 +129,7 @@ export class DualEngineCoordinator {
       now,
     }));
     const candidateModelRefIds = input.candidateTrialIds.map((trialId) =>
-      this.dependencies.store.recordNavigatorModelTrialEvidence({
+      this.dependencies.persistence.recordNavigatorModelTrialEvidence({
         cohort: "candidate",
         modelTrialId: trialId,
         harnessDigest: input.harnessDigest,
@@ -127,7 +137,7 @@ export class DualEngineCoordinator {
         now,
       }));
     const baselineModelRefIds = input.baselineTrialIds.map((trialId) =>
-      this.dependencies.store.recordNavigatorModelTrialEvidence({
+      this.dependencies.persistence.recordNavigatorModelTrialEvidence({
         cohort: "baseline",
         modelTrialId: trialId,
         harnessDigest: input.harnessDigest,
@@ -135,14 +145,14 @@ export class DualEngineCoordinator {
         now,
       }));
     const safetyIds = measuredSafetyCounters(input.corpus).map((entry) =>
-      this.dependencies.store.recordNavigatorSafetyEvidence({
+      this.dependencies.persistence.recordNavigatorSafetyEvidence({
         counter: entry.counter,
         count: entry.count,
         snapshotId: `safety-${entry.counter}`,
         evidenceDigest: artifactDigest,
         now,
       }));
-    this.dependencies.store.publishNavigatorPromotionManifest({
+    this.dependencies.persistence.publishNavigatorPromotionManifest({
       deterministicIds,
       corpusId,
       liveRunIds,

@@ -36,7 +36,7 @@ import {
 } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { runJobExecutorService } from "../src/services/job-executor-service";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { openStore, openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
 import { policyFixture, sha } from "./helpers";
 
@@ -91,6 +91,7 @@ function modelRoute() {
 type OwnedFixture = Readonly<{
   bb: ReturnType<typeof createFakePluginHost>["bb"];
   store: TelegramAgentStore;
+  implementationPersistence: import("../src/navigator/implementation-persistence").NavigatorImplementationPersistence;
   database: Database.Database;
   job: Job;
   specificationId: string;
@@ -152,10 +153,11 @@ function bindNavigatorTickets(store: TelegramAgentStore, job: Job, now: () => nu
 }
 
 function startResolvedIntegration(
-  fixture: Pick<OwnedFixture, "store" | "database" | "job" | "specificationId" | "ticketIds" | "now">,
+  fixture: Pick<OwnedFixture, "store" | "implementationPersistence" | "database" | "job" | "specificationId" | "ticketIds" | "now">,
 ): void {
   const executor = new NavigatorImplementationExecutor({
     store: fixture.store,
+    persistence: fixture.implementationPersistence,
     gitObserver: {
       observe: vi.fn(async (request) => ({
         kind: "navigator_git_observation" as const,
@@ -211,7 +213,8 @@ function ownedFixture(
   const { bb } = createFakePluginHost({ pluginId: `navigator-release-${fixtureSequence}` });
   let currentTime = 10_100;
   const now = () => currentTime++;
-  const store = openStore(bb.storage, bb.storage.kv, now);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, now);
+  const store = composition.store;
   const policy = productionPolicy();
   store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
   if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) throw new Error("owner pairing failed");
@@ -241,6 +244,7 @@ function ownedFixture(
     return {
       bb,
       store,
+      implementationPersistence: composition.navigatorImplementation,
       database: bb.storage.database(),
       job: selected,
       specificationId: "recipe-spec",
@@ -284,6 +288,7 @@ function ownedFixture(
   const fixture = {
     bb,
     store,
+    implementationPersistence: composition.navigatorImplementation,
     database: bb.storage.database(),
     job: bound,
     specificationId,

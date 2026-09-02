@@ -1,14 +1,17 @@
 import type { ModelRoute } from "../capabilities/models";
-import type { StoredEffect } from "../domain/models";
+import type { JobEffect, StoredEffect } from "../domain/models";
+import type { TaskAuthorityOperation } from "../domain/task-authority";
 import type { EffectFence } from "../services/effect-runner";
-import type { TelegramAgentStore } from "../storage/store";
 import type {
   NavigatorInferenceObservation,
   NavigatorProposalDecision,
+  NavigatorPlanningResultRecord,
   NavigatorSkillAttempt,
   NavigatorSnapshot,
+  NavigatorWorkflowStepOutcome,
 } from "./models";
 import type { NavigatorSkillReceipt } from "./effect-contracts";
+import type { NavigatorArtifactBinding } from "./models";
 import { NAVIGATOR_RESEARCH_STEP_CONTRACT } from "./models";
 import {
   NavigatorPublicationDriftError,
@@ -39,8 +42,87 @@ export interface NavigatorSkillRunner {
   }>>;
 }
 
+/**
+ * Persistence owned by the legacy workflow/planning surface.
+ *
+ * The durable effect protocol is the production execution path. This
+ * interface keeps the existing planning API usable without giving it the
+ * broad store or a database handle while callers finish migrating.
+ */
+export interface NavigatorWorkflowPersistence {
+  createNavigatorSnapshot(input: Readonly<{
+    jobId: string;
+    externalStateDigest: string;
+    evidenceRefs: readonly string[];
+    now: number;
+  }>): NavigatorSnapshot;
+  recordNavigatorProposal(input: Readonly<{
+    snapshotId: string;
+    rawProposal: unknown;
+    observation: NavigatorInferenceObservation;
+    selectModelRoute(): ModelRoute;
+    now: number;
+  }>): NavigatorProposalDecision;
+  leaseNavigatorSkillEffect(input: Readonly<{
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): StoredEffect | null;
+  getNavigatorSkillAttempt(id: string): NavigatorSkillAttempt | null;
+  taskAuthorityOperationIsCurrent(effect: JobEffect, operation: TaskAuthorityOperation): boolean;
+  renewJobOperationFences(input: Readonly<{
+    jobId: string;
+    effectIdempotencyKey: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+    leaseMs: number;
+  }>): boolean;
+  bindNavigatorSkillAttemptResource(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    resource: Readonly<{ kind: "bb_thread"; id: string }>;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): boolean;
+  getNavigatorPlanningResult(attemptId: string): NavigatorPlanningResultRecord | null;
+  recordNavigatorPlanningResult(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): NavigatorPlanningResultRecord | null;
+  settleNavigatorSkillAttempt(input: Readonly<{
+    attemptId: string;
+    effectIdempotencyKey: string;
+    observedExternalStateDigest: string;
+    result: unknown;
+    receipt?: NavigatorSkillReceipt;
+    publishedArtifactBindings?: readonly NavigatorArtifactBinding[];
+    reconciledArtifactIds?: readonly string[];
+    policyFailureReason?: string;
+    ownerId: string;
+    generation: number;
+    now: number;
+  }>): NavigatorWorkflowStepOutcome | null;
+  failEffect(
+    key: string,
+    ownerId: string,
+    generation: number,
+    error: string,
+    nextAttemptAt: number,
+    now: number,
+  ): boolean;
+  deadLetterEffect(key: string, ownerId: string, generation: number, error: string, now: number): boolean;
+}
+
 export type NavigatorWorkflowExecutorDependencies = Readonly<{
-  store: TelegramAgentStore;
+  store: NavigatorWorkflowPersistence;
   navigator: WorkflowNavigator;
   observeInference(snapshot: NavigatorSnapshot): Promise<NavigatorInferenceObservation>;
   skillRunner: NavigatorSkillRunner;

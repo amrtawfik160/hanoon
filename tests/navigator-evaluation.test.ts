@@ -6,7 +6,7 @@ import {
   navigatorEvaluationCategoryCoverage,
 } from "../src/navigator/evaluation-corpus";
 import { evaluateNavigatorCorpus } from "../src/navigator/evaluation";
-import { openStore } from "../src/storage/store";
+import { openStoreComposition } from "../src/storage/store";
 
 describe("navigator dual-engine evaluation corpus", () => {
   it("covers every required category with a frozen 58-case budget", () => {
@@ -28,8 +28,11 @@ describe("navigator dual-engine evaluation corpus", () => {
 
   it("matches every corpus case and records zero unauthorized effects", async () => {
     const { bb } = createFakePluginHost({ pluginId: "navigator-evaluation-corpus" });
-    const store = openStore(bb.storage);
-    const result = await evaluateNavigatorCorpus(store, bb.storage.database());
+    const composition = openStoreComposition(bb.storage);
+    const result = await evaluateNavigatorCorpus(composition.navigatorEvaluation, {
+      effectPersistence: composition.navigatorEffects,
+      implementationPersistence: composition.navigatorImplementation,
+    });
 
     expect(result.total).toBe(58);
     expect(result.correct).toBe(58);

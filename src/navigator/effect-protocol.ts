@@ -2,7 +2,7 @@ import type { Job, StoredEffect } from "../domain/models";
 import type { TaskAuthorityOperation } from "../domain/task-authority";
 import type { JobResourceClaim } from "../autonomy/models";
 import type { EffectFence } from "../services/effect-runner";
-import type { TelegramAgentStore } from "../storage/store";
+import type { NavigatorEffectPersistence } from "./effect-persistence";
 import { navigatorClaimContract } from "./claim-contracts";
 import type {
   NavigatorArtifactBinding,
@@ -41,7 +41,7 @@ export const NAVIGATOR_EFFECT_KINDS = [
 ] as const;
 
 export type NavigatorEffectKind = (typeof NAVIGATOR_EFFECT_KINDS)[number];
-type NavigatorJob = NonNullable<ReturnType<TelegramAgentStore["getJob"]>>;
+type NavigatorJob = NonNullable<ReturnType<NavigatorEffectPersistence["getJob"]>>;
 
 export type NavigatorEffectOutcome =
   | Readonly<{ outcome: "completed"; receipt: NavigatorEffectReceipt }>
@@ -65,36 +65,8 @@ export type NavigatorEffectAdapter = Readonly<{
   reconcile?(context: NavigatorEffectContext): Promise<NavigatorEffectOutcome>;
 }>;
 
-type NavigatorEffectStore = Pick<
-  TelegramAgentStore,
-  | "leaseNavigatorEffect"
-  | "isExecutorLeaseCurrent"
-  | "getEffect"
-  | "getJob"
-  | "getNavigatorWorkflowStep"
-  | "getNavigatorProposal"
-  | "getNavigatorProposalDecision"
-  | "getNavigatorSkillAttempt"
-  | "getNavigatorReleaseAttempt"
-  | "getNavigatorCapabilityEvidence"
-  | "admitNavigatorCapabilityEvidence"
-  | "settleNavigatorSkillAttempt"
-  | "settleNavigatorTicketWorkerAttempt"
-  | "settleNavigatorReleaseEffect"
-  | "getNavigatorTicketAttemptContext"
-  | "bindNavigatorTicketWorkerResource"
-  | "getCurrentWorkArtifactSnapshot"
-  | "isWorkArtifactSnapshotValid"
-  | "listCurrentHeldResourceClaims"
-  | "taskAuthorityOperationIsCurrent"
-  | "renewJobOperationFences"
-  | "completeEffect"
-  | "failEffect"
-  | "deadLetterEffect"
->;
-
 export type NavigatorEffectProtocolDependencies = Readonly<{
-  store: NavigatorEffectStore;
+  store: NavigatorEffectPersistence;
   clock: { now(): number };
   adapters: readonly NavigatorEffectAdapter[];
   leaseMs?: number;
@@ -714,7 +686,7 @@ export class NavigatorEffectProtocol {
     effect: StoredEffect,
     context: NavigatorEffectContext,
     now: number,
-  ): Parameters<NavigatorEffectStore["renewJobOperationFences"]>[0] {
+  ): Parameters<NavigatorEffectPersistence["renewJobOperationFences"]>[0] {
     return {
       jobId: effect.jobId,
       effectIdempotencyKey: effect.idempotencyKey,

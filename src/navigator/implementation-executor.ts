@@ -1,6 +1,6 @@
 import type { ModelRoute } from "../capabilities/models";
-import { compatibilityCapabilityFindingDisposition } from "../capabilities/catalog";
-import type { TelegramAgentStore } from "../storage/store";
+import type { Job } from "../domain/models";
+import type { WorkArtifact, WorkArtifactSnapshot } from "../work-artifacts/models";
 import {
   navigatorGitObservationSchema,
   navigatorJsonDigest,
@@ -35,8 +35,6 @@ export {
   NavigatorTicketWorkerRetryableError,
   NavigatorTicketWorkerUnavailableError,
 } from "./ticket-adapter";
-export const navigatorFindingDisposition = compatibilityCapabilityFindingDisposition;
-
 const GIT_SHA = /^[0-9a-f]{40}$/u;
 const IDENTIFIER = /^[A-Za-z0-9_.:/-]{1,256}$/u;
 
@@ -111,8 +109,16 @@ export interface NavigatorPullRequestPublisher {
   createOrRefresh(request: NavigatorPullRequestRequest): Promise<NavigatorPullRequestRecord>;
 }
 
+export interface NavigatorImplementationReadStore {
+  getJob(jobId: string): Job | null;
+  getWorkArtifact(id: string): WorkArtifact | null;
+  getCurrentWorkArtifactSnapshot(artifactId: string): WorkArtifactSnapshot | null;
+  isWorkArtifactSnapshotValid(snapshotId: string): boolean;
+}
+
 type NavigatorImplementationExecutorDependencies = Readonly<{
-  store: TelegramAgentStore;
+  store: NavigatorImplementationReadStore;
+  persistence: NavigatorImplementationPersistence;
   gitObserver: NavigatorGitObserver;
   pullRequests: NavigatorPullRequestPublisher;
   modelRoute(kind: "implementation" | "review"): ModelRoute;
@@ -145,7 +151,7 @@ export class NavigatorImplementationExecutor {
   private readonly persistence: NavigatorImplementationPersistence;
 
   public constructor(private readonly dependencies: NavigatorImplementationExecutorDependencies) {
-    this.persistence = dependencies.store.getNavigatorImplementationPersistence();
+    this.persistence = dependencies.persistence;
   }
 
   public startIntegration(input: Readonly<{

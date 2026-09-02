@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import type Database from "better-sqlite3";
 import { DEFAULT_MODEL_POOL_REGISTRY, type ModelRoute } from "../capabilities/models";
 import type { ProjectPolicy } from "../domain/models";
-import type { TelegramAgentStore } from "../storage/store";
+import type { NavigatorEffectPersistence } from "./effect-persistence";
+import type { NavigatorEvaluationPersistence } from "./evaluation-persistence";
+import type { NavigatorImplementationPersistence } from "./implementation-persistence";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../work-artifacts/repository";
 import type { NavigatorInferenceObservation, NavigatorProposal } from "./models";
 import {
@@ -163,8 +164,7 @@ function buildProposal(
 }
 
 function setupJob(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  persistence: NavigatorEvaluationPersistence,
   evaluationCase: NavigatorEvaluationCase,
   sequence: number,
 ): { jobId: string; now: number } {
@@ -173,7 +173,7 @@ function setupJob(
   const specId = stableWorkArtifactId("proj_eval", `eval-spec-${sequence}`);
   const bindings: Array<{ artifactId: string; snapshotId: string; snapshotDigest: string }> = [];
   if (evaluationCase.artifacts !== "none") {
-    const ticket = store.captureWorkArtifact(artifactInput({
+    const ticket = persistence.captureWorkArtifact(artifactInput({
       artifactId: ticketId,
       operationId: `ticket-${sequence}`,
       kind: "implementation_ticket",
@@ -186,7 +186,7 @@ function setupJob(
     });
   }
   if (evaluationCase.artifacts === "specification+ticket") {
-    const specification = store.captureWorkArtifact(artifactInput({
+    const specification = persistence.captureWorkArtifact(artifactInput({
       artifactId: specId,
       operationId: `spec-${sequence}`,
       kind: "specification",
@@ -198,7 +198,7 @@ function setupJob(
       snapshotDigest: specification.snapshot.snapshotDigest,
     });
   }
-  const draft = store.createJob({
+  const draft = persistence.createJob({
     id: `job_eval_${sequence}`,
     sourceUpdateId: 90_000 + sequence,
     requestText: "Evaluate navigator dual-engine proposals.",
@@ -207,7 +207,7 @@ function setupJob(
       : {}),
     now,
   });
-  const selected = store.applyJobEvent(draft.id, draft.version, {
+  const selected = persistence.applyJobEvent(draft.id, draft.version, {
     type: "PROJECT_SELECTED",
     projectId: "proj_eval",
     policyVersion: 1,
@@ -215,33 +215,36 @@ function setupJob(
   }, now + 1);
   let job = selected;
   if (bindings.length > 0 && evaluationCase.engine === "navigator-v1") {
-    job = store.bindNavigatorJobArtifacts({
+    job = persistence.bindNavigatorJobArtifacts({
       jobId: selected.id,
       expectedVersion: selected.version,
       artifactBindings: bindings,
       now: now + 2,
     });
   }
-  if (evaluationCase.taskOutcome) {
-    database.prepare("UPDATE jobs SET task_outcome = ?, task_constraints_json = ? WHERE id = ?")
-      .run(evaluationCase.taskOutcome, JSON.stringify([]), job.id);
-  }
-  if (evaluationCase.jobState) {
-    database.prepare("UPDATE jobs SET state = ? WHERE id = ?").run(evaluationCase.jobState, job.id);
+  if (evaluationCase.taskOutcome || evaluationCase.jobState) {
+    persistence.setEvaluationJobFacts({
+      jobId: job.id,
+      ...(evaluationCase.taskOutcome ? { taskOutcome: evaluationCase.taskOutcome } : {}),
+      ...(evaluationCase.jobState ? { state: evaluationCase.jobState } : {}),
+    });
   }
   return { jobId: job.id, now: now + 3 };
 }
 
 export async function evaluateNavigatorCorpus(
-  store: TelegramAgentStore,
-  database: Database.Database,
+  evaluation: NavigatorEvaluationPersistence,
+  persistence: Readonly<{
+    effectPersistence: NavigatorEffectPersistence;
+    implementationPersistence: NavigatorImplementationPersistence;
+  }>,
 ): Promise<NavigatorCorpusEvaluationResult> {
   const cases: NavigatorCorpusEvaluationResult["cases"][number][] = [];
   for (const [sequence, evaluationCase] of NAVIGATOR_EVALUATION_CORPUS.entries()) {
     if (evaluationCase.category === "restart") {
       const restart = await measureNavigatorRestartPoint(
-        store,
-        database,
+        evaluation,
+        persistence,
         evaluationCase,
         sequence + 1,
       );
@@ -255,21 +258,21 @@ export async function evaluateNavigatorCorpus(
       });
       continue;
     }
-    const setup = setupJob(store, database, evaluationCase, sequence + 1);
-    const snapshot = store.createNavigatorSnapshot({
+    const setup = setupJob(evaluation, evaluationCase, sequence + 1);
+    const snapshot = evaluation.createNavigatorSnapshot({
       jobId: setup.jobId,
       externalStateDigest: EXTERNAL_DIGEST,
       evidenceRefs: ["eval:corpus"],
       now: setup.now,
     });
-    const decision = store.recordNavigatorProposal({
+    const decision = evaluation.recordNavigatorProposal({
       snapshotId: snapshot.snapshotId,
       rawProposal: buildProposal(snapshot, evaluationCase.proposal),
       observation: observation(evaluationCase.proposal === "native_tools" ? { nativeToolCalls: ["shell"] } : {}),
       selectModelRoute: modelRoute,
       now: setup.now + 1,
     });
-    const effects = store.listEffectsForJob(setup.jobId).filter((effect) =>
+    const effects = evaluation.listEffectsForJob(setup.jobId).filter((effect) =>
       effect.kind === "run_navigator_skill" || effect.kind === "run_navigator_release");
     const unauthorizedEffects = evaluationCase.engine === "recipe-v1" || decision.decision !== "accepted"
       ? effects.length

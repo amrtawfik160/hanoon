@@ -28,7 +28,7 @@ import type {
   NavigatorTicketWorkerInput,
   NavigatorTicketWorkerOperation,
 } from "../src/navigator/ticket-adapter";
-import { openStore } from "../src/storage/store";
+import { openStore, openStoreComposition } from "../src/storage/store";
 import { stableWorkArtifactId } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
 
@@ -745,7 +745,8 @@ describe("plugin navigator inference and release adapters", () => {
         },
       },
     });
-    const store = openStore(bb.storage);
+    const composition = openStoreComposition(bb.storage);
+    const store = composition.store;
     store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
     if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) {
       throw new Error("owner pairing failed");
@@ -801,8 +802,11 @@ describe("plugin navigator inference and release adapters", () => {
       "UPDATE jobs SET implementation_thread_id = ? WHERE id = ?",
     ).run("thr_native_shell", selected.id);
     const runtime = createNavigatorRuntime({
-      store,
-      database: bb.storage.database(),
+      effectPersistence: composition.navigatorEffects,
+      workflowPersistence: composition.navigatorWorkflow,
+      implementationRead: composition.navigatorImplementationRead,
+      implementationPersistence: composition.navigatorImplementation,
+      releasePersistence: composition.navigatorRelease,
       sdk: bb.sdk,
       modelRoute: () => ({ pool: "strong", ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong }),
       clock: { now: () => now + 3 },

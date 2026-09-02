@@ -18,7 +18,7 @@ import { selectControllerCapabilityProfile } from "../src/capabilities/controlle
 import { DualEngineCoordinator, DualEngineContractionError } from "../src/navigator/coordinator";
 import { workflowIdentityForNewAdmission } from "../src/navigator/promotion";
 import { transition } from "../src/domain/state-machine";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { openStore, openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import { jobFixture, policyFixture, stateJob } from "./helpers";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 
@@ -33,11 +33,21 @@ function openFixture(settings?: Parameters<typeof openStore>[4]) {
   const { bb } = createFakePluginHost({ pluginId: `navigator-contraction-${fixtureSequence}` });
   let currentTime = 10_000;
   const now = () => currentTime++;
-  const store = openStore(bb.storage, bb.storage.kv, now, undefined, settings);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, now, undefined, settings);
+  const store = composition.store;
   store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
   if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) throw new Error("owner pairing failed");
   store.upsertProjectPolicy(policyFixture(), 1_002);
-  return { bb, store, database: bb.storage.database(), now };
+  return {
+    bb,
+    store,
+    database: bb.storage.database(),
+    navigatorCoordinator: composition.navigatorCoordinator,
+    navigatorEvaluation: composition.navigatorEvaluation,
+    navigatorEffects: composition.navigatorEffects,
+    navigatorImplementation: composition.navigatorImplementation,
+    now,
+  };
 }
 
 function confirmControllerJob(
@@ -240,7 +250,7 @@ describe("contracted new-work admission", () => {
 
 describe("final recipe contraction", () => {
   it("refuses contraction while a nonterminal recipe job still needs a legacy skill or state handler", () => {
-    const { store, database, now } = openFixture();
+    const { store, database, navigatorCoordinator, navigatorEvaluation, navigatorEffects, navigatorImplementation, now } = openFixture();
     const deploying = store.createJob({
       id: "job_recipe_deploying",
       sourceUpdateId: 44_100,
@@ -248,7 +258,7 @@ describe("final recipe contraction", () => {
       now: 2_000,
     });
     database.prepare("UPDATE jobs SET state = 'deploying' WHERE id = ?").run(deploying.id);
-    const coordinator = new DualEngineCoordinator({ store, database, now });
+    const coordinator = new DualEngineCoordinator({ persistence: navigatorCoordinator, evaluation: navigatorEvaluation, navigatorEffects, navigatorImplementation, now });
     expect(() => coordinator.assertContractionAllowed()).toThrow(DualEngineContractionError);
     expect(() => coordinator.contractRecipeEngine()).toThrow(/legacy skill or state handler/u);
   });
@@ -271,7 +281,7 @@ describe("final recipe contraction", () => {
   });
 
   it("records contraction once the recipe engine is empty and keeps navigator jobs untouched", () => {
-    const { store, database, now } = openFixture();
+    const { store, database, navigatorCoordinator, navigatorEvaluation, navigatorEffects, navigatorImplementation, now } = openFixture();
     store.appendWorkflowEngineRolloutDecision({
       action: "promote",
       reasonCode: "promotion_gates_passed",
@@ -298,7 +308,7 @@ describe("final recipe contraction", () => {
       requestText: "Cancel this idle recipe job",
       now: 2_000,
     });
-    const coordinator = new DualEngineCoordinator({ store, database, now });
+    const coordinator = new DualEngineCoordinator({ persistence: navigatorCoordinator, evaluation: navigatorEvaluation, navigatorEffects, navigatorImplementation, now });
     expect(coordinator.drainRecipeJobs()).toEqual({ cancelled: [idle.id], remaining: [] });
     const contraction = coordinator.contractRecipeEngine();
     expect(contraction).toMatchObject({ engine: "recipe-v1", remainingJobIds: [] });
@@ -312,7 +322,7 @@ describe("final recipe contraction", () => {
 
 describe("historical recipe evidence after contraction", () => {
   it("keeps historical recipe columns, descriptors, and receipts readable", () => {
-    const { store, database, now } = openFixture();
+    const { store, database, navigatorCoordinator, navigatorEvaluation, navigatorEffects, navigatorImplementation, now } = openFixture();
     const recipeJob = store.createJob({
       id: "job_recipe_history",
       sourceUpdateId: 44_300,
@@ -341,7 +351,7 @@ describe("historical recipe evidence after contraction", () => {
       traits: ["multi-session"],
       now: 2_001,
     });
-    const coordinator = new DualEngineCoordinator({ store, database, now });
+    const coordinator = new DualEngineCoordinator({ persistence: navigatorCoordinator, evaluation: navigatorEvaluation, navigatorEffects, navigatorImplementation, now });
     coordinator.contractRecipeEngine();
 
     expect(store.getJob(recipeJob.id)).toMatchObject({
@@ -370,7 +380,7 @@ describe("historical recipe evidence after contraction", () => {
   });
 
   it("lets the dual-engine release restore the legacy bundle without rewriting navigator jobs", async () => {
-    const { store, database, now } = openFixture();
+    const { store, database, navigatorCoordinator, navigatorEvaluation, navigatorEffects, navigatorImplementation, now } = openFixture();
     store.appendWorkflowEngineRolloutDecision({
       action: "promote",
       reasonCode: "promotion_gates_passed",
@@ -382,7 +392,7 @@ describe("historical recipe evidence after contraction", () => {
       updateId: 44_400,
       now: now(),
     });
-    const coordinator = new DualEngineCoordinator({ store, database, now });
+    const coordinator = new DualEngineCoordinator({ persistence: navigatorCoordinator, evaluation: navigatorEvaluation, navigatorEffects, navigatorImplementation, now });
     coordinator.contractRecipeEngine();
     const beforeRestore = store.getJob(navigator.job.id);
     if (!beforeRestore) throw new Error("navigator job disappeared after contraction");

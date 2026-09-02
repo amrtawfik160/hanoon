@@ -1308,7 +1308,7 @@ describe("navigator-v1 durable executor slice", () => {
     },
   );
 
-  it("quarantines legacy work until explicit reauthorization, then resumes the same effect once", async () => {
+  it("keeps preceding-schema work pending when compatibility reauthorization is unavailable", async () => {
     const value = fixture();
     const workflow = executor(value);
     const accepted = await workflow.proposeNext({
@@ -1320,8 +1320,7 @@ describe("navigator-v1 durable executor slice", () => {
       throw new Error("navigator compatibility continuation identity was not stored");
     }
     const attempt = value.store.getNavigatorSkillAttempt(accepted.attemptId);
-    const profile = attempt ? value.store.getLatestCapabilityProfile("worker_attempt", attempt.id) : null;
-    if (!attempt || !profile) throw new Error("navigator compatibility profile was not stored");
+    if (!attempt) throw new Error("navigator compatibility profile was not stored");
     value.db.exec("DROP TRIGGER navigator_effect_capability_evidence_append_only_delete");
     value.db.prepare("DELETE FROM navigator_effect_capability_evidence WHERE effect_idempotency_key = ?")
       .run(accepted.effectIdempotencyKey);
@@ -1342,67 +1341,30 @@ describe("navigator-v1 durable executor slice", () => {
     }
 
     const execute = vi.fn(async (context: NavigatorEffectContext) => skillCompletion(context));
-    const protocol = protocolFor(value, execute, 1_000, undefined, () => 1_100);
-    await runCapabilityExecutor(value, protocol, 1_100);
+    const predecessorProtocol = protocolFor(value, execute, 1_000, undefined, () => 1_100);
+    await runCapabilityExecutor(value, predecessorProtocol, 1_100);
     expect(execute).not.toHaveBeenCalled();
     expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "pending" });
 
-    let reauthorized = false;
-    const currentNow = (): number => {
-      const lease = value.db.prepare("SELECT owner_id, generation FROM executor_lease WHERE singleton = 1")
-        .get() as { owner_id: string | null; generation: number };
-      if (!reauthorized && lease.owner_id !== null) {
-        if (!value.store.reauthorizeNavigatorCompatibilityEffect({
-          effectIdempotencyKey: accepted.effectIdempotencyKey!,
-          attemptId: attempt.id,
-          profileId: profile.id,
-          profileRevision: profile.revision,
-          ownerId: lease.owner_id,
-          generation: lease.generation,
-          now: 1_100,
-          leaseMs: 1_000,
-        })) throw new Error("navigator compatibility reauthorization was rejected");
-        reauthorized = true;
-      }
-      return 1_100;
-    };
-    const continuationAbort = new AbortController();
-    await runJobExecutorService({
+    const protocol = new NavigatorEffectProtocol({
       store: value.store,
-      clock: { now: currentNow },
+      clock: { now: () => 1_100 },
       leaseMs: 1_000,
-      navigatorEffects: new NavigatorEffectProtocol({
-        store: value.store,
-        clock: { now: currentNow },
-        leaseMs: 1_000,
-        adapters: [
-          { kind: "run_navigator_skill", execute },
-          { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
-          { kind: "run_navigator_release", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
-        ],
-      }),
-      effectRunnerFactory: () => ({ run: async () => undefined }),
-      waitForWork: async () => continuationAbort.abort(),
-      releaseOnShutdown: true,
-    }, continuationAbort.signal);
+      adapters: [
+        { kind: "run_navigator_skill", execute },
+        { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+        { kind: "run_navigator_release", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+      ],
+    });
+    await runCapabilityExecutor(value, protocol, 1_100);
 
-    expect(reauthorized).toBe(true);
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    expect(execute).not.toHaveBeenCalled();
+    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "pending" });
     expect(value.db.prepare(
       "SELECT profile_id, profile_revision, owner_id, generation FROM navigator_effect_compatibility_resolutions WHERE effect_idempotency_key = ?",
-    ).get(accepted.effectIdempotencyKey)).toMatchObject({
-      profile_id: profile.id,
-      profile_revision: profile.revision,
-      owner_id: expect.any(String),
-      generation: expect.any(Number),
-    });
-
-    await runCapabilityExecutor(value, protocol, 1_100);
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(value.store.getEffect(value.job.id, accepted.effectIdempotencyKey)).toMatchObject({ status: "done" });
+    ).get(accepted.effectIdempotencyKey)).toBeUndefined();
     expect(value.db.prepare("SELECT COUNT(*) AS count FROM navigator_effect_compatibility_resolutions").get())
-      .toEqual({ count: 1 });
+      .toEqual({ count: 0 });
   });
 
   it.each(CLAIM_CASES)("requires the exact skill claim set (%s)", async (claimCase) => {

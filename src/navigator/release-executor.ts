@@ -1,11 +1,11 @@
 import type { StoredEffect } from "../domain/models";
 import type { EffectFence } from "../services/effect-runner";
-import type { TelegramAgentStore } from "../storage/store";
+import type { NavigatorReleasePersistence } from "./effect-persistence";
 import type { NavigatorPullRequestRecord } from "./implementation-contracts";
 import type { NavigatorReleaseReceipt } from "./effect-contracts";
 
 export type NavigatorReleaseExecutorDependencies = Readonly<{
-  store: TelegramAgentStore;
+  store: NavigatorReleasePersistence;
   publishPullRequest(input: Readonly<{ jobId: string; title: string; body: string }>): Promise<NavigatorPullRequestRecord>;
   integrationWorktreeId(jobId: string): string;
   clock: { now(): number };

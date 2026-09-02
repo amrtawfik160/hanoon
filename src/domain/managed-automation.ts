@@ -201,6 +201,22 @@ export const managedAutomationObservationEnvelopeSchema = z.object({
   value: managedAutomationObservationSchema,
 }).strict();
 
+export const managedAutomationRunSchema = z.object({
+  id: boundedId,
+  automationId: boundedId,
+  runMode: z.enum(["agent", "script"]),
+  threadId: boundedId.nullable(),
+  status: z.enum(["running", "succeeded", "failed", "skipped"]),
+  trigger: z.enum(["schedule", "manual"]),
+  skipReason: z.string().max(16_384).nullable(),
+  error: z.string().max(16_384).nullable(),
+  output: z.string().max(1_048_576).nullable(),
+  exitCode: z.number().int().safe().nullable(),
+  scheduledFor: z.number().int().nonnegative(),
+  startedAt: z.number().int().nonnegative(),
+  finishedAt: z.number().int().nonnegative().nullable(),
+}).strict();
+
 export const managedAutomationCreateReceiptSchema = z.object({
   version: z.literal(1),
   operationId: boundedId,
@@ -337,6 +353,7 @@ export const managedAutomationOperationRequestSchema = z.object({
   operationClass: managedAutomationOperationClassSchema,
   targetProjectId: boundedId,
   definitionRevision: positiveRevision,
+  idempotencyKey: boundedId.optional(),
 }).strict();
 
 export type ManagedAutomationOperationClass = z.infer<typeof managedAutomationOperationClassSchema>;

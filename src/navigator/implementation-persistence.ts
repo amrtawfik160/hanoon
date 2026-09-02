@@ -2,8 +2,13 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { CAPABILITY_GRAPH_DIGEST, CAPABILITY_REGISTRY_DIGEST } from "../capabilities/catalog";
 import type { ModelRoute } from "../capabilities/models";
-import type { TelegramAgentStore } from "../storage/store";
-import type { WorkArtifactClaim } from "../work-artifacts/models";
+import type { CapabilityKind } from "../capabilities/contracts";
+import type { CapabilityProfile, CreateCapabilityProfileInput } from "../storage/capability-repository";
+import type {
+  WorkArtifactClaim,
+  WorkArtifactRelationship,
+  WorkArtifactResolution,
+} from "../work-artifacts/models";
 import { artifactBindingSchema, type NavigatorArtifactBinding } from "./models";
 import {
   NAVIGATOR_TICKET_STEP_CONTRACTS,
@@ -27,13 +32,39 @@ import {
   type NavigatorTicketWorkerProfile,
   type NavigatorTicketWorkOrder,
 } from "./implementation-contracts";
-import type { NavigatorIntegrationSnapshot, NavigatorTicketWorkerAttempt } from "./implementation-executor";
+import type {
+  NavigatorImplementationReadStore,
+  NavigatorIntegrationSnapshot,
+  NavigatorTicketWorkerAttempt,
+} from "./implementation-executor";
+import type { NavigatorFindingLedger } from "./finding-ledger";
 import type { NavigatorTicketWorkerOutcome } from "./ticket-settlement-repository";
 
 type SqliteDatabase = Database.Database;
 type IntegrationState = NavigatorIntegrationSnapshot["integration"]["state"];
 type TicketState = NavigatorIntegrationSnapshot["tickets"][number]["state"];
 type ActiveSlice = Exclude<NavigatorIntegrationSnapshot["activeSlice"], null>;
+
+interface NavigatorImplementationPersistenceStore extends NavigatorImplementationReadStore {
+  getWorkArtifactClaim(claimId: number): WorkArtifactClaim | null;
+  getWorkArtifactResolution(artifactId: string): WorkArtifactResolution | null;
+  listWorkArtifactRelationships(artifactId: string): readonly WorkArtifactRelationship[];
+  createCapabilityProfile(input: CreateCapabilityProfileInput): CapabilityProfile;
+  recordNavigatorCapabilityEvidence(input: Readonly<{
+    effectIdempotencyKey: string;
+    jobId: string;
+    projectId: string;
+    operation: "worktree_write";
+    profileId: string;
+    profileRevision: number;
+    assignments: readonly Readonly<{
+      capabilityId: string;
+      capabilityKind: CapabilityKind;
+      descriptorDigest: string;
+    }>[];
+    now: number;
+  }>): void;
+}
 
 export type NavigatorImplementationPersistence = Readonly<{
   startIntegration(input: Readonly<{
@@ -288,7 +319,8 @@ function parseOutcome(row: OutcomeRow): NavigatorTicketWorkerOutcome {
 export class NavigatorImplementationRepository implements NavigatorImplementationPersistence {
   public constructor(
     private readonly db: SqliteDatabase,
-    private readonly store: TelegramAgentStore,
+    private readonly store: NavigatorImplementationPersistenceStore,
+    private readonly findingLedger: NavigatorFindingLedger,
   ) {}
 
   public startIntegration(input: Readonly<{
@@ -372,29 +404,17 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
     modelRoute: ModelRoute;
     now: number;
   }>): ActiveSlice {
-    const claim = this.store.getWorkArtifactClaim(input.claimId);
-    const ticketBeforeAdoption = this.requireTicket(input.jobId, input.ticketArtifactId);
-    if (
-      !claim || claim.jobId !== input.jobId || claim.artifactId !== ticketBeforeAdoption.artifact_id ||
-      claim.snapshotId !== ticketBeforeAdoption.snapshot_id || !this.bindingIsCurrent({
-        artifactId: ticketBeforeAdoption.artifact_id,
-        snapshotId: ticketBeforeAdoption.snapshot_id,
-        snapshotDigest: ticketBeforeAdoption.snapshot_digest,
-      }) || !this.store.adoptWorkArtifactClaim({
-        artifactId: claim.artifactId,
-        workflowStepId: claim.workflowStepId,
-        jobId: input.jobId,
-        externalAssignee: claim.externalAssignee,
-        ownerId: input.ownerId,
-        generation: input.generation,
-        expectedOwnerId: claim.ownerId,
-        expectedGeneration: claim.generation,
-        expectedLeaseExpiresAt: claim.leaseExpiresAt,
-        now: input.now,
-        leaseMs: input.leaseMs,
-      })
-    ) throw new TypeError("implementation ticket claim could not be adopted by the current executor");
     return this.db.transaction(() => {
+      const claim = this.store.getWorkArtifactClaim(input.claimId);
+      const ticketBeforeAdoption = this.requireTicket(input.jobId, input.ticketArtifactId);
+      if (
+        !claim || claim.jobId !== input.jobId || claim.artifactId !== ticketBeforeAdoption.artifact_id ||
+        claim.snapshotId !== ticketBeforeAdoption.snapshot_id || !this.bindingIsCurrent({
+          artifactId: ticketBeforeAdoption.artifact_id,
+          snapshotId: ticketBeforeAdoption.snapshot_id,
+          snapshotDigest: ticketBeforeAdoption.snapshot_digest,
+        }) || !this.adoptClaimInTransaction(claim, input)
+      ) throw new TypeError("implementation ticket claim could not be adopted by the current executor");
       const integration = this.requireWritableIntegration(input.jobId, input.now);
       const evidenceRefs = mergeEvidenceRefs(JSON.parse(integration.evidence_refs_json) as readonly string[], input.evidenceRefs);
       const existing = this.sliceForTicket(input.jobId, input.ticketArtifactId);
@@ -665,7 +685,7 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
        WHERE attempt.job_id = ? ORDER BY outcome.recorded_at, outcome.attempt_id`,
     ).all(jobId) as OutcomeRow[];
     const activeSlice = integration.active_slice_id === null ? null : this.requireSlice(integration.active_slice_id);
-    const findingLedgerDecision = this.store.getNavigatorFindingLedgerDecision(jobId);
+    const findingLedgerDecision = this.findingLedger.currentDecision({ jobId });
     return {
       integration: {
         jobId: integration.job_id,
@@ -1066,6 +1086,56 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
         snapshotDigest: input.ticket.snapshot_digest,
       })
     ) throw new TypeError("implementation ticket claim is stale or belongs to another lane");
+  }
+
+  private adoptClaimInTransaction(
+    claim: WorkArtifactClaim,
+    input: Readonly<{
+      jobId: string;
+      claimId: number;
+      ownerId: string;
+      generation: number;
+      leaseMs: number;
+      now: number;
+    }>,
+  ): boolean {
+    const artifact = this.store.getWorkArtifact(claim.artifactId);
+    const currentClaim = this.store.getWorkArtifactClaim(input.claimId);
+    if (
+      !artifact || !currentClaim || currentClaim.id !== claim.id ||
+      currentClaim.workflowStepId !== claim.workflowStepId || currentClaim.jobId !== input.jobId ||
+      currentClaim.externalAssignee !== claim.externalAssignee ||
+      currentClaim.snapshotId !== artifact.currentSnapshotId || artifact.status !== "claimed" ||
+      artifact.externalStatus !== "open" || artifact.assignees.length !== 1 ||
+      artifact.assignees[0] !== claim.externalAssignee || !this.store.isWorkArtifactSnapshotValid(currentClaim.snapshotId) ||
+      !this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now) ||
+      currentClaim.ownerId !== claim.ownerId || currentClaim.generation !== claim.generation ||
+      currentClaim.leaseExpiresAt !== claim.leaseExpiresAt ||
+      ((currentClaim.ownerId !== input.ownerId || currentClaim.generation !== input.generation) &&
+        currentClaim.leaseExpiresAt > input.now)
+    ) return false;
+    return this.db.prepare(
+      `UPDATE work_artifact_claims
+          SET owner_id = ?, generation = ?, lease_expires_at = ?, renewed_at = ?
+        WHERE id = ? AND state = 'held' AND owner_id = ? AND generation = ?
+          AND lease_expires_at = ?`,
+    ).run(
+      input.ownerId,
+      input.generation,
+      input.now + input.leaseMs,
+      input.now,
+      currentClaim.id,
+      claim.ownerId,
+      claim.generation,
+      claim.leaseExpiresAt,
+    ).changes === 1;
+  }
+
+  private executorLeaseIsCurrent(ownerId: string, generation: number, now: number): boolean {
+    return this.db.prepare(
+      `SELECT 1 FROM executor_lease
+        WHERE singleton = 1 AND owner_id = ? AND generation = ? AND lease_expires_at > ?`,
+    ).get(ownerId, generation, now) !== undefined;
   }
 
   private integrationRow(jobId: string): IntegrationRow | null {

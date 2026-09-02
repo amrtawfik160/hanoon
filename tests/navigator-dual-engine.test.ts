@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { DualEngineCoordinator, DualEngineContractionError } from "../src/navigator/coordinator";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
-import { openStore, type TelegramAgentStore } from "../src/storage/store";
+import { openStore, openStoreComposition, type TelegramAgentStore } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
 import { policyFixture } from "./helpers";
 
@@ -19,11 +19,21 @@ function openFixture(settings?: Parameters<typeof openStore>[4]) {
   const { bb } = createFakePluginHost({ pluginId: `navigator-dual-engine-${fixtureSequence}` });
   let currentTime = 10_000;
   const now = () => currentTime++;
-  const store = openStore(bb.storage, bb.storage.kv, now, undefined, settings);
+  const composition = openStoreComposition(bb.storage, bb.storage.kv, now, undefined, settings);
+  const store = composition.store;
   store.createPairingCode(hashSecret("pair"), 1_000, 20_000);
   if (!store.pairOwnerWithCode(hashSecret("pair"), "7", "7", 1_001).ok) throw new Error("owner pairing failed");
   store.upsertProjectPolicy(policyFixture(), 1_002);
-  return { bb, store, database: bb.storage.database(), now };
+  return {
+    bb,
+    store,
+    database: bb.storage.database(),
+    navigatorCoordinator: composition.navigatorCoordinator,
+    navigatorEvaluation: composition.navigatorEvaluation,
+    navigatorEffects: composition.navigatorEffects,
+    navigatorImplementation: composition.navigatorImplementation,
+    now,
+  };
 }
 
 function confirmControllerJob(
@@ -246,14 +256,14 @@ describe("navigator dual-engine admission", () => {
 
 describe("dual-engine drain and contraction", () => {
   it("cancels idle recipe jobs and contracts only after the recipe engine is empty", () => {
-    const { store, database, now } = openFixture();
+    const { store, database, navigatorCoordinator, navigatorEvaluation, navigatorEffects, navigatorImplementation, now } = openFixture();
     const idle = store.createJob({
       id: "job_recipe_idle",
       sourceUpdateId: 43_300,
       requestText: "Cancel this idle recipe job",
       now: 2_000,
     });
-    const coordinator = new DualEngineCoordinator({ store, database, now });
+    const coordinator = new DualEngineCoordinator({ persistence: navigatorCoordinator, evaluation: navigatorEvaluation, navigatorEffects, navigatorImplementation, now });
     expect(coordinator.drainRecipeJobs()).toEqual({
       cancelled: [idle.id],
       remaining: [],
@@ -264,7 +274,7 @@ describe("dual-engine drain and contraction", () => {
   });
 
   it("refuses contraction while a deploying recipe job remains", () => {
-    const { store, database, now } = openFixture();
+    const { store, database, navigatorCoordinator, navigatorEvaluation, navigatorEffects, navigatorImplementation, now } = openFixture();
     const deploying = store.createJob({
       id: "job_recipe_deploying",
       sourceUpdateId: 43_301,
@@ -272,7 +282,7 @@ describe("dual-engine drain and contraction", () => {
       now: 2_000,
     });
     database.prepare("UPDATE jobs SET state = 'deploying' WHERE id = ?").run(deploying.id);
-    const coordinator = new DualEngineCoordinator({ store, database, now });
+    const coordinator = new DualEngineCoordinator({ persistence: navigatorCoordinator, evaluation: navigatorEvaluation, navigatorEffects, navigatorImplementation, now });
     expect(coordinator.drainRecipeJobs()).toEqual({
       cancelled: [],
       remaining: [deploying.id],

@@ -1,12 +1,16 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import type Database from "better-sqlite3";
 import type { ModelRoute } from "../capabilities/models";
 import { buildPublishPullRequestCommand, parsePublishedPullRequest } from "../bb/pr-publish";
 import { PR_HEAD_COMMAND, parseLsRemoteHead } from "../bb/validation";
 import { TerminalCommandRunner, shellSingleQuote, type CommandResult } from "../bb/terminal-command";
 import { modelRouteSpawnArgs } from "../domain/stage-execution";
-import type { TelegramAgentStore } from "../storage/store";
-import type { WorkArtifactSnapshot } from "../work-artifacts/models";
+import type {
+  NavigatorEffectPersistence,
+  NavigatorReleasePersistence,
+} from "./effect-persistence";
+import type { NavigatorWorkflowPersistence } from "./executor";
+import type { NavigatorImplementationPersistence } from "./implementation-persistence";
+import type { NavigatorImplementationReadStore } from "./implementation-executor";
 import {
   NavigatorWorkflowExecutor,
   type NavigatorSkillRunner,
@@ -687,11 +691,11 @@ async function observeBoundThread(
 }
 
 async function observePluginNavigatorInference(
-  store: TelegramAgentStore,
+  persistence: Pick<NavigatorEffectPersistence, "getJob">,
   sdk: BbSdk,
   snapshot: NavigatorSnapshot,
 ): Promise<NavigatorInferenceObservation> {
-  const job = store.getJob(snapshot.identity.jobId);
+  const job = persistence.getJob(snapshot.identity.jobId);
   const threadIds = [
     job?.implementationThreadId,
     job?.reviewThreadId,
@@ -715,8 +719,11 @@ async function observePluginNavigatorInference(
 }
 
 export function createNavigatorRuntime(input: Readonly<{
-  store: TelegramAgentStore;
-  database: Database.Database;
+  effectPersistence: NavigatorEffectPersistence;
+  workflowPersistence: NavigatorWorkflowPersistence;
+  implementationRead: NavigatorImplementationReadStore;
+  implementationPersistence: NavigatorImplementationPersistence;
+  releasePersistence: NavigatorReleasePersistence;
   sdk: BbSdk;
   modelRoute(): ModelRoute;
   clock: { now(): number };
@@ -724,13 +731,13 @@ export function createNavigatorRuntime(input: Readonly<{
 }>): NavigatorPluginRuntime {
   const skillRunner = new PluginNavigatorSkillRunner(input.sdk);
   const navigator = new NavigatorWorkflowExecutor({
-      store: input.store,
-      navigator: input.navigator ?? new DeterministicWorkflowNavigator(),
-      observeInference: (snapshot) => observePluginNavigatorInference(input.store, input.sdk, snapshot),
-      skillRunner,
-      modelRoute: input.modelRoute,
-      clock: input.clock,
-    });
+    store: input.workflowPersistence,
+    navigator: input.navigator ?? new DeterministicWorkflowNavigator(),
+    observeInference: (snapshot) => observePluginNavigatorInference(input.effectPersistence, input.sdk, snapshot),
+    skillRunner,
+    modelRoute: input.modelRoute,
+    clock: input.clock,
+  });
   const ticketWorker = new PluginNavigatorTicketWorkerRunner(input.sdk);
   const ticketOperation: NavigatorTicketWorkerOperation = {
     prepare: (workerInput, signal) => ticketWorker.prepare(workerInput, signal),
@@ -739,18 +746,19 @@ export function createNavigatorRuntime(input: Readonly<{
     observe: (request, signal) => new PluginNavigatorGitObserver(input.sdk).observe(request, signal),
   };
   const implementation = new NavigatorImplementationExecutor({
-      store: input.store,
-      gitObserver: new PluginNavigatorGitObserver(input.sdk),
-      pullRequests: new PluginNavigatorPullRequestPublisher(input.sdk),
-      modelRoute: () => input.modelRoute(),
-      clock: input.clock,
-    });
+    store: input.implementationRead,
+    persistence: input.implementationPersistence,
+    gitObserver: new PluginNavigatorGitObserver(input.sdk),
+    pullRequests: new PluginNavigatorPullRequestPublisher(input.sdk),
+    modelRoute: () => input.modelRoute(),
+    clock: input.clock,
+  });
   const release = new NavigatorReleaseExecutor({
-      store: input.store,
-      publishPullRequest: (request) => publishPluginNavigatorPullRequest(input.sdk, request),
-      integrationWorktreeId: (jobId) => `env_${jobId}`,
-      clock: input.clock,
-    });
+    store: input.releasePersistence,
+    publishPullRequest: (request) => publishPluginNavigatorPullRequest(input.sdk, request),
+    integrationWorktreeId: (jobId) => `env_${jobId}`,
+    clock: input.clock,
+  });
   const skillAdapter: NavigatorEffectAdapter = {
     kind: "run_navigator_skill",
     execute: async (context) => {
@@ -773,7 +781,7 @@ export function createNavigatorRuntime(input: Readonly<{
   };
   return {
     effects: new NavigatorEffectProtocol({
-      store: input.store,
+      store: input.effectPersistence,
       clock: input.clock,
       adapters: [
         skillAdapter,

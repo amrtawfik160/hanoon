@@ -124,7 +124,6 @@ import {
 import { BROKER_BINDING_STATES, OPAQUE_ID_PATTERN } from "../credentials/protocol";
 import type { CredentialAccessService } from "../credentials/service";
 import type {
-  ManagedAutomationMutation,
   ManagedAutomationService,
 } from "../services/managed-automation-service";
 import type { ManagedAutomationBinding } from "../storage/managed-automation-repository";
@@ -2399,8 +2398,6 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           throw new Error("That managed BB schedule is unavailable");
         }
         requireCronOccurrence(params.cron, dependencies.now());
-        const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
-          runControllerMutation(dependencies, authorized, context, () => mutation());
         const updated = await automations.update({
           id: binding.id,
           scope: { kind: "host", hostId: controller.hostId, cwd: null },
@@ -2410,7 +2407,14 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
             prompt: params.instruction,
           },
           now: dependencies.now(),
-          mutate,
+          fence: {
+            kind: "controller",
+            value: {
+              ownerId: authorized.fence.ownerId,
+              generation: authorized.fence.generation,
+              turnId: authorized.turn.id,
+            },
+          },
           signal: context.signal,
         });
         trustedState(resolution).automationBindingId = updated.id;
@@ -2432,8 +2436,6 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         cron: params.cron,
         instruction: params.instruction,
       });
-      const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
-        runControllerMutation(dependencies, authorized, context, () => mutation());
       const binding = await automations.create({
         scope: { kind: "host", hostId: controller.hostId, cwd: null },
         controllerKey: controller.controllerKey,
@@ -2471,7 +2473,6 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         },
         notificationPolicy: "material",
         now,
-        mutate,
         signal: context.signal,
         deferProvider: true,
         operation: {
@@ -2480,10 +2481,13 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
           targetProjectId: context.projectId,
           definitionRevision: 1,
         },
-        controllerFence: {
-          ownerId: authorized.fence.ownerId,
-          generation: authorized.fence.generation,
-          turnId: authorized.turn.id,
+        fence: {
+          kind: "controller",
+          value: {
+            ownerId: authorized.fence.ownerId,
+            generation: authorized.fence.generation,
+            turnId: authorized.turn.id,
+          },
         },
       });
       trustedState(resolution).automationBindingId = binding.id;
@@ -2515,13 +2519,18 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         const automations = dependencies.automations;
         if (!automations) throw new Error("BB Automations is not configured for this controller");
         if (!controller.hostId) throw new Error("The controller has no verified BB host for automation management");
-        const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
-          runControllerMutation(dependencies, authorized, context, () => mutation());
         await automations.retire({
           id: params.id,
           scope: { kind: "host", hostId: controller.hostId, cwd: null },
           now: dependencies.now(),
-          mutate,
+          fence: {
+            kind: "controller",
+            value: {
+              ownerId: authorized.fence.ownerId,
+              generation: authorized.fence.generation,
+              turnId: authorized.turn.id,
+            },
+          },
           signal: context.signal,
         });
         return { cancelled: true };
