@@ -298,6 +298,21 @@ export class BbAutomationNotFoundError extends Error {
   }
 }
 
+/**
+ * BB's automations plugin refuses some projects outright; BB's personal
+ * project is one (it answers "Project not found"). That is a standing property
+ * of the project, not a transient failure, so callers can keep a plugin-local
+ * schedule instead of retrying BB.
+ */
+export class BbAutomationProjectUnavailableError extends Error {
+  public constructor(public readonly projectId: string) {
+    super(`BB automations are not available for project ${projectId}`);
+    this.name = "BbAutomationProjectUnavailableError";
+  }
+}
+
+const PROJECT_UNAVAILABLE_OUTPUT = /^Project (\S+) is not available: HTTP 404: Project not found\s*$/u;
+
 export class TerminalBbAutomationAdapter {
   public constructor(private readonly runner: AutomationCommandRunner) {}
 
@@ -322,6 +337,10 @@ export class TerminalBbAutomationAdapter {
         result.output.trim() === "Automation not found") {
         throw new BbAutomationNotFoundError();
       }
+      const unavailable = result.outcome === "exited"
+        ? PROJECT_UNAVAILABLE_OUTPUT.exec(result.output.trim())
+        : null;
+      if (unavailable?.[1]) throw new BbAutomationProjectUnavailableError(unavailable[1]);
       throw commandFailure(input.title, result);
     }
     return input.schema.parse(parseCommandJson<unknown>(result.output, input.title));

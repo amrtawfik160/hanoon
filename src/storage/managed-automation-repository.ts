@@ -176,10 +176,17 @@ export class ManagedAutomationRepository {
     const definitionSha256 = managedAutomationDigest(input.definition);
     return this.db.transaction(() => {
       const existing = this.getBySource(input.controllerKey, input.sourceKey);
-      if (existing?.state === "retired") {
-        // A retired source is a closed chapter, not a poisoned key: creating
-        // it again re-arms the same binding so its run history stays attached
-        // and the next create asks BB for a fresh automation.
+      if (existing && existing.definitionSha256 === definitionSha256 && existing.state !== "retired") {
+        return existing;
+      }
+      if (existing) {
+        // Only a binding that holds a live BB automation must keep its
+        // definition. A retired source is a closed chapter, and a failed one
+        // that never reached BB holds nothing durable there, so either may be
+        // re-armed under the requested definition with its history attached.
+        if (existing.state !== "retired" && !(existing.state === "failed" && existing.bbAutomationId === null)) {
+          throw new Error("managed automation source already has a different durable definition");
+        }
         const reopened = this.db.prepare(
           `UPDATE managed_automations
               SET project_id = ?, bb_automation_id = NULL, name = ?, mode = ?,
@@ -187,7 +194,7 @@ export class ManagedAutomationRepository {
                   notification_policy = ?, state = 'pending', legacy_monitor_id = ?,
                   observed_json = NULL, observed_sha256 = NULL, last_reconciled_at = NULL,
                   last_error = NULL, updated_at = ?
-            WHERE id = ? AND state = 'retired'`,
+            WHERE id = ? AND (state = 'retired' OR (state = 'failed' AND bb_automation_id IS NULL))`,
         ).run(
           input.projectId,
           input.name,
@@ -202,12 +209,6 @@ export class ManagedAutomationRepository {
         );
         if (reopened.changes !== 1) throw new Error("managed automation re-arm fence was lost");
         return this.get(existing.id)!;
-      }
-      if (existing) {
-        if (existing.definitionSha256 !== definitionSha256) {
-          throw new Error("managed automation source already has a different durable definition");
-        }
-        return existing;
       }
       const id = `automation-binding-${randomUUID()}`;
       this.db.prepare(

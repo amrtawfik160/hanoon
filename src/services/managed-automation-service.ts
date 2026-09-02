@@ -3,6 +3,7 @@ import { redactError } from "../errors";
 import {
   assertAutomationMatches,
   BbAutomationNotFoundError,
+  BbAutomationProjectUnavailableError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
   type BbAutomation,
@@ -442,6 +443,7 @@ function requireActiveBinding(
 }
 
 function automationErrorClass(error: unknown): string {
+  if (error instanceof BbAutomationProjectUnavailableError) return "bb_automation_project_unavailable";
   const message = error instanceof Error ? error.message.toLowerCase() : "";
   if (message.includes("timed out")) return "bb_automation_timeout";
   if (message.includes("aborted")) return "bb_automation_aborted";
@@ -476,7 +478,11 @@ export async function migrateLegacyClockMonitor(input: {
     definition: {
       mode: "agent",
       projectId: input.projectId,
-      name: input.monitor.systemKey ?? `Hanoon schedule ${input.monitor.id.slice(0, 24)}`,
+      // Same name as a fresh install of the same upkeep, so a later pass that
+      // no longer sees the legacy row reserves the identical durable definition.
+      name: input.monitor.systemKey
+        ? `Hanoon ${input.monitor.systemKey}`
+        : `Hanoon schedule ${input.monitor.id.slice(0, 24)}`,
       trigger: { kind: "cron", cron: input.monitor.cron, timezone: "Etc/UTC" },
       prompt: input.monitor.instruction,
       providerId: input.providerId,

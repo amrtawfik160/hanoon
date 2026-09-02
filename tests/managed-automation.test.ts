@@ -341,6 +341,30 @@ describe("managed BB automations", () => {
     expect(fake.create).toHaveBeenCalledTimes(2);
   });
 
+  it("redefines a failed source that never reached BB instead of rejecting it forever", async () => {
+    const { repository } = fixture();
+    const fake = createFakeBbAutomationAdapter(NOW);
+    fake.create.mockRejectedValueOnce(new Error("BB unavailable"));
+    const service = new ManagedAutomationService(repository, fake.adapter, () => true);
+    await expect(service.create(createInput())).rejects.toThrow("BB unavailable");
+    const failed = service.list("owner-7-controller")[0]!;
+    expect(failed).toMatchObject({ state: "failed", bbAutomationId: null });
+
+    const renamed = await service.create({
+      ...createInput(),
+      definition: { ...definition, name: "Daily release health (renamed)" },
+      now: NOW + 1,
+    });
+
+    expect(renamed).toMatchObject({ id: failed.id, state: "active", name: "Daily release health (renamed)" });
+    // A binding that does hold a BB automation keeps its definition.
+    await expect(service.create({
+      ...createInput(),
+      definition: { ...definition, name: "Daily release health (again)" },
+      now: NOW + 2,
+    })).rejects.toThrow("different durable definition");
+  });
+
   it("reconciles an interrupted governed definition update from durable intent", async () => {
     const { repository } = fixture();
     const fake = createFakeBbAutomationAdapter(NOW);

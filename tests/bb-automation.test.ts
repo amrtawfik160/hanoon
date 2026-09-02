@@ -6,6 +6,7 @@ import {
   buildListAutomationsCommand,
   buildUpdateAutomationCommand,
   BbAutomationNotFoundError,
+  BbAutomationProjectUnavailableError,
   TerminalBbAutomationAdapter,
   type BbAgentAutomationDefinition,
   type BbAutomation,
@@ -205,5 +206,24 @@ describe("BB automation adapter", () => {
 
     await expect(adapter.delete(input)).rejects.toBeInstanceOf(BbAutomationNotFoundError);
     await expect(adapter.delete(input)).rejects.toThrow("command exited 1");
+  });
+
+  it("classifies BB refusing the project as a standing condition, not a command failure", async () => {
+    // Production, 2026-09-02: BB's personal project answers exactly this.
+    const adapter = new TerminalBbAutomationAdapter({
+      run: async () => ({
+        outcome: "exited",
+        exitCode: 1,
+        output: "Project proj_personal is not available: HTTP 404: Project not found\n",
+      }),
+    });
+
+    const failure = await adapter.create({
+      scope: { kind: "environment", environmentId: "env_owner" },
+      definition: { ...definition, projectId: "proj_personal" },
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BbAutomationProjectUnavailableError);
+    expect((failure as BbAutomationProjectUnavailableError).projectId).toBe("proj_personal");
   });
 });

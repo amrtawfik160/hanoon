@@ -8,6 +8,7 @@ import {
   installSystemAutomations,
   systemAutomationInstallationComplete,
 } from "../src/services/system-monitors";
+import { BbAutomationProjectUnavailableError } from "../src/bb/automation";
 import { ManagedAutomationService } from "../src/services/managed-automation-service";
 import { ManagedAutomationRepository } from "../src/storage/managed-automation-repository";
 import { nextCronOccurrence, MonitorService } from "../src/services/monitor-service";
@@ -153,6 +154,33 @@ it("reinstalls upkeep after self-maintenance was switched off and on again", asy
   await expect(install(value, NOW + 2)).resolves.toBe(SYSTEM_MONITORS.length);
 
   expect(value.service.list(CONTROLLER_KEY).every((binding) => binding.state === "active")).toBe(true);
+});
+
+it("keeps upkeep as plugin-local schedules when BB refuses to host automations for the controller's project", async () => {
+  // Production, 2026-09-02: the controller runs in BB's personal project,
+  // which BB's automations plugin answers with "Project not found".
+  const value = fixture();
+  value.fake.create.mockRejectedValue(new BbAutomationProjectUnavailableError("proj_a"));
+  const warnings: string[] = [];
+
+  const installed = await installSystemAutomations({
+    store: value.store,
+    service: value.service,
+    providerId: "codex",
+    execution: EXECUTION,
+    clock: { now: () => NOW },
+    warn: (message) => warnings.push(message),
+  });
+
+  expect(installed).toBe(SYSTEM_MONITORS.length);
+  expect(systemAutomationInstallationComplete(installed)).toBe(true);
+  expect(value.store.listSystemMonitors().map((monitor) => monitor.state)).toEqual(["armed", "armed", "armed"]);
+  expect(value.fake.automations.size).toBe(0);
+  expect(warnings).toHaveLength(SYSTEM_MONITORS.length);
+  expect(warnings[0]).toMatch(/not available for project proj_a; system-stale-jobs stays a plugin-local schedule/);
+  // The same pass on the next tick is idempotent: the local rows are reused.
+  await expect(install(value, NOW + 60_000)).resolves.toBe(SYSTEM_MONITORS.length);
+  expect(value.store.listSystemMonitors()).toHaveLength(SYSTEM_MONITORS.length);
 });
 
 it("installs nothing until an owner is paired", async () => {

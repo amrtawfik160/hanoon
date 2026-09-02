@@ -2,6 +2,7 @@ import type { BbPluginApi, PluginAgentConfigurationContext, PluginAgentToolConte
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
+  BbAutomationProjectUnavailableError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
 } from "../bb/automation";
@@ -2392,7 +2393,9 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       });
       const mutate: ManagedAutomationMutation = <T>(mutation: () => T) =>
         runControllerMutation(dependencies, authorized, context, () => mutation());
-      const binding = await automations.create({
+      let binding: ManagedAutomationBinding;
+      try {
+        binding = await automations.create({
         scope: { kind: "host_path", hostId: controller.hostId, cwd: null },
         controllerKey: controller.controllerKey,
         sourceKey: `owner-schedule:${identity}`,
@@ -2424,6 +2427,25 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
         mutate,
         signal: context.signal,
       });
+      } catch (error) {
+        if (!(error instanceof BbAutomationProjectUnavailableError)) throw error;
+        // BB refuses to host automations for this project (its personal
+        // project answers "not found"). The plugin's own clock schedule is
+        // the truthful fallback: it fires through the monitor service and
+        // is listed and cancelled like any other watch.
+        const monitor = runControllerMutation(dependencies, authorized, context, (mutationNow) =>
+          dependencies.store.createMonitor({
+            controllerKey: controller.controllerKey,
+            kind: "schedule",
+            cron: params.cron,
+            instruction: params.instruction,
+            dueAt: requireCronOccurrence(params.cron, mutationNow),
+            now: mutationNow,
+          }));
+        trustedState(resolution).monitorId = monitor.id;
+        dependencies.notify();
+        return { watching: monitorProjection(monitor) };
+      }
       trustedState(resolution).automationBindingId = binding.id;
       dependencies.notify();
       return { watching: automationProjection(binding) };

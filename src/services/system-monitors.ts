@@ -1,9 +1,11 @@
 import { redactError } from "../errors";
 import type { TelegramAgentStore } from "../storage/store";
 import {
+  BbAutomationProjectUnavailableError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
 } from "../bb/automation";
+import { nextCronOccurrence } from "./monitor-service";
 import {
   ManagedAutomationService,
   migrateLegacyClockMonitor,
@@ -53,7 +55,7 @@ export function systemAutomationInstallationComplete(installed: number): boolean
 export type SystemAutomationInstaller = Readonly<{
   store: Pick<
     TelegramAgentStore,
-    "getOwner" | "getControllerForOwner" | "listSystemMonitors" | "cancelMonitor"
+    "getOwner" | "getControllerForOwner" | "listSystemMonitors" | "cancelMonitor" | "ensureSystemMonitor"
   >;
   service: ManagedAutomationService;
   providerId: string;
@@ -71,6 +73,11 @@ export type SystemAutomationInstaller = Readonly<{
 /**
  * Installs reasoning-based upkeep in BB's scheduler. Existing plugin-local
  * schedules are handed over only after BB reads back an active next run.
+ *
+ * BB refuses to host automations for some projects, notably its personal
+ * project, which is where the controller runs on a single-owner installation.
+ * There the upkeep stays a plugin-local clock schedule, which the monitor
+ * service already fires, and the installer says so instead of retrying BB.
  */
 export async function installSystemAutomations(dependencies: SystemAutomationInstaller): Promise<number> {
   const owner = dependencies.store.getOwner();
@@ -140,6 +147,24 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
       }
       installed += 1;
     } catch (error) {
+      if (error instanceof BbAutomationProjectUnavailableError) {
+        const dueAt = nextCronOccurrence(definition.cron, now);
+        if (dueAt !== null) {
+          dependencies.store.ensureSystemMonitor({
+            systemKey: definition.systemKey,
+            controllerKey: controller.controllerKey,
+            cron: definition.cron,
+            instruction: definition.instruction,
+            dueAt,
+            now,
+          });
+          installed += 1;
+          dependencies.warn?.(
+            `BB automations are not available for project ${error.projectId}; ${definition.systemKey} stays a plugin-local schedule`,
+          );
+          continue;
+        }
+      }
       dependencies.warn?.(
         `System automation ${definition.systemKey} could not be installed: ${redactError(error).slice(0, 200)}`,
       );
