@@ -4056,6 +4056,7 @@ SELECT observation.observation_id, observation.job_id, observation.authority_id,
    AND boundary.authority_revision = observation.authority_revision
    AND boundary.affected_effect_idempotency_key = observation.affected_effect_idempotency_key
  WHERE boundary.status <> 'revoked';
+`, String.raw`
 CREATE TRIGGER policy_boundary_observations_require_live_executor_fence
 BEFORE INSERT ON policy_boundary_observations
 WHEN EXISTS (
