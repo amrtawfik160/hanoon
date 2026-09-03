@@ -45,7 +45,7 @@ function completedTurn(
   const lease = store.acquireExecutorLease(`executor-${updateId}`, now, 60 * 60_000);
   if (!lease.acquired) throw new Error("missing lease");
   const fence = { ownerId: `executor-${updateId}`, generation: lease.generation, now };
-  store.claimNextControllerTurn(fence);
+  store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 });
   store.markControllerSpawned({ ...fence, turnId: turn.id, projectId: "p", hostId: "h", threadId: "thr_c" });
   store.markControllerTurnSubmitted({ ...fence, turnId: turn.id });
   completeTurnThroughFinalization(store, fence, {

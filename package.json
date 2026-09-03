@@ -5,7 +5,7 @@
   "private": true,
   "engines": {
     "bb": ">=0.36",
-    "bbPluginSdk": ">=0.4.21"
+    "bbPluginSdk": ">=0.4.34"
   },
   "bb": {
     "name": "Telegram Agent",
@@ -43,7 +43,7 @@
     "broker"
   ],
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.21",
+    "@get-bb/plugin-sdk": "0.4.34",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",

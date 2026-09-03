@@ -4605,6 +4605,21 @@ BEFORE DELETE ON navigator_release_review_finding_events
 BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
 `] as const;
 
+/**
+ * Burst grouping and provenance: per-turn structured source records, document
+ * attachments, the durable link from a folded follower to its leader, and the
+ * reserved steer text for a combined mid-answer addition. Append-only history.
+ */
+export const CONTROLLER_BURST_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN source_json TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_name TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_mime_type TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_size_bytes INTEGER;
+ALTER TABLE controller_turns ADD COLUMN burst_leader_turn_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN steer_reservation_text TEXT;
+`] as const;
+
 export const MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS = [String.raw`
 CREATE TABLE managed_automations_v2 (
   id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
@@ -4864,5 +4879,6 @@ export const ALL_MIGRATIONS = [
   ...MANAGED_AUTOMATION_MIGRATIONS,
   ...NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   ...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  ...CONTROLLER_BURST_MIGRATIONS,
   ...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
 ] as const;

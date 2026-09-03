@@ -1,6 +1,17 @@
 export const NAVIGATOR_RELEASE_INCIDENT_BUDGET = 1;
 export const NAVIGATOR_RELEASE_STEP_SKILL_ID = "start_release";
 
+export type NavigatorReleaseEntryRequest = Readonly<{
+  operationId: string;
+  jobId: string;
+  title: string;
+  body: string;
+}>;
+
+export function navigatorReleaseOperationId(jobId: string): string {
+  return `release:${jobId}`;
+}
+
 export const NAVIGATOR_RELEASE_STATES = [
   "locating_pr",
   "resolving_pr_head",
