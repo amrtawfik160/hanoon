@@ -21,10 +21,12 @@ import type {
   NavigatorTicketWorkerAttempt,
   NavigatorTicketWorkerExecution,
 } from "../src/navigator/implementation-executor";
+import type { NavigatorPullRequestRecord } from "../src/navigator/implementation-contracts";
 import type {
   NavigatorReleaseEffectContext,
   NavigatorTicketEffectContext,
 } from "../src/navigator/effect-protocol";
+import { navigatorReleaseOperationId } from "../src/navigator/release-contracts";
 import { openStore } from "../src/storage/store";
 import { stableWorkArtifactId } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
@@ -368,19 +370,19 @@ describe("plugin navigator inference and release adapters", () => {
     expect(durableState).toEqual(before);
   });
 
-  it("returns a typed release receipt without settling durable state through processLeased", async () => {
+  it("returns a typed release receipt without settling durable state", async () => {
     const durableState = { workflow: "pending", effect: "leased", outbox: [] as string[] };
     const before = structuredClone(durableState);
-    const processLeased = vi.fn(async () => true);
     const executeEntry = vi.fn(async () => ({
-      operationId: "pr-adapter",
+      operationId: navigatorReleaseOperationId("job-release-adapter"),
       jobId: "job-release-adapter",
       number: 43,
       url: "https://github.com/acme/cyndra/pull/43",
       headSha: REMOTE_HEAD,
     }));
+    const reconcileEntry = vi.fn(async () => executeEntry());
     const integrationEnvironmentId = vi.fn(() => "env_release_adapter");
-    const operation = { executeEntry, integrationEnvironmentId, processLeased };
+    const operation = { executeEntry, reconcileEntry, integrationEnvironmentId };
     const adapter = createNavigatorReleaseEffectAdapter(operation);
 
     const outcome = await adapter.execute(releaseAdapterContext());
@@ -391,6 +393,8 @@ describe("plugin navigator inference and release adapters", () => {
         kind: "run_navigator_release",
         effectIdempotencyKey: "effect-release-adapter",
         attemptId: "attempt-release-adapter",
+        jobId: "job-release-adapter",
+        operationId: navigatorReleaseOperationId("job-release-adapter"),
         resource: { kind: "environment", id: "env_release_adapter" },
         number: 43,
         url: "https://github.com/acme/cyndra/pull/43",
@@ -398,8 +402,71 @@ describe("plugin navigator inference and release adapters", () => {
       },
     });
     expect(executeEntry).toHaveBeenCalledTimes(1);
-    expect(processLeased).not.toHaveBeenCalled();
+    expect(executeEntry).toHaveBeenCalledWith(
+      expect.objectContaining({ operationId: navigatorReleaseOperationId("job-release-adapter") }),
+      undefined,
+    );
+    expect(reconcileEntry).not.toHaveBeenCalled();
     expect(durableState).toEqual(before);
+  });
+
+  it.each([
+    ["invalid number", { number: 0 }, "env_release_adapter"],
+    ["invalid URL", { url: "not-a-url" }, "env_release_adapter"],
+    ["invalid environment", {}, ""],
+  ] as const)("rejects a %s release entry record at the adapter boundary", async (_label, change, environmentId) => {
+    const published = {
+      operationId: navigatorReleaseOperationId("job-release-adapter"),
+      jobId: "job-release-adapter",
+      number: 43,
+      url: "https://github.com/acme/cyndra/pull/43",
+      headSha: REMOTE_HEAD,
+      ...change,
+    } as unknown as NavigatorPullRequestRecord;
+    const executeEntry = vi.fn(async () => published);
+    const adapter = createNavigatorReleaseEffectAdapter({
+      executeEntry,
+      reconcileEntry: async () => published,
+      integrationEnvironmentId: () => environmentId,
+    });
+
+    await expect(adapter.execute(releaseAdapterContext())).resolves.toEqual({
+      outcome: "permanent",
+      reason: "Navigator release entry receipt is invalid",
+    });
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["job", { jobId: "job-release-other" }],
+    ["operation", { operationId: navigatorReleaseOperationId("job-release-other") }],
+  ] as const)("rejects a %s identity mismatch from execution and reconciliation", async (_label, change) => {
+    const published: NavigatorPullRequestRecord = {
+      operationId: navigatorReleaseOperationId("job-release-adapter"),
+      jobId: "job-release-adapter",
+      number: 43,
+      url: "https://github.com/acme/cyndra/pull/43",
+      headSha: REMOTE_HEAD,
+      ...change,
+    };
+    const executeEntry = vi.fn(async () => published);
+    const reconcileEntry = vi.fn(async () => published);
+    const adapter = createNavigatorReleaseEffectAdapter({
+      executeEntry,
+      reconcileEntry,
+      integrationEnvironmentId: () => "env_release_adapter",
+    });
+
+    await expect(adapter.execute(releaseAdapterContext())).resolves.toEqual({
+      outcome: "permanent",
+      reason: "Navigator release entry identity is invalid",
+    });
+    await expect(adapter.reconcile?.(releaseAdapterContext())).resolves.toEqual({
+      outcome: "permanent",
+      reason: "Navigator release entry identity is invalid",
+    });
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+    expect(reconcileEntry).toHaveBeenCalledTimes(1);
   });
 
   it("publishes one pull request and verifies the remote base, branch, and exact head", async () => {
@@ -604,12 +671,14 @@ describe("plugin navigator inference and release adapters", () => {
     });
     const record = await publishPluginNavigatorPullRequest(bb.sdk, {
       jobId: "job_pr_head",
+      operationId: navigatorReleaseOperationId("job_pr_head"),
       title: "Ship accepted navigator tickets",
       body: "Exact-head release of the accepted implementation tickets.",
     });
 
     expect(record).toMatchObject({
       jobId: "job_pr_head",
+      operationId: navigatorReleaseOperationId("job_pr_head"),
       number: 43,
       url: "https://github.com/acme/cyndra/pull/43",
       headSha: REMOTE_HEAD,

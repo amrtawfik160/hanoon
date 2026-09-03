@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { vi } from "vitest";
-import { productionResourceKey, projectResourceKey } from "../../src/autonomy/models";
+import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../../src/autonomy/models";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../../src/capabilities/models";
 import { navigatorAcceptanceCriteria } from "../../src/navigator/implementation-contracts";
 import {
@@ -10,7 +10,10 @@ import {
 } from "../../src/navigator/implementation-executor";
 import { assertNavigatorLiveScenarioEvidence } from "../../src/navigator/live-evidence";
 import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/navigator/promotion";
+import { NavigatorEffectProtocol } from "../../src/navigator/effect-protocol";
+import { createNavigatorReleaseEffectAdapter } from "../../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../../src/navigator/release-executor";
+import { navigatorReleaseOperationId } from "../../src/navigator/release-contracts";
 import { EffectRunner } from "../../src/services/effect-runner";
 import type { ProductionStageSnapshot } from "../../src/services/production-runner";
 import type { TelegramAgentStore } from "../../src/storage/store";
@@ -583,15 +586,25 @@ function seedProduction(
     ).run(jobId, job.projectId, queueSeq, now(), now());
   }
   const expires = now() + 180_000;
+  const acquired = now();
+  const updateClaim = database.prepare(
+    `UPDATE job_resource_claims
+        SET job_id = ?, state = 'held', owner_id = ?, generation = ?, lease_expires_at = ?,
+            renewed_at = ?, released_at = NULL, release_reason = NULL
+      WHERE resource_key = ?`,
+  );
   const insertClaim = database.prepare(
     `INSERT INTO job_resource_claims (
        job_id, resource_key, resource_kind, state, owner_id, generation,
        lease_expires_at, acquired_at, renewed_at
      ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
   );
-  const acquired = now();
-  insertClaim.run(jobId, projectResourceKey(job.projectId), "project", ownerId, generation, expires, acquired, acquired);
-  insertClaim.run(jobId, productionResourceKey(job.policy), "production_target", ownerId, generation, expires, acquired, acquired);
+  const reactivateClaim = (resourceKey: string, resourceKind: string): void => {
+    const updated = updateClaim.run(jobId, ownerId, generation, expires, acquired, resourceKey);
+    if (updated.changes === 0) insertClaim.run(jobId, resourceKey, resourceKind, ownerId, generation, expires, acquired, acquired);
+  };
+  reactivateClaim(projectResourceKey(job.projectId), "project");
+  reactivateClaim(productionResourceKey(job.policy), "production_target");
   const current = store.getJob(jobId)!;
   const kind = state === "deploying" ? "deploy_production" : "verify_production";
   database.prepare(
@@ -848,23 +861,43 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
         body: "Implements the live scenario with one repair.",
       });
       markShippedChange(input.database, opened.jobId);
-      propose(input.store, opened.jobId, input.now, {
+      const releaseDecision = propose(input.store, opened.jobId, input.now, {
         kind: "start_release",
         implementationTicketIds: [opened.ticketId],
       });
+      if (!releaseDecision.effectIdempotencyKey) throw new Error("live release effect was not accepted");
+      const releaseJob = input.store.getJob(opened.jobId);
+      if (!releaseJob?.policy || releaseJob.projectId === null) throw new Error("live release policy is missing");
+      const releaseClaimNow = input.now();
+      const insertReleaseClaim = input.database.prepare(
+        `INSERT INTO job_resource_claims (
+           job_id, resource_key, resource_kind, state, owner_id, generation,
+           lease_expires_at, acquired_at, renewed_at
+         ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
+      );
+      insertReleaseClaim.run(opened.jobId, projectResourceKey(releaseJob.projectId), "project", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
+      insertReleaseClaim.run(opened.jobId, repositoryMergeResourceKey(releaseJob.policy.githubRepository), "repository_merge", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
+      insertReleaseClaim.run(opened.jobId, productionResourceKey(releaseJob.policy), "production_target", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
       const release = new NavigatorReleaseExecutor({
-        store: input.store,
         publishPullRequest: async () => ({
-          operationId: "pr-43",
+          operationId: navigatorReleaseOperationId(opened.jobId),
           jobId: opened.jobId,
           number: 43,
           url: "https://github.com/acme/cyndra/pull/43",
           headSha: NEXT_HEAD,
         }),
         integrationWorktreeId: () => `env_${opened.jobId}`,
-        clock: { now: input.now },
       });
-      await release.processOne({
+      const releaseProtocol = new NavigatorEffectProtocol({
+        store: input.store,
+        clock: { now: input.now },
+        adapters: [
+          { kind: "run_navigator_skill", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          createNavigatorReleaseEffectAdapter(release),
+        ],
+      });
+      await releaseProtocol.processOne({
         ownerId,
         generation: lease.generation,
         signal: new AbortController().signal,
