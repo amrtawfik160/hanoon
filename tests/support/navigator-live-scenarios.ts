@@ -341,7 +341,6 @@ function implementationExecutor(
   };
   const executor = new NavigatorImplementationExecutor({
     store,
-    database,
     gitObserver,
     pullRequests: {
       createOrRefresh: vi.fn(async (request) => ({

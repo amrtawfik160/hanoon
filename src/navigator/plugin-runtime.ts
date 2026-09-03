@@ -789,7 +789,6 @@ export function createNavigatorRuntime(input: Readonly<{
   };
   const implementation = new NavigatorImplementationExecutor({
       store: input.store,
-      database: input.database,
       gitObserver: new PluginNavigatorGitObserver(input.sdk),
       pullRequests: new PluginNavigatorPullRequestPublisher(input.sdk),
       modelRoute: () => input.modelRoute(),

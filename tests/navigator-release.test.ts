@@ -31,6 +31,7 @@ import {
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
+  NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
@@ -160,7 +161,6 @@ function startResolvedIntegration(
 ): void {
   const executor = new NavigatorImplementationExecutor({
     store: fixture.store,
-    database: fixture.database,
     gitObserver: {
       observe: vi.fn(async (request) => ({
         kind: "navigator_git_observation" as const,
@@ -755,14 +755,19 @@ function admitCompetingMerge(fixture: OwnedFixture): string {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    // The finding-ledger upgrade is the newest tail, with the automation
-    // lifecycle, the effect protocol, the burst migration and then the
-    // managed-automation state upgrade ahead of it. Each contributes several
-    // statements, so every block is located by offset rather than a fixed index.
-    [...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+    // The review-convergence upgrade is the newest tail, with the finding
+    // ledger, the automation lifecycle, the effect protocol, the burst
+    // migration and then the managed-automation state upgrade ahead of it.
+    // Each contributes several statements, so every block is located by offset
+    // rather than a fixed index.
+    [...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const findingLedgerOffset = NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
+    const convergenceOffset = NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length;
+    [...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(convergenceOffset + index + 1))).toBe(migration);
+    });
+    const findingLedgerOffset = convergenceOffset + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
     [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(findingLedgerOffset + index + 1))).toBe(migration);
     });

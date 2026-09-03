@@ -24,6 +24,7 @@ import {
   CONTROLLER_BURST_MIGRATIONS,
   NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
+  NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -234,13 +235,14 @@ it("keeps every shipped migration at its original position and appends new ones"
       NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length +
       MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length +
       CONTROLLER_BURST_MIGRATIONS.length + NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length +
-        MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length,
+        MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length +
+          NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length,
   );
   // The burst block is no longer the tail: the navigator effect protocol was
   // appended after it.
-  const burstTail = ALL_MIGRATIONS.length - NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length -
-    MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length - NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length -
-    CONTROLLER_BURST_MIGRATIONS.length;
+  const burstTail = ALL_MIGRATIONS.length - NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length -
+    NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length - MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length -
+    NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length - CONTROLLER_BURST_MIGRATIONS.length;
   expect(ALL_MIGRATIONS[burstTail]).toContain("source_json");
   expect(ALL_MIGRATIONS[burstTail]).toContain("doc_file_id");
   expect(ALL_MIGRATIONS[burstTail]).toContain("burst_leader_turn_id");

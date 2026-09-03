@@ -327,6 +327,10 @@ import {
 } from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
 import { NavigatorRepository } from "../navigator/repository";
+import {
+  NavigatorImplementationRepository,
+  type NavigatorImplementationPersistence,
+} from "../navigator/implementation-persistence";
 import type { NavigatorTicketWorkerOutcome } from "../navigator/ticket-settlement-repository";
 import type { NavigatorFindingLedgerDecision } from "../navigator/finding-ledger";
 import type {
@@ -4192,6 +4196,7 @@ export interface TelegramAgentStore {
   bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean;
   settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
   getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision;
+  getNavigatorImplementationPersistence(): NavigatorImplementationPersistence;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
     attemptId: string;
@@ -5863,6 +5868,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
   private readonly navigatorRepository: NavigatorRepository;
+  private readonly navigatorImplementationRepository: NavigatorImplementationRepository;
   private readonly taskAuthorityRepository: TaskAuthorityRepository;
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
@@ -5884,6 +5890,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.referenceRepository = new ReferenceRepository(db);
     this.workArtifactRepository = new WorkArtifactRepository(db);
     this.navigatorRepository = new NavigatorRepository(db);
+    this.navigatorImplementationRepository = new NavigatorImplementationRepository(db, this);
     this.taskAuthorityRepository = new TaskAuthorityRepository(db);
     this.releaseAuthorityRepository = new ReleaseAuthorityRepository(db);
     this.ownerBoundaryRepository = new OwnerBoundaryRepository(db);
@@ -13330,6 +13337,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision {
     return this.navigatorRepository.getNavigatorFindingLedgerDecision(jobId);
+  }
+
+  public getNavigatorImplementationPersistence(): NavigatorImplementationPersistence {
+    return this.navigatorImplementationRepository;
   }
 
   public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {

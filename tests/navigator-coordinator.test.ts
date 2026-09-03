@@ -494,7 +494,6 @@ describe("disposable navigator live path", () => {
     };
     const executor = new NavigatorImplementationExecutor({
       store,
-      database,
       gitObserver: {
         observe: async (request) => ({
           kind: "navigator_git_observation",

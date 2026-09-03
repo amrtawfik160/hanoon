@@ -4532,6 +4532,83 @@ CREATE INDEX navigator_review_finding_events_fingerprint
 ALTER TABLE navigator_review_convergence ADD COLUMN last_verification_attempt_id TEXT;
 `] as const;
 
+export const NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS = [String.raw`
+DROP TRIGGER IF EXISTS navigator_review_finding_events_append_only_update;
+DROP TRIGGER IF EXISTS navigator_review_finding_events_append_only_delete;
+DROP INDEX IF EXISTS navigator_review_finding_events_fingerprint;
+DROP INDEX IF EXISTS navigator_review_finding_events_slice;
+ALTER TABLE navigator_review_finding_events RENAME TO navigator_review_finding_events_v1;
+CREATE TABLE navigator_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE CHECK (length(id) BETWEEN 1 AND 256),
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  verification_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  root_cause_id TEXT NOT NULL CHECK (length(root_cause_id) BETWEEN 1 AND 256),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved', 'disputed', 'corrected')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL,
+  occurrence INTEGER NOT NULL CHECK (occurrence >= 0 AND occurrence <= 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  severity TEXT NOT NULL DEFAULT 'low' CHECK (severity IN ('critical', 'high', 'medium', 'low')),
+  requirement_id TEXT,
+  evidence_class TEXT NOT NULL DEFAULT 'legacy',
+  normalized_subject TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL DEFAULT '',
+  descriptor_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(descriptor_digest) = 64),
+  descriptor_version TEXT NOT NULL DEFAULT 'legacy',
+  policy_revision INTEGER NOT NULL DEFAULT 0 CHECK (policy_revision >= 0),
+  policy_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(policy_digest) = 64),
+  requirement_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(requirement_ids_json)),
+  artifact_snapshot_id TEXT,
+  artifact_snapshot_digest TEXT CHECK (artifact_snapshot_digest IS NULL OR length(artifact_snapshot_digest) = 64),
+  specification_snapshot_id TEXT,
+  specification_snapshot_digest TEXT CHECK (specification_snapshot_digest IS NULL OR length(specification_snapshot_digest) = 64),
+  source_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(source_attempt_digest) = 64),
+  verification_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(verification_attempt_digest) = 64),
+  root_cause_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (root_cause_confirmed IN (0, 1)),
+  supersedes_root_cause_id TEXT CHECK (supersedes_root_cause_id IS NULL OR length(supersedes_root_cause_id) BETWEEN 1 AND 256),
+  UNIQUE(verification_attempt_id, root_cause_id)
+);
+INSERT INTO navigator_review_finding_events (
+  sequence, id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
+  root_cause_id, capability_id, rule_id, disposition, event, head_sha,
+  finding_json, evidence_refs_json, occurrence, blocking_burden, created_at,
+  severity, requirement_id, evidence_class, normalized_subject, fingerprint,
+  descriptor_digest, descriptor_version, policy_revision, policy_digest,
+  requirement_ids_json, artifact_snapshot_id, artifact_snapshot_digest,
+  specification_snapshot_id, specification_snapshot_digest,
+  source_attempt_digest, verification_attempt_digest, root_cause_confirmed,
+  supersedes_root_cause_id
+)
+SELECT sequence, id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
+  root_cause_id, capability_id, rule_id, disposition, event, head_sha,
+  finding_json, evidence_refs_json, occurrence, blocking_burden, created_at,
+  severity, requirement_id, evidence_class, normalized_subject, fingerprint,
+  descriptor_digest, descriptor_version, policy_revision, policy_digest,
+  requirement_ids_json, artifact_snapshot_id, artifact_snapshot_digest,
+  specification_snapshot_id, specification_snapshot_digest,
+  source_attempt_digest, verification_attempt_digest, root_cause_confirmed, NULL
+FROM navigator_review_finding_events_v1;
+DROP TABLE navigator_review_finding_events_v1;
+CREATE INDEX navigator_review_finding_events_slice
+  ON navigator_review_finding_events(slice_id, sequence);
+CREATE INDEX navigator_review_finding_events_fingerprint
+  ON navigator_review_finding_events(slice_id, fingerprint, sequence);
+CREATE TRIGGER navigator_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+CREATE TRIGGER navigator_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+`] as const;
+
 export const MANAGED_AUTOMATION_MIGRATIONS = [String.raw`
 CREATE TABLE managed_automations (
   id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
@@ -4996,4 +5073,5 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   ...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
   ...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
+  ...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
 ] as const;

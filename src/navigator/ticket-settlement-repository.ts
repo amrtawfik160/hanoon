@@ -8,7 +8,7 @@ import { CapabilityRepository } from "../storage/capability-repository";
 import { WorkArtifactRepository } from "../work-artifacts/repository";
 import { guardRequirementBindings } from "../capabilities/guards";
 import { NavigatorFindingLedger } from "./finding-ledger";
-import type { NavigatorFindingLedgerEntry } from "./finding-ledger";
+import type { NavigatorFindingLedgerDecision, NavigatorFindingLedgerEntry } from "./finding-ledger";
 import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
 import {
   navigatorTicketReceiptSchema,
@@ -298,7 +298,7 @@ type TicketSettlementAssessment = Readonly<{
   parsedResult: NavigatorTicketWorkerResult | null;
   gitObservation: NavigatorGitObservation | null;
   exactHeadSha: string;
-  verifiedBlockingBurden: number | null;
+  findingDecision: NavigatorFindingLedgerDecision | null;
   scheduleRetry: boolean;
   retrySameAttempt: boolean;
 }>;
@@ -485,12 +485,12 @@ export class NavigatorTicketSettlementRepository {
     });
     let outcome: NavigatorTicketWorkerOutcome["outcome"] = reasonCode === null ? "succeeded" : "policy_failure";
     let finalReasonCode = reasonCode ?? "accepted";
-    let verifiedBlockingBurden: number | null = null;
+    let findingDecision: NavigatorFindingLedgerDecision | null = null;
     if (reasonCode === null && parsedResult.success && parsedResult.data.kind === "code_review_result") {
       const review = this.assessReview(attempt, parsedResult.data, now);
       outcome = review.outcome;
       finalReasonCode = review.reasonCode;
-      verifiedBlockingBurden = review.blockingBurden;
+      findingDecision = review.findingDecision;
     }
     const result = parsedResult.success ? parsedResult.data : { kind: "policy_failure", reasonCode: finalReasonCode };
     return {
@@ -500,7 +500,7 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: parsedResult.success ? parsedResult.data : null,
       gitObservation,
       exactHeadSha,
-      verifiedBlockingBurden,
+      findingDecision,
       scheduleRetry: false,
       retrySameAttempt: false,
     };
@@ -530,7 +530,7 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: null,
       gitObservation: null,
       exactHeadSha: receipt.exactHeadSha,
-      verifiedBlockingBurden: null,
+      findingDecision: null,
       scheduleRetry: !exhausted,
       retrySameAttempt: false,
     };
@@ -553,7 +553,7 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: null,
       gitObservation: null,
       exactHeadSha: receipt.exactHeadSha,
-      verifiedBlockingBurden: null,
+      findingDecision: null,
       scheduleRetry: false,
       retrySameAttempt: !exhausted,
     };
@@ -570,7 +570,7 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: null,
       gitObservation: null,
       exactHeadSha: attempt.workOrder.baseHeadSha,
-      verifiedBlockingBurden: null,
+      findingDecision: null,
       scheduleRetry: false,
       retrySameAttempt: false,
     };
@@ -580,21 +580,37 @@ export class NavigatorTicketSettlementRepository {
     attempt: NavigatorTicketWorkerAttempt,
     reviewResult: Readonly<Extract<NavigatorTicketWorkerResult, { kind: "code_review_result" }>>,
     now: number,
-  ): Readonly<{ outcome: NavigatorTicketWorkerOutcome["outcome"]; reasonCode: string; blockingBurden: number | null }> {
+  ): Readonly<{ outcome: NavigatorTicketWorkerOutcome["outcome"]; reasonCode: string; findingDecision: NavigatorFindingLedgerDecision | null }> {
     if (attempt.workOrder.verificationOf !== undefined) {
       const verification = this.recordFindingVerification(attempt, reviewResult, now);
-      if (verification.policyFailureReason !== null) {
-        return { outcome: "policy_failure", reasonCode: verification.policyFailureReason, blockingBurden: verification.blockingBurden };
+      if (verification.failureReason !== null || verification.decision === null) {
+        return { outcome: "policy_failure", reasonCode: verification.failureReason ?? "finding_assessment_blocked", findingDecision: verification.decision };
       }
-      return verification.blockingBurden > 0
-        ? { outcome: "findings", reasonCode: "confirmed_review_findings", blockingBurden: verification.blockingBurden }
-        : { outcome: "succeeded", reasonCode: reviewResult.findings.length > 0 ? "accepted_advisories" : "findings_disputed", blockingBurden: 0 };
+      return this.reviewDecisionAssessment(verification.decision, reviewResult.findings.length > 0);
     }
-    if (reviewResult.outcome === "findings") return { outcome: "findings", reasonCode: "review_findings_unverified", blockingBurden: null };
-    const convergenceFailure = this.recordPassingReview(attempt, reviewResult, now);
-    return convergenceFailure === null
-      ? { outcome: "succeeded", reasonCode: "accepted", blockingBurden: 0 }
-      : { outcome: "policy_failure", reasonCode: convergenceFailure, blockingBurden: null };
+    if (reviewResult.outcome === "findings") return { outcome: "findings", reasonCode: "review_findings_unverified", findingDecision: null };
+    return this.reviewDecisionAssessment(this.recordPassingReview(attempt, reviewResult, now), false);
+  }
+
+  private reviewDecisionAssessment(
+    decision: NavigatorFindingLedgerDecision,
+    hasFindings: boolean,
+  ): Readonly<{ outcome: NavigatorTicketWorkerOutcome["outcome"]; reasonCode: string; findingDecision: NavigatorFindingLedgerDecision }> {
+    if (decision.outcome === "blocked" || decision.allowedNextAction === "recheck" || decision.allowedNextAction === "stop") {
+      return {
+        outcome: "policy_failure",
+        reasonCode: decision.reasonCode ?? "finding_assessment_blocked",
+        findingDecision: decision,
+      };
+    }
+    if (decision.allowedNextAction === "repair") {
+      return { outcome: "findings", reasonCode: "confirmed_review_findings", findingDecision: decision };
+    }
+    return {
+      outcome: "succeeded",
+      reasonCode: hasFindings ? "accepted_advisories" : "findings_disputed",
+      findingDecision: decision,
+    };
   }
 
   private resultHead(
@@ -769,7 +785,7 @@ export class NavigatorTicketSettlementRepository {
       this.scheduleFindingVerification(attempt, reviewResult, navigatorJsonDigest(assessment.result), now);
       return;
     }
-    if (assessment.outcome === "findings" && assessment.verifiedBlockingBurden !== null) {
+    if (assessment.findingDecision?.allowedNextAction === "repair") {
       this.db.prepare(
         "UPDATE navigator_ticket_slices SET state = 'repair_pending', updated_at = ? WHERE id = ?",
       ).run(now, attempt.sliceId);
@@ -905,8 +921,8 @@ export class NavigatorTicketSettlementRepository {
     attempt: NavigatorTicketWorkerAttempt,
     reviewResult: Readonly<{ axes: { requirements: { evidenceRefs: readonly string[] }; standards: { evidenceRefs: readonly string[] } } }>,
     now: number,
-  ): string | null {
-    const decision = this.findingLedger.resolvePassingReview({
+  ): NavigatorFindingLedgerDecision {
+    return this.findingLedger.resolvePassingReview({
       jobId: attempt.jobId,
       sliceId: attempt.sliceId,
       verificationAttemptId: attempt.id,
@@ -924,18 +940,17 @@ export class NavigatorTicketSettlementRepository {
       now,
       maxReviewCycles: attempt.workOrder.projectPolicy.maxReviewCycles,
     });
-    return decision.outcome === "blocked" ? decision.reasonCode ?? "finding_assessment_blocked" : null;
   }
 
   private recordFindingVerification(
     attempt: NavigatorTicketWorkerAttempt,
     reviewResult: Readonly<{ findings: readonly NavigatorReviewFinding[] }>,
     now: number,
-  ): Readonly<{ blockingBurden: number; policyFailureReason: string | null }> {
+  ): Readonly<{ decision: NavigatorFindingLedgerDecision | null; failureReason: string | null }> {
     const verification = attempt.workOrder.verificationOf;
-    if (verification === undefined) return { blockingBurden: 0, policyFailureReason: "finding_verification_source_missing" };
+    if (verification === undefined) return { decision: null, failureReason: "finding_verification_source_missing" };
     const requirementIds = this.reviewRequirementIds(attempt);
-    if (requirementIds === null) return { blockingBurden: 0, policyFailureReason: "finding_requirement_context_missing" };
+    if (requirementIds === null) return { decision: null, failureReason: "finding_requirement_context_missing" };
     const decision = this.findingLedger.assess({
       jobId: attempt.jobId,
       sliceId: attempt.sliceId,
@@ -961,8 +976,8 @@ export class NavigatorTicketSettlementRepository {
       maxReviewCycles: attempt.workOrder.projectPolicy.maxReviewCycles,
     });
     return {
-      blockingBurden: decision.blockingBurden,
-      policyFailureReason: decision.outcome === "blocked" ? decision.reasonCode ?? "finding_assessment_blocked" : null,
+      decision,
+      failureReason: decision.outcome === "blocked" ? decision.reasonCode ?? "finding_assessment_blocked" : null,
     };
   }
 
