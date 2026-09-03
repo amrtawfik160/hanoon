@@ -96,6 +96,7 @@ export type BbAutomation = z.infer<typeof bbAutomationSchema>;
 const bbAutomationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),
+  idempotencyKey: z.string().min(1).max(256).nullable().optional(),
   runMode: z.enum(["agent", "script"]),
   threadId: z.string().min(1).nullable(),
   status: z.enum(["running", "succeeded", "failed", "skipped"]),
@@ -125,11 +126,21 @@ export type BbScriptAutomationDefinition = Extract<ManagedAutomationDefinition, 
 export type BbAutomationDefinition = ManagedAutomationDefinition;
 export type BbAgentAutomationCapabilities = ManagedAutomationCapabilities;
 
+/**
+ * BB runs an agent automation without a wall-clock bound or an output bound,
+ * and starts a scheduled run without asking Hanoon first. Hanoon therefore
+ * enforces the declared execution contract itself: every observed run is
+ * classified against `timeoutMs` and `resultContract` before its evidence or
+ * controller handoff is recorded, and a binding whose authority is no longer
+ * current is paused at the next reconciliation sweep. Neither is a claim that
+ * BB stopped the run; both are truthful classifications of what BB did.
+ */
 export const INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES: BbAgentAutomationCapabilities = Object.freeze({
   executionTimeout: false,
   resultContract: false,
   preRunAuthority: false,
 });
+
 
 export type AutomationCommandRunner = Readonly<{
   run(input: {
@@ -227,7 +238,7 @@ export function buildShowAutomationCommand(projectId: string, automationId: stri
 }
 
 export function buildListAutomationsCommand(projectId: string): string {
-  return command("list", [...flag("project", projectId)]);
+  return command("list", flag("project", projectId));
 }
 
 export function buildAutomationActionCommand(
@@ -336,6 +347,21 @@ export class BbAutomationNotFoundError extends Error {
   }
 }
 
+/**
+ * BB's automations plugin refuses some projects outright; BB's personal
+ * project is one (it answers "Project not found"). That is a standing property
+ * of the project, not a transient failure, so callers can keep a plugin-local
+ * schedule instead of retrying BB.
+ */
+export class BbAutomationProjectUnavailableError extends Error {
+  public constructor(public readonly projectId: string) {
+    super(`BB automations are not available for project ${projectId}`);
+    this.name = "BbAutomationProjectUnavailableError";
+  }
+}
+
+const PROJECT_UNAVAILABLE_OUTPUT = /^Project (\S+) is not available: HTTP 404: Project not found\s*$/u;
+
 export class TerminalBbAutomationAdapter {
   public readonly agentAutomationCapabilities = INSTALLED_BB_AGENT_AUTOMATION_CAPABILITIES;
 
@@ -362,11 +388,21 @@ export class TerminalBbAutomationAdapter {
         result.output.trim() === "Automation not found") {
         throw new BbAutomationNotFoundError();
       }
+      const unavailable = result.outcome === "exited"
+        ? PROJECT_UNAVAILABLE_OUTPUT.exec(result.output.trim())
+        : null;
+      if (unavailable?.[1]) throw new BbAutomationProjectUnavailableError(unavailable[1]);
       throw commandFailure(input.title, result);
     }
     return input.schema.parse(parseCommandJson<unknown>(result.output, input.title));
   }
 
+  /**
+   * Returns BB's create acknowledgement only, as a receipt carrying the
+   * operation's ownership marker. Acceptance is the service's job: it persists
+   * the returned provider id before the exact read-back, so a crash between the
+   * two cannot leave a live BB schedule that no binding knows about.
+   */
   public async create(input: {
     scope: ManagedAutomationScope;
     definition: BbAutomationDefinition;
@@ -398,12 +434,18 @@ export class TerminalBbAutomationAdapter {
       title: "List BB automations",
       command: buildListAutomationsCommand(input.projectId),
       schema: z.union([
-        z.object({ automations: z.array(bbAutomationSchema) }).passthrough(),
-        z.array(bbAutomationSchema),
+        z.object({ automations: z.array(z.unknown()) }).passthrough(),
+        z.array(z.unknown()),
       ]),
       signal: input.signal,
     });
-    return Array.isArray(response) ? response : response.automations;
+    const rows = Array.isArray(response) ? response : response.automations;
+    // BB keeps damaged records visible under a `problem` discriminator. A
+    // record Hanoon cannot read exactly is never a candidate for adoption.
+    return rows.flatMap((row) => {
+      const parsed = bbAutomationSchema.safeParse(row);
+      return parsed.success && !("problem" in parsed.data) ? [parsed.data] : [];
+    });
   }
 
   public async findByDefinition(input: {
@@ -500,7 +542,7 @@ export class TerminalBbAutomationAdapter {
       schema: bbAutomationSchema,
       signal: input.signal,
     });
-    const observed = await this.show(input);
+    const observed = await this.show({ ...input, expectedEnabled: input.enabled });
     if (observed.enabled !== input.enabled) throw new Error("BB automation enabled state did not reconcile");
     return observed;
   }
@@ -519,7 +561,13 @@ export class TerminalBbAutomationAdapter {
       schema: z.object({ run: bbAutomationRunSchema }).passthrough(),
       signal: input.signal,
     });
-    return response.run;
+    if (response.run.idempotencyKey !== undefined && response.run.idempotencyKey !== null &&
+      response.run.idempotencyKey !== input.idempotencyKey) {
+      throw new TypeError("BB automation run acknowledgement identity did not match its idempotency key");
+    }
+    return response.run.idempotencyKey === input.idempotencyKey
+      ? response.run
+      : { ...response.run, idempotencyKey: input.idempotencyKey };
   }
 
   public async runs(input: {

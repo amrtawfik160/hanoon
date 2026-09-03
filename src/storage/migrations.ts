@@ -4630,6 +4630,21 @@ BEFORE DELETE ON navigator_release_review_finding_events
 BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
 `] as const;
 
+/**
+ * Burst grouping and provenance: per-turn structured source records, document
+ * attachments, the durable link from a folded follower to its leader, and the
+ * reserved steer text for a combined mid-answer addition. Append-only history.
+ */
+export const CONTROLLER_BURST_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN source_json TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_name TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_mime_type TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_size_bytes INTEGER;
+ALTER TABLE controller_turns ADD COLUMN burst_leader_turn_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN steer_reservation_text TEXT;
+`] as const;
+
 export const MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS = [String.raw`
 CREATE TABLE managed_automations_v2 (
   id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
@@ -4794,6 +4809,94 @@ ALTER TABLE managed_automation_operations ADD COLUMN provider_ownership_marker T
 );
 `] as const;
 
+export const MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS = [String.raw`
+ALTER TABLE managed_automations ADD COLUMN desired_state TEXT NOT NULL DEFAULT 'enabled' CHECK (
+  desired_state IN ('enabled', 'paused', 'retired')
+);
+ALTER TABLE managed_automations ADD COLUMN last_reconciled_operation_id TEXT;
+ALTER TABLE managed_automations ADD COLUMN last_reconciled_operation_outcome TEXT CHECK (
+  last_reconciled_operation_outcome IS NULL OR
+  last_reconciled_operation_outcome IN ('succeeded', 'failed', 'ambiguous')
+);
+UPDATE managed_automations
+   SET desired_state = CASE
+     WHEN state IN ('paused') THEN 'paused'
+     WHEN state IN ('retiring', 'retired') THEN 'retired'
+     ELSE 'enabled'
+   END,
+       last_reconciled_operation_id = CASE
+         WHEN last_operation_outcome IN ('succeeded', 'failed', 'ambiguous') THEN last_operation_id
+         ELSE NULL
+       END,
+       last_reconciled_operation_outcome = CASE
+         WHEN last_operation_outcome IN ('succeeded', 'failed', 'ambiguous') THEN last_operation_outcome
+         ELSE NULL
+       END;
+
+ALTER TABLE managed_automation_run_evidence ADD COLUMN receipt_version INTEGER;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN initiating_operation_id TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN definition_revision INTEGER;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN authority_json TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN capability_evidence_json TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN idempotency_key TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN outcome_class TEXT CHECK (
+  outcome_class IS NULL OR outcome_class IN ('running', 'succeeded', 'failed', 'skipped', 'contract_violated')
+);
+
+CREATE TABLE managed_automation_operations_v2 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  operation_class TEXT NOT NULL CHECK (
+    operation_class IN ('create', 'update', 'enable', 'disable', 'run_now', 'retire', 'reconcile')
+  ),
+  operation_version INTEGER NOT NULL DEFAULT 1 CHECK (operation_version = 1),
+  target_project_id TEXT NOT NULL,
+  definition_revision INTEGER NOT NULL CHECK (definition_revision >= 1),
+  intent_key TEXT CHECK (intent_key IS NULL OR length(intent_key) BETWEEN 1 AND 256),
+  authority_json TEXT NOT NULL,
+  capability_evidence_json TEXT,
+  controller_owner_id TEXT,
+  controller_generation INTEGER CHECK (controller_generation IS NULL OR controller_generation >= 1),
+  controller_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 1),
+  lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+  provider_automation_id TEXT,
+  provider_ownership_marker TEXT CHECK (
+    provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+  ),
+  outcome_json TEXT,
+  last_error TEXT,
+  next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0)
+);
+INSERT INTO managed_automation_operations_v2 (
+  id, binding_id, operation_class, operation_version, target_project_id, definition_revision,
+  intent_key, authority_json, capability_evidence_json, controller_owner_id,
+  controller_generation, controller_turn_id, state, attempts,
+  lease_owner, lease_generation, lease_expires_at, provider_automation_id,
+  provider_ownership_marker, outcome_json, last_error, next_attempt_at,
+  created_at, updated_at, settled_at
+)
+SELECT id, binding_id, operation_class, operation_version, target_project_id, definition_revision,
+       NULL, authority_json, capability_evidence_json, controller_owner_id,
+       controller_generation, controller_turn_id, state, attempts,
+       lease_owner, lease_generation, lease_expires_at, provider_automation_id,
+       provider_ownership_marker, outcome_json, last_error, next_attempt_at,
+       created_at, updated_at, settled_at
+  FROM managed_automation_operations;
+DROP TABLE managed_automation_operations;
+ALTER TABLE managed_automation_operations_v2 RENAME TO managed_automation_operations;
+CREATE INDEX managed_automation_operations_due
+  ON managed_automation_operations(state, next_attempt_at, created_at);
+CREATE INDEX managed_automation_operations_binding
+  ON managed_automation_operations(binding_id, created_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -4889,6 +4992,8 @@ export const ALL_MIGRATIONS = [
   ...MANAGED_AUTOMATION_MIGRATIONS,
   ...NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   ...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  ...CONTROLLER_BURST_MIGRATIONS,
   ...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
+  ...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
   ...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
 ] as const;

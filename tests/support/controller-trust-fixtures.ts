@@ -68,7 +68,8 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
     generation: lease.generation,
     now: 2_000,
   };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(queued.id);
+  // The claim waits out the burst quiet gap past the 2_000 receipt.
+  expect(store.claimNextControllerTurn({ ...fence, now: 5_000 })?.id).toBe(queued.id);
   expect(store.reserveControllerSpawn({
     controllerKey: queued.controllerKey,
     turnId: queued.id,

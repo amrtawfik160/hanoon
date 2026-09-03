@@ -84,6 +84,7 @@ export type ManagedAutomationCreateReceipt = Readonly<{
 export type ManagedAutomationRun = Readonly<{
   id: string;
   automationId: string;
+  idempotencyKey?: string | null;
   runMode: "agent" | "script";
   threadId: string | null;
   status: "running" | "succeeded" | "failed" | "skipped";
@@ -322,6 +323,44 @@ export type ManagedAutomationCapabilityEvidence = z.infer<typeof managedAutomati
 export type ManagedAutomationTaskAuthority = z.infer<typeof taskAuthoritySchema>;
 export type ManagedAutomationStandingAuthority = z.infer<typeof standingAuthoritySchema>;
 
+const managedAutomationRunOutcomeClassSchema = z.enum([
+  "running",
+  "succeeded",
+  "failed",
+  "skipped",
+  "contract_violated",
+]);
+
+export const managedAutomationRunReceiptSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("run-receipt"),
+  providerRunId: boundedId,
+  automationBindingId: boundedId,
+  providerAutomationId: boundedId,
+  definitionRevision: positiveRevision,
+  initiatingOperationId: boundedId,
+  authority: managedAutomationAuthoritySchema,
+  capabilityEvidence: managedAutomationCapabilityEvidenceSchema,
+  scheduledFor: z.number().int().nonnegative().safe(),
+  startedAt: z.number().int().nonnegative().safe(),
+  finishedAt: z.number().int().nonnegative().nullable(),
+  observedAt: z.number().int().nonnegative().safe(),
+  outcomeClass: managedAutomationRunOutcomeClassSchema,
+}).strict().superRefine((receipt, context) => {
+  if (receipt.startedAt < receipt.scheduledFor) {
+    context.addIssue({ code: "custom", message: "run started before it was scheduled", path: ["startedAt"] });
+  }
+  if (receipt.finishedAt !== null && receipt.finishedAt < receipt.startedAt) {
+    context.addIssue({ code: "custom", message: "run finished before it started", path: ["finishedAt"] });
+  }
+  if (receipt.observedAt < receipt.startedAt) {
+    context.addIssue({ code: "custom", message: "run was observed before it started", path: ["observedAt"] });
+  }
+  if (receipt.outcomeClass === "running" && receipt.finishedAt !== null) {
+    context.addIssue({ code: "custom", message: "running run receipt cannot have a finish time", path: ["finishedAt"] });
+  }
+});
+
 export const managedAutomationOperationClassSchema = z.enum([
   "create",
   "update",
@@ -337,10 +376,13 @@ export const managedAutomationOperationRequestSchema = z.object({
   operationClass: managedAutomationOperationClassSchema,
   targetProjectId: boundedId,
   definitionRevision: positiveRevision,
+  intentKey: boundedId.optional(),
 }).strict();
 
 export type ManagedAutomationOperationClass = z.infer<typeof managedAutomationOperationClassSchema>;
 export type ManagedAutomationOperationRequest = z.infer<typeof managedAutomationOperationRequestSchema>;
+export type ManagedAutomationRunReceipt = z.infer<typeof managedAutomationRunReceiptSchema>;
+export type ManagedAutomationRunOutcomeClass = z.infer<typeof managedAutomationRunOutcomeClassSchema>;
 
 const managedAutomationOutcomeValueSchema = z.enum(["succeeded", "failed", "ambiguous"]);
 
@@ -363,6 +405,7 @@ export const managedAutomationOutcomeReceiptSchema = z.object({
   providerAutomationId: boundedId.nullable(),
   ownershipMarker: boundedId.nullable(),
   observedSha256: sha256.nullable(),
+  runReceipt: managedAutomationRunReceiptSchema.nullable().optional(),
   evidence: z.record(z.string().max(256), z.unknown()).nullable(),
   errorClass: boundedId.nullable(),
 }).strict();
@@ -393,6 +436,18 @@ export function parseManagedAutomationAuthority(value: unknown): StoredManagedAu
 
 export function isCurrentManagedAutomationAuthority(value: StoredManagedAutomationAuthority): value is ManagedAutomationAuthority {
   return typeof value === "object" && value !== null && "version" in value && value.version === 1;
+}
+
+/**
+ * True when Hanoon installed this automation for its own upkeep rather than at
+ * the owner's request, so it stays out of the owner's watch list. A current
+ * authority says so with a system-maintenance origin; a legacy row recorded by
+ * the installer says so with `source: "system"`.
+ */
+export function managedAutomationIsSystemOwned(authority: StoredManagedAutomationAuthority): boolean {
+  return isCurrentManagedAutomationAuthority(authority)
+    ? authority.origin === "system-maintenance"
+    : authority.source === "system";
 }
 
 export function currentManagedAutomationAuthority(

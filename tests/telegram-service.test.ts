@@ -69,7 +69,7 @@ function createOwnerJobForNarrowing(store: TelegramAgentStore): { jobId: string;
   const turn = store.claimNextControllerTurn({
     ownerId: "controller",
     generation: lease.generation,
-    now: 1_101,
+    now: 4101,
   });
   if (!turn) throw new Error("controller turn missing");
   if (!store.markControllerSpawned({
@@ -322,7 +322,7 @@ describe("Telegram ingress service", () => {
     expect(store.claimNextControllerTurn({
       ownerId: "voice-order",
       generation: lease.generation,
-      now: 2_000,
+      now: 5000,
     })).toBeNull();
 
     const voice = new ControllerVoiceService({
@@ -338,7 +338,7 @@ describe("Telegram ingress service", () => {
     expect(store.claimNextControllerTurn({
       ownerId: "voice-order",
       generation: lease.generation,
-      now: 2_001,
+      now: 5001,
     })).toMatchObject({ updateId: 10, inputText: "the earlier voice request" });
   });
 

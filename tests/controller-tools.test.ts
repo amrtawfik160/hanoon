@@ -22,6 +22,7 @@ import { canonicalControllerJson, sha256ControllerJson } from "../src/controller
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
 import { ControllerEvidenceProjector } from "../src/controller/evidence-projector";
 import { controllerFinalizationJsonSchema } from "../src/controller/finalization-contract";
+import { BbAutomationProjectUnavailableError } from "../src/bb/automation";
 import { createTestManagedAutomations } from "./support/managed-automation-fixture";
 
 type ThreadListEntry = Awaited<ReturnType<ReturnType<typeof createFakePluginHost>["bb"]["sdk"]["threads"]["list"]>>[number];
@@ -234,7 +235,7 @@ function fixture(options: {
   });
   const lease = store.acquireExecutorLease("executor", 10_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
-  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 10_000 });
+  const turn = store.claimNextControllerTurn({ ownerId: "executor", generation: lease.generation, now: 13000 });
   if (!turn) throw new Error("missing controller turn");
   expect(store.markControllerSpawned({
     turnId: turn.id,
@@ -464,7 +465,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned when BB replaced experimental status labels with the stable
   // presentation contract in plugin SDK 0.4.21.
   // Re-pinned when watch gained the governed update_schedule variant.
-  expect(digest).toBe("3fd7a98dcc64b9c33ee62cbbd0b3154e651ae8da4c14ac48b762a9cf26551808");
+  // Re-pinned when watch gained durable pause, resume, and run-now variants.
+  expect(digest).toBe("e84e1cf9927fdfc9b0cbfecd8010b7e350198e27d676726522fcc0f887e09e9c");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -1550,6 +1552,75 @@ it("rejects repeating schedules that poll live work", async () => {
   expect(automations.create).toHaveBeenCalledOnce();
 });
 
+it("refuses to create a clock schedule from a system-origin turn, so a scheduled run cannot widen automations", async () => {
+  const { bb, harness, store } = fixture({
+    active: true,
+    controllerTools: "all-tools",
+    origin: "system",
+    inputText: "A BB Automation run finished. Treat this as a scheduled system handoff, not a new owner request.",
+  });
+  const automations = createTestManagedAutomations();
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  await expect(harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )).rejects.toThrow(/turn the owner sent/i);
+  expect(automations.create).not.toHaveBeenCalled();
+});
+
+it("keeps an owner schedule as a plugin-local watch when BB refuses to host automations for the project", async () => {
+  // Production, 2026-09-02: the controller's personal project is refused by
+  // BB's automations plugin, so the schedule must not simply fail.
+  const { bb, harness, store } = fixture({ active: true, automationCapability: true });
+  const automations = createTestManagedAutomations();
+  automations.create.mockRejectedValueOnce(new BbAutomationProjectUnavailableError("proj_personal"));
+  registerControllerTools(bb, {
+    store,
+    sdk: bb.sdk,
+    threadOperations: { request: vi.fn() },
+    health: () => ({ ok: true }),
+    notify: vi.fn(),
+    now: () => 10_000,
+    controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
+  });
+
+  const result = parseToolJson(await harness.behavior.callAgentTool(
+    "telegram_agent_watch",
+    { kind: "schedule", cron: "0 9 * * 1-5", instruction: "Send the weekday morning digest." },
+    controllerToolContext,
+  )) as { watching: { id: string; kind: string; cron: string; state: string } };
+
+  expect(result.watching).toMatchObject({ kind: "schedule", cron: "0 9 * * 1-5", state: "armed" });
+  expect(store.listMonitors("owner-7-controller", false)).toMatchObject([
+    { id: result.watching.id, kind: "schedule", cron: "0 9 * * 1-5", state: "armed" },
+  ]);
+  expect(automations.bindings.size).toBe(0);
+});
+
 it("updates an owned BB schedule through the governed controller seam without widening its execution", async () => {
   const { bb, harness, store } = fixture({ active: true, automationCapability: true });
   const automations = createTestManagedAutomations();
@@ -1593,8 +1664,10 @@ it("updates an owned BB schedule through the governed controller seam without wi
       instruction: "Send the revised weekday digest.",
     },
   });
-  expect(automations.update).toHaveBeenCalledWith(expect.objectContaining({
+  expect(automations.submitLifecycleOperation).toHaveBeenCalledWith(expect.objectContaining({
     id: created.watching.id,
+    operationClass: "update",
+    desiredState: "enabled",
     definition: expect.objectContaining({
       mode: "agent",
       providerId: "codex",
@@ -1605,6 +1678,7 @@ it("updates an owned BB schedule through the governed controller seam without wi
       prompt: "Send the revised weekday digest.",
     }),
   }));
+  expect(automations.update).not.toHaveBeenCalled();
 });
 
 it("retires an already-armed live-work poller without touching clock-time schedules", () => {

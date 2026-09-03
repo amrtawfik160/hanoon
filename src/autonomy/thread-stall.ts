@@ -66,7 +66,7 @@ export type DelegatedThreadObservation = Readonly<{
 }>;
 
 const SETTLED_STATUSES: ReadonlySet<string> = new Set(["idle", "error", "missing", "completed", "failed"]);
-const STARTING_STATUSES: ReadonlySet<string> = new Set(["starting", "provisioning", "created"]);
+const STARTING_STATUSES: ReadonlySet<string> = new Set(["pending", "starting", "provisioning", "created"]);
 const RECONNECTING_STATUSES: ReadonlySet<string> = new Set(["host-reconnecting", "waiting-for-host"]);
 
 function healthy(reason: ThreadStallReason, signals: ThreadStallVerdict["signals"] = {}): ThreadStallVerdict {

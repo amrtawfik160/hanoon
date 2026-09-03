@@ -134,6 +134,8 @@ export const navigatorReleaseReceiptSchema = z.object({
   kind: z.literal("run_navigator_release"),
   effectIdempotencyKey: identifierSchema,
   attemptId: identifierSchema,
+  jobId: identifierSchema,
+  operationId: identifierSchema,
   resource: environmentResourceSchema,
   number: z.number().int().positive(),
   url: z.string().url().max(2_048),

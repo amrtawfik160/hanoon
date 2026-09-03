@@ -97,7 +97,7 @@ import { retireLiveWorkPollingSchedules } from "./controller/monitor-policy";
 import { parseWorkerThreadTitle } from "./agent-skills/role-resolver";
 import {
   BbControllerAdapter,
-  ControllerImagePreparationError,
+  ControllerAttachmentPreparationError,
   parseControllerInteractionResolution,
 } from "./controller/bb-controller";
 import { ControllerEvidenceProjector } from "./controller/evidence-projector";
@@ -131,6 +131,8 @@ import { MemoryCurationService } from "./services/memory-curation-service";
 import { MemoryEmbeddingService } from "./services/memory-embedding-service";
 import {
   installSystemAutomations,
+  systemMaintenanceAuthority,
+  systemMaintenanceCapabilityEvidence,
   systemAutomationInstallationComplete,
 } from "./services/system-monitors";
 import {
@@ -138,7 +140,7 @@ import {
   ManagedAutomationService,
   managedAutomationAuthorityIsCurrent,
 } from "./services/managed-automation-service";
-import { ManagedAutomationRepository } from "./storage/managed-automation-repository";
+import { ManagedAutomationRepository, managedAutomationDigest } from "./storage/managed-automation-repository";
 import { ProductionHealthService } from "./services/production-health-service";
 import { RegressionWatchService } from "./services/regression-watch-service";
 import { FailureLoopService } from "./services/failure-loop-service";
@@ -680,24 +682,32 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
       const current = managedAutomationAuthorityIsCurrent(
         binding,
-        controller?.controllerKey ?? null,
+        controller,
         store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
       );
       if (!current || !controller?.hostId) return false;
       if (isCurrentManagedAutomationAuthority(binding.authority)) {
         return binding.authority.hostId === controller.hostId;
       }
-      // Legacy bindings remain readable and reconcilable for migration. They
-      // cannot submit a new durable operation because the repository requires
-      // current versioned authority for that path.
+      // Legacy bindings remain readable and reconcilable for migration. The
+      // system-maintenance retirement path upgrades them before reserving work.
       return true;
     },
     (binding, operation) => {
       const authority = isCurrentManagedAutomationAuthority(binding.authority) ? binding.authority : null;
       const evidence = binding.capabilityEvidence;
-      if (!authority || authority.origin !== "owner" || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
-        operation.operationClass !== "create" || operation.targetProjectId !== binding.projectId ||
-        authority.taskAuthority.kind !== "controller-turn" || authority.taskAuthority.turnId === "") return false;
+      if (!authority || !evidence || evidence.capabilityId !== "telegram_agent_watch" ||
+        !(["create", "update", "enable", "disable", "run_now", "retire", "reconcile"] as const).includes(operation.operationClass) ||
+        operation.targetProjectId !== binding.projectId ||
+        operation.definitionRevision !== binding.definitionRevision) return false;
+      if (authority.origin === "system-maintenance") {
+        return authority.standingAuthority.revision === 1 &&
+          managedAutomationDigest(evidence) === managedAutomationDigest(
+            systemMaintenanceCapabilityEvidence(authority.standingAuthority.systemKey),
+          );
+      }
+      if (authority.origin !== "owner" || authority.taskAuthority.kind !== "controller-turn" ||
+        authority.taskAuthority.turnId === "") return false;
       const profile = store.getCapabilityProfileById(evidence.profileId);
       if (!profile || profile.mode !== "active" || profile.subjectKind !== "controller_turn" ||
         profile.subjectId !== authority.taskAuthority.turnId || profile.revision !== evidence.profileRevision ||
@@ -1178,12 +1188,13 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       if (!config.ok) throw new Error(config.message);
       return controllerExecutionProfiles(config.value);
     },
-    downloadImage: async (fileId, maxBytes, signal) => {
+    // The adapter restates the failure with the kind of file that failed.
+    downloadFile: async (fileId, maxBytes, signal) => {
       try {
         return await verifiedTelegramClient().downloadFile(fileId, maxBytes, signal);
       } catch (error) {
         if (error instanceof TelegramFileTooLargeError) {
-          throw new ControllerImagePreparationError(false);
+          throw new ControllerAttachmentPreparationError(false);
         }
         throw error;
       }
@@ -1226,6 +1237,11 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     adapter: controllerAdapter,
     interactionService: controllerInteractionService,
     clock: { now: clock },
+    // Short text documents are inlined into the dispatch through the same
+    // Telegram download the adapter uses for attachments. A failed download
+    // only drops the readable copy; the attachment still rides with the turn.
+    downloadFile: async (fileId, maxBytes, signal) =>
+      verifiedTelegramClient().downloadFile(fileId, maxBytes, signal),
     warn: (message) => bb.log.warn(message),
   });
   const monitors = new MonitorService({
@@ -1481,8 +1497,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     warn: (message) => bb.log.warn(message),
   });
   let systemMonitorsInstalled = false;
+  let nextSystemAutomationAttemptAt = 0;
   const systemMonitors = {
-    install: async () => {
+    install: async (fence: EffectFence) => {
       // Turning the setting off has to retire what is already armed, or the
       // owner keeps getting the daily sweep they just switched off.
       if (config.ok && !systemUpkeepEnabled(config.value)) {
@@ -1496,11 +1513,23 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
               : binding.authority.source === "system";
             if (!isSystemBinding) continue;
             try {
-              await managedAutomations.retire({
-                id: binding.id,
-                scope: { kind: "host", hostId: controller.hostId, cwd: null },
-                now: clock(),
+              const authority = systemMaintenanceAuthority({
+                systemKey: binding.sourceKey,
+                controllerKey: controller.controllerKey,
+                projectId: binding.projectId,
+                hostId: controller.hostId,
               });
+              const reserved = store.runExecutorMutation(
+                { ownerId: fence.ownerId, generation: fence.generation },
+                () => managedAutomations.submitSystemMaintenanceRetirementOperation({
+                  id: binding.id,
+                  systemKey: binding.sourceKey,
+                  authority,
+                  now: clock(),
+                  mutate: (mutation) => mutation(),
+                }),
+              );
+              if (reserved.outcome === "stale") throw new Error("executor lease was lost before system retirement reservation");
               systemMonitorsInstalled = false;
             } catch {
               bb.log.warn(`System automation ${binding.id} could not be retired`);
@@ -1511,6 +1540,12 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       }
       if (systemMonitorsInstalled) return;
       if (!config.ok) return;
+      // Installing goes through `bb automation` commands. A BB outage must not
+      // turn every executor pass into a burst of failed commands, so a partial
+      // install is retried about once a minute rather than on every pass.
+      const attemptAt = clock();
+      if (attemptAt < nextSystemAutomationAttemptAt) return;
+      nextSystemAutomationAttemptAt = attemptAt + 60_000;
       const execution = controllerExecutionProfile(config.value);
       const installed = await installSystemAutomations({
         store,
@@ -1518,6 +1553,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         providerId: controllerProviderFor(execution.model),
         execution,
         clock: { now: clock },
+        signal: fence.signal,
         warn: (message) => bb.log.warn(message),
       });
       if (systemAutomationInstallationComplete(installed)) systemMonitorsInstalled = true;
