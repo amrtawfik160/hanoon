@@ -39,11 +39,11 @@ const permittedBundleCombinations = Array.from(
   (_, mask) => CONTROLLER_BUNDLE_IDS.filter((_, index) => (mask & (1 << index)) !== 0),
 );
 
-it("partitions all 32 domain tools exactly once and keeps metadata and protocol separate", () => {
+it("partitions all 33 domain tools exactly once and keeps metadata and protocol separate", () => {
   const partition = Object.values(CONTROLLER_TOOL_BUNDLES).flat();
 
   expect(partition).toHaveLength(32);
-  expect(new Set(partition)).toEqual(new Set(CONTROLLER_DOMAIN_TOOL_IDS));
+  expect(new Set([...partition, "telegram_agent_connector_inspect"])).toEqual(new Set(CONTROLLER_DOMAIN_TOOL_IDS));
   expect(new Set(partition).size).toBe(partition.length);
   expect(CONTROLLER_METADATA_TOOL_IDS).toEqual([
     "telegram_agent_capabilities",
@@ -122,7 +122,10 @@ it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(
   (bundleIds) => {
     const selected = controllerToolsForBundles(bundleIds);
     const selectedDomainTools = new Set(bundleIds.flatMap((bundleId) => CONTROLLER_TOOL_BUNDLES[bundleId]));
-    const expectedDomainTools = CONTROLLER_DOMAIN_TOOL_IDS.filter((toolId) => selectedDomainTools.has(toolId));
+    const expectedDomainTools = [
+      ...CONTROLLER_DOMAIN_TOOL_IDS.filter((toolId) => (selectedDomainTools as ReadonlySet<string>).has(toolId)),
+      ...(bundleIds.includes("core-observation") ? ["telegram_agent_connector_inspect" as const] : []),
+    ];
 
     expect(selected).toEqual([
       ...expectedDomainTools,
@@ -134,6 +137,19 @@ it.each(permittedBundleCombinations.map((bundleIds) => [bundleIds]))(
     }
   },
 );
+
+it.each([
+  ["Inspect the enrolled Convex project", "telegram_agent_convex_project_inspect"],
+  ["Inspect the enrolled Vercel project", "telegram_agent_vercel_project_inspect"],
+  ["Inspect the enrolled Vercel browser session", "telegram_agent_browser_vercel_project_inspect"],
+] as const)("selects the exact connector assignment for %s", (inputText, capabilityId) => {
+  const selection = selectControllerCapabilityProfile(inputText, ["core-observation"]);
+
+  expect(selection.assignments).toEqual(expect.arrayContaining([
+    expect.objectContaining({ capabilityId, capabilityKind: "connector" }),
+  ]));
+  expect(selection.assignments.filter((entry) => entry.capabilityKind === "connector")).toHaveLength(1);
+});
 
 it("loads manual discovery skills only for an explicit slash invocation", () => {
     expect(controllerSkillsForTurn("Help me think this through")).toEqual([

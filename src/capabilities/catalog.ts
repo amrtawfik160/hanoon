@@ -652,7 +652,7 @@ function catalogDigests(catalog: readonly CapabilityDescriptor[]): Readonly<{ re
 
 export const HISTORICAL_RECIPE_CAPABILITY_CATALOG = validateCapabilityCatalog([
   ...skillDescriptors,
-  ...toolDescriptors,
+  ...toolDescriptors.filter((entry) => entry.id !== "telegram_agent_connector_inspect"),
   ...bundleDescriptors,
   ...nativeAdapterDescriptors,
   ...recipeDescriptors,

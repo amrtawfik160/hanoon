@@ -14,6 +14,12 @@ import {
 } from "./catalog";
 import type { CapabilityDescriptor } from "./contracts";
 import { modelRouteSchema } from "./models";
+import type { ControllerToolName } from "../controller/capability-policy";
+import {
+  PROTECTED_CONNECTOR_OPERATIONS,
+  protectedConnectorCapabilityFor,
+  type ProtectedConnectorOperation,
+} from "../credentials/connector-protocol";
 
 export const DEFAULT_CONTROLLER_CAPABILITY_MODEL: CapabilityModelSelection = Object.freeze({
   pool: "standard",
@@ -84,6 +90,15 @@ const BUNDLE_INTENT: Readonly<Record<Exclude<ControllerToolBundleId, "core-obser
 
 const MANUAL_DISCOVERY_COMMAND = /(?:^|\s)\/(?:grill-with-docs|grilling|domain-modeling)(?=\s|$)/iu;
 const REPITCH_COMMAND = /(?:^|\s)\/wait-what(?=\s|$)/iu;
+
+function connectorOperationForText(text: string): ProtectedConnectorOperation | null {
+  if (/\bvercel\b[\s\S]{0,80}\b(?:browser|session)\b|\b(?:browser|session)\b[\s\S]{0,80}\bvercel\b/iu.test(text)) {
+    return "browser.vercel_project.inspect.v1";
+  }
+  if (/\bvercel\b/iu.test(text)) return "vercel.project.inspect.v1";
+  if (/\bconvex\b/iu.test(text)) return "convex.project.inspect.v1";
+  return null;
+}
 
 function assertBundleIds(values: readonly string[]): asserts values is readonly ControllerToolBundleId[] {
   if (values.length > CONTROLLER_BUNDLE_IDS.length || new Set(values).size !== values.length) {
@@ -158,21 +173,23 @@ export function controllerToolsForBundles(
   rawBundleIds: readonly string[],
 ): Array<
   | (typeof CONTROLLER_TOOL_BUNDLES)[ControllerToolBundleId][number]
+  | "telegram_agent_connector_inspect"
   | (typeof CONTROLLER_METADATA_TOOL_IDS)[number]
   | (typeof CONTROLLER_PROTOCOL_TOOL_IDS)[number]
 > {
   assertBundleIds(rawBundleIds);
   const selected = new Set(rawBundleIds);
-  const selectedTools = new Set(
+  const selectedTools = new Set<string>(
     CONTROLLER_BUNDLE_IDS.flatMap((bundleId) =>
       selected.has(bundleId) ? [...CONTROLLER_TOOL_BUNDLES[bundleId]] : []
     ),
   );
   return [
     ...CONTROLLER_DOMAIN_TOOL_IDS.filter((toolId) => selectedTools.has(toolId)),
+    ...(selected.has("core-observation") ? ["telegram_agent_connector_inspect" as const] : []),
     ...CONTROLLER_METADATA_TOOL_IDS,
     ...CONTROLLER_PROTOCOL_TOOL_IDS,
-  ];
+  ] as Array<ControllerToolName | (typeof CONTROLLER_METADATA_TOOL_IDS)[number] | (typeof CONTROLLER_PROTOCOL_TOOL_IDS)[number]>;
 }
 
 export type ControllerCapabilityCompatibility =
@@ -230,6 +247,7 @@ function profileAssignments(input: {
   modelPool: CapabilityModelSelection["pool"];
   bundleIds: readonly ControllerToolBundleId[];
   skills: readonly CapabilitySkillId[];
+  connectorOperation?: ProtectedConnectorOperation | null;
 }): ControllerCapabilityProfileSelection["assignments"] {
   const capabilityIds = new Set<string>([
     ...input.skills,
@@ -237,6 +255,7 @@ function profileAssignments(input: {
     "controller-bundle-metadata",
     ...input.bundleIds.map((bundleId) => `controller-bundle-${bundleId}`),
     ...controllerToolsForBundles(input.bundleIds),
+    ...(input.connectorOperation ? [protectedConnectorCapabilityFor(input.connectorOperation)] : []),
   ]);
   return [...capabilityIds]
     .sort((left, right) => left.localeCompare(right))
@@ -262,6 +281,7 @@ export function selectControllerCapabilityProfile(
   selected.add("core-observation");
   const bundleIds = orderedBundles(selected);
   const skills = controllerSkillsForTurn(text);
+  const connectorOperation = connectorOperationForText(text);
   return {
     recipeId: "architectural",
     recipeVersion: 1,
@@ -279,6 +299,7 @@ export function selectControllerCapabilityProfile(
       modelPool: model.pool,
       bundleIds,
       skills,
+      connectorOperation,
     }),
   };
 }
@@ -327,6 +348,9 @@ export function expandControllerCapabilityProfile(
   const skills = current.assignments
     .filter((entry): entry is typeof entry & { capabilityId: CapabilitySkillId } => entry.capabilityKind === "skill")
     .map((entry) => entry.capabilityId);
+  const connectorOperation = PROTECTED_CONNECTOR_OPERATIONS.find((operation) =>
+    current.assignments.some((entry) => entry.capabilityId === protectedConnectorCapabilityFor(operation))
+  );
   return {
     recipeId: current.recipeId,
     recipeVersion: current.recipeVersion,
@@ -344,6 +368,7 @@ export function expandControllerCapabilityProfile(
       modelPool: current.model.pool,
       bundleIds,
       skills,
+      connectorOperation,
     }),
   };
 }

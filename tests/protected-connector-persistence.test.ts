@@ -1,5 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
+import { createConnection } from "node:net";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CAPABILITY_BY_ID,
@@ -25,9 +27,29 @@ import {
   BROKER_FOUNDATION_SCHEMA,
   applyBrokerMigrations,
 } from "../broker/src/migrations";
+import { BrokerProtectedConnectorStore } from "../broker/src/connector-store";
+import { createAdminServer } from "../broker/src/admin-server";
+import { BrokerStore } from "../broker/src/store";
 import { temporaryBrokerDatabase } from "./support/credential-broker-fixtures";
 
 const NOW = 1_800_000_000_000;
+
+function sendAdminRequest(socketPath: string, request: unknown): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    const chunks: Buffer[] = [];
+    socket.once("connect", () => socket.end(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    socket.once("error", reject);
+    socket.once("close", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8").split("\n")[0]) as Record<string, unknown>);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
 
 function projection(overrides: Partial<ProtectedConnectorBindingProjection> = {}): ProtectedConnectorBindingProjection {
   return {
@@ -53,6 +75,12 @@ function projection(overrides: Partial<ProtectedConnectorBindingProjection> = {}
     ...overrides,
   } as ProtectedConnectorBindingProjection;
 }
+
+const convexTarget = {
+  operation: "convex.project.inspect.v1" as const,
+  teamIdOrSlug: "convex-team",
+  projectSlug: "hanoon",
+};
 
 function request(overrides: Partial<ProtectedConnectorRequestEnvelope> = {}): ProtectedConnectorRequestEnvelope {
   return {
@@ -383,11 +411,15 @@ describe("append-only schema compatibility", () => {
       .toEqual({ name: "credential_connector_bindings" });
   });
 
-  it("migrates and restarts a shipped broker foundation without changing version-1 rows", () => {
+  it("migrates and restarts a shipped broker foundation without changing version-1 rows", async () => {
     const fixture = temporaryBrokerDatabase();
     try {
       fixture.db.exec(BROKER_FOUNDATION_SCHEMA);
       fixture.db.prepare("INSERT INTO broker_schema_migrations(version, applied_at) VALUES (1, ?)").run(NOW);
+      expect(() => fixture.db.prepare(`
+        INSERT INTO broker_admin_events (event_id, operation, installation_id, outcome, occurred_at)
+        VALUES ('pre-fix-rejected', 'connector.binding.enroll', 'installation-v1', 'succeeded', ?)
+      `).run(NOW)).toThrow(/CHECK constraint failed/);
       fixture.db.prepare(`
         INSERT INTO broker_installations (
           installation_id, client_certificate_fingerprint, policy_digest,
@@ -437,11 +469,77 @@ describe("append-only schema compatibility", () => {
       expect(fixture.db.prepare("SELECT result, protocol_version FROM broker_receipts WHERE receipt_id = 'receipt-v1'").get())
         .toEqual({ result: "valid", protocol_version: 1 });
       expect(fixture.db.prepare("SELECT version FROM broker_schema_migrations ORDER BY version").all())
-        .toEqual([{ version: 1 }, { version: 2 }]);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+
+      const connectors = new BrokerProtectedConnectorStore(fixture.db, {
+        dataKey: new Uint8Array(32).fill(0x11),
+        clock: () => NOW,
+      });
+      const enrolled = connectors.enrollProtectedBinding({
+        projectId: "project-v1",
+        policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+        enabledOperations: ["convex.project.inspect.v1"],
+        projection: projection({ installationId: "installation-v1", bindingId: "binding-v1-connector" }),
+        target: convexTarget,
+        credentialReference: "op://vault/item/token",
+        now: NOW,
+      });
+      expect(enrolled.projection.bindingId).toBe("binding-v1-connector");
 
       const reopened = new Database(fixture.databasePath);
       applyBrokerMigrations(reopened);
       expect(reopened.prepare("SELECT count(*) AS count FROM broker_receipts").get()).toEqual({ count: 1 });
+      expect(reopened.prepare("SELECT operation, installation_id FROM broker_connector_admin_events ORDER BY occurred_at").all())
+        .toEqual([
+          { operation: "policy.set", installation_id: "installation-v1" },
+          { operation: "binding.enroll", installation_id: "installation-v1" },
+        ]);
+      expect(reopened.prepare("SELECT count(*) AS count FROM broker_admin_events").get()).toEqual({ count: 0 });
+      const adminServer = createAdminServer({
+        socketPath: join(fixture.directory, "legacy-admin.sock"),
+        store: new BrokerStore(reopened, {
+          dataKey: new Uint8Array(32).fill(0x11),
+          auditKey: new Uint8Array(32).fill(0x22),
+          clock: () => NOW,
+        }),
+        connectorStore: new BrokerProtectedConnectorStore(reopened, {
+          dataKey: new Uint8Array(32).fill(0x11),
+          clock: () => NOW,
+        }),
+        adapter: {
+          health: async () => ({ outcome: "ready" as const }),
+          verify: async () => ({ outcome: "valid" as const, versionHmac: "d".repeat(64) }),
+        },
+        clock: () => NOW,
+        brokerVersion: "0.1.0",
+      });
+      await adminServer.start();
+      try {
+        const rejected = await sendAdminRequest(join(fixture.directory, "legacy-admin.sock"), {
+          operation: "connector.binding.enroll",
+          installationId: "installation-v1",
+          projectId: "project-v1",
+          policyDigest: PROTECTED_CONNECTOR_POLICY_DIGEST,
+          enabledOperations: ["convex.project.inspect.v1"],
+          projection: projection({
+            installationId: "installation-v1",
+            bindingId: "binding-rejected",
+            state: "active",
+          }),
+          target: convexTarget,
+          credentialReference: null,
+        });
+        expect(rejected).toEqual({
+          ok: false,
+          operation: "connector.binding.enroll",
+          code: "invalid_request",
+        });
+        expect(reopened.prepare(
+          "SELECT operation, outcome FROM broker_admin_events WHERE operation = 'connector.binding.enroll' ORDER BY occurred_at",
+        ).all()).toEqual([{ operation: "connector.binding.enroll", outcome: "failed" }]);
+      } finally {
+        await adminServer.close();
+      }
       reopened.close();
     } finally {
       fixture.close();

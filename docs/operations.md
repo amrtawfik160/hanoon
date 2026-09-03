@@ -69,14 +69,20 @@ bb telegram-agent doctor --json
 
 With **Credential broker mode** at its `disabled` default, this prints one `credential broker` row and nothing else attempts to reach a broker. Once isolated mode is configured, it prints `credential: <check>` rows in a fixed order — trust kernel, controller permission, isolated configuration, topology receipt, broker TLS, broker identity, protocol version, installation identity, broker audit, and the 1Password adapter — with only 3 or 4 rows when trust kernel, controller permission, isolated configuration, or a stale topology receipt already fails, and all 10 otherwise. None of these rows ever contain a certificate, endpoint, digest value, vault id, or raw broker error; see [Configuration](configuration.md#credential-broker-foundation) for the full settings shape.
 
-Inspect bindings and broker reachability without changing anything:
+Read-only binding and broker inspection:
 
 ```bash
 bb telegram-agent access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
 bb telegram-agent access status [binding-id] [--json]
 ```
 
-`access list` returns only locally stored, secret-free binding metadata and never contacts the broker. `access status` runs the same diagnostic health check as the doctor and, when given a binding id, reports that one binding's state and generation. Neither command resolves or verifies a credential, and there is no CLI command that does: a live verification can only be requested by the owner from Telegram, and it can only move a binding to `vault_verified` — proof that the broker reached the configured vault item, not that the credential works for its application. It never reaches `active`.
+Import a protected-host projection into Hanoon (mutates local binding state):
+
+```bash
+bb telegram-agent access reconcile <project-id> --projection-json '<secret-free projection JSON>' [--json]
+```
+
+`access list` returns only locally stored, secret-free binding metadata and never contacts the broker. `access status` runs the same diagnostic health check as the doctor and, when given a binding id, reports that one binding's state and generation. `access reconcile` is the mutating local projection import: it accepts only a validated, secret-free projection from protected-host `connector binding enroll --stdin`, requires the active controller project/thread and executor lease, writes Hanoon's local projection, and performs no broker call or credential verification. Typed provider identity probes use fixed Convex/Vercel adapters and can only be requested by the owner from Telegram; the governed browser operation is unavailable in the default broker composition. The installed `@1password/sdk` 0.5.0 has no `AbortSignal` for `Secrets.resolveAll` and no public client close/dispose operation, so SDK-backed credential resolution fails closed before starting that operation; injected-port cancellation tests do not close this SDK gap. Current full readiness is required before and after dispatch; timeout, stale authority, mismatch, and ambiguity fail closed. The repository's executable acceptance path uses controlled local vault/TLS fixtures and makes no live-provider claim.
 
 Rotating broker settings follows the same rule as the bot token: change them only in **Extensions → Plugins → Telegram Agent**, never on a command line. Changing the endpoint, installation id, certificates, private key, or topology receipt digest/expiry while already isolated rotates the connection immediately; the next `access status` or doctor call re-attempts the broker health check under the new material. Turning isolated mode on for the first time additionally needs `bb plugin reload telegram-agent` before verification becomes reachable. An endpoint change does not migrate existing bindings.
 

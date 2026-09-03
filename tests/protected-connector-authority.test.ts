@@ -17,6 +17,7 @@ import {
   type ProtectedConnectorAuthorityPort,
   type ProtectedConnectorExecutor,
 } from "../broker/src/connector-authority-service";
+import { createDurableProtectedConnectorAuthority } from "../broker/src/main";
 import { BrokerProtectedConnectorStore } from "../broker/src/connector-store";
 import { BrokerStore } from "../broker/src/store";
 import { temporaryBrokerDatabase } from "./support/credential-broker-fixtures";
@@ -175,7 +176,6 @@ function createHarness(): Harness {
           projectId: "vercel-project-id",
           projectName: "hanoon",
           teamId: "vercel-team-id",
-          teamSlug: "vercel-team",
           framework: "nextjs",
           status: "ready",
           connectorVersion: "vercel-1",
@@ -222,6 +222,59 @@ function totalCalls(harness: Harness): number {
 }
 
 describe("protected connector success and exact targets", () => {
+  it("uses current durable topology, audit, policy, and fence authority", () => {
+    const harness = createHarness();
+    try {
+      const authority = createDurableProtectedConnectorAuthority(harness.foundationStore, harness.connectorStore, () => NOW);
+      expect(authority.topologyReady("convex.project.inspect.v1", {
+        installationId: "installation-1",
+        projectId: "project-1",
+      })).toBe(true);
+      expect(authority.auditWritable()).toBe(true);
+      expect(authority.fenceCurrent({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+      })).toBe(false);
+      harness.connectorStore.claimRequest({ request: request("convex.project.inspect.v1"), certificateFingerprint: CERTIFICATE, now: NOW });
+      // A request claim records intent only. It must not mint executor authority.
+      expect(authority.fenceCurrent({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+      })).toBe(false);
+      expect(harness.foundationStore.attestExecutorFence({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+        expiresAt: NOW + 10_000,
+        now: NOW,
+      })).toBe(true);
+      expect(authority.fenceCurrent({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "executor-1",
+        fenceGeneration: 1,
+      })).toBe(true);
+      expect(authority.fenceCurrent({
+        installationId: "installation-1",
+        taskId: "task-1",
+        projectId: "project-1",
+        fenceOwner: "stale-executor",
+        fenceGeneration: 1,
+      })).toBe(false);
+    } finally {
+      harness.close();
+    }
+  });
+
   it("does not enroll an active binding before an identity receipt exists", () => {
     const harness = createHarness();
     expect(() => harness.connectorStore.enrollBinding({
@@ -261,7 +314,6 @@ describe("protected connector success and exact targets", () => {
           projectId: "wrong-project-id",
           projectName: "wrong-project",
           teamId: "vercel-team-id",
-          teamSlug: "vercel-team",
           framework: "nextjs",
           status: "ready",
           connectorVersion: "vercel-1",

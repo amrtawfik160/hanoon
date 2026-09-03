@@ -48,6 +48,7 @@ export type CredentialAccessStore = Pick<
   | "markCredentialOperationAmbiguous"
   | "getCredentialReceipt"
   | "getCredentialHealth"
+  | "markCredentialHealthUnavailable"
   | "runControllerMutation"
 >;
 
@@ -384,6 +385,16 @@ export class CredentialAccessService {
       else complete(this.deps.now());
       return;
     }
+    const failureClass = callOutcome.outcome === "ambiguous"
+      ? "result_ambiguous" as const
+      : "provider_unavailable" as const;
+    const invalidate = (boundaryNow: number) => this.deps.store.markCredentialHealthUnavailable({
+      installationId,
+      failureClass,
+      now: boundaryNow,
+    });
+    if (authorized) this.runControllerMutation(authorized, invalidate);
+    else invalidate(this.deps.now());
     const mark = (boundaryNow: number) => this.deps.store.markCredentialOperationAmbiguous({
       installationId,
       requestId: toSend.requestId,

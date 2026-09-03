@@ -25,25 +25,32 @@ export type TemporaryBrokerDatabase = Readonly<{
   databasePath: string;
   walPath: string;
   shmPath: string;
-  db: Database.Database;
+  readonly db: Database.Database;
+  reopen(): Database.Database;
   close(): void;
 }>;
 
 export function temporaryBrokerDatabase(): TemporaryBrokerDatabase {
   const directory = mkdtempSync(join(tmpdir(), "hanoon-broker-test-"));
   const databasePath = join(directory, "broker.sqlite");
-  const db = new Database(databasePath);
+  let db = new Database(databasePath);
   let closed = false;
   return {
     directory,
     databasePath,
     walPath: `${databasePath}-wal`,
     shmPath: `${databasePath}-shm`,
-    db,
+    get db() { return db; },
+    reopen: () => {
+      if (closed) throw new Error("temporary_broker_database_closed");
+      if (db.open) db.close();
+      db = new Database(databasePath);
+      return db;
+    },
     close: () => {
       if (closed) return;
       closed = true;
-      db.close();
+      if (db.open) db.close();
       rmSync(directory, { recursive: true, force: true });
     },
   };

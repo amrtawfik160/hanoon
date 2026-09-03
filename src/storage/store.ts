@@ -334,7 +334,12 @@ import {
   type SettleStageExecutionInput,
   type StageExecutionRecord,
 } from "./stage-execution-repository";
-import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
+import type {
+  BrokerBindingState,
+  BrokerFailureClass,
+  BrokerRequestEnvelope,
+  CredentialBindingMetadata,
+} from "../credentials/protocol";
 import type {
   ProtectedConnectorOperation,
   ProtectedConnectorRequestEnvelope,
@@ -4611,6 +4616,11 @@ export interface TelegramAgentStore {
   ): CredentialVerificationCompleteResult;
   getCredentialReceipt(installationId: string, receiptId: string): CredentialReceiptRecord | null;
   getCredentialHealth(installationId: string): CredentialHealthRecord | null;
+  markCredentialHealthUnavailable(input: Readonly<{
+    installationId: string;
+    failureClass: BrokerFailureClass;
+    now: number;
+  }>): CredentialHealthRecord | null;
   reconcileProtectedConnectorBinding(input: Readonly<{
     projection: ProtectedConnectorBindingProjection;
     now: number;
@@ -4641,6 +4651,16 @@ export interface TelegramAgentStore {
     installationId: string;
     requestId: string;
     now: number;
+  }>): ProtectedConnectorOperationRecord | null;
+  getProtectedConnectorOperation(input: Readonly<{
+    installationId: string;
+    bindingId: string;
+    operation: ProtectedConnectorOperation;
+    bindingGeneration: number;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
   }>): ProtectedConnectorOperationRecord | null;
   getProtectedConnectorReceipt(installationId: string, receiptId: string): ProtectedConnectorReceiptRecord | null;
 }
@@ -6220,6 +6240,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.credentialAccessRepository.getCredentialHealth(installationId);
   }
 
+  public markCredentialHealthUnavailable(input: Readonly<{
+    installationId: string;
+    failureClass: BrokerFailureClass;
+    now: number;
+  }>): CredentialHealthRecord | null {
+    return this.credentialAccessRepository.markCredentialHealthUnavailable(input);
+  }
+
   public reconcileProtectedConnectorBinding(input: Readonly<{
     projection: ProtectedConnectorBindingProjection;
     now: number;
@@ -6273,6 +6301,19 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     now: number;
   }>): ProtectedConnectorOperationRecord | null {
     return this.protectedConnectorRepository.markOperationAmbiguous(input);
+  }
+
+  public getProtectedConnectorOperation(input: Readonly<{
+    installationId: string;
+    bindingId: string;
+    operation: ProtectedConnectorOperation;
+    bindingGeneration: number;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+  }>): ProtectedConnectorOperationRecord | null {
+    return this.protectedConnectorRepository.getOperation(input);
   }
 
   public getProtectedConnectorReceipt(

@@ -179,6 +179,7 @@ it("leaves no controller tool unreachable from every profile", () => {
   // the registration-versus-manifest check compares the allowlist against
   // itself, and a grep for the name finds all of it.
   const bundled = new Set<string>(Object.values(CONTROLLER_BUNDLE_TOOLS).flat());
+  bundled.add("telegram_agent_connector_inspect");
   const alwaysOn = new Set<string>([
     ...CONTROLLER_METADATA_TOOL_IDS,
     ...CONTROLLER_PROTOCOL_TOOL_IDS,

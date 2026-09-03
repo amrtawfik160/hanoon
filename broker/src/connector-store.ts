@@ -317,6 +317,79 @@ export class BrokerProtectedConnectorStore {
     return this.getBinding(projection.value.installationId, projection.value.bindingId)!;
   }
 
+  public enrollProtectedBinding(input: Readonly<{
+    projectId: string;
+    policyDigest: string;
+    enabledOperations: readonly ProtectedConnectorOperation[];
+    projection: ProtectedConnectorBindingProjection;
+    target: ProtectedConnectorTarget;
+    credentialReference?: string | null;
+    now?: number;
+  }>): BrokerConnectorBinding {
+    const policy = input;
+    if (
+      !SHA256_PATTERN.test(policy.policyDigest) ||
+      policy.enabledOperations.length === 0 ||
+      policy.enabledOperations.length > PROTECTED_CONNECTOR_OPERATIONS.length ||
+      new Set(policy.enabledOperations).size !== policy.enabledOperations.length ||
+      !policy.enabledOperations.every((operation) => PROTECTED_CONNECTOR_OPERATIONS.includes(operation))
+    ) throw stableError("connector_policy_invalid");
+    const projection = parseProtectedConnectorBindingProjection(input.projection);
+    const target = parseProtectedConnectorTarget(input.target);
+    if (!projection.ok || !target.ok || projection.value.operation !== target.value.operation ||
+        projection.value.state === "active") {
+      throw stableError("connector_binding_invalid");
+    }
+    const requiresCredential = target.value.operation !== "browser.vercel_project.inspect.v1";
+    if (requiresCredential !== (typeof input.credentialReference === "string" && input.credentialReference.length > 0)) {
+      throw stableError("connector_binding_invalid");
+    }
+    this.assertActiveInstallation(projection.value.installationId);
+    if (!policy.enabledOperations.includes(projection.value.operation)) throw stableError("connector_policy_invalid");
+    const now = input.now ?? this.clock();
+    const targetJson = canonicalBrokerJson(target.value);
+    const targetCiphertext = encryptBrokerReference({
+      reference: targetJson,
+      key: this.dataKey,
+      aad: { installationId: projection.value.installationId, bindingId: targetAad(projection.value.bindingId), generation: projection.value.generation },
+    });
+    const credentialCiphertext = requiresCredential ? encryptBrokerReference({
+      reference: input.credentialReference!,
+      key: this.dataKey,
+      aad: { installationId: projection.value.installationId, bindingId: credentialAad(projection.value.bindingId), generation: projection.value.generation },
+    }) : null;
+    const projectionJson = canonicalBrokerJson(projection.value);
+    const targetDigest = protectedConnectorTargetDigest(target.value);
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO broker_connector_policies (
+          installation_id, project_id, policy_digest, enabled_operations_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (installation_id, project_id) DO UPDATE SET
+          policy_digest = excluded.policy_digest,
+          enabled_operations_json = excluded.enabled_operations_json,
+          updated_at = excluded.updated_at
+      `).run(projection.value.installationId, input.projectId, policy.policyDigest, JSON.stringify(policy.enabledOperations), now, now);
+      this.db.prepare(`
+        INSERT INTO broker_connector_bindings (
+          installation_id, binding_id, operation, generation, state, projection_json,
+          target_ciphertext, target_digest, credential_reference_ciphertext, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        projection.value.installationId, projection.value.bindingId, projection.value.operation,
+        projection.value.generation, projection.value.state, projectionJson, targetCiphertext,
+        targetDigest, credentialCiphertext, now, now,
+      );
+      this.insertAdminEvent({ operation: "policy.set", installationId: projection.value.installationId, projectId: input.projectId, occurredAt: now });
+      this.insertAdminEvent({
+        operation: "binding.enroll", installationId: projection.value.installationId,
+        bindingId: projection.value.bindingId, targetDigest,
+        projectionSha256: createHash("sha256").update(projectionJson, "utf8").digest("hex"), occurredAt: now,
+      });
+    }).immediate();
+    return this.getBinding(projection.value.installationId, projection.value.bindingId)!;
+  }
+
   public getBinding(installationId: string, bindingId: string): BrokerConnectorBinding | null {
     const row = this.bindingRow(installationId, bindingId);
     return row ? bindingFromRow(row) : null;
@@ -413,6 +486,27 @@ export class BrokerProtectedConnectorStore {
       throw error;
     }
     return { outcome: "claimed" };
+  }
+
+  public fenceCurrent(input: Readonly<{
+    installationId: string;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+  }>): boolean {
+    const row = this.db.prepare(`
+      SELECT fence_owner, fence_generation, expires_at
+        FROM broker_connector_executor_fences
+       WHERE installation_id = ? AND task_id = ? AND project_id = ?
+    `).get(input.installationId, input.taskId, input.projectId) as {
+      fence_owner: string;
+      fence_generation: number;
+      expires_at: number;
+    } | undefined;
+    return row?.fence_owner === input.fenceOwner &&
+      row.fence_generation === input.fenceGeneration &&
+      row.expires_at > this.clock();
   }
 
   public completeRequest(input: Readonly<{

@@ -25,6 +25,7 @@ import type {
   BrokerRejectedAdminMutation,
   BrokerStore,
 } from "./store.js";
+import type { BrokerProtectedConnectorStore } from "./connector-store.js";
 
 const ADMIN_SOCKET_MODE = 0o600;
 const ADMIN_CONNECTION_TIMEOUT_MS = 10_000;
@@ -36,6 +37,7 @@ export type AdminServerDependencies = Readonly<{
   adapter: VaultAdapter;
   clock?: () => number;
   brokerVersion: string;
+  connectorStore?: BrokerProtectedConnectorStore;
 }>;
 
 export type RunningAdminServer = Readonly<{
@@ -90,9 +92,35 @@ function mapStoreError(error: unknown): AdminOperationError {
     broker_installation_unavailable: "installation_unavailable",
     broker_binding_missing: "binding_missing",
     binding_limit: "binding_limit",
+    connector_policy_invalid: "connector_policy_invalid",
+    connector_binding_invalid: "connector_invalid",
+    connector_data_key_invalid: "connector_store_unavailable",
     invalid_binding: "invalid_reference",
   };
   return new AdminOperationError(codeByStoreError[storeCode] ?? "store_failure");
+}
+
+function handleConnectorBindingEnroll(
+  request: Extract<AdminRequest, { operation: "connector.binding.enroll" }>,
+  dependencies: AdminServerDependencies,
+  now: number,
+): AdminResponse {
+  if (!dependencies.connectorStore) throw new AdminOperationError("connector_store_unavailable");
+  try {
+    const binding = dependencies.connectorStore.enrollProtectedBinding({ ...request, now });
+    return {
+      ok: true,
+      operation: "connector.binding.enroll",
+      installationId: request.installationId,
+      projectId: request.projectId,
+      bindingId: binding.projection.bindingId,
+      state: binding.projection.state as Exclude<typeof binding.projection.state, "active">,
+      generation: binding.projection.generation,
+      projection: binding.projection,
+    };
+  } catch (error) {
+    throw mapStoreError(error);
+  }
 }
 
 function adapterState(result: Awaited<ReturnType<VaultAdapter["health"]>>): "ready" | "degraded" | "unavailable" {
@@ -256,6 +284,7 @@ async function dispatchAdminRequest(request: AdminRequest, dependencies: AdminSe
     case "installation.revoke": return handleInstallationRevoke(request, dependencies, now);
     case "binding.add": return handleBindingAdd(request, dependencies, now);
     case "binding.revoke": return handleBindingRevoke(request, dependencies, now);
+    case "connector.binding.enroll": return handleConnectorBindingEnroll(request, dependencies, now);
     case "installation.doctor": return handleInstallationDoctor(request, dependencies, now);
     case "broker.status": return handleBrokerStatus(dependencies);
   }

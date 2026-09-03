@@ -340,6 +340,35 @@ export class ProtectedConnectorRepository {
     }).immediate();
   }
 
+  public getOperation(input: Readonly<{
+    installationId: string;
+    bindingId: string;
+    operation: ProtectedConnectorOperation;
+    bindingGeneration: number;
+    taskId: string;
+    projectId: string;
+    fenceOwner: string;
+    fenceGeneration: number;
+  }>): ProtectedConnectorOperationRecord | null {
+    const row = this.db.prepare(`
+      SELECT * FROM credential_connector_operations
+       WHERE installation_id = ? AND binding_id = ? AND operation = ?
+         AND binding_generation = ? AND task_id = ? AND project_id = ?
+         AND fence_owner = ? AND fence_generation = ?
+       ORDER BY created_at DESC LIMIT 1
+    `).get(
+      input.installationId,
+      input.bindingId,
+      input.operation,
+      input.bindingGeneration,
+      input.taskId,
+      input.projectId,
+      input.fenceOwner,
+      input.fenceGeneration,
+    ) as OperationRow | undefined;
+    return row ? operationFromRow(row) : null;
+  }
+
   public completeOperation(input: Readonly<{
     installationId: string;
     requestId: string;

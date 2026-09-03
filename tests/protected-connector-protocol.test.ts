@@ -86,7 +86,6 @@ function success(operation: ProtectedConnectorOperation): ProtectedConnectorResp
       projectId: "vercel-project-id",
       projectName: "hanoon",
       teamId: "vercel-team-id",
-      teamSlug: "hanoon-team",
       framework: "nextjs",
       status: "ready",
       connectorVersion: "vercel-1",
@@ -211,6 +210,13 @@ describe("protected connector response protocol", () => {
         .toEqual({ ok: false, code: "unknown_field" });
     },
   );
+
+  it("rejects invented Vercel team slugs from the authoritative result shape", () => {
+    expect(parseProtectedConnectorResponse({
+      ...success("vercel.project.inspect.v1"),
+      result: { ...success("vercel.project.inspect.v1").result!, teamSlug: "invented-slug" },
+    })).toEqual({ ok: false, code: "unknown_field" });
+  });
 
   it("rejects unreceipted success, operation/result confusion, and nested provider fields", () => {
     expect(parseProtectedConnectorResponse({ ...success("convex.project.inspect.v1"), receiptId: null }))

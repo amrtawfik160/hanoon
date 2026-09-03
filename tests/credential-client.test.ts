@@ -217,6 +217,36 @@ it("completes a correct call against a trusted server with a valid client certif
   expect(outcome.response.outcome).toBe("succeeded");
 });
 
+it("attests the current executor fence over the authenticated fence endpoint", async () => {
+  const fenceNow = 1_800_000_000_000;
+  const { port } = await startServer({
+    handler: (request, response, body) => {
+      expect(request.method).toBe("POST");
+      expect(request.url).toBe("/v1/fences");
+      expect(JSON.parse(body.toString("utf8"))).toEqual({
+        installationId: "install_1",
+        taskId: "turn_1",
+        projectId: "project_1",
+        fenceOwner: "executor_1",
+        fenceGeneration: 1,
+        expiresAt: fenceNow + 5_000,
+      });
+      response.writeHead(204);
+      response.end();
+    },
+  });
+  const client = new CredentialBrokerClient(buildConfig(port), { clock: () => fenceNow });
+
+  await expect(client.attestExecutorFence({
+    installationId: "install_1",
+    taskId: "turn_1",
+    projectId: "project_1",
+    fenceOwner: "executor_1",
+    fenceGeneration: 1,
+    expiresAt: fenceNow + 5_000,
+  })).resolves.toBe(true);
+});
+
 // --- untrusted server ---------------------------------------------------------
 
 it("fails closed against a server certificate signed by an untrusted CA", async () => {
