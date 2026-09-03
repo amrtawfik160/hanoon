@@ -12,8 +12,11 @@ const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 const requiredEvidenceRefsSchema = z.array(z.string().trim().min(1).max(1_024)).min(1).max(128);
 const projectPathSchema = z.string().trim().min(1).max(4_096).refine(
-  (path) => !path.startsWith("/") && !path.includes("\0") &&
-    path.split(/[\\/]/u).every((segment) => segment.length > 0 && segment !== "." && segment !== ".."),
+  (path) => {
+    const normalized = path.replace(/\\/gu, "/").replace(/^\.\//u, "");
+    return !path.startsWith("/") && !/^[A-Za-z]:\//u.test(normalized) && !path.includes("\0") &&
+      normalized.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+  },
   "changed paths must be safe project-relative paths",
 );
 const taskEvidenceSchema = z.array(z.enum([
@@ -32,6 +35,7 @@ export const navigatorReviewFindingSchema = z.object({
   subject: projectPathSchema,
   line: z.number().int().positive().nullable(),
   requirementId: identifierSchema.nullable(),
+  evidenceClass: identifierSchema.default("review"),
   summary: boundedTextSchema,
   evidenceRefs: requiredEvidenceRefsSchema,
 }).strict();

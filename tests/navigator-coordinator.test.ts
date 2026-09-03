@@ -439,7 +439,7 @@ describe("disposable navigator live path", () => {
             severity: "high" as const,
             subject: "src/app.ts",
             line: 1,
-            requirementId: "SPEC-DUAL-REPAIR",
+            requirementId: null,
             summary: "Repair this finding.",
             evidenceRefs: ["review:1"],
           }]

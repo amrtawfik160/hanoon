@@ -6,6 +6,7 @@ import {
   type CapabilityDescriptor,
   type CapabilityRoute,
 } from "./contracts";
+import { evaluateFindingDisposition, isBoundedPolicyKey, type FindingDispositionInput } from "./guards";
 
 export const TASK_RECIPES = [
   "direct",
@@ -866,6 +867,146 @@ export function capabilityDescriptorById(id: string, digest?: string): Capabilit
 
 export const CAPABILITY_REGISTRY_DIGEST = catalogDigests(CAPABILITY_CATALOG).registry;
 export const CAPABILITY_GRAPH_DIGEST = catalogDigests(CAPABILITY_CATALOG).graph;
+
+export type CapabilityFindingPolicy = Readonly<{
+  capabilityId: string;
+  descriptorDigest: string;
+  descriptorVersion: string;
+  policyRevision: number;
+  defaultDisposition: "must_fix" | "advisory";
+  mustFixRuleIds: readonly string[];
+  advisoryRuleIds: readonly string[];
+  requirementIds: readonly string[];
+  policyDigest: string;
+}>;
+
+const FINDING_POLICY_DEFAULTS: Readonly<Record<string, Readonly<{
+  defaultDisposition: CapabilityFindingPolicy["defaultDisposition"];
+  mustFixRuleIds: readonly string[];
+  advisoryRuleIds: readonly string[];
+}>>> = Object.freeze({
+  "code-review": Object.freeze({ defaultDisposition: "advisory", mustFixRuleIds: [], advisoryRuleIds: [] }),
+  "blast-radius": Object.freeze({ defaultDisposition: "advisory", mustFixRuleIds: [], advisoryRuleIds: [] }),
+  "clean-code-guard": Object.freeze({
+    defaultDisposition: "advisory",
+    mustFixRuleIds: ["clean.rule-1"],
+    advisoryRuleIds: ["clean.rule-10"],
+  }),
+  "docs-guard": Object.freeze({
+    defaultDisposition: "advisory",
+    mustFixRuleIds: ["docs.rule-1"],
+    advisoryRuleIds: ["docs.rule-10"],
+  }),
+  "test-guard": Object.freeze({
+    defaultDisposition: "advisory",
+    mustFixRuleIds: ["tests.rule-1"],
+    advisoryRuleIds: ["tests.rule-10"],
+  }),
+  "durable-boundary-audit": Object.freeze({ defaultDisposition: "advisory", mustFixRuleIds: [], advisoryRuleIds: [] }),
+});
+
+export function admittedCapabilityFindingPolicy(input: Readonly<{
+  capabilityId: string;
+  descriptorDigest: string;
+  requirementIds: readonly string[];
+}>): CapabilityFindingPolicy | null {
+  const descriptor = capabilityDescriptorById(input.capabilityId, input.descriptorDigest) ??
+    CAPABILITY_BY_ID.get(input.capabilityId);
+  const defaults = FINDING_POLICY_DEFAULTS[input.capabilityId];
+  const admission = SKILL_ADMISSION_BY_ID.get(input.capabilityId as AdmittedCapabilitySkillId);
+  const admittedDescriptorDigests = [admission?.bundleDescriptorDigest, descriptor?.digest, CAPABILITY_BY_ID.get(input.capabilityId)?.digest].filter(
+    (digest): digest is string => digest !== undefined,
+  );
+  if (
+    !descriptor || descriptor.status !== "admitted" || descriptor.evidence.receiptType !== "guard" ||
+    !admittedDescriptorDigests.includes(input.descriptorDigest) || !defaults ||
+    input.requirementIds.length > 100 || new Set(input.requirementIds).size !== input.requirementIds.length
+  ) return null;
+  const requirementIds = [...input.requirementIds].sort((left, right) => left.localeCompare(right));
+  const policyRevision = 1;
+  const policyDigest = stableDigest(JSON.stringify({
+    capabilityId: descriptor.id,
+    descriptorDigest: input.descriptorDigest,
+    descriptorVersion: descriptor.version,
+    policyRevision,
+    defaultDisposition: defaults.defaultDisposition,
+    mustFixRuleIds: defaults.mustFixRuleIds,
+    advisoryRuleIds: defaults.advisoryRuleIds,
+    requirementIds,
+  }));
+  return Object.freeze({
+    capabilityId: descriptor.id,
+    descriptorDigest: input.descriptorDigest,
+    descriptorVersion: descriptor.version,
+    policyRevision,
+    defaultDisposition: defaults.defaultDisposition,
+    mustFixRuleIds: Object.freeze([...defaults.mustFixRuleIds]),
+    advisoryRuleIds: Object.freeze([...defaults.advisoryRuleIds]),
+    requirementIds: Object.freeze(requirementIds),
+    policyDigest,
+  });
+}
+
+/**
+ * Compatibility classification for callers that still expose the old helper.
+ * Navigator assessment uses the versioned ledger policy, including evidence and
+ * requirement inputs, through `NavigatorFindingLedger.assess`.
+ */
+type CompatibilityFindingInput = Readonly<{
+  capabilityId: string;
+  ruleId: string;
+} & Partial<Record<string, unknown>>>;
+
+function isFindingSeverity(value: unknown): value is FindingDispositionInput["severity"] {
+  return value === "critical" || value === "high" || value === "medium" || value === "low";
+}
+
+function compatibilityFindingObservation(input: CompatibilityFindingInput): FindingDispositionInput | null {
+  const severity = input.severity === undefined ? "low" : input.severity;
+  const requirementId = input.requirementId === undefined ? null : input.requirementId;
+  const evidenceClass = input.evidenceClass === undefined ? "review" : input.evidenceClass;
+  return isBoundedPolicyKey(input.ruleId) && isFindingSeverity(severity) &&
+    (requirementId === null || isBoundedPolicyKey(requirementId)) && isBoundedPolicyKey(evidenceClass)
+    ? { ruleId: input.ruleId, severity, requirementId, evidenceClass }
+    : null;
+}
+
+function compatibilityRequirementIds(input: CompatibilityFindingInput): readonly string[] | null {
+  const requirementIds = input.requirementIds;
+  if (requirementIds === undefined) return [];
+  return Array.isArray(requirementIds) && requirementIds.length <= 100 && requirementIds.every(isBoundedPolicyKey)
+    ? requirementIds
+    : null;
+}
+
+function compatibilityDescriptorDigest(
+  input: CompatibilityFindingInput,
+  admission: SkillAdmissionEvidence | undefined,
+  descriptor: CapabilityDescriptor,
+): string | null {
+  if (input.descriptorDigest === undefined) return admission?.bundleDescriptorDigest ?? descriptor.digest;
+  return typeof input.descriptorDigest === "string" ? input.descriptorDigest : null;
+}
+
+export function compatibilityCapabilityFindingDisposition(
+  input: CompatibilityFindingInput,
+): "must_fix" | "advisory" | null {
+  if (!isBoundedPolicyKey(input.capabilityId)) return null;
+  const descriptor = CAPABILITY_BY_ID.get(input.capabilityId);
+  if (!descriptor) return null;
+  const admission = SKILL_ADMISSION_BY_ID.get(input.capabilityId as AdmittedCapabilitySkillId);
+  const finding = compatibilityFindingObservation(input);
+  const requirementIds = compatibilityRequirementIds(input);
+  const descriptorDigest = compatibilityDescriptorDigest(input, admission, descriptor);
+  if (!finding || requirementIds === null || descriptorDigest === null) return null;
+  const policy = admittedCapabilityFindingPolicy({
+    capabilityId: input.capabilityId,
+    descriptorDigest,
+    requirementIds,
+  });
+  if (!policy) return null;
+  return evaluateFindingDisposition(finding, policy);
+}
 
 export function capabilityCatalogView(engine: "recipe-v1" | "navigator-v1"): Readonly<{
   byId: ReadonlyMap<string, CapabilityDescriptor>;

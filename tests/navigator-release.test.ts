@@ -30,6 +30,7 @@ import {
   MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
+  NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
@@ -754,14 +755,18 @@ function admitCompetingMerge(fixture: OwnedFixture): string {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    // The automation lifecycle migration is the newest tail, with the effect
-    // protocol, the burst migration and then the managed-automation state
-    // upgrade ahead of it. Each contributes several statements, so every block
-    // is located by offset rather than a fixed index.
-    [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
+    // The finding-ledger upgrade is the newest tail, with the automation
+    // lifecycle, the effect protocol, the burst migration and then the
+    // managed-automation state upgrade ahead of it. Each contributes several
+    // statements, so every block is located by offset rather than a fixed index.
+    [...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const lifecycleOffset = MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
+    const findingLedgerOffset = NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
+    [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(findingLedgerOffset + index + 1))).toBe(migration);
+    });
+    const lifecycleOffset = findingLedgerOffset + MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
     [...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(lifecycleOffset + index + 1))).toBe(migration);
     });

@@ -308,7 +308,7 @@ function implementationExecutor(
           severity: "high" as const,
           subject: "src/app.ts",
           line: 1,
-          requirementId: "LIVE-REPAIR",
+          requirementId: null,
           summary: "Repair this finding.",
           evidenceRefs: ["review:1"],
         }]

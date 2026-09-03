@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { ModelRoute } from "../capabilities/models";
-import { CAPABILITY_GRAPH_DIGEST, CAPABILITY_REGISTRY_DIGEST } from "../capabilities/catalog";
+import {
+  CAPABILITY_GRAPH_DIGEST,
+  CAPABILITY_REGISTRY_DIGEST,
+  compatibilityCapabilityFindingDisposition,
+} from "../capabilities/catalog";
 import type { TelegramAgentStore } from "../storage/store";
 import type { WorkArtifactClaim } from "../work-artifacts/models";
 import {
@@ -12,7 +16,6 @@ import {
   navigatorJsonDigest,
   navigatorPersistedTicketStepContractSchema,
   navigatorPullRequestRequestSchema,
-  navigatorReviewFindingSchema,
   navigatorTicketWorkerProfile,
   navigatorTicketWorkerProfileSchema,
   navigatorTicketRepairProposalSchema,
@@ -32,14 +35,14 @@ import {
 import { artifactBindingSchema, type NavigatorArtifactBinding } from "./models";
 import type {
   NavigatorFindingLedgerEntry,
-  NavigatorTicketWorkerOutcome,
-} from "./ticket-settlement-repository";
+} from "./finding-ledger";
+import type { NavigatorTicketWorkerOutcome } from "./ticket-settlement-repository";
 import type { NavigatorGitObserver } from "./ticket-adapter";
 
 export type {
   NavigatorFindingLedgerEntry,
-  NavigatorTicketWorkerOutcome,
-} from "./ticket-settlement-repository";
+} from "./finding-ledger";
+export type { NavigatorTicketWorkerOutcome } from "./ticket-settlement-repository";
 export type {
   NavigatorGitObservationRequest,
   NavigatorGitObserver,
@@ -52,7 +55,7 @@ export {
   NavigatorTicketWorkerRetryableError,
   NavigatorTicketWorkerUnavailableError,
 } from "./ticket-adapter";
-export { navigatorFindingDisposition } from "./ticket-settlement-repository";
+export const navigatorFindingDisposition = compatibilityCapabilityFindingDisposition;
 
 const GIT_SHA = /^[0-9a-f]{40}$/u;
 const IDENTIFIER = /^[A-Za-z0-9_.:/-]{1,256}$/u;
@@ -108,7 +111,18 @@ export type NavigatorIntegrationSnapshot = Readonly<{
   }> | null;
   attempts: readonly NavigatorTicketWorkerAttempt[];
   outcomes: readonly NavigatorTicketWorkerOutcome[];
-  findingLedger: readonly NavigatorFindingLedgerEntry[];
+  findingLedger: readonly Readonly<{
+    rootCauseId: string;
+    sliceId: string;
+    sourceReviewAttemptId: string;
+    verificationAttemptId: string;
+    disposition: "must_fix" | "advisory";
+    state: "open" | "resolved" | "disputed" | "stale";
+    occurrence: number;
+    blockingBurden: number;
+    headSha: string;
+    finding: NavigatorFindingLedgerEntry["finding"];
+  }>[];
 }>;
 
 export interface NavigatorPullRequestPublisher {
@@ -194,34 +208,6 @@ type OutcomeRow = Readonly<{
   recorded_at: number;
 }>;
 
-type FindingEventRow = Readonly<{
-  sequence: number;
-  id: string;
-  job_id: string;
-  slice_id: string;
-  source_review_attempt_id: string;
-  verification_attempt_id: string;
-  root_cause_id: string;
-  capability_id: string;
-  rule_id: string;
-  disposition: "must_fix" | "advisory";
-  event: "opened" | "reobserved" | "resolved" | "disputed";
-  head_sha: string;
-  finding_json: string;
-  evidence_refs_json: string;
-  occurrence: number;
-  blocking_burden: number;
-  created_at: number;
-}>;
-
-type ConvergenceRow = Readonly<{
-  slice_id: string;
-  last_blocking_burden: number;
-  plateau_recoveries: number;
-  review_cycles: number;
-  updated_at: number;
-}>;
-
 type NavigatorImplementationExecutorDependencies = Readonly<{
   store: TelegramAgentStore;
   database: Database.Database;
@@ -259,11 +245,6 @@ function mergeEvidenceRefs(...groups: readonly (readonly string[])[]): readonly 
 
 function stableId(prefix: string, ...parts: readonly string[]): string {
   return `${prefix}_${createHash("sha256").update(parts.join("\0"), "utf8").digest("base64url").slice(0, 24)}`;
-}
-
-function findingState(event: FindingEventRow["event"]): NavigatorFindingLedgerEntry["state"] {
-  if (event === "opened" || event === "reobserved") return "open";
-  return event === "resolved" ? "resolved" : "disputed";
 }
 
 function parseRepairSnapshot(rawSnapshot: unknown): NavigatorTicketRepairSnapshot {
@@ -847,34 +828,18 @@ export class NavigatorImplementationExecutor {
     };
   }
 
-  private currentFindingRows(jobId: string, sliceId?: string): FindingEventRow[] {
-    return this.db.prepare(
-      `SELECT event.*
-         FROM navigator_review_finding_events AS event
-        WHERE event.job_id = ?
-          AND (? IS NULL OR event.slice_id = ?)
-          AND event.sequence = (
-            SELECT MAX(newest.sequence)
-              FROM navigator_review_finding_events AS newest
-             WHERE newest.slice_id = event.slice_id
-               AND newest.root_cause_id = event.root_cause_id
-          )
-        ORDER BY event.slice_id, event.root_cause_id`,
-    ).all(jobId, sliceId ?? null, sliceId ?? null) as FindingEventRow[];
-  }
-
-  private currentFindingLedger(jobId: string, sliceId?: string): NavigatorFindingLedgerEntry[] {
-    return this.currentFindingRows(jobId, sliceId).map((row) => ({
-      rootCauseId: row.root_cause_id,
-      sliceId: row.slice_id,
-      sourceReviewAttemptId: row.source_review_attempt_id,
-      verificationAttemptId: row.verification_attempt_id,
-      disposition: row.disposition,
-      state: findingState(row.event),
-      occurrence: row.occurrence,
-      blockingBurden: row.blocking_burden,
-      headSha: row.head_sha,
-      finding: navigatorReviewFindingSchema.parse(JSON.parse(row.finding_json)),
+  private currentFindingLedger(jobId: string): NavigatorIntegrationSnapshot["findingLedger"] {
+    return this.dependencies.store.getNavigatorFindingLedgerDecision(jobId).entries.map((entry) => ({
+      rootCauseId: entry.rootCauseId,
+      sliceId: entry.sliceId,
+      sourceReviewAttemptId: entry.sourceReviewAttemptId,
+      verificationAttemptId: entry.verificationAttemptId,
+      disposition: entry.disposition,
+      state: entry.state,
+      occurrence: entry.occurrence,
+      blockingBurden: entry.blockingBurden,
+      headSha: entry.headSha,
+      finding: entry.finding,
     }));
   }
 

@@ -4507,6 +4507,31 @@ CREATE TABLE navigator_review_convergence (
 );
 `] as const;
 
+export const NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS = [String.raw`
+ALTER TABLE navigator_review_finding_events ADD COLUMN severity TEXT NOT NULL DEFAULT 'low' CHECK (
+  severity IN ('critical', 'high', 'medium', 'low')
+);
+ALTER TABLE navigator_review_finding_events ADD COLUMN requirement_id TEXT;
+ALTER TABLE navigator_review_finding_events ADD COLUMN evidence_class TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE navigator_review_finding_events ADD COLUMN normalized_subject TEXT NOT NULL DEFAULT '';
+ALTER TABLE navigator_review_finding_events ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE navigator_review_finding_events ADD COLUMN descriptor_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(descriptor_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN descriptor_version TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE navigator_review_finding_events ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 0 CHECK (policy_revision >= 0);
+ALTER TABLE navigator_review_finding_events ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(policy_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN requirement_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(requirement_ids_json));
+ALTER TABLE navigator_review_finding_events ADD COLUMN artifact_snapshot_id TEXT;
+ALTER TABLE navigator_review_finding_events ADD COLUMN artifact_snapshot_digest TEXT CHECK (artifact_snapshot_digest IS NULL OR length(artifact_snapshot_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN specification_snapshot_id TEXT;
+ALTER TABLE navigator_review_finding_events ADD COLUMN specification_snapshot_digest TEXT CHECK (specification_snapshot_digest IS NULL OR length(specification_snapshot_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN source_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(source_attempt_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN verification_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(verification_attempt_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN root_cause_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (root_cause_confirmed IN (0, 1));
+CREATE INDEX navigator_review_finding_events_fingerprint
+  ON navigator_review_finding_events(slice_id, fingerprint, sequence);
+ALTER TABLE navigator_review_convergence ADD COLUMN last_verification_attempt_id TEXT;
+`] as const;
+
 export const MANAGED_AUTOMATION_MIGRATIONS = [String.raw`
 CREATE TABLE managed_automations (
   id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
@@ -4970,4 +4995,5 @@ export const ALL_MIGRATIONS = [
   ...CONTROLLER_BURST_MIGRATIONS,
   ...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   ...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
+  ...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
 ] as const;
