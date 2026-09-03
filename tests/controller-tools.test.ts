@@ -465,7 +465,8 @@ it("preserves the exact Task 6 metadata and adds the bounded evidence-index sche
   // Re-pinned when BB replaced experimental status labels with the stable
   // presentation contract in plugin SDK 0.4.21.
   // Re-pinned when watch gained the governed update_schedule variant.
-  expect(digest).toBe("3fd7a98dcc64b9c33ee62cbbd0b3154e651ae8da4c14ac48b762a9cf26551808");
+  // Re-pinned when watch gained durable pause, resume, and run-now variants.
+  expect(digest).toBe("e84e1cf9927fdfc9b0cbfecd8010b7e350198e27d676726522fcc0f887e09e9c");
   expect(metadata[21]).toEqual({
     name: "telegram_agent_turn_evidence",
     description: "List bounded evidence for the current authorized controller turn after reconciling BB-native work.",
@@ -1663,8 +1664,10 @@ it("updates an owned BB schedule through the governed controller seam without wi
       instruction: "Send the revised weekday digest.",
     },
   });
-  expect(automations.update).toHaveBeenCalledWith(expect.objectContaining({
+  expect(automations.submitLifecycleOperation).toHaveBeenCalledWith(expect.objectContaining({
     id: created.watching.id,
+    operationClass: "update",
+    desiredState: "enabled",
     definition: expect.objectContaining({
       mode: "agent",
       providerId: "codex",
@@ -1675,6 +1678,7 @@ it("updates an owned BB schedule through the governed controller seam without wi
       prompt: "Send the revised weekday digest.",
     }),
   }));
+  expect(automations.update).not.toHaveBeenCalled();
 });
 
 it("retires an already-armed live-work poller without touching clock-time schedules", () => {

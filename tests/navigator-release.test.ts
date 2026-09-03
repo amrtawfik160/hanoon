@@ -27,6 +27,7 @@ import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-run
 import {
   ALL_MIGRATIONS,
   MANAGED_AUTOMATION_MIGRATIONS,
+  MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
   MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
   NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
@@ -753,14 +754,18 @@ function admitCompetingMerge(fixture: OwnedFixture): string {
 
 describe("navigator exact-head release", () => {
   it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    // The effect-protocol migration is the newest tail, with the burst
-    // migration and then the managed-automation state upgrade ahead of it.
-    // Each contributes several statements, so every block is located by offset
-    // rather than a fixed index.
-    [...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS].reverse().forEach((migration, index) => {
+    // The automation lifecycle migration is the newest tail, with the effect
+    // protocol, the burst migration and then the managed-automation state
+    // upgrade ahead of it. Each contributes several statements, so every block
+    // is located by offset rather than a fixed index.
+    [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const protocolOffset = NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
+    const lifecycleOffset = MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
+    [...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(lifecycleOffset + index + 1))).toBe(migration);
+    });
+    const protocolOffset = lifecycleOffset + NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
     [...CONTROLLER_BURST_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(protocolOffset + index + 1))).toBe(migration);
     });

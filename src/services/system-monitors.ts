@@ -1,5 +1,10 @@
 import { redactError } from "../errors";
 import type { TelegramAgentStore } from "../storage/store";
+import { capabilityDescriptorById } from "../capabilities/catalog";
+import type {
+  ManagedAutomationAuthority,
+  ManagedAutomationCapabilityEvidence,
+} from "../domain/managed-automation";
 import {
   BbAutomationProjectUnavailableError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
@@ -47,6 +52,53 @@ export const SYSTEM_MONITORS: readonly SystemMonitorDefinition[] = Object.freeze
       "Write the weekly scorecard. Read it from durable state and report: work completed, blocked, and cancelled; decisions you needed from the owner; remediation cycles; delivery retries and anything undeliverable. Give the numbers you have and the window they cover, never a rate you cannot support. Keep it to a short message; end with the one thing most worth their attention this week.",
   }),
 ]);
+
+const SYSTEM_MAINTENANCE_CAPABILITY_ID = "telegram_agent_watch";
+const SYSTEM_MAINTENANCE_AUTHORITY_REVISION = 1;
+type SystemMaintenanceAuthority = Extract<ManagedAutomationAuthority, { origin: "system-maintenance" }>;
+
+export function systemMaintenanceCapabilityEvidence(systemKey: string): ManagedAutomationCapabilityEvidence {
+  const descriptor = capabilityDescriptorById(SYSTEM_MAINTENANCE_CAPABILITY_ID);
+  if (!descriptor || descriptor.status !== "admitted") {
+    throw new Error("system-maintenance capability is not admitted");
+  }
+  return {
+    version: 1,
+    profileId: `system-maintenance:${systemKey}`,
+    profileRevision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
+    capabilityId: descriptor.id,
+    descriptorVersion: descriptor.version,
+    descriptorDigest: descriptor.digest,
+    evidenceRefs: [
+      `capability-admission:${descriptor.id}:${descriptor.version}:${descriptor.digest}`,
+      `system-maintenance:${systemKey}:standing-authority:${SYSTEM_MAINTENANCE_AUTHORITY_REVISION}`,
+    ],
+  };
+}
+
+export function systemMaintenanceAuthority(input: Readonly<{
+  systemKey: string;
+  controllerKey: string;
+  projectId: string;
+  hostId: string;
+}>): SystemMaintenanceAuthority {
+  return {
+    version: 1,
+    origin: "system-maintenance",
+    controllerKey: input.controllerKey,
+    projectId: input.projectId,
+    hostId: input.hostId,
+    taskAuthority: null,
+    standingAuthority: {
+      version: 1,
+      kind: "system-maintenance",
+      systemKey: input.systemKey,
+      revision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
+    },
+    capabilityEvidence: systemMaintenanceCapabilityEvidence(input.systemKey),
+    mayWidenAutomation: false,
+  };
+}
 
 export function systemAutomationInstallationComplete(installed: number): boolean {
   return installed === SYSTEM_MONITORS.length;
@@ -106,6 +158,12 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
           serviceTier: dependencies.execution.serviceTier,
           permissionMode: dependencies.execution.permissionMode,
           hostId: controller.hostId,
+          authority: systemMaintenanceAuthority({
+            systemKey: definition.systemKey,
+            controllerKey: controller.controllerKey,
+            projectId: controller.projectId,
+            hostId: controller.hostId,
+          }),
           now,
           signal: dependencies.signal,
         });
@@ -133,13 +191,12 @@ export async function installSystemAutomations(dependencies: SystemAutomationIns
             timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
             resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
           },
-          authority: {
-            source: "system",
+          authority: systemMaintenanceAuthority({
+            systemKey: definition.systemKey,
             controllerKey: controller.controllerKey,
             projectId: controller.projectId,
             hostId: controller.hostId,
-            mayWidenAutomation: false,
-          },
+          }),
           notificationPolicy: "material",
           now,
           signal: dependencies.signal,
