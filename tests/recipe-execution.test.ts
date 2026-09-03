@@ -45,7 +45,10 @@ describe("recipe execution graphs", () => {
     ]);
   });
 
-  it("uses deterministic direct delivery metadata and reserves pr-writer for nontrivial diffs", () => {
+  // The bundled skill this engine used to name for a nontrivial diff is gone,
+  // and the frozen recipe-v1 catalog cannot name its replacement, so every
+  // recipe delivers deterministic metadata rather than routing to a skill.
+  it("uses deterministic delivery metadata for every diff, trivial or not", () => {
     expect(deliveryMetadataPolicy({
       recipe: "direct",
       diff: "diff --git a/docs/usage.md b/docs/usage.md\n+++ b/docs/usage.md\n@@ -1 +1 @@\n-old\n+new",
@@ -53,7 +56,7 @@ describe("recipe execution graphs", () => {
     expect(deliveryMetadataPolicy({
       recipe: "bounded",
       diff: "diff --git a/src/api.ts b/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-old\n+export const api = true;",
-    })).toMatchObject({ mode: "pr-writer", capabilityId: "pr-writer" });
+    })).toMatchObject({ mode: "deterministic", capabilityId: null });
   });
 });
 

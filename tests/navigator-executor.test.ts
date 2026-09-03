@@ -533,7 +533,7 @@ describe("navigator-v1 durable executor slice", () => {
       workflowMode: "deterministic",
       artifactBindings: [],
     });
-    expect(NAVIGATOR_SKILL_CATALOG).toHaveLength(36);
+    expect(NAVIGATOR_SKILL_CATALOG).toHaveLength(35);
   });
 
   it("accepts one strict admitted read-only proposal and creates its effect atomically", async () => {

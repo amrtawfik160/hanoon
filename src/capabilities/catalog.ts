@@ -71,7 +71,6 @@ const ADMITTED_SKILL_BUNDLE = {
   handoff: { sourceDigest: "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25", bundleDescriptorDigest: "423c22f3804d4033a4435e629187bad38242fe76199376cc2ee039bf025753ff", invocationClass: "user" },
   implement: { sourceDigest: "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3", bundleDescriptorDigest: "e41da514b2c2f671bff0efc0dee773a606842c84ae1dccb6e5f82d43595a80ef", invocationClass: "user" },
   "improve-codebase-architecture": { sourceDigest: "d1ac25511a936ff4250a48dbcefda363837d6bb9321b3cba73df99fa37270a75", bundleDescriptorDigest: "24732f0720aaa6b7dd37db3669e394722698d24ba0578098ed3990fab739ac9b", invocationClass: "user" },
-  "pr-writer": { sourceDigest: "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc", bundleDescriptorDigest: "6fe1ab2cbe47303da8a613703b3e7d49c5e7ffd03f7273d365a1584ac4e7e11f", invocationClass: "model" },
   prototype: { sourceDigest: "714de632d116bb73f65cdb5a882db15b9369a6713b9a47c0fad827848f0bfbe3", bundleDescriptorDigest: "7bd26fbafde838442449be94facaee393a9c89fc783b7975b68fc3f468bb67ab", invocationClass: "model" },
   research: { sourceDigest: "985569f15739c713d6784887c3d186d4ef9ac85bec5ad9c068d25bf0739928e4", bundleDescriptorDigest: "0607555f7ea8634bff956695f02c42c4f87a814dcf1761a5555833235be0e312", invocationClass: "model" },
   "resolving-merge-conflicts": { sourceDigest: "9d8114f8ef0b31f535a265fc05c364bd8cf2e2895a830040e06c22acb11f54b0", bundleDescriptorDigest: "0d0b45ea81e64fe6eaa4e2650770d4015363c4ccf6638b76546809ed447494c8", invocationClass: "model" },
@@ -97,6 +96,10 @@ const LEGACY_SKILL_DIGESTS = {
   "dispatching-parallel-agents": "1968923066f3b707eb01d1992cdf4c42284c3855f70253b9cd5000ff45fca13c",
   "executing-plans": "c4c3d8b628c51114cd165fb8246fe02744cd8be180032328391252e653028d9b",
   "finishing-a-development-branch": "8db5a922b242dd4e1bf824cb91c13b3e8d8e8a86d6ceaf7f0774eb9cce909d65",
+  // Retired from the bundle in favour of show-me. The digest is the one the
+  // frozen recipe-v1 registry was computed from, so it must not be re-derived:
+  // an installed job recorded that registry digest and still has to resolve.
+  "pr-writer": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc",
   "proportional-development-workflow": "96870c75b91543cf751afa47bd9a217f99c3d5e8d27ccdada6e1dcfec3af2096",
   "receiving-code-review": "091df1629510af1b92fc4abd6f96732ebedb4cb2c0f3457e8f2740b0504a2438",
   "requesting-code-review": "d71cc01ba56d2325cf8af5f7c11837819b63ecd57de0bfdb812f7f3ff7751df8",
@@ -677,7 +680,7 @@ if (historicalDigests.graph !== HISTORICAL_RECIPE_GRAPH_DIGEST) {
 
 const RETAINED_WORKER_SKILL_IDS = new Set<AdmittedCapabilitySkillId>([
   "blast-radius", "checking-system-logs", "clean-code-guard", "docs-guard", "driving-bb",
-  "durable-boundary-audit", "pr-writer", "technical-writing", "test-guard", "unslop",
+  "durable-boundary-audit", "show-me", "technical-writing", "test-guard", "unslop",
 ]);
 
 function admittedSkillRoute(id: AdmittedCapabilitySkillId): CapabilityRoute {
@@ -689,7 +692,6 @@ function admittedSkillSource(id: AdmittedCapabilitySkillId): { source: string; v
   if (["clean-code-guard", "docs-guard", "test-guard"].includes(id)) {
     return { source: "https://github.com/amElnagdy/guard-skills", version: "pinned" };
   }
-  if (id === "pr-writer") return { source: "https://github.com/getsentry/skills", version: "pinned" };
   if (id === "technical-writing" || id === "unslop") {
     return { source: "https://github.com/cursor/plugins", version: "pstack@60c641e4" };
   }
@@ -747,20 +749,12 @@ function admittedSkillRouting(id: AdmittedCapabilitySkillId): Pick<DescriptorInp
         evidenceStrength: "high",
         modelPools: ["standard", "strong"],
       };
-    case "pr-writer":
-      return {
-        roles: ["implementation"],
-        stages: ["delivery"],
-        receiptType: "worker",
-        modelPools: ["fast", "standard"],
-      };
-    // Draws the sketch a PR description opens with, so it follows the prose
-    // writer it illustrates rather than competing with it for the same text.
+    // The delivery-stage writer: it turns the exact final diff into the
+    // reviewer-facing description, as a sketch, diagram, or code shape.
     case "show-me":
       return {
         roles: ["implementation"],
         stages: ["delivery"],
-        orderAfter: ["pr-writer"],
         receiptType: "worker",
         modelPools: ["fast", "standard"],
       };

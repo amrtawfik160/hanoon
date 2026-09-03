@@ -1724,7 +1724,6 @@ it("routes verified implementation attempts through their exact durable effect b
       "clean-code-guard",
       "test-guard",
       "durable-boundary-audit",
-      "pr-writer",
       "show-me",
     ],
   });

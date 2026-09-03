@@ -105,7 +105,7 @@ function recipeWorkOrder(job: Job): Readonly<{ outcome: string; workflow: readon
           "Inspect only the directly affected files and preserve existing behavior outside the request.",
           "Make the smallest clear change; add tests only when logic, state, data, a regression, or a public contract changed.",
           "Run the selected verification or focused check appropriate to the exact change.",
-          "Use deterministic delivery metadata; do not invoke pr-writer for a trivial final diff.",
+          "Use deterministic delivery metadata; do not invoke a writing skill for a trivial final diff.",
         ],
       };
     case "bounded":

@@ -44,7 +44,7 @@ test("rebuild-lock cannot rebuild the lock outside the reviewed-source maintaine
   expect(readFileSync(join(root, "skills/skills.lock.json"), "utf8")).toBe(before);
 });
 
-test("committed lock still admits 36 skills with no leftover kits", () => {
+test("committed lock still admits 35 skills with no leftover kits", () => {
   const lock = JSON.parse(readFileSync(join(repositoryRoot, "skills/skills.lock.json"), "utf8")) as {
     skills: Array<{ id: string }>;
     legacySkills: unknown[];
@@ -53,7 +53,7 @@ test("committed lock still admits 36 skills with no leftover kits", () => {
     discoveryKit?: unknown;
   };
 
-  expect(lock.skills).toHaveLength(36);
+  expect(lock.skills).toHaveLength(35);
   expect(lock.legacySkills).toEqual([]);
   expect(lock.shadowedSkills).toEqual([]);
   expect(lock.workflowKit).toBeUndefined();

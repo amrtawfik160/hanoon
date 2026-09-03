@@ -115,7 +115,6 @@ Unknown fields, unknown enum values, incomplete executable descriptors, digest m
 | `clean-code-guard` | worker | Production-code diff |
 | `test-guard` | worker | Test-code diff |
 | `docs-guard` | worker | Technical-documentation diff |
-| `pr-writer` | worker | Nontrivial exact final diff; metadata only |
 | `using-superpowers` | hanoon-native | Profile selection and workflow discipline |
 | `using-git-worktrees` | hanoon-native | Managed-worktree lifecycle and safety checks |
 | `dispatching-parallel-agents` | hanoon-native | Independent parallel lanes selected by the executor |
@@ -138,7 +137,6 @@ The registry enforces these initial composition rules:
 - bug diagnosis precedes regression-test and implementation work;
 - `receiving-code-review` activates only for remediation;
 - changed files select applicable guards from the exact diff;
-- `pr-writer` receives the exact final diff after implementation and remediation settle;
 - orchestration-route skills are never injected into a worker;
 - communication guidance is excluded from strict structured-output roles;
 - a documentation worker runs only when deterministic change-surface triage selects it;
@@ -172,7 +170,7 @@ Observed paths, schemas, dependencies, diffs, or failures may promote rigor. At 
 | Skill authoring | failing baseline pressure test → skill change → compliance test → review → delivery |
 | Adopted PR | resolve exact remote head → inspect → validate → independent review → bounded remediation when required → delivery |
 
-For any recipe, observed diff triggers and project policy add mandatory checks. A repository change intended for merge still requires the existing exact-head independent review and owner approval, even when its recipe otherwise omits a general review stage. Trivial direct changes use deterministic delivery metadata; `pr-writer` handles nontrivial final diffs. Delivery metadata does not grant commit, push, pull-request, merge, or deployment authority; the executor alone performs authorized effects.
+For any recipe, observed diff triggers and project policy add mandatory checks. A repository change intended for merge still requires the existing exact-head independent review and owner approval, even when its recipe otherwise omits a general review stage. Every recipe uses deterministic delivery metadata: this engine's catalog is frozen and no longer carries a skill that writes it. Delivery metadata does not grant commit, push, pull-request, merge, or deployment authority; the executor alone performs authorized effects.
 
 ## Controller capability bundles
 

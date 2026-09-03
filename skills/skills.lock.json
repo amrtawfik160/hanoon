@@ -15,11 +15,6 @@
     "license": "MIT",
     "licensePath": "skills/guards/LICENSE"
   },
-  "deliveryKit": {
-    "sourceUrl": "https://github.com/getsentry/skills",
-    "license": "Apache-2.0",
-    "licensePath": "skills/delivery/LICENSE"
-  },
   "hanoonKit": {
     "sourceUrl": "first-party",
     "license": "first-party",
@@ -226,17 +221,6 @@
       "descriptorDigest": "24732f0720aaa6b7dd37db3669e394722698d24ba0578098ed3990fab739ac9b"
     },
     {
-      "id": "pr-writer",
-      "skillPath": "skills/delivery/pr-writer/SKILL.md",
-      "sourcePath": "skills/delivery/pr-writer/SKILL.md",
-      "source": "https://github.com/getsentry/skills",
-      "sourceRevision": "vendored",
-      "sourceDigest": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc",
-      "license": "Apache-2.0",
-      "invocationClass": "model",
-      "descriptorDigest": "6fe1ab2cbe47303da8a613703b3e7d49c5e7ffd03f7273d365a1584ac4e7e11f"
-    },
-    {
       "id": "prototype",
       "skillPath": "skills/matt-pocock/engineering/prototype/SKILL.md",
       "sourcePath": "skills/engineering/prototype",
@@ -438,14 +422,6 @@
   "legacySkills": [],
   "shadowedSkills": [],
   "files": [
-    {
-      "path": "skills/delivery/LICENSE",
-      "sha256": "96e78a9ce85795b117c8929887bdb78f88bf23f7b85a31f0872cde4dff7e92cd"
-    },
-    {
-      "path": "skills/delivery/pr-writer/SKILL.md",
-      "sha256": "785a2b1f084407e42f61661f83c7b0c621889865a483774f44c893c0cbcf57bc"
-    },
     {
       "path": "skills/guards/clean-code-guard/agents/openai.yaml",
       "sha256": "9ad8cf7e8898531829bbb9dce8764fb3e727ea290798f897a8bfaffa0b9b379e"

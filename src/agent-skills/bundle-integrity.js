@@ -4,7 +4,6 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
-  DELIVERY_KIT,
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
@@ -46,7 +45,6 @@ const requiredMattSkillRoots = REQUIRED_MATT_POCOCK_SKILLS.map((skill) =>
 const expectedKits = [
   ["mattPocockKit", "matt-pocock-kit", MATT_POCOCK_KIT],
   ["guardKit", "guard-kit", GUARD_KIT],
-  ["deliveryKit", "delivery-kit", DELIVERY_KIT],
   ["hanoonKit", "hanoon-kit", HANOON_KIT],
   ["pstackKit", "pstack-kit", PSTACK_KIT],
   ["humanlayerKit", "humanlayer-kit", HUMANLAYER_KIT],

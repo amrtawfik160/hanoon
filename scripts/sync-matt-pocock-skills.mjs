@@ -17,7 +17,6 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
-  DELIVERY_KIT,
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
@@ -343,7 +342,7 @@ function sortedSkillRecords(rootByPublicPath, requiredSkills) {
 }
 
 function assertSkillCatalog(skills, legacySkills, shadowedSkills) {
-  if (skills.length !== 36 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
+  if (skills.length !== 35 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
     skills.length + legacySkills.length + shadowedSkills.length > MAX_SKILLS) {
     fail("required active, legacy, or shadowed skill catalog differs");
   }
@@ -383,7 +382,6 @@ function buildLock(stagedMatt) {
     schemaVersion: LOCK_SCHEMA_VERSION,
     mattPocockKit: MATT_POCOCK_KIT,
     guardKit: GUARD_KIT,
-    deliveryKit: DELIVERY_KIT,
     hanoonKit: HANOON_KIT,
     pstackKit: PSTACK_KIT,
     humanlayerKit: HUMANLAYER_KIT,

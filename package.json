@@ -16,7 +16,6 @@
     "server": "./server.ts",
     "skills": [
       "skills/guards",
-      "skills/delivery",
       "skills/matt-pocock/engineering",
       "skills/matt-pocock/productivity",
       "skills/hanoon",

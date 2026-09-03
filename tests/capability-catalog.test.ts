@@ -37,7 +37,6 @@ const EXPECTED_SKILL_ROUTES = {
   handoff: "manual-only",
   implement: "manual-only",
   "improve-codebase-architecture": "manual-only",
-  "pr-writer": "worker",
   prototype: "worker",
   research: "worker",
   "resolving-merge-conflicts": "worker",
@@ -67,7 +66,7 @@ function redigest(descriptor: CapabilityDescriptor): CapabilityDescriptor {
 }
 
 describe("capability catalog", () => {
-  it("freezes the historical recipe registry while the live catalog admits 36 navigator skills", () => {
+  it("freezes the historical recipe registry while the live catalog admits 35 navigator skills", () => {
     expect(HISTORICAL_RECIPE_REGISTRY_DIGEST)
       .toBe("d14130f744f1ca484beec08d8956a20e16db854b88a304f9576fcc79bdaa0481");
     expect(HISTORICAL_RECIPE_GRAPH_DIGEST)
@@ -76,6 +75,10 @@ describe("capability catalog", () => {
     expect(CAPABILITY_GRAPH_DIGEST).not.toBe(HISTORICAL_RECIPE_GRAPH_DIGEST);
     expect(HISTORICAL_RECIPE_CAPABILITY_CATALOG.some((entry) => entry.id === "using-superpowers")).toBe(true);
     expect(CAPABILITY_CATALOG.some((entry) => entry.id === "using-superpowers")).toBe(false);
+    // Retired from the bundle, but its frozen recipe-v1 descriptor must survive
+    // so an installed job's recorded digest still resolves.
+    expect(HISTORICAL_RECIPE_CAPABILITY_CATALOG.some((entry) => entry.id === "pr-writer")).toBe(true);
+    expect(CAPABILITY_CATALOG.some((entry) => entry.id === "pr-writer")).toBe(false);
     expect(CAPABILITY_CATALOG.some((entry) => entry.kind === "recipe")).toBe(false);
     expect(CAPABILITY_CATALOG.some((entry) => entry.kind === "native-adapter")).toBe(false);
   });
