@@ -327,7 +327,7 @@ import {
 } from "./stage-execution-repository";
 import type { BrokerBindingState, BrokerRequestEnvelope, CredentialBindingMetadata } from "../credentials/protocol";
 import { NavigatorRepository } from "../navigator/repository";
-import type { NavigatorTicketWorkerOutcome } from "../navigator/implementation-executor";
+import type { NavigatorTicketWorkerOutcome } from "../navigator/ticket-settlement-repository";
 import type {
   NavigatorArtifactBinding,
   NavigatorInferenceObservation,
@@ -355,6 +355,7 @@ import type {
   NavigatorReleaseReceipt,
   NavigatorTicketAttemptContext,
   NavigatorTicketSettlementInput,
+  NavigatorTicketWorkerResourceBindingInput,
   NavigatorSkillReceipt,
 } from "../navigator/effect-contracts";
 import { navigatorReleaseReceiptSchema } from "../navigator/effect-contracts";
@@ -905,8 +906,6 @@ export type NavigatorReleaseEffectSettlementInput = ExecutorFence & Readonly<{
   environmentId: string;
   receipt: NavigatorReleaseReceipt;
 }>;
-
-type NavigatorTicketSettlementHandler = (input: NavigatorTicketSettlementInput) => NavigatorTicketWorkerOutcome | null;
 
 function navigatorReleaseStartedEvent(
   input: NavigatorReleaseEffectSettlementInput,
@@ -4189,7 +4188,7 @@ export interface TelegramAgentStore {
     generation: number;
     now: number;
   }): NavigatorTicketAttemptContext | null;
-  registerNavigatorTicketSettlement(handler: NavigatorTicketSettlementHandler): void;
+  bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean;
   settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
@@ -5862,7 +5861,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly referenceRepository: ReferenceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
   private readonly navigatorRepository: NavigatorRepository;
-  private navigatorTicketSettlementHandler: NavigatorTicketSettlementHandler | null = null;
   private readonly taskAuthorityRepository: TaskAuthorityRepository;
   private readonly releaseAuthorityRepository: ReleaseAuthorityRepository;
   private readonly ownerBoundaryRepository: OwnerBoundaryRepository;
@@ -13320,12 +13318,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.getNavigatorTicketAttemptContext(input);
   }
 
-  public registerNavigatorTicketSettlement(handler: NavigatorTicketSettlementHandler): void {
-    this.navigatorTicketSettlementHandler = handler;
+  public bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean {
+    return this.navigatorRepository.bindNavigatorTicketWorkerResource(input);
   }
 
   public settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null {
-    return this.navigatorTicketSettlementHandler?.(input) ?? null;
+    return this.navigatorRepository.settleNavigatorTicketWorkerAttempt(input);
   }
 
   public getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null {

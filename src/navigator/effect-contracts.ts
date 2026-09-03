@@ -161,3 +161,17 @@ export type NavigatorTicketSettlementInput = Readonly<{
   generation: number;
   now: number;
 }>;
+
+export type NavigatorTicketWorkerResource = Readonly<{
+  kind: "bb_thread";
+  id: string;
+}>;
+
+export type NavigatorTicketWorkerResourceBindingInput = Readonly<{
+  attemptId: string;
+  effectIdempotencyKey: string;
+  resource: NavigatorTicketWorkerResource;
+  ownerId: string;
+  generation: number;
+  now: number;
+}>;

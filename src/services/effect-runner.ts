@@ -226,7 +226,14 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "stop_thread": return [];
     case "steer_implementation": return ["implementing", "remediating"];
     case "reconcile_job": return [];
-    default: return [];
+    case "run_navigator_skill":
+    case "run_navigator_ticket_worker":
+    case "run_navigator_release":
+      return [];
+    default: {
+      const unreachable: never = kind;
+      return [unreachable];
+    }
   }
 }
 

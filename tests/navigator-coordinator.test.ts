@@ -16,14 +16,18 @@ import {
 } from "../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
-  type NavigatorTicketWorkerAttempt,
 } from "../src/navigator/implementation-executor";
+import {
+  createNavigatorTicketEffectAdapter,
+  type NavigatorTicketWorkerInput,
+  type NavigatorTicketWorkerOperation,
+} from "../src/navigator/ticket-adapter";
+import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
 import { DurableNavigatorPromotionEvidenceReader } from "../src/navigator/promotion-evidence";
 import {
   NAVIGATOR_LIVE_SCENARIOS,
   NavigatorPromotionService,
 } from "../src/navigator/promotion";
-import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
 import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import { navigatorReleaseOperationId } from "../src/navigator/release-contracts";
@@ -40,6 +44,23 @@ let fixtureSequence = 0;
 
 function modelRoute() {
   return { pool: "strong" as const, ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong };
+}
+
+function ticketProtocol(
+  store: TelegramAgentStore,
+  now: () => number,
+  operation: NavigatorTicketWorkerOperation,
+): NavigatorEffectProtocol {
+  const unused = async () => ({ outcome: "permanent" as const, reason: "unused in coordinator test" });
+  return new NavigatorEffectProtocol({
+    store,
+    clock: { now },
+    adapters: [
+      { kind: "run_navigator_skill", execute: unused },
+      createNavigatorTicketEffectAdapter(operation),
+      { kind: "run_navigator_release", execute: unused },
+    ],
+  });
 }
 
 function artifactInput(input: Readonly<{
@@ -374,15 +395,19 @@ describe("disposable navigator live path", () => {
     });
     database.prepare("UPDATE jobs SET state = 'implementing' WHERE id = ?").run(draft.id);
     const lease = { generation: leaseGeneration };
+    const claimTime = now();
+    database.prepare(
+      `INSERT INTO job_resource_claims (
+         job_id, resource_key, resource_kind, state, owner_id, generation,
+         lease_expires_at, acquired_at, renewed_at
+       ) VALUES (?, ?, 'project', 'held', 'executor', ?, ?, ?, ?)`,
+    ).run(draft.id, projectResourceKey("proj_1"), lease.generation, claimTime + 100_000, claimTime, claimTime);
 
-    const workerRunner = {
-      run: vi.fn(async (attempt: NavigatorTicketWorkerAttempt, hooks: {
-        bindResource(resource: { kind: "bb_thread"; id: string }): Promise<void>;
-      }) => {
+    const ticketOperation: NavigatorTicketWorkerOperation = {
+      run: vi.fn(async (input: NavigatorTicketWorkerInput) => {
+        const { attempt, ticket: ticketSnapshot } = input;
         const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
-        await hooks.bindResource(resource);
         if (attempt.kind === "implementation") {
-          const ticketSnapshot = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
           return {
             resource,
             result: {
@@ -442,7 +467,21 @@ describe("disposable navigator live path", () => {
           },
         };
       }),
-      reconcileUnavailableResource: vi.fn(),
+      reconcile: vi.fn(),
+      observe: async (request) => ({
+        kind: "navigator_git_observation" as const,
+        worktreeId: request.worktreeId,
+        branch: request.integrationBranch,
+        headSha: request.expectedHeadSha,
+        baseHeadSha: request.baseHeadSha,
+        baseHeadIsAncestor: true,
+        comparisonBaseHeadSha: request.comparisonBaseHeadSha,
+        comparisonBaseHeadIsAncestor: true,
+        clean: true,
+        changedPaths: [...request.expectedChangedPaths],
+        evidenceRef: `git-observation:${request.expectedHeadSha}`,
+        observedAt: now(),
+      }),
     };
     const pullRequests = {
       createOrRefresh: vi.fn(async (request: Readonly<{ headSha: string; operationId: string }>) => ({
@@ -456,7 +495,6 @@ describe("disposable navigator live path", () => {
     const executor = new NavigatorImplementationExecutor({
       store,
       database,
-      workerRunner,
       gitObserver: {
         observe: async (request) => ({
           kind: "navigator_git_observation",
@@ -480,6 +518,7 @@ describe("disposable navigator live path", () => {
       }),
       clock: { now },
     });
+    const protocol = ticketProtocol(store, now, ticketOperation);
     executor.startIntegration({
       jobId: draft.id,
       specificationArtifactId: specificationId,
@@ -571,9 +610,9 @@ describe("disposable navigator live path", () => {
       ownerId: "executor",
       generation: lease.generation,
     });
-    await executor.processOne(fence, new AbortController().signal);
-    await executor.processOne(fence, new AbortController().signal);
-    await executor.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
     const firstSlice = executor.snapshot(draft.id);
     expect(firstSlice.activeSlice?.state).toBe("repair_pending");
     const repairSnapshot = executor.prepareRepairNavigation({
@@ -596,8 +635,8 @@ describe("disposable navigator live path", () => {
       ticketArtifactId: firstTicketId,
       proposalId: repairDecision.proposalId,
     });
-    await executor.processOne(fence, new AbortController().signal);
-    await executor.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
     const firstAccepted = executor.snapshot(draft.id);
     const firstReview = [...firstAccepted.attempts].reverse().find((attempt) => attempt.kind === "review")!;
     close(firstTicketId, firstReview.id);
@@ -613,8 +652,8 @@ describe("disposable navigator live path", () => {
       ownerId: "executor",
       generation: lease.generation,
     });
-    await executor.processOne(fence, new AbortController().signal);
-    await executor.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
+    await protocol.processOne(fence, new AbortController().signal);
     const secondAccepted = executor.snapshot(draft.id);
     const secondReview = [...secondAccepted.attempts].reverse().find((attempt) =>
       attempt.kind === "review" && attempt.workOrder.ticket.artifactId === secondTicketId)!;
@@ -655,11 +694,17 @@ describe("disposable navigator live path", () => {
     });
     expect(releaseDecision.decision).toBe("accepted");
     const releaseClaimNow = now();
+    // Ticket execution may already hold one of these, so the executor's hold is
+    // ensured rather than assumed absent.
     const insertReleaseClaim = database.prepare(
       `INSERT INTO job_resource_claims (
          job_id, resource_key, resource_kind, state, owner_id, generation,
          lease_expires_at, acquired_at, renewed_at
-       ) VALUES (?, ?, ?, 'held', 'executor', ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, 'held', 'executor', ?, ?, ?, ?)
+       ON CONFLICT(resource_key) WHERE state = 'held' DO UPDATE SET
+         job_id = excluded.job_id, resource_kind = excluded.resource_kind,
+         owner_id = excluded.owner_id, generation = excluded.generation,
+         lease_expires_at = excluded.lease_expires_at, renewed_at = excluded.renewed_at`,
     );
     insertReleaseClaim.run(draft.id, projectResourceKey("proj_1"), "project", lease.generation, 130_000, releaseClaimNow, releaseClaimNow);
     insertReleaseClaim.run(draft.id, repositoryMergeResourceKey("acme/cyndra"), "repository_merge", lease.generation, 130_000, releaseClaimNow, releaseClaimNow);

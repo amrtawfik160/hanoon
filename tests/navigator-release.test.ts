@@ -159,7 +159,6 @@ function startResolvedIntegration(
   const executor = new NavigatorImplementationExecutor({
     store: fixture.store,
     database: fixture.database,
-    workerRunner: { run: vi.fn(), reconcileUnavailableResource: vi.fn() },
     gitObserver: {
       observe: vi.fn(async (request) => ({
         kind: "navigator_git_observation" as const,
