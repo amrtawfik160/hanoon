@@ -6,7 +6,7 @@ import type {
 } from "../storage/store";
 import type { EffectFence } from "../services/effect-runner";
 import {
-  ControllerImagePreparationError,
+  ControllerAttachmentPreparationError,
   parseControllerInteractionResolution,
   type ControllerInteractionReference,
   type ControllerInteractionSnapshot,
@@ -21,7 +21,18 @@ import {
   controllerInteractionResolutionMatches,
 } from "./interaction-service";
 import { parseControllerInteraction } from "./questions";
-import type { ControllerThreadRecord, ControllerTurnRecord } from "./models";
+import type {
+  ControllerAttachment,
+  ControllerThreadRecord,
+  ControllerTurnRecord,
+} from "./models";
+import {
+  CONTROLLER_DOCUMENT_INLINE_MAX_CHARS,
+  MAX_CONTROLLER_DOCUMENT_BYTES,
+  controllerAttachmentsForTurn,
+  isTextDocument,
+} from "./models";
+import { burstMemberView, renderBurstTranscript, type ControllerBurstMemberView } from "./burst";
 import { normalizeControllerEventObservation, projectControllerStream } from "./stream";
 import type { ControllerEventObservation } from "./bb-controller";
 import { buildTurnContext, composeTurnInput } from "./context";
@@ -32,12 +43,34 @@ import {
   type ControllerEvidenceReconciler,
 } from "./evidence-projector";
 
+/**
+ * The composer's view of one burst member, with its text document inlined
+ * when it was fetched and is short enough to read in the transcript. Inlined
+ * bodies exist only in the dispatch text and are never persisted, so a
+ * forwarded document cannot leak through the plugin's records.
+ */
+function inlinedMemberView(
+  member: ControllerTurnRecord,
+  fetched: ReadonlyMap<string, Uint8Array>,
+): ControllerBurstMemberView {
+  const view = burstMemberView(member);
+  const document = member.document;
+  if (!document) return view;
+  const bytes = fetched.get(document.fileId);
+  if (bytes === undefined) return view;
+  const text = new TextDecoder().decode(bytes);
+  if (text.length > CONTROLLER_DOCUMENT_INLINE_MAX_CHARS) return view;
+  return { ...view, inlineText: text, inlineFileName: document.fileName };
+}
+
 export type LunaControllerServiceDependencies = {
   store: TelegramAgentStore;
   adapter: ControllerAdapter;
   interactionService?: ControllerInteractionService;
   evidenceProjector: ControllerEvidenceReconciler;
   clock: { now(): number };
+  /** Telegram file download, used to inline short text documents into the dispatch. */
+  downloadFile?: (fileId: string, maxBytes: number, signal: AbortSignal) => Promise<Uint8Array>;
   warn?: (message: string) => void;
 };
 
@@ -64,7 +97,7 @@ export const CONTROLLER_BUSY_NOTICE_MS = 2 * 60_000;
 // unrelated busy state would otherwise strand queued owner input forever.
 export const CONTROLLER_BUSY_ROLLOVER_MS = CONTROLLER_STALL_MS + 2 * 60_000;
 const MAX_STEER_ATTEMPTS = 3;
-const MAX_IMAGE_PREPARATION_ATTEMPTS = 3;
+const MAX_ATTACHMENT_PREPARATION_ATTEMPTS = 3;
 export const CONTROLLER_COMPLETION_RECOVERY_PROMPT =
   "Your previous turn ended without an accepted telegram_agent_respond call. Inspect telegram_agent_turn_evidence, correct any rejected finalization, and make telegram_agent_respond your final action now. Do not repeat a side effect.";
 export const CONTROLLER_RECOVERY_PROMPT = CONTROLLER_COMPLETION_RECOVERY_PROMPT;
@@ -155,7 +188,7 @@ export class LunaControllerService {
           this.requeueAfterTransientRead(turn, fence, "Controller event baseline was invalid");
           return true;
         }
-        const input = this.composeInput(turn, { includeDigest: false });
+        const input = await this.composeInput(turn, signal, { includeDigest: false });
         if (!this.providerMutationAllowed(turn, controller, fence, signal)) return true;
         if (!this.dependencies.store.prepareControllerDispatch({
           ...fenceAt(fence, this.dependencies.clock.now()),
@@ -165,13 +198,15 @@ export class LunaControllerService {
           dispatchAfterSeq,
         })) return true;
         try {
-          if (turn.image) {
-            await this.dependencies.adapter.send(controller.threadId, input, signal, turn.image, turn.modelFallbackIndex);
-          } else {
-            await this.dependencies.adapter.send(controller.threadId, input, signal, null, turn.modelFallbackIndex);
-          }
+          await this.dependencies.adapter.send(
+            controller.threadId,
+            input.text,
+            signal,
+            input.attachments.length > 0 ? input.attachments : null,
+            turn.modelFallbackIndex,
+          );
         } catch (error) {
-          if (this.handleImagePreparationError(error, turn, fence, signal)) return true;
+          if (this.handleAttachmentPreparationError(error, turn, fence, signal)) return true;
           if (!this.dependencies.store.markControllerDeliveryUnknown({
             ...fenceAt(fence, this.dependencies.clock.now()),
             turnId: turn.id,
@@ -237,6 +272,15 @@ export class LunaControllerService {
     const pending = this.dependencies.store.getPendingControllerTurn(controller.controllerKey);
     if (pending?.state !== "submitted" || pending.awaitingInteractionId !== null) return null;
     return Math.max(0, pending.updatedAt + CONTROLLER_STALL_MS - now);
+  }
+
+  /**
+   * Milliseconds until a waiting burst has gone quiet and can be claimed whole,
+   * or null when nothing is waiting. A lone message therefore waits at most one
+   * quiet gap rather than the executor's ordinary idle poll.
+   */
+  public nextBurstQuietWaitMs(now: number): number | null {
+    return this.dependencies.store.nextControllerBurstQuietMs(now);
   }
 
   public async reconcile(fence: EffectFence, signal: AbortSignal): Promise<boolean> {
@@ -426,7 +470,7 @@ export class LunaControllerService {
       );
       return true;
     }
-    if (status === "active" || status === "starting" || status === "stopping") {
+    if (status === "active" || status === "pending" || status === "starting" || status === "stopping") {
       if (!accepted) {
         this.dependencies.store.refreshControllerDraft({
           ...fenceAt(fence, refreshedAt),
@@ -436,26 +480,38 @@ export class LunaControllerService {
         // Anything the owner says while an answer is being written belongs to that
         // answer. Holding it back until the turn ends is how a correction arrives
         // too late to correct anything.
-        const waiting = parked === null
-          ? this.dependencies.store.getQueuedControllerTurn(controller.controllerKey)
+        // The waiting burst is selected under the same gap and caps as a
+        // claimed one, so a correction that is still arriving is not steered
+        // half-empty, and the whole addition reaches the answer at once.
+        const waitingBurst = parked === null
+          ? this.dependencies.store.getQueuedControllerSteerBurst(controller.controllerKey, this.dependencies.clock.now())
           : null;
-        if (waiting && !waiting.image && waiting.recoverySourceTurnId === null &&
+        const waiting = waitingBurst?.leader ?? null;
+        if (waiting && !waiting.image && !waiting.document &&
+            waiting.recoverySourceTurnId === null &&
             waiting.retryCount < MAX_STEER_ATTEMPTS) {
           if (signal.aborted || !this.dependencies.store.reserveControllerSteer({
             ...fenceAt(fence, this.dependencies.clock.now()),
             runningTurnId: turn.id,
             waitingTurnId: waiting.id,
+            memberTurnIds: waitingBurst!.members.map((member) => member.id),
             controllerKey: turn.controllerKey,
             expectedThreadId: controller.threadId,
           })) return true;
+          // The reservation holds the combined attributed transcript, so the
+          // steer and its later reconciliation replay exactly the same text.
+          const reserved = this.dependencies.store.getControllerSteerReservation(turn.controllerKey);
+          const steerText = reserved?.waitingTurnId === waiting.id && reserved.inputText !== null
+            ? reserved.inputText
+            : waiting.inputText;
           let outcome: ControllerSteerReconciliation = "applied";
           try {
-            await this.dependencies.adapter.steer(controller.threadId, waiting.inputText, signal);
+            await this.dependencies.adapter.steer(controller.threadId, steerText, signal);
           } catch {
             // A thrown call may have reached BB; reconcile before choosing any retry.
             outcome = await this.reconcileProviderSteer({
               threadId: controller.threadId,
-              inputText: waiting.inputText,
+              inputText: steerText,
               idempotencyKey: `controller-steer:${turn.id}:${waiting.id}`,
             }, signal);
           }
@@ -1416,7 +1472,8 @@ export class LunaControllerService {
     }
     // A replacement thread opens with the conversation so far, so retiring a
     // failed thread costs the owner a pause rather than the whole conversation.
-    const seeded = { ...turn, inputText: this.composeInput(turn, { includeDigest: true }) };
+    const input = await this.composeInput(turn, signal, { includeDigest: true });
+    const seeded = { ...turn, inputText: input.text };
     if (!this.providerMutationAllowed(turn, controller, fence, signal)) {
       if (signal.aborted) {
         this.dependencies.store.requeueControllerTurn({
@@ -1432,9 +1489,14 @@ export class LunaControllerService {
       kind: "spawn",
     })) return null;
     try {
-      return await this.dependencies.adapter.spawn(seeded, controller, signal);
+      return await this.dependencies.adapter.spawn(
+        seeded,
+        controller,
+        signal,
+        input.attachments.length > 0 ? input.attachments : null,
+      );
     } catch (error) {
-      if (this.handleImagePreparationError(error, turn, fence, signal)) return null;
+      if (this.handleAttachmentPreparationError(error, turn, fence, signal)) return null;
       if (!this.dependencies.store.markControllerDeliveryUnknown({
         ...fenceAt(fence, this.dependencies.clock.now()),
         turnId: turn.id,
@@ -1447,20 +1509,64 @@ export class LunaControllerService {
     }
   }
 
-  private composeInput(turn: ControllerTurnRecord, options: { includeDigest: boolean }): string {
+  /**
+   * What one dispatch hands the adapter: the composed text, and every file the
+   * burst carries across the leader and all its members.
+   */
+  private async composeInput(
+    turn: ControllerTurnRecord,
+    signal: AbortSignal,
+    options: { includeDigest: boolean },
+  ): Promise<{ text: string; attachments: ControllerAttachment[] }> {
+    const burst = [turn, ...this.dependencies.store.listControllerBurstMembers(turn.id)];
+    const attachments = burst.flatMap((member) => controllerAttachmentsForTurn(member));
+    // A text document is fetched once per dispatch: the bytes that inline it
+    // are the bytes the adapter uploads, so the same file is never downloaded
+    // twice.
+    const fetched = await this.fetchTextDocuments(burst, signal);
+    for (const attachment of attachments) {
+      const bytes = fetched.get(attachment.fileId);
+      if (attachment.kind === "document" && bytes !== undefined) attachment.bytes = bytes;
+    }
+    const transcript = renderBurstTranscript(burst.map((member) => inlinedMemberView(member, fetched)));
     const recovery = turn.completionContinuations >= 2 || turn.recoverySourceTurnId !== null
       ? { privateDraft: turn.privateDraftText, sourceTurnId: turn.recoverySourceTurnId }
       : undefined;
     const context = buildTurnContext({
       store: this.dependencies.store,
       controllerKey: turn.controllerKey,
-      inputText: turn.inputText,
+      inputText: transcript,
       includeDigest: options.includeDigest || recovery !== undefined,
       turnId: turn.id,
       recovery,
       now: this.dependencies.clock.now(),
     });
-    return composeTurnInput(context, turn.inputText);
+    return { text: composeTurnInput(context, transcript), attachments };
+  }
+
+  /**
+   * The Markdown and plain-text documents a burst carries, downloaded once and
+   * keyed by Telegram file id. A document that fails to download is simply
+   * absent: the attachment still rides with the dispatch, and only the
+   * readable copy in the transcript is missing.
+   */
+  private async fetchTextDocuments(
+    burst: readonly ControllerTurnRecord[],
+    signal: AbortSignal,
+  ): Promise<Map<string, Uint8Array>> {
+    const fetched = new Map<string, Uint8Array>();
+    const download = this.dependencies.downloadFile;
+    if (download === undefined) return fetched;
+    for (const member of burst) {
+      const document = member.document;
+      if (!document || !isTextDocument(document.mimeType)) continue;
+      try {
+        fetched.set(document.fileId, await download(document.fileId, MAX_CONTROLLER_DOCUMENT_BYTES, signal));
+      } catch {
+        // Documented above: a missing readable copy is not a failed dispatch.
+      }
+    }
+    return fetched;
   }
 
   private providerMutationAllowed(
@@ -1520,24 +1626,28 @@ export class LunaControllerService {
     });
   }
 
-  private failImage(turn: ControllerTurnRecord, fence: EffectFence): void {
+  private failAttachment(
+    turn: ControllerTurnRecord,
+    fence: EffectFence,
+    kind: ControllerAttachmentPreparationError["kind"],
+  ): void {
     this.fail(
       turn,
       fence,
-      "Controller image preparation failed",
-      "image_preparation_failed",
+      `Controller ${kind} preparation failed`,
+      kind === "document" ? "document_preparation_failed" : "image_preparation_failed",
     );
   }
 
-  private handleImagePreparationError(
+  private handleAttachmentPreparationError(
     error: unknown,
     turn: ControllerTurnRecord,
     fence: EffectFence,
     signal: AbortSignal,
   ): boolean {
-    if (!(error instanceof ControllerImagePreparationError)) return false;
-    if (!error.retryable || turn.retryCount + 1 >= MAX_IMAGE_PREPARATION_ATTEMPTS) {
-      this.failImage(turn, fence);
+    if (!(error instanceof ControllerAttachmentPreparationError)) return false;
+    if (!error.retryable || turn.retryCount + 1 >= MAX_ATTACHMENT_PREPARATION_ATTEMPTS) {
+      this.failAttachment(turn, fence, error.kind);
       return true;
     }
     const now = this.dependencies.clock.now();

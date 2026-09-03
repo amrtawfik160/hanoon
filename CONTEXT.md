@@ -219,6 +219,14 @@ _Avoid_: Persona, shared owner login, model-readable password
 The ability to use every pre-enrolled system required by an enabled project through approved credential bindings and capability routes, while task authority and project policy still control each action.
 _Avoid_: Vault-wide access, global authority, readable secret
 
+**Burst**:
+The set of owner messages that arrived within one quiet gap and are answered together: the oldest queued turn leads, later members fold into the leader's answer with one acknowledgement, and the attributed transcript carries each message's provenance. Fixed caps bound a burst; a cap, a system turn, a lifecycle follow-up, or an untranscribed voice note starts the next one.
+_Avoid_: One answer per message, semantic topic grouping
+
+**Quiet gap**:
+The fixed interval a claim waits past the newest burst candidate so a burst still arriving is read whole. Measured on the plugin's receipt time of each message.
+_Avoid_: Debounce setting, configurable window
+
 **Managed automation**:
 A clock-based BB automation that Hanoon creates or adopts for one project, then wraps with task authority, run evidence, credential policy, and owner reporting. BB owns the schedule and run history; Hanoon owns whether the work is allowed and what counts as complete.
 _Avoid_: Hanoon schedule, event monitor, ungoverned cron

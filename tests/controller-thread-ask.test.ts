@@ -44,7 +44,7 @@ function submitTurn(
     inputText,
     now: 2_000,
   });
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
   const spawned = store.getControllerByThreadId("thr_controller") !== null;
   if (spawned) {
     expect(store.prepareControllerDispatch({

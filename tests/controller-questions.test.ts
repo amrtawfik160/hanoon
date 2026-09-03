@@ -350,7 +350,7 @@ function submittedTurn(store: ReturnType<typeof storeFixture>["store"], fence: {
     inputText: "review all open issues",
     now: 2_000,
   });
-  store.claimNextControllerTurn({ ...fence, now: 2_000 });
+  store.claimNextControllerTurn({ ...fence, now: 5000 });
   expect(store.reserveControllerSpawn({
     controllerKey: turn.controllerKey,
     turnId: turn.id,
@@ -866,7 +866,10 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
     telegramChatId: "7",
     updateId: 92,
     inputText: "in review i mean not in progress",
-    now: 2_100,
+    // Quiet before the reconcile at 2_200 that steers it mid-answer. The
+    // receipt precedes the claim's clock, but the turn was inserted after the
+    // leader was already submitted, so it stays queued to be steered.
+    now: 100,
   });
   const adapter = serviceAdapter();
   const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_200 } });
@@ -878,7 +881,8 @@ it("hands a message sent mid-answer to the thread already writing it", async () 
   expect(store.getControllerTurn(correction.id)?.state).toBe("completed");
   // The running answer still owns the reply; the correction gets no second one.
   // A folded message still draws a bubble, so the owner can see it landed.
-  expect(store.getOutbox(`controller:${running.id}:steer-folded`)?.payload.text)
+  // The burst's own leader keys the fold acknowledgement.
+  expect(store.getOutbox(`controller:${correction.id}:steer-folded`)?.payload.text)
     .toMatch(/already writing/i);
   expect(store.getControllerTurn(running.id)?.state).toBe("submitted");
 });
@@ -892,7 +896,10 @@ it("preserves a mid-answer message when the provider steer result is ambiguous",
     telegramChatId: "7",
     updateId: 93,
     inputText: "actually hold on",
-    now: 2_100,
+    // Quiet before the reconcile at 2_200 that steers it mid-answer. The
+    // receipt precedes the claim's clock, but the turn was inserted after the
+    // leader was already submitted, so it stays queued to be steered.
+    now: 100,
   });
   const adapter = serviceAdapter({
     steer: vi.fn(async () => { throw new Error("BB refused the steer"); }),
@@ -960,7 +967,10 @@ it("does not replay a message when the provider keeps returning ambiguous steer 
     telegramChatId: "7",
     updateId: 94,
     inputText: "actually hold on",
-    now: 2_100,
+    // Quiet before the reconcile at 2_200 that steers it mid-answer. The
+    // receipt precedes the claim's clock, but the turn was inserted after the
+    // leader was already submitted, so it stays queued to be steered.
+    now: 100,
   });
   const steer = vi.fn(async () => { throw new Error("BB refused the steer"); });
   const adapter = serviceAdapter({ steer });

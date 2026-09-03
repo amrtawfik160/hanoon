@@ -51,6 +51,7 @@ export function createTestManagedAutomations() {
         ? input.authority.capabilityEvidence
         : null,
       notificationPolicy: input.notificationPolicy,
+      desiredState: "enabled",
       state: "active",
       legacyMonitorId: input.legacyMonitorId ?? null,
       observed: automation,
@@ -61,6 +62,8 @@ export function createTestManagedAutomations() {
       lastError: null,
       lastOperationId: input.deferProvider ? "managed-automation-operation-test" : null,
       lastOperationOutcome: input.deferProvider ? "pending" : null,
+      lastReconciledOperationId: null,
+      lastReconciledOperationOutcome: null,
       createdAt: input.now,
       updatedAt: input.now,
     };
@@ -96,5 +99,30 @@ export function createTestManagedAutomations() {
     bindings.set(input.id, retired);
     return retired;
   });
-  return { bindings, create, get, list, update, retire };
+  const submitLifecycleOperation = vi.fn(
+    (input: Parameters<ManagedAutomationService["submitLifecycleOperation"]>[0]): ManagedAutomationBinding => {
+      const binding = bindings.get(input.id);
+      if (!binding) throw new Error("missing test automation");
+      const updated: ManagedAutomationBinding = {
+        ...binding,
+        name: input.definition?.name ?? binding.name,
+        mode: input.definition?.mode ?? binding.mode,
+        definition: input.definition ?? binding.definition,
+        desiredState: input.desiredState,
+        state: input.operationClass === "retire"
+          ? "retiring"
+          : ["update", "enable", "disable"].includes(input.operationClass)
+            ? "updating"
+            : binding.state,
+        lastOperationId: `managed-automation-operation-test-${input.operationClass}`,
+        lastOperationOutcome: "pending",
+        updatedAt: input.now,
+      };
+      return input.mutate(() => {
+        bindings.set(input.id, updated);
+        return updated;
+      });
+    },
+  );
+  return { bindings, create, get, list, update, retire, submitLifecycleOperation };
 }
