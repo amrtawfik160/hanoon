@@ -39,6 +39,7 @@ import { EffectRunner } from "../src/services/effect-runner";
 import { runJobExecutorService } from "../src/services/job-executor-service";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { stableWorkArtifactId, type CaptureWorkArtifactInput } from "../src/work-artifacts/repository";
+import { CONTROLLER_BURST_QUIET_GAP_MS } from "../src/controller/burst";
 import { policyFixture, sha } from "./helpers";
 
 const HEAD = "1".repeat(40);
@@ -686,7 +687,8 @@ function admitCompetingMerge(fixture: OwnedFixture): string {
   const claimed = fixture.store.claimNextControllerTurn({
     ownerId: "executor",
     generation: fixture.leaseGeneration,
-    now,
+    // A burst is claimed only once its newest message has gone quiet.
+    now: now + CONTROLLER_BURST_QUIET_GAP_MS,
   });
   if (!claimed || claimed.id !== turn.id) throw new Error("competing controller turn was not claimed");
   if (!fixture.store.markControllerSpawned({
