@@ -6,7 +6,7 @@ import { createConnection, type AddressInfo } from "node:net";
 import { createServer as createHttpsServer, request as httpsRequest, type Server as HttpsServer } from "node:https";
 import Database from "better-sqlite3";
 import { AuthExpiredError, RateLimitExceededError } from "@1password/sdk";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "../server";
 import { hashSecret } from "../src/crypto";
@@ -312,7 +312,7 @@ function createHanoonCanaryHarness(broker: BrokerCanaryHarness): HanoonCanaryHar
   const initialFence = store.acquireExecutorLease("executor-canary", NOW, 60_000);
   if (!initialFence.acquired) throw new Error("canary_executor_lease_missing");
   const fence = { ownerId: "executor-canary", generation: initialFence.generation, now: NOW };
-  if (store.claimNextControllerTurn(fence)?.id !== queued.id) throw new Error("canary_turn_claim_missing");
+  if (store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id !== queued.id) throw new Error("canary_turn_claim_missing");
   expect(store.markControllerSpawned({
     ...fence,
     turnId: queued.id,

@@ -4,16 +4,25 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022", "DOM"],
-    "types": ["node", "vitest/globals"],
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "types": [
+      "node",
+      "vitest/globals"
+    ],
     "paths": {
-      "@bb/plugin-sdk": ["./types/bb-plugin-sdk.d.ts"],
       "@bb/plugin-sdk-testing-actual": [
-        "./node_modules/@bb/plugin-sdk/bundled-types/bb-plugin-sdk-testing.d.ts"
+        "./node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk-testing.d.ts"
       ]
     },
     "noEmit": true,
     "skipLibCheck": false
   },
-  "include": ["server.ts", "src/**/*.ts", "tests/**/*.ts", "types/**/*.d.ts"]
+  "include": [
+    "server.ts",
+    "src/**/*.ts",
+    "tests/**/*.ts"
+  ]
 }

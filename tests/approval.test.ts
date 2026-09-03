@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { JobEffect } from "../src/domain/models";

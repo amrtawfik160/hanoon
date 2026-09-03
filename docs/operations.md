@@ -119,9 +119,9 @@ Both are owner-facing in the chat rather than through the CLI:
 
 Memories are bounded per scope; when the bound is reached the weakest is dropped, so recall stays useful rather than unbounded. Credential-shaped text is refused at the write, so a pasted token never enters memory or the search index.
 
-An invalid cron expression is rejected when the monitor is created. A schedule that later cannot be advanced is marked failed and reported by `/health` rather than retried forever.
+A schedule is a BB agent automation with a UTC cron, created only from a turn you sent yourself. When BB refuses to host automations for the controller's project, which is the case for BB's personal project, the plugin keeps the schedule itself and fires it as a follow-up turn. An invalid cron expression is rejected before BB is asked. A schedule BB cannot read back exactly is not activated, and one whose project policy is later disabled is paused at the next reconciliation sweep rather than left running.
 
-Asking what the agent is watching lists durable monitor rows only. Starting or messaging a thread tries to arm a best-effort courtesy monitor; at the armed-monitor cap the action still succeeds without that monitor. Lifecycle handling can also infer engagement from durable controller evidence containing the exact `thread:<id>` reference and enqueue a follow-up without a monitor row. That inferred follow-up is absent from the watch list and does not consume the armed-monitor cap; thread list and status reads currently produce qualifying evidence too. The armed count in `/health` therefore covers monitors, not every possible lifecycle follow-up. Its next-due time covers schedules only, since a thread watch waits on its thread rather than on the clock.
+Asking what the agent is watching lists durable monitor rows and the BB schedules the agent manages. Starting or messaging a thread tries to arm a best-effort courtesy monitor; at the armed-monitor cap the action still succeeds without that monitor. Lifecycle handling can also infer engagement from durable controller evidence containing the exact `thread:<id>` reference and enqueue a follow-up without a monitor row. That inferred follow-up is absent from the watch list and does not consume the armed-monitor cap; thread list and status reads currently produce qualifying evidence too. The armed count in `/health` therefore covers monitors, not every possible lifecycle follow-up. Its next-due time covers schedules only, since a thread watch waits on its thread rather than on the clock.
 
 ## Reference documents
 
@@ -140,6 +140,12 @@ Inside a project-bound BB thread, the invoking project is authoritative: omittin
 Notices about top-level threads are automatic; nothing needs arming. The plugin records each thread the first time it sees it and reports later moves into `idle` or `error`, so a freshly installed or restarted plugin does not replay a backlog.
 
 If a thread seems stuck and you were told nothing, check that it is top-level — a sub-agent's thread is reported to its parent, not to you — and that it is `visible`. To recover a controller thread that has wedged, `bb thread archive <id>`: the plugin reads the archived thread as missing and opens a fresh session on its own, which is safer than editing the database.
+
+## Controller attachments and bursts
+
+Messages sent in quick succession are answered as one burst; each answer starts about two seconds after the last message so the whole burst is read together. The fixed caps are 25 messages per burst, 32 KB of rendered transcript, and 10 attachments counting the first message's own file. A burst gets one answer and no separate acknowledgement; only messages folded into an answer already being written draw the one-line "got that" bubble, once per burst.
+
+The controller accepts PDF, Markdown, and plain-text documents as attachments, plus images and clips as before. A document's caption becomes the message text. Per-file limits: images 10 MB, clips and documents 20 MB; Markdown and plain-text files of up to 64,000 characters are also inlined into the answer's input. A file of another type, or over its limit, gets one short reply at intake and is not queued; several such files arriving together, even across a plugin restart, draw that reply once.
 
 ## Inspect jobs
 

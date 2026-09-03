@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import type { JobEffect, StoredEffect, WorkerLiveness } from "../src/domain/models";

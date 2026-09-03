@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
 import { createConnection } from "node:net";
 import { join } from "node:path";

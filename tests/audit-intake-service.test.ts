@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import type { AuditResult } from "../src/autonomy/audit-contract";
 import { INTAKE_SUPPRESSION_MS } from "../src/autonomy/audit-intake";

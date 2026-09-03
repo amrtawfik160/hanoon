@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { renderJobFinishNote } from "../src/telegram/finish-note";
 import { openStore } from "../src/storage/store";

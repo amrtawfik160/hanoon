@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { expect, it } from "vitest";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import {
   disposeTrackedFakePluginHosts,
   trackedFakePluginHostCount,

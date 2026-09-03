@@ -1,8 +1,8 @@
 import type {
   BbPluginApi,
   PluginAgentToolContext,
-  PluginAgentToolExperimentalStatusLabels,
-} from "@bb/plugin-sdk";
+  PluginAgentToolPresentation,
+} from "@get-bb/plugin-sdk";
 import { createHash } from "node:crypto";
 import type { z } from "zod";
 import type { ControllerProofKind } from "./models";
@@ -590,7 +590,7 @@ export type ControllerCapabilityToolRegistration<Schema extends z.ZodType> = Rea
   descriptor: ControllerCapabilityDescriptor;
   description: string;
   parameters: Schema;
-  experimental_statusLabels?: PluginAgentToolExperimentalStatusLabels;
+  presentation?: PluginAgentToolPresentation;
   resolveScope(
     params: z.output<Schema>,
     context: PluginAgentToolContext,
@@ -623,8 +623,8 @@ export function registerControllerCapabilityTool<Schema extends z.ZodType>(
     name: registration.name,
     description: registration.description,
     parameters: registration.parameters,
-    ...(registration.experimental_statusLabels
-      ? { experimental_statusLabels: registration.experimental_statusLabels }
+    ...(registration.presentation
+      ? { presentation: registration.presentation }
       : {}),
     execute: async (params, context) => {
       try {

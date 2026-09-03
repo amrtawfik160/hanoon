@@ -4056,7 +4056,6 @@ SELECT observation.observation_id, observation.job_id, observation.authority_id,
    AND boundary.authority_revision = observation.authority_revision
    AND boundary.affected_effect_idempotency_key = observation.affected_effect_idempotency_key
  WHERE boundary.status <> 'revoked';
-`, String.raw`
 CREATE TRIGGER policy_boundary_observations_require_live_executor_fence
 BEFORE INSERT ON policy_boundary_observations
 WHEN EXISTS (
@@ -4310,6 +4309,143 @@ WHEN NOT (
 BEGIN SELECT RAISE(ABORT, 'owner boundary lacks an exact authoritative source'); END;
 `] as const;
 
+export const NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS = [String.raw`
+ALTER TABLE navigator_skill_attempts ADD COLUMN capability_profile_id TEXT REFERENCES capability_profiles(id);
+ALTER TABLE navigator_skill_attempts ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+ALTER TABLE navigator_ticket_worker_attempts ADD COLUMN capability_profile_id TEXT REFERENCES capability_profiles(id);
+ALTER TABLE navigator_ticket_worker_attempts ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+ALTER TABLE navigator_release_attempts ADD COLUMN capability_profile_id TEXT REFERENCES capability_profiles(id);
+ALTER TABLE navigator_release_attempts ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+
+CREATE TABLE navigator_effect_capability_evidence (
+  effect_idempotency_key TEXT NOT NULL REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 256),
+  operation TEXT NOT NULL CHECK (operation IN ('artifact_write', 'prototype_write', 'worktree_write', 'release_entry')),
+  profile_id TEXT NOT NULL REFERENCES capability_profiles(id),
+  profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 128),
+  capability_kind TEXT NOT NULL CHECK (capability_kind IN (
+    'skill', 'tool', 'bundle', 'native-adapter', 'model', 'connector', 'recipe'
+  )),
+  descriptor_digest TEXT NOT NULL CHECK (length(descriptor_digest) = 64),
+  receipt_id TEXT NOT NULL REFERENCES capability_receipts(id),
+  owner_id TEXT,
+  generation INTEGER CHECK (generation IS NULL OR generation >= 1),
+  admitted_at INTEGER,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (effect_idempotency_key, operation, capability_id)
+);
+CREATE INDEX navigator_effect_capability_evidence_profile
+  ON navigator_effect_capability_evidence(profile_id, profile_revision);
+CREATE TRIGGER navigator_effect_capability_evidence_append_only_delete
+BEFORE DELETE ON navigator_effect_capability_evidence
+BEGIN SELECT RAISE(ABORT, 'navigator capability evidence cannot be deleted'); END;
+
+CREATE TABLE navigator_effect_receipts (
+  effect_idempotency_key TEXT PRIMARY KEY REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('run_navigator_skill', 'run_navigator_ticket_worker', 'run_navigator_release')),
+  receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
+  receipt_digest TEXT NOT NULL CHECK (length(receipt_digest) = 64),
+  owner_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0)
+);
+CREATE TRIGGER navigator_effect_receipts_append_only_update
+BEFORE UPDATE ON navigator_effect_receipts
+BEGIN SELECT RAISE(ABORT, 'navigator effect receipts are append-only'); END;
+CREATE TRIGGER navigator_effect_receipts_append_only_delete
+BEFORE DELETE ON navigator_effect_receipts
+BEGIN SELECT RAISE(ABORT, 'navigator effect receipts are append-only'); END;
+`, String.raw`
+CREATE TABLE navigator_effect_compatibility (
+  effect_idempotency_key TEXT PRIMARY KEY REFERENCES effects(idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('run_navigator_skill', 'run_navigator_ticket_worker', 'run_navigator_release')),
+  attempt_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state = 'pending'),
+  reason_code TEXT NOT NULL CHECK (reason_code = 'preceding_schema_capability_evidence_missing'),
+  decoder_revision INTEGER NOT NULL CHECK (decoder_revision = 1),
+  created_at INTEGER NOT NULL,
+  UNIQUE (job_id, attempt_id)
+);
+CREATE TRIGGER navigator_effect_compatibility_append_only_update
+BEFORE UPDATE ON navigator_effect_compatibility
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility records are append-only'); END;
+CREATE TRIGGER navigator_effect_compatibility_append_only_delete
+BEFORE DELETE ON navigator_effect_compatibility
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility records are append-only'); END;
+
+INSERT OR IGNORE INTO navigator_effect_compatibility (
+  effect_idempotency_key, job_id, kind, attempt_id, state, reason_code,
+  decoder_revision, created_at
+)
+SELECT effect.idempotency_key, effect.job_id, effect.kind, attempt.id,
+       'pending', 'preceding_schema_capability_evidence_missing', 1, effect.created_at
+  FROM effects AS effect
+  JOIN navigator_skill_attempts AS attempt
+    ON attempt.effect_idempotency_key = effect.idempotency_key
+ WHERE effect.kind = 'run_navigator_skill'
+   AND effect.status IN ('pending', 'leased', 'failed')
+   AND attempt.capability_profile_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM navigator_effect_capability_evidence AS evidence
+      WHERE evidence.effect_idempotency_key = effect.idempotency_key
+   )
+UNION ALL
+SELECT effect.idempotency_key, effect.job_id, effect.kind, attempt.id,
+       'pending', 'preceding_schema_capability_evidence_missing', 1, effect.created_at
+  FROM effects AS effect
+  JOIN navigator_ticket_worker_attempts AS attempt
+    ON attempt.effect_idempotency_key = effect.idempotency_key
+ WHERE effect.kind = 'run_navigator_ticket_worker'
+   AND effect.status IN ('pending', 'leased', 'failed')
+   AND attempt.capability_profile_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM navigator_effect_capability_evidence AS evidence
+      WHERE evidence.effect_idempotency_key = effect.idempotency_key
+   )
+UNION ALL
+SELECT effect.idempotency_key, effect.job_id, effect.kind, attempt.id,
+       'pending', 'preceding_schema_capability_evidence_missing', 1, effect.created_at
+  FROM effects AS effect
+  JOIN navigator_release_attempts AS attempt
+    ON attempt.effect_idempotency_key = effect.idempotency_key
+ WHERE effect.kind = 'run_navigator_release'
+   AND effect.status IN ('pending', 'leased', 'failed')
+   AND attempt.capability_profile_id IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM navigator_effect_capability_evidence AS evidence
+      WHERE evidence.effect_idempotency_key = effect.idempotency_key
+   );
+`, String.raw`
+CREATE TABLE navigator_effect_compatibility_resolutions (
+  effect_idempotency_key TEXT PRIMARY KEY REFERENCES navigator_effect_compatibility(effect_idempotency_key),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('run_navigator_skill', 'run_navigator_ticket_worker', 'run_navigator_release')),
+  attempt_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL REFERENCES capability_profiles(id),
+  profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),
+  owner_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
+  UNIQUE (job_id, attempt_id)
+);
+CREATE TRIGGER navigator_effect_compatibility_resolutions_append_only_update
+BEFORE UPDATE ON navigator_effect_compatibility_resolutions
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility resolutions are append-only'); END;
+CREATE TRIGGER navigator_effect_compatibility_resolutions_append_only_delete
+BEFORE DELETE ON navigator_effect_compatibility_resolutions
+BEGIN SELECT RAISE(ABORT, 'navigator effect compatibility resolutions are append-only'); END;
+`] as const;
+
 export const NAVIGATOR_PROMOTION_MIGRATIONS = [String.raw`
 CREATE TRIGGER jobs_workflow_engine_immutable
 BEFORE UPDATE ON jobs
@@ -4465,6 +4601,512 @@ BEFORE DELETE ON workflow_engine_contractions
 BEGIN SELECT RAISE(ABORT, 'workflow_engine_contractions are append-only'); END;
 `] as const;
 
+export const NAVIGATOR_REVIEW_LEDGER_MIGRATIONS = [String.raw`
+CREATE TABLE navigator_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE CHECK (length(id) BETWEEN 1 AND 256),
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  verification_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  root_cause_id TEXT NOT NULL CHECK (length(root_cause_id) BETWEEN 1 AND 256),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved', 'disputed')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL,
+  occurrence INTEGER NOT NULL CHECK (occurrence >= 0 AND occurrence <= 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE(verification_attempt_id, root_cause_id)
+);
+CREATE INDEX navigator_review_finding_events_slice
+  ON navigator_review_finding_events(slice_id, sequence);
+CREATE TRIGGER navigator_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+CREATE TRIGGER navigator_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+
+CREATE TABLE navigator_review_convergence (
+  slice_id TEXT PRIMARY KEY REFERENCES navigator_ticket_slices(id),
+  last_blocking_burden INTEGER NOT NULL CHECK (last_blocking_burden >= 0),
+  plateau_recoveries INTEGER NOT NULL CHECK (plateau_recoveries BETWEEN 0 AND 1),
+  review_cycles INTEGER NOT NULL CHECK (review_cycles >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+);
+`] as const;
+
+export const NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS = [String.raw`
+ALTER TABLE navigator_review_finding_events ADD COLUMN severity TEXT NOT NULL DEFAULT 'low' CHECK (
+  severity IN ('critical', 'high', 'medium', 'low')
+);
+ALTER TABLE navigator_review_finding_events ADD COLUMN requirement_id TEXT;
+ALTER TABLE navigator_review_finding_events ADD COLUMN evidence_class TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE navigator_review_finding_events ADD COLUMN normalized_subject TEXT NOT NULL DEFAULT '';
+ALTER TABLE navigator_review_finding_events ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE navigator_review_finding_events ADD COLUMN descriptor_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(descriptor_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN descriptor_version TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE navigator_review_finding_events ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 0 CHECK (policy_revision >= 0);
+ALTER TABLE navigator_review_finding_events ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(policy_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN requirement_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(requirement_ids_json));
+ALTER TABLE navigator_review_finding_events ADD COLUMN artifact_snapshot_id TEXT;
+ALTER TABLE navigator_review_finding_events ADD COLUMN artifact_snapshot_digest TEXT CHECK (artifact_snapshot_digest IS NULL OR length(artifact_snapshot_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN specification_snapshot_id TEXT;
+ALTER TABLE navigator_review_finding_events ADD COLUMN specification_snapshot_digest TEXT CHECK (specification_snapshot_digest IS NULL OR length(specification_snapshot_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN source_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(source_attempt_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN verification_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(verification_attempt_digest) = 64);
+ALTER TABLE navigator_review_finding_events ADD COLUMN root_cause_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (root_cause_confirmed IN (0, 1));
+CREATE INDEX navigator_review_finding_events_fingerprint
+  ON navigator_review_finding_events(slice_id, fingerprint, sequence);
+ALTER TABLE navigator_review_convergence ADD COLUMN last_verification_attempt_id TEXT;
+`] as const;
+
+export const NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS = [String.raw`
+DROP TRIGGER IF EXISTS navigator_review_finding_events_append_only_update;
+DROP TRIGGER IF EXISTS navigator_review_finding_events_append_only_delete;
+DROP INDEX IF EXISTS navigator_review_finding_events_fingerprint;
+DROP INDEX IF EXISTS navigator_review_finding_events_slice;
+ALTER TABLE navigator_review_finding_events RENAME TO navigator_review_finding_events_v1;
+CREATE TABLE navigator_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE CHECK (length(id) BETWEEN 1 AND 256),
+  job_id TEXT NOT NULL REFERENCES navigator_integrations(job_id),
+  slice_id TEXT NOT NULL REFERENCES navigator_ticket_slices(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  verification_attempt_id TEXT NOT NULL REFERENCES navigator_ticket_worker_attempts(id),
+  root_cause_id TEXT NOT NULL CHECK (length(root_cause_id) BETWEEN 1 AND 256),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved', 'disputed', 'corrected')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL,
+  occurrence INTEGER NOT NULL CHECK (occurrence >= 0 AND occurrence <= 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  severity TEXT NOT NULL DEFAULT 'low' CHECK (severity IN ('critical', 'high', 'medium', 'low')),
+  requirement_id TEXT,
+  evidence_class TEXT NOT NULL DEFAULT 'legacy',
+  normalized_subject TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL DEFAULT '',
+  descriptor_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(descriptor_digest) = 64),
+  descriptor_version TEXT NOT NULL DEFAULT 'legacy',
+  policy_revision INTEGER NOT NULL DEFAULT 0 CHECK (policy_revision >= 0),
+  policy_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(policy_digest) = 64),
+  requirement_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(requirement_ids_json)),
+  artifact_snapshot_id TEXT,
+  artifact_snapshot_digest TEXT CHECK (artifact_snapshot_digest IS NULL OR length(artifact_snapshot_digest) = 64),
+  specification_snapshot_id TEXT,
+  specification_snapshot_digest TEXT CHECK (specification_snapshot_digest IS NULL OR length(specification_snapshot_digest) = 64),
+  source_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(source_attempt_digest) = 64),
+  verification_attempt_digest TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(verification_attempt_digest) = 64),
+  root_cause_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (root_cause_confirmed IN (0, 1)),
+  supersedes_root_cause_id TEXT CHECK (supersedes_root_cause_id IS NULL OR length(supersedes_root_cause_id) BETWEEN 1 AND 256),
+  UNIQUE(verification_attempt_id, root_cause_id)
+);
+INSERT INTO navigator_review_finding_events (
+  sequence, id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
+  root_cause_id, capability_id, rule_id, disposition, event, head_sha,
+  finding_json, evidence_refs_json, occurrence, blocking_burden, created_at,
+  severity, requirement_id, evidence_class, normalized_subject, fingerprint,
+  descriptor_digest, descriptor_version, policy_revision, policy_digest,
+  requirement_ids_json, artifact_snapshot_id, artifact_snapshot_digest,
+  specification_snapshot_id, specification_snapshot_digest,
+  source_attempt_digest, verification_attempt_digest, root_cause_confirmed,
+  supersedes_root_cause_id
+)
+SELECT sequence, id, job_id, slice_id, source_review_attempt_id, verification_attempt_id,
+  root_cause_id, capability_id, rule_id, disposition, event, head_sha,
+  finding_json, evidence_refs_json, occurrence, blocking_burden, created_at,
+  severity, requirement_id, evidence_class, normalized_subject, fingerprint,
+  descriptor_digest, descriptor_version, policy_revision, policy_digest,
+  requirement_ids_json, artifact_snapshot_id, artifact_snapshot_digest,
+  specification_snapshot_id, specification_snapshot_digest,
+  source_attempt_digest, verification_attempt_digest, root_cause_confirmed, NULL
+FROM navigator_review_finding_events_v1;
+DROP TABLE navigator_review_finding_events_v1;
+CREATE INDEX navigator_review_finding_events_slice
+  ON navigator_review_finding_events(slice_id, sequence);
+CREATE INDEX navigator_review_finding_events_fingerprint
+  ON navigator_review_finding_events(slice_id, fingerprint, sequence);
+CREATE TRIGGER navigator_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+CREATE TRIGGER navigator_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator review finding events are append-only'); END;
+`] as const;
+
+export const MANAGED_AUTOMATION_MIGRATIONS = [String.raw`
+CREATE TABLE managed_automations (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  controller_key TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  bb_automation_id TEXT UNIQUE,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
+  mode TEXT NOT NULL CHECK (mode IN ('agent', 'script')),
+  definition_json TEXT NOT NULL,
+  definition_sha256 TEXT NOT NULL CHECK (length(definition_sha256) = 64),
+  authority_json TEXT NOT NULL,
+  notification_policy TEXT NOT NULL CHECK (notification_policy IN ('material', 'always', 'silent')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'paused', 'retired', 'failed')),
+  legacy_monitor_id TEXT UNIQUE,
+  observed_json TEXT,
+  observed_sha256 TEXT CHECK (observed_sha256 IS NULL OR length(observed_sha256) = 64),
+  last_reconciled_at INTEGER,
+  last_run_id TEXT,
+  last_run_status TEXT CHECK (last_run_status IS NULL OR last_run_status IN ('running', 'succeeded', 'failed', 'skipped')),
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  UNIQUE(controller_key, source_key)
+);
+CREATE INDEX managed_automations_state ON managed_automations(state, updated_at);
+
+CREATE TABLE managed_automation_run_evidence (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  bb_run_id TEXT NOT NULL,
+  bb_automation_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+  run_mode TEXT NOT NULL CHECK (run_mode IN ('agent', 'script')),
+  trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'manual')),
+  thread_id TEXT,
+  output_sha256 TEXT,
+  error_class TEXT,
+  scheduled_for INTEGER NOT NULL CHECK (scheduled_for >= 0),
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  finished_at INTEGER,
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  evidence_json TEXT NOT NULL,
+  UNIQUE(bb_run_id, status)
+);
+CREATE INDEX managed_automation_run_evidence_binding
+  ON managed_automation_run_evidence(binding_id, sequence);
+CREATE TRIGGER managed_automation_run_evidence_append_only_update
+BEFORE UPDATE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+CREATE TRIGGER managed_automation_run_evidence_append_only_delete
+BEFORE DELETE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+
+CREATE TABLE managed_automation_notifications (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  bb_run_id TEXT NOT NULL UNIQUE,
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  controller_key TEXT NOT NULL,
+  update_id INTEGER UNIQUE,
+  input_text TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'enqueued')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  enqueued_at INTEGER
+);
+CREATE INDEX managed_automation_notifications_state
+  ON managed_automation_notifications(state, sequence);
+`] as const;
+
+export const NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS = [String.raw`
+CREATE TABLE navigator_release_review_finding_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  workflow_step_id TEXT REFERENCES workflow_steps(id),
+  source_review_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64),
+  capability_id TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 256),
+  rule_id TEXT NOT NULL CHECK (length(rule_id) BETWEEN 1 AND 256),
+  disposition TEXT NOT NULL CHECK (disposition IN ('must_fix', 'advisory')),
+  event TEXT NOT NULL CHECK (event IN ('opened', 'reobserved', 'resolved')),
+  head_sha TEXT NOT NULL CHECK (length(head_sha) = 40),
+  finding_json TEXT NOT NULL CHECK (json_valid(finding_json)),
+  evidence_refs_json TEXT NOT NULL CHECK (json_valid(evidence_refs_json)),
+  occurrence INTEGER NOT NULL CHECK (occurrence BETWEEN 0 AND 3),
+  blocking_burden INTEGER NOT NULL CHECK (blocking_burden >= 0),
+  recorded_at INTEGER NOT NULL,
+  UNIQUE(source_review_attempt_id, fingerprint, event)
+);
+CREATE INDEX navigator_release_review_finding_events_job
+  ON navigator_release_review_finding_events(job_id, sequence);
+CREATE TRIGGER navigator_release_review_finding_events_append_only_update
+BEFORE UPDATE ON navigator_release_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
+CREATE TRIGGER navigator_release_review_finding_events_append_only_delete
+BEFORE DELETE ON navigator_release_review_finding_events
+BEGIN SELECT RAISE(ABORT, 'navigator release review finding events are append-only'); END;
+`] as const;
+
+/**
+ * Burst grouping and provenance: per-turn structured source records, document
+ * attachments, the durable link from a folded follower to its leader, and the
+ * reserved steer text for a combined mid-answer addition. Append-only history.
+ */
+export const CONTROLLER_BURST_MIGRATIONS = [String.raw`
+ALTER TABLE controller_turns ADD COLUMN source_json TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_file_name TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_mime_type TEXT;
+ALTER TABLE controller_turns ADD COLUMN doc_size_bytes INTEGER;
+ALTER TABLE controller_turns ADD COLUMN burst_leader_turn_id TEXT;
+ALTER TABLE controller_turns ADD COLUMN steer_reservation_text TEXT;
+`] as const;
+
+export const MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS = [String.raw`
+CREATE TABLE managed_automations_v2 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  controller_key TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  bb_automation_id TEXT UNIQUE,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
+  mode TEXT NOT NULL CHECK (mode IN ('agent', 'script')),
+  definition_json TEXT NOT NULL,
+  definition_sha256 TEXT NOT NULL CHECK (length(definition_sha256) = 64),
+  authority_json TEXT NOT NULL,
+  notification_policy TEXT NOT NULL CHECK (notification_policy IN ('material', 'always', 'silent')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'paused', 'updating', 'retiring', 'retired', 'failed')),
+  legacy_monitor_id TEXT UNIQUE,
+  observed_json TEXT,
+  observed_sha256 TEXT CHECK (observed_sha256 IS NULL OR length(observed_sha256) = 64),
+  last_reconciled_at INTEGER,
+  last_run_id TEXT,
+  last_run_status TEXT CHECK (last_run_status IS NULL OR last_run_status IN ('running', 'succeeded', 'failed', 'skipped')),
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  UNIQUE(controller_key, source_key)
+);
+
+CREATE TABLE managed_automation_run_evidence_v2 (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  binding_id TEXT NOT NULL REFERENCES managed_automations_v2(id),
+  bb_run_id TEXT NOT NULL,
+  bb_automation_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+  run_mode TEXT NOT NULL CHECK (run_mode IN ('agent', 'script')),
+  trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'manual')),
+  thread_id TEXT,
+  output_sha256 TEXT,
+  error_class TEXT,
+  scheduled_for INTEGER NOT NULL CHECK (scheduled_for >= 0),
+  started_at INTEGER NOT NULL CHECK (started_at >= 0),
+  finished_at INTEGER,
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  evidence_json TEXT NOT NULL,
+  UNIQUE(bb_run_id, status)
+);
+
+CREATE TABLE managed_automation_notifications_v2 (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  bb_run_id TEXT NOT NULL UNIQUE,
+  binding_id TEXT NOT NULL REFERENCES managed_automations_v2(id),
+  controller_key TEXT NOT NULL,
+  update_id INTEGER UNIQUE,
+  input_text TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'enqueued')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  enqueued_at INTEGER
+);
+
+INSERT INTO managed_automations_v2 (
+  id, controller_key, source_key, project_id, bb_automation_id, name, mode,
+  definition_json, definition_sha256, authority_json, notification_policy, state,
+  legacy_monitor_id, observed_json, observed_sha256, last_reconciled_at, last_run_id,
+  last_run_status, last_error, created_at, updated_at
+)
+SELECT id, controller_key, source_key, project_id, bb_automation_id, name, mode,
+       definition_json, definition_sha256, authority_json, notification_policy, state,
+       legacy_monitor_id, observed_json, observed_sha256, last_reconciled_at, last_run_id,
+       last_run_status, last_error, created_at, updated_at
+  FROM managed_automations;
+
+INSERT INTO managed_automation_run_evidence_v2 (
+  sequence, binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+  thread_id, output_sha256, error_class, scheduled_for, started_at, finished_at,
+  observed_at, evidence_json
+)
+SELECT sequence, binding_id, bb_run_id, bb_automation_id, status, run_mode, trigger_kind,
+       thread_id, output_sha256, error_class, scheduled_for, started_at, finished_at,
+       observed_at, evidence_json
+  FROM managed_automation_run_evidence;
+
+INSERT INTO managed_automation_notifications_v2 (
+  sequence, bb_run_id, binding_id, controller_key, update_id, input_text, state,
+  created_at, enqueued_at
+)
+SELECT sequence, bb_run_id, binding_id, controller_key, update_id, input_text, state,
+       created_at, enqueued_at
+  FROM managed_automation_notifications;
+
+DROP TRIGGER managed_automation_run_evidence_append_only_update;
+DROP TRIGGER managed_automation_run_evidence_append_only_delete;
+DROP TABLE managed_automation_run_evidence;
+DROP TABLE managed_automation_notifications;
+DROP TABLE managed_automations;
+
+ALTER TABLE managed_automations_v2 RENAME TO managed_automations;
+ALTER TABLE managed_automation_run_evidence_v2 RENAME TO managed_automation_run_evidence;
+ALTER TABLE managed_automation_notifications_v2 RENAME TO managed_automation_notifications;
+
+CREATE INDEX managed_automations_state ON managed_automations(state, updated_at);
+CREATE INDEX managed_automation_run_evidence_binding
+  ON managed_automation_run_evidence(binding_id, sequence);
+CREATE TRIGGER managed_automation_run_evidence_append_only_update
+BEFORE UPDATE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+CREATE TRIGGER managed_automation_run_evidence_append_only_delete
+BEFORE DELETE ON managed_automation_run_evidence
+BEGIN SELECT RAISE(ABORT, 'managed automation run evidence is append-only'); END;
+CREATE INDEX managed_automation_notifications_state
+  ON managed_automation_notifications(state, sequence);
+`,
+String.raw`
+
+ALTER TABLE managed_automations ADD COLUMN definition_revision INTEGER NOT NULL DEFAULT 1 CHECK (definition_revision >= 1);
+ALTER TABLE managed_automations ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0 CHECK (authority_version >= 0);
+ALTER TABLE managed_automations ADD COLUMN capability_profile_id TEXT;
+ALTER TABLE managed_automations ADD COLUMN capability_profile_revision INTEGER CHECK (
+  capability_profile_revision IS NULL OR capability_profile_revision >= 1
+);
+ALTER TABLE managed_automations ADD COLUMN capability_evidence_json TEXT;
+ALTER TABLE managed_automations ADD COLUMN last_operation_id TEXT;
+ALTER TABLE managed_automations ADD COLUMN last_operation_outcome TEXT CHECK (
+  last_operation_outcome IS NULL OR last_operation_outcome IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')
+);
+
+CREATE TABLE managed_automation_operations (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  operation_class TEXT NOT NULL CHECK (
+    operation_class IN ('create', 'update', 'enable', 'disable', 'run_now', 'retire', 'reconcile')
+  ),
+  operation_version INTEGER NOT NULL DEFAULT 1 CHECK (operation_version = 1),
+  target_project_id TEXT NOT NULL,
+  definition_revision INTEGER NOT NULL CHECK (definition_revision >= 1),
+  authority_json TEXT NOT NULL,
+  capability_evidence_json TEXT,
+  controller_owner_id TEXT,
+  controller_generation INTEGER CHECK (controller_generation IS NULL OR controller_generation >= 1),
+  controller_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 1),
+  lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+  provider_automation_id TEXT,
+  outcome_json TEXT,
+  last_error TEXT,
+  next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0),
+  UNIQUE(binding_id, definition_revision, operation_class)
+);
+CREATE INDEX managed_automation_operations_due
+  ON managed_automation_operations(state, next_attempt_at, created_at);
+CREATE INDEX managed_automation_operations_binding
+  ON managed_automation_operations(binding_id, created_at);
+`, String.raw`
+ALTER TABLE managed_automations ADD COLUMN provider_ownership_marker TEXT CHECK (
+  provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+);
+ALTER TABLE managed_automation_operations ADD COLUMN provider_ownership_marker TEXT CHECK (
+  provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+);
+`] as const;
+
+export const MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS = [String.raw`
+ALTER TABLE managed_automations ADD COLUMN desired_state TEXT NOT NULL DEFAULT 'enabled' CHECK (
+  desired_state IN ('enabled', 'paused', 'retired')
+);
+ALTER TABLE managed_automations ADD COLUMN last_reconciled_operation_id TEXT;
+ALTER TABLE managed_automations ADD COLUMN last_reconciled_operation_outcome TEXT CHECK (
+  last_reconciled_operation_outcome IS NULL OR
+  last_reconciled_operation_outcome IN ('succeeded', 'failed', 'ambiguous')
+);
+UPDATE managed_automations
+   SET desired_state = CASE
+     WHEN state IN ('paused') THEN 'paused'
+     WHEN state IN ('retiring', 'retired') THEN 'retired'
+     ELSE 'enabled'
+   END,
+       last_reconciled_operation_id = CASE
+         WHEN last_operation_outcome IN ('succeeded', 'failed', 'ambiguous') THEN last_operation_id
+         ELSE NULL
+       END,
+       last_reconciled_operation_outcome = CASE
+         WHEN last_operation_outcome IN ('succeeded', 'failed', 'ambiguous') THEN last_operation_outcome
+         ELSE NULL
+       END;
+
+ALTER TABLE managed_automation_run_evidence ADD COLUMN receipt_version INTEGER;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN initiating_operation_id TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN definition_revision INTEGER;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN authority_json TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN capability_evidence_json TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN idempotency_key TEXT;
+ALTER TABLE managed_automation_run_evidence ADD COLUMN outcome_class TEXT CHECK (
+  outcome_class IS NULL OR outcome_class IN ('running', 'succeeded', 'failed', 'skipped', 'contract_violated')
+);
+
+CREATE TABLE managed_automation_operations_v2 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 256),
+  binding_id TEXT NOT NULL REFERENCES managed_automations(id),
+  operation_class TEXT NOT NULL CHECK (
+    operation_class IN ('create', 'update', 'enable', 'disable', 'run_now', 'retire', 'reconcile')
+  ),
+  operation_version INTEGER NOT NULL DEFAULT 1 CHECK (operation_version = 1),
+  target_project_id TEXT NOT NULL,
+  definition_revision INTEGER NOT NULL CHECK (definition_revision >= 1),
+  intent_key TEXT CHECK (intent_key IS NULL OR length(intent_key) BETWEEN 1 AND 256),
+  authority_json TEXT NOT NULL,
+  capability_evidence_json TEXT,
+  controller_owner_id TEXT,
+  controller_generation INTEGER CHECK (controller_generation IS NULL OR controller_generation >= 1),
+  controller_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'succeeded', 'failed', 'ambiguous')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 1),
+  lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+  provider_automation_id TEXT,
+  provider_ownership_marker TEXT CHECK (
+    provider_ownership_marker IS NULL OR length(provider_ownership_marker) BETWEEN 1 AND 256
+  ),
+  outcome_json TEXT,
+  last_error TEXT,
+  next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  settled_at INTEGER CHECK (settled_at IS NULL OR settled_at >= 0)
+);
+INSERT INTO managed_automation_operations_v2 (
+  id, binding_id, operation_class, operation_version, target_project_id, definition_revision,
+  intent_key, authority_json, capability_evidence_json, controller_owner_id,
+  controller_generation, controller_turn_id, state, attempts,
+  lease_owner, lease_generation, lease_expires_at, provider_automation_id,
+  provider_ownership_marker, outcome_json, last_error, next_attempt_at,
+  created_at, updated_at, settled_at
+)
+SELECT id, binding_id, operation_class, operation_version, target_project_id, definition_revision,
+       NULL, authority_json, capability_evidence_json, controller_owner_id,
+       controller_generation, controller_turn_id, state, attempts,
+       lease_owner, lease_generation, lease_expires_at, provider_automation_id,
+       provider_ownership_marker, outcome_json, last_error, next_attempt_at,
+       created_at, updated_at, settled_at
+  FROM managed_automation_operations;
+DROP TABLE managed_automation_operations;
+ALTER TABLE managed_automation_operations_v2 RENAME TO managed_automation_operations;
+CREATE INDEX managed_automation_operations_due
+  ON managed_automation_operations(state, next_attempt_at, created_at);
+CREATE INDEX managed_automation_operations_binding
+  ON managed_automation_operations(binding_id, created_at);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -4556,5 +5198,14 @@ export const ALL_MIGRATIONS = [
   ...POLICY_APPROVAL_INTENT_MIGRATIONS,
   ...NAVIGATOR_RELEASE_MIGRATIONS,
   ...NAVIGATOR_PROMOTION_MIGRATIONS,
+  ...NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  ...MANAGED_AUTOMATION_MIGRATIONS,
+  ...NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
+  ...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  ...CONTROLLER_BURST_MIGRATIONS,
+  ...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
+  ...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
+  ...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
+  ...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   ...PROTECTED_CONNECTOR_MIGRATIONS,
 ] as const;

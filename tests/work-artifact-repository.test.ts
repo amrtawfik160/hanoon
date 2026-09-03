@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { hashSecret } from "../src/crypto";
@@ -96,7 +96,10 @@ function recordArtifactEvidence(
     generation: input.generation,
     now: input.now,
   };
-  if (store.claimNextControllerTurn(fence)?.id !== turn.id) {
+  // The executor leases here are shorter than the burst quiet gap, so the
+  // claim waits past the gap under a renewed lease.
+  store.renewExecutorLease(input.ownerId, input.generation, input.now, 10_000);
+  if (store.claimNextControllerTurn({ ...fence, now: input.now + 3_000 })?.id !== turn.id) {
     throw new Error("controller evidence turn was not claimed");
   }
   if (!store.reserveControllerSpawn({

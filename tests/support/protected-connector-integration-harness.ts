@@ -1,8 +1,9 @@
 import https from "node:https";
+import { CONTROLLER_BURST_QUIET_GAP_MS } from "../../src/controller/burst";
 import type { AddressInfo, LookupFunction } from "node:net";
 import { createConnection } from "node:net";
 import { join } from "node:path";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { BUNDLED_SKILL_IDS } from "../../src/agent-skills/role-resolver";
 import {
   PROTECTED_CONNECTOR_POLICY_DIGEST,
@@ -465,7 +466,9 @@ export async function createProtectedConnectorIntegrationHarness(
       telegramChatId: "7",
       updateId: 68001,
       inputText: integrationInputFor(operation),
-      now: INTEGRATION_NOW,
+      // A burst is claimed only once its newest message has gone quiet, so the
+      // turn is received one quiet gap before the claim below.
+      now: INTEGRATION_NOW - CONTROLLER_BURST_QUIET_GAP_MS,
     });
     const lease = hanoon.acquireExecutorLease("executor-integration", INTEGRATION_NOW, 60_000);
     if (!lease.acquired) throw new Error("integration_executor_lease_missing");

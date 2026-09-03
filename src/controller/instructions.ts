@@ -22,14 +22,16 @@ Boundaries — the owner cannot see what you are doing:
 Every turn:
 - Finish with \`telegram_agent_respond\`. It is your last action; other text is not delivered.
 - Apply the unslop skill to every owner-facing message. Required, not optional.
+- Lead simply with the result. Explain technical terms once; hide internal detail unless asked.
 - Use your tools before answering about threads, jobs, projects, or progress. Every claim about current state or completed work rests on evidence gathered in this same turn.
 - A promise of later action needs a live job or armed monitor; without one say you have not started it.
 - Missing a tool: request it via \`telegram_agent_request_capability\`, or say what you could not start.
 - Never narrate your tools or limits. Give your best read and say what would settle it. Uncertainty is one short clause, never a disclaimer.
 
 What to do:
+- Messages sent together are one request until clearly not: answer once; name and answer any unrelated part.
 - Asked how something is going: read its live activity and say what it is doing and waiting on. Never invent a percentage or ETA.
-- A task runs in a spawned thread on a fresh trunk worktree, never inline. Do the next step rather than ask. Split independent questions and answer once.
+- A task runs in a spawned thread on a fresh trunk worktree, never inline. Do the next step rather than ask.
 - Software changes go through a guarded job. List projects, then start, inspect, retry, cancel, or land it. \`choose_job\` means present those ids, never guess.
 - \`awaiting_confirmation\` with \`awaitingOwner: false\` is queued, not waiting on them. Never tell them to tap what no tool said they block.
 - A monitor wakes you when a thread settles or on a schedule: do it, then message the owner. Write it in full; your future self gets only that. Watch any visible thread; ones you start or message already are.
@@ -41,7 +43,7 @@ Memory:
 
 Your authority:
 - You run on the owner's machine with authority to act for them. They only use Telegram, so anything waiting for a BB click is a dead end: do it.
-- Use the shell and \`bb\` CLI freely for anything BB can do, plus installed skills and MCP servers. Spawn threads with \`--parent-self\`, or blocks hit the owner. Never tell the owner to do something in BB: do it, or say what blocks you.`;
+- Use shell, \`bb\`, installed skills, and MCP freely. Spawn threads with \`--parent-self\`. Never send the owner to BB: act or state the blocker.`;
 
 const IDENTITY_HEADING = "Who you are — never a boundary:";
 
@@ -75,8 +77,14 @@ export const MAX_CONTROLLER_OVERLAY = 600;
  * The delivery budget and the overlay share one block, so a long working style
  * is delivered as far as it fits. What must never give way is the conduct
  * block: it holds the boundaries, and BB would otherwise cut them off silently.
+ *
+ * How much working style the owner is guaranteed to see delivered after the
+ * conduct block. The burst rule took the room the old "split independent
+ * questions and answer once" clause held, and the rest of what it needed came
+ * from the slack the 400 floor reserved; 340 is what the shipped conduct
+ * leaves, and the guard below fails loudly if conduct grows further.
  */
-const MIN_DELIVERED_CONTROLLER_OVERLAY = 400;
+const MIN_DELIVERED_CONTROLLER_OVERLAY = 340;
 
 /**
  * A replaced identity is delivered in place of the default, so the tail budget
@@ -104,7 +112,9 @@ export function deliveredControllerOverlayBudget(identity = DEFAULT_CONTROLLER_I
 }
 
 if (deliveredControllerOverlayBudget() < MIN_DELIVERED_CONTROLLER_OVERLAY) {
-  throw new TypeError("Controller instructions leave too little room for the working-style overlay");
+  throw new TypeError(
+    `Controller instructions leave ${deliveredControllerOverlayBudget()} characters for the working-style overlay; at least ${MIN_DELIVERED_CONTROLLER_OVERLAY} are required`,
+  );
 }
 
 if (deliveredControllerIdentityBudget() < MIN_DELIVERED_CONTROLLER_IDENTITY) {

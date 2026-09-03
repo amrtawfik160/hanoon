@@ -74,6 +74,10 @@ export const CONTROLLER_MANUAL_DISCOVERY_SKILLS = [
   "domain-modeling",
 ] as const satisfies readonly CapabilitySkillId[];
 
+export const CONTROLLER_REPITCH_SKILLS = [
+  "wait-what",
+] as const satisfies readonly CapabilitySkillId[];
+
 const BUNDLE_INTENT: Readonly<Record<Exclude<ControllerToolBundleId, "core-observation">, RegExp>> = {
   // The conduct block already names these actions. A turn that asks for them
   // must receive the tools, or the agent can only describe the job pipeline.
@@ -85,6 +89,7 @@ const BUNDLE_INTENT: Readonly<Record<Exclude<ControllerToolBundleId, "core-obser
 };
 
 const MANUAL_DISCOVERY_COMMAND = /(?:^|\s)\/(?:grill-with-docs|grilling|domain-modeling)(?=\s|$)/iu;
+const REPITCH_COMMAND = /(?:^|\s)\/wait-what(?=\s|$)/iu;
 
 function connectorOperationForText(text: string): ProtectedConnectorOperation | null {
   if (/\bvercel\b[\s\S]{0,80}\b(?:browser|session)\b|\b(?:browser|session)\b[\s\S]{0,80}\bvercel\b/iu.test(text)) {
@@ -157,9 +162,11 @@ export function selectControllerBundlesForConversation(
 }
 
 export function controllerSkillsForTurn(text: string): CapabilitySkillId[] {
-  return MANUAL_DISCOVERY_COMMAND.test(text)
-    ? [...CONTROLLER_DEFAULT_SKILLS, ...CONTROLLER_MANUAL_DISCOVERY_SKILLS]
-    : [...CONTROLLER_DEFAULT_SKILLS];
+  return [
+    ...CONTROLLER_DEFAULT_SKILLS,
+    ...(MANUAL_DISCOVERY_COMMAND.test(text) ? CONTROLLER_MANUAL_DISCOVERY_SKILLS : []),
+    ...(REPITCH_COMMAND.test(text) ? CONTROLLER_REPITCH_SKILLS : []),
+  ];
 }
 
 export function controllerToolsForBundles(

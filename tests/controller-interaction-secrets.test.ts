@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
@@ -347,7 +347,7 @@ it("keeps a provider credential out of storage, the outbox, and the logs", async
     controllerKey: CONTROLLER_KEY, telegramUserId: OWNER, telegramChatId: OWNER,
     updateId: 300, inputText: "ship it", now: 2_000,
   });
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     ...fence, turnId: turn.id, projectId: "proj_secret", hostId: "host_secret", threadId: THREAD_ID,
   })).toBe(true);

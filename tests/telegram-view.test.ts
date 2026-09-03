@@ -153,19 +153,16 @@ describe("deterministic Telegram views", () => {
       validation: [{ name: "unit", outcome: "passed" }],
     });
 
-    expect(rendered.text).toContain("Workflow navigator: <code>recipe-v1/live</code>");
-    expect(rendered.text).toContain("Recipe: <code>bounded@1</code>");
-    expect(rendered.text).toContain("Stage: <code>validating</code>");
-    expect(rendered.text).toContain("Rigor: promoted 1/2");
-    expect(rendered.text).toContain("Model escalation: <code>strong</code>");
+    expect(rendered.text).toContain("Status: running checks");
     expect(rendered.text).toContain("Verification: passed");
     expect(rendered.text).toContain("Mandatory guards: passed");
     expect(rendered.text).toContain("Decision: Merge approval required");
     expect(rendered.text).toContain("Delivery: in progress");
+    expect(rendered.text).not.toMatch(/Workflow navigator:|Recipe:|Rigor:|Model escalation:/u);
     expect(rendered.text).not.toMatch(/cap_profile:|descriptor|receipt|test-driven-development/u);
   });
 
-  it("keeps routine routing quiet beyond recipe, stage, and delivery", () => {
+  it("describes routine progress without exposing routing mechanics", () => {
     const rendered = renderJobStatus(jobFixture({
       id: telegramJobId,
       state: "implementing",
@@ -175,14 +172,13 @@ describe("deterministic Telegram views", () => {
       routingMode: "shadow",
     }));
 
-    expect(rendered.text).toContain("Recipe: <code>direct@1</code>");
-    expect(rendered.text).toContain("Stage: <code>implementing</code>");
+    expect(rendered.text).toContain("Status: coding and testing");
     expect(rendered.text).toContain("Delivery: in progress");
     expect(rendered.text).not.toContain("Model escalation:");
     expect(rendered.text).not.toContain("Mandatory guards:");
   });
 
-  it("names the workflow navigator for new work without a recipe line", () => {
+  it("keeps workflow navigator mechanics out of the default status", () => {
     const rendered = renderJobStatus(jobFixture({
       id: telegramJobId,
       state: "implementing",
@@ -191,8 +187,8 @@ describe("deterministic Telegram views", () => {
       routingMode: "active",
     }));
 
-    expect(rendered.text).toContain("Workflow navigator: <code>navigator-v1/deterministic</code>");
-    expect(rendered.text).not.toContain("Recipe:");
+    expect(rendered.text).toContain("Status: coding and testing");
+    expect(rendered.text).not.toMatch(/Workflow navigator:|Recipe:/u);
   });
 
   it("renders bounded plural status groups with an exact remaining count", () => {
@@ -285,8 +281,8 @@ describe("deterministic Telegram views", () => {
     expect(rendered.text).toContain("Fix &lt;redirect&gt; &amp; safety");
     expect(rendered.text).toContain("4 files, +12 / -3");
     expect(rendered.text).toContain("aaaaaaaaaaaaaaaa");
-    expect(rendered.text).toContain("thr_implementation");
-    expect(rendered.text).toContain("thr_review");
+    expect(rendered.text).not.toContain("thr_implementation");
+    expect(rendered.text).not.toContain("thr_review");
     expect(rendered.text).toContain("https://bb.example/app");
     expect(rendered.text).toContain("No &lt;actionable&gt; findings");
     expect(rendered.text).toContain("42 passed");

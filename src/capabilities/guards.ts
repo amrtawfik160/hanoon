@@ -8,6 +8,10 @@ const BOUNDED_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_GUARDS = 16;
 const MAX_FINDINGS = 100;
 
+export function isBoundedPolicyKey(value: unknown): value is string {
+  return typeof value === "string" && BOUNDED_KEY.test(value);
+}
+
 const guardFindingSchema = z.object({
   ruleId: z.string().regex(BOUNDED_KEY),
   severity: z.enum(["critical", "high", "medium", "low"]),
@@ -90,6 +94,37 @@ export type AssessedGuardFinding = GuardFinding & Readonly<{
   fingerprint: string;
 }>;
 
+export type FindingDispositionPolicy = Readonly<{
+  defaultDisposition: "must_fix" | "advisory";
+  mustFixRuleIds: readonly string[];
+  advisoryRuleIds: readonly string[];
+  requirementIds: readonly string[];
+}>;
+
+export type FindingDispositionInput = Readonly<{
+  ruleId: string;
+  severity: "critical" | "high" | "medium" | "low";
+  requirementId: string | null;
+  evidenceClass: string;
+}>;
+
+/**
+ * Evaluate one finding against an admitted, versioned policy snapshot.
+ * A null result means the finding references policy context that was not
+ * admitted for the assessment and must therefore fail closed.
+ */
+export function evaluateFindingDisposition(
+  finding: FindingDispositionInput,
+  policy: FindingDispositionPolicy,
+): "must_fix" | "advisory" | null {
+  if (finding.requirementId !== null && !policy.requirementIds.includes(finding.requirementId)) return null;
+  if (finding.severity === "critical" || finding.severity === "high") return "must_fix";
+  if (finding.requirementId !== null || finding.evidenceClass === "public-contract") return "must_fix";
+  if (policy.mustFixRuleIds.includes(finding.ruleId)) return "must_fix";
+  if (policy.advisoryRuleIds.includes(finding.ruleId)) return "advisory";
+  return policy.defaultDisposition;
+}
+
 export type GuardEnvelopeAssessment = Readonly<{
   outcome: "pass" | "pass_with_advisories" | "changes_requested" | "blocked";
   reasons: readonly string[];
@@ -160,7 +195,7 @@ function blocked(reason: string): GuardEnvelopeAssessment {
 
 function hasUniqueBoundedKeys(values: readonly string[], maximum: number): boolean {
   return values.length <= maximum && new Set(values).size === values.length &&
-    values.every((value) => BOUNDED_KEY.test(value));
+    values.every(isBoundedPolicyKey);
 }
 
 function validPolicy(policy: GuardAssessmentPolicy): boolean {
@@ -185,7 +220,7 @@ export function normalizeGuardSubject(rawSubject: string): string {
     .replace(/\/$/u, "");
   if (normalized.length < 1 || normalized.length > 512 || normalized.startsWith("/") ||
     /^[A-Za-z]:\//u.test(normalized) || normalized.includes("\0") ||
-    normalized.split("/").some((segment) => segment === ".." || segment.length === 0)) {
+    normalized.split("/").some((segment) => segment === "." || segment === ".." || segment.length === 0)) {
     throw new TypeError("Guard finding subject must be a normalized project-relative identity");
   }
   return normalized;
@@ -210,16 +245,6 @@ export function guardFindingFingerprint(input: Readonly<{
     findingRequirementClass(parsed),
   ];
   return createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex");
-}
-
-function dispositionFor(
-  finding: GuardFinding,
-  policy: GuardAssessmentPolicy,
-): "must_fix" | "advisory" {
-  if (finding.severity === "critical" || finding.severity === "high") return "must_fix";
-  if (finding.requirementId !== null || finding.evidenceClass === "public-contract") return "must_fix";
-  if (policy.mustFixRuleIds.includes(finding.ruleId)) return "must_fix";
-  return "advisory";
 }
 
 function compareFindings(left: AssessedGuardFinding, right: AssessedGuardFinding): number {
@@ -276,6 +301,12 @@ export function assessGuardEnvelope(
   const substitutions: Array<{ capabilityId: string; substituteCapabilityId: string }> = [];
   const reasons: string[] = [];
   const findings: AssessedGuardFinding[] = [];
+  const dispositionPolicy: FindingDispositionPolicy = {
+    defaultDisposition: "advisory",
+    mustFixRuleIds: policy.mustFixRuleIds,
+    advisoryRuleIds: policy.advisoryRuleIds,
+    requirementIds: policy.requirementIds,
+  };
   let mandatoryFailure = false;
   let hasAdvisoryCondition = false;
 
@@ -312,11 +343,13 @@ export function assessGuardEnvelope(
         return blocked("guard finding subject is not project-relative");
       }
       const normalizedFinding = { ...finding, subject };
+      const disposition = evaluateFindingDisposition(normalizedFinding, dispositionPolicy);
+      if (disposition === null) return blocked(`guard finding references unknown requirement ${finding.requirementId}`);
       findings.push({
         ...normalizedFinding,
         capabilityId: selected.capabilityId,
         descriptorDigest: selected.descriptorDigest,
-        disposition: dispositionFor(normalizedFinding, policy),
+        disposition,
         fingerprint: guardFindingFingerprint({
           descriptorDigest: selected.descriptorDigest,
           finding: normalizedFinding,

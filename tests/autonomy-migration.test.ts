@@ -1,5 +1,5 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { expect, it, vi } from "vitest";
 import {
   ALL_MIGRATIONS,
   OWNER_BOUNDARY_SOURCE_MIGRATIONS,
@@ -12,12 +12,24 @@ import {
   TASK_AUTHORITY_REVISION_MIGRATIONS,
   NAVIGATOR_RELEASE_MIGRATIONS,
   NAVIGATOR_PROMOTION_MIGRATIONS,
+  NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
+  MANAGED_AUTOMATION_MIGRATIONS,
+  MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS,
+  NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
+  MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS,
+  CONTROLLER_BURST_MIGRATIONS,
+  NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS,
+  NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
+  NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   PROTECTED_CONNECTOR_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   WorkArtifactRepository,
   registerWorkArtifactRelationshipValidation,
 } from "../src/work-artifacts/repository";
+import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
+import { runJobExecutorService } from "../src/services/job-executor-service";
+import { openStore } from "../src/storage/store";
 
 const LEGACY_MIGRATION_COUNT = 16;
 const LEGACY_PROJECT_ID = "proj_legacy";
@@ -61,10 +73,25 @@ const TICKET_41_MIGRATION_COUNT = TASK_AUTHORITY_MIGRATIONS.length +
   POLICY_APPROVAL_INTENT_MIGRATIONS.length;
 const TICKET_42_MIGRATION_COUNT = NAVIGATOR_RELEASE_MIGRATIONS.length;
 const TICKET_43_MIGRATION_COUNT = NAVIGATOR_PROMOTION_MIGRATIONS.length;
+const TICKET_44_MIGRATION_COUNT = NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length;
+const TICKET_45_MIGRATION_COUNT = MANAGED_AUTOMATION_MIGRATIONS.length;
+const NATIVE_SDLC_UPGRADE_MIGRATION_COUNT = NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length +
+  MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
+const CONTROLLER_BURST_MIGRATION_COUNT = CONTROLLER_BURST_MIGRATIONS.length;
+const NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT = NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
+const MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT = MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
+const FINDING_LEDGER_UPGRADE_MIGRATION_COUNT = NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
+const REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT = NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length;
 
 const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length
-  - TICKET_41_MIGRATION_COUNT - TICKET_42_MIGRATION_COUNT - TICKET_43_MIGRATION_COUNT
-  - PROTECTED_CONNECTOR_MIGRATIONS.length;
+  - TICKET_41_MIGRATION_COUNT - TICKET_42_MIGRATION_COUNT - TICKET_43_MIGRATION_COUNT -
+  TICKET_44_MIGRATION_COUNT - TICKET_45_MIGRATION_COUNT - NATIVE_SDLC_UPGRADE_MIGRATION_COUNT -
+  CONTROLLER_BURST_MIGRATION_COUNT -
+  NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT -
+  MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT -
+  FINDING_LEDGER_UPGRADE_MIGRATION_COUNT -
+    REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT -
+      PROTECTED_CONNECTOR_MIGRATIONS.length;
 
 function legacyDatabase(pluginId: string) {
   const { bb } = createFakePluginHost({ pluginId });
@@ -119,7 +146,12 @@ function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
     -(
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
       POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length +
-      NAVIGATOR_PROMOTION_MIGRATIONS.length + PROTECTED_CONNECTOR_MIGRATIONS.length
+      NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
+      MANAGED_AUTOMATION_MIGRATIONS.length + NATIVE_SDLC_UPGRADE_MIGRATION_COUNT +
+      CONTROLLER_BURST_MIGRATION_COUNT + NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT +
+      MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
+        REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+          PROTECTED_CONNECTOR_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -176,11 +208,89 @@ function insertRelationshipUpgradeArtifact(
   ).run(id, operationId, externalId, operationId);
 }
 
+function insertLegacyNavigatorEffect(
+  db: ReturnType<typeof legacyDatabase>["db"],
+  input: { jobId: string; effectKey: string; kind: string; status: "pending" | "leased" },
+): void {
+  db.prepare(
+    `INSERT INTO jobs (
+       id, source_update_id, request_text, state, workflow_engine, workflow_mode,
+       workflow_revision, artifact_bindings_json, created_at, updated_at
+     ) VALUES (?, ?, 'legacy request', 'planning', 'navigator-v1', 'deterministic', 1, '[]', 900, 1000)`,
+  ).run(input.jobId, Number(input.jobId.replace("job_legacy_", "")));
+  db.prepare(
+    `INSERT INTO effects (
+       idempotency_key, job_id, kind, payload_json, status, attempts,
+       lease_owner, lease_generation, lease_expires_at,
+       next_attempt_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 1000, 1000, 1000)`,
+  ).run(
+    input.effectKey,
+    input.jobId,
+    input.kind,
+    "{}",
+    input.status,
+    input.status === "leased" ? "legacy-worker" : null,
+    input.status === "leased" ? 1 : null,
+    input.status === "leased" ? 2_000 : null,
+  );
+}
+
+function insertLegacySkillAttempt(
+  db: ReturnType<typeof legacyDatabase>["db"],
+  effectKey: string,
+): void {
+  db.prepare(
+    `INSERT INTO navigator_skill_attempts (
+       id, job_id, workflow_step_id, effect_idempotency_key, skill_id, skill_revision,
+       skill_source_digest, descriptor_digest, step_contract_id, step_contract_revision,
+       step_contract_digest, catalog_digest, step_input_json, step_input_digest,
+       model_route_json, artifact_bindings_json, snapshot_digest, job_version,
+       workflow_revision, resource_kind, resource_id, created_at, updated_at
+     ) VALUES ('skill_legacy', 'job_legacy_1', 'legacy_step_1', ?, 'skill', '1',
+       'source', 'descriptor', 'contract', 1, 'contract-digest', 'catalog', '{}',
+       'input', '{}', '{}', 'snapshot', 1, 1, NULL, NULL, 1000, 1000)`,
+  ).run(effectKey);
+}
+
+function insertLegacyTicketAttempt(
+  db: ReturnType<typeof legacyDatabase>["db"],
+  effectKey: string,
+): void {
+  db.prepare(
+    `INSERT INTO navigator_ticket_worker_attempts (
+       id, job_id, slice_id, kind, ordinal, effect_idempotency_key, work_order_json,
+       work_order_digest, step_contract_id, step_contract_revision, step_contract_digest,
+       profile_json, profile_digest, model_route_json, resource_kind, resource_id,
+       created_at, updated_at
+     ) VALUES ('ticket_legacy', 'job_legacy_2', 'legacy_slice_2', 'implementation', 1, ?,
+       '{}', 'work-order', 'contract', 1, 'contract-digest', '{}', 'profile', '{}',
+       NULL, NULL, 1000, 1000)`,
+  ).run(effectKey);
+}
+
+function insertLegacyReleaseAttempt(
+  db: ReturnType<typeof legacyDatabase>["db"],
+  effectKey: string,
+): void {
+  db.prepare(
+    `INSERT INTO navigator_release_attempts (
+       id, job_id, workflow_step_id, effect_idempotency_key, implementation_ticket_ids_json,
+       snapshot_digest, job_version, workflow_revision, created_at, updated_at
+     ) VALUES ('release_legacy', 'job_legacy_3', 'legacy_step_3', ?, '[]', ?, 1, 1, 1000, 1000)`,
+  ).run(effectKey, "a".repeat(64));
+}
+
 it("keeps the autonomy migration after the frozen legacy positions and appends later migrations", () => {
   expect(PRE_TICKET_41_MIGRATION_COUNT).toBe(LEGACY_MIGRATION_COUNT + 64);
   expect(ALL_MIGRATIONS).toHaveLength(
     PRE_TICKET_41_MIGRATION_COUNT + TICKET_41_MIGRATION_COUNT + TICKET_42_MIGRATION_COUNT +
-      TICKET_43_MIGRATION_COUNT + PROTECTED_CONNECTOR_MIGRATIONS.length,
+      TICKET_43_MIGRATION_COUNT + TICKET_44_MIGRATION_COUNT + TICKET_45_MIGRATION_COUNT +
+      NATIVE_SDLC_UPGRADE_MIGRATION_COUNT + CONTROLLER_BURST_MIGRATION_COUNT +
+        NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT + MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT +
+        FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
+          REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+            PROTECTED_CONNECTOR_MIGRATIONS.length,
   );
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
@@ -290,7 +400,12 @@ it("rolls back the boundary-source upgrade when active legacy evidence cannot be
     0,
     -(OWNER_BOUNDARY_SOURCE_MIGRATIONS.length + POLICY_APPROVAL_INTENT_MIGRATIONS.length +
       NAVIGATOR_RELEASE_MIGRATIONS.length + NAVIGATOR_PROMOTION_MIGRATIONS.length +
-      PROTECTED_CONNECTOR_MIGRATIONS.length),
+      NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length + MANAGED_AUTOMATION_MIGRATIONS.length +
+      NATIVE_SDLC_UPGRADE_MIGRATION_COUNT + CONTROLLER_BURST_MIGRATION_COUNT +
+        NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT + MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT +
+        FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
+          REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+            PROTECTED_CONNECTOR_MIGRATIONS.length),
   ));
   db.prepare(
     `INSERT INTO task_authorities (
@@ -351,7 +466,12 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
       POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length +
-      NAVIGATOR_PROMOTION_MIGRATIONS.length + PROTECTED_CONNECTOR_MIGRATIONS.length
+      NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
+      MANAGED_AUTOMATION_MIGRATIONS.length + NATIVE_SDLC_UPGRADE_MIGRATION_COUNT +
+      CONTROLLER_BURST_MIGRATION_COUNT + NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT +
+      MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
+        REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+          PROTECTED_CONNECTOR_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -405,7 +525,12 @@ it("fails the authority upgrade when an older bound revision cannot be reconstru
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
       POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length +
-      NAVIGATOR_PROMOTION_MIGRATIONS.length + PROTECTED_CONNECTOR_MIGRATIONS.length
+      NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
+      MANAGED_AUTOMATION_MIGRATIONS.length + NATIVE_SDLC_UPGRADE_MIGRATION_COUNT +
+      CONTROLLER_BURST_MIGRATION_COUNT + NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT +
+      MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
+        REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+          PROTECTED_CONNECTOR_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -467,7 +592,12 @@ it("reconstructs an older shipped revision from its authoritative release bindin
       TASK_AUTHORITY_REVISION_MIGRATIONS.length + TASK_AUTHORITY_CLOSURE_MIGRATIONS.length +
       TASK_AUTHORITY_PUBLISH_MIGRATIONS.length + OWNER_BOUNDARY_SOURCE_MIGRATIONS.length +
       POLICY_APPROVAL_INTENT_MIGRATIONS.length + NAVIGATOR_RELEASE_MIGRATIONS.length +
-      NAVIGATOR_PROMOTION_MIGRATIONS.length + PROTECTED_CONNECTOR_MIGRATIONS.length
+      NAVIGATOR_PROMOTION_MIGRATIONS.length + NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.length +
+      MANAGED_AUTOMATION_MIGRATIONS.length + NATIVE_SDLC_UPGRADE_MIGRATION_COUNT +
+      CONTROLLER_BURST_MIGRATION_COUNT + NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT +
+      MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
+        REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+          PROTECTED_CONNECTOR_MIGRATIONS.length
     ),
   ));
   db.prepare(
@@ -1224,4 +1354,136 @@ it("rolls back instead of repairing a selected job with mismatched policy projec
     created_at: 7_900,
     updated_at: 8_000,
   });
+});
+
+it("continues preceding-schema active Navigator attempts without fabricating capability evidence", async () => {
+  const { bb } = createFakePluginHost({ pluginId: "navigator-capability-compatibility" });
+  const db = bb.storage.database();
+  registerWorkArtifactRelationshipValidation(db);
+  bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(
+    0,
+    -(NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT + MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT +
+      FINDING_LEDGER_UPGRADE_MIGRATION_COUNT + REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
+      PROTECTED_CONNECTOR_MIGRATIONS.length),
+  ));
+
+  db.pragma("foreign_keys = OFF");
+  insertLegacyNavigatorEffect(db, {
+    jobId: "job_legacy_1",
+    effectKey: "job_legacy_1:skill",
+    kind: "run_navigator_skill",
+    status: "pending",
+  });
+  insertLegacySkillAttempt(db, "job_legacy_1:skill");
+  insertLegacyNavigatorEffect(db, {
+    jobId: "job_legacy_2",
+    effectKey: "job_legacy_2:ticket",
+    kind: "run_navigator_ticket_worker",
+    status: "leased",
+  });
+  insertLegacyTicketAttempt(db, "job_legacy_2:ticket");
+  insertLegacyNavigatorEffect(db, {
+    jobId: "job_legacy_3",
+    effectKey: "job_legacy_3:release",
+    kind: "run_navigator_release",
+    status: "pending",
+  });
+  insertLegacyReleaseAttempt(db, "job_legacy_3:release");
+  db.pragma("foreign_keys = ON");
+
+  applyCurrentMigrations(bb);
+
+  expect(db.prepare(
+    `SELECT effect_idempotency_key, job_id, kind, attempt_id, state, reason_code, decoder_revision
+       FROM navigator_effect_compatibility
+      ORDER BY effect_idempotency_key`,
+  ).all()).toEqual([
+    {
+      effect_idempotency_key: "job_legacy_1:skill",
+      job_id: "job_legacy_1",
+      kind: "run_navigator_skill",
+      attempt_id: "skill_legacy",
+      state: "pending",
+      reason_code: "preceding_schema_capability_evidence_missing",
+      decoder_revision: 1,
+    },
+    {
+      effect_idempotency_key: "job_legacy_2:ticket",
+      job_id: "job_legacy_2",
+      kind: "run_navigator_ticket_worker",
+      attempt_id: "ticket_legacy",
+      state: "pending",
+      reason_code: "preceding_schema_capability_evidence_missing",
+      decoder_revision: 1,
+    },
+    {
+      effect_idempotency_key: "job_legacy_3:release",
+      job_id: "job_legacy_3",
+      kind: "run_navigator_release",
+      attempt_id: "release_legacy",
+      state: "pending",
+      reason_code: "preceding_schema_capability_evidence_missing",
+      decoder_revision: 1,
+    },
+  ]);
+  expect(db.prepare(
+    `SELECT idempotency_key, status, lease_owner, lease_generation, lease_expires_at
+       FROM effects
+      WHERE idempotency_key LIKE 'job_legacy_%'
+      ORDER BY idempotency_key`,
+  ).all()).toEqual([
+    {
+      idempotency_key: "job_legacy_1:skill",
+      status: "pending",
+      lease_owner: null,
+      lease_generation: null,
+      lease_expires_at: null,
+    },
+    {
+      idempotency_key: "job_legacy_2:ticket",
+      status: "leased",
+      lease_owner: "legacy-worker",
+      lease_generation: 1,
+      lease_expires_at: 2_000,
+    },
+    {
+      idempotency_key: "job_legacy_3:release",
+      status: "pending",
+      lease_owner: null,
+      lease_generation: null,
+      lease_expires_at: null,
+    },
+  ]);
+  expect(db.prepare("SELECT COUNT(*) AS count FROM navigator_effect_capability_evidence").get())
+    .toEqual({ count: 0 });
+
+  const adapter = vi.fn(async () => ({ outcome: "permanent" as const, reason: "must remain quarantined" }));
+  const protocol = new NavigatorEffectProtocol({
+    store: openStore(bb.storage, bb.storage.kv, () => 1_100),
+    clock: { now: () => 1_100 },
+    adapters: [
+      { kind: "run_navigator_skill", execute: adapter },
+      { kind: "run_navigator_ticket_worker", execute: adapter },
+      { kind: "run_navigator_release", execute: adapter },
+    ],
+  });
+  const abort = new AbortController();
+  await runJobExecutorService({
+    store: openStore(bb.storage, bb.storage.kv, () => 1_100),
+    clock: { now: () => 1_100 },
+    navigatorEffects: protocol,
+    effectRunnerFactory: () => ({ run: async () => undefined }),
+    waitForWork: async () => abort.abort(),
+    releaseOnShutdown: true,
+  }, abort.signal);
+  expect(adapter).not.toHaveBeenCalled();
+  expect(db.prepare(
+    "SELECT status FROM effects WHERE idempotency_key IN ('job_legacy_1:skill', 'job_legacy_2:ticket', 'job_legacy_3:release') ORDER BY idempotency_key",
+  ).all()).toEqual([{ status: "pending" }, { status: "leased" }, { status: "pending" }]);
+  expect(db.prepare("SELECT COUNT(*) AS count FROM navigator_effect_compatibility_resolutions").get())
+    .toEqual({ count: 0 });
+
+  bb.storage.migrate(db, [...ALL_MIGRATIONS]);
+  expect(db.prepare("SELECT COUNT(*) AS count FROM navigator_effect_compatibility").get())
+    .toEqual({ count: 3 });
 });

@@ -4,6 +4,9 @@ const telegramUserSchema = z
   .object({
     id: z.number().int(),
     is_bot: z.boolean(),
+    first_name: z.string().max(256).optional(),
+    last_name: z.string().max(256).optional(),
+    username: z.string().max(256).optional(),
   })
   .passthrough();
 
@@ -11,8 +14,44 @@ const telegramChatSchema = z
   .object({
     id: z.number().int(),
     type: z.enum(["private", "group", "supergroup", "channel"]),
+    title: z.string().max(256).optional(),
   })
   .passthrough();
+
+/** Telegram forward origins: a user, a hidden user, a chat, or a channel. */
+const telegramForwardOriginSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("user"),
+      date: z.number().int().optional(),
+      sender_user: telegramUserSchema.optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal("hidden_user"),
+      date: z.number().int().optional(),
+      sender_user_name: z.string().max(256).optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal("chat"),
+      date: z.number().int().optional(),
+      sender_chat: telegramChatSchema.optional(),
+      author_signature: z.string().max(256).optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal("channel"),
+      date: z.number().int().optional(),
+      chat: telegramChatSchema.optional(),
+      message_id: z.number().int().optional(),
+      author_signature: z.string().max(256).optional(),
+    })
+    .passthrough(),
+]);
 
 const telegramPhotoSizeSchema = z
   .object({
@@ -101,6 +140,8 @@ export const telegramMessageSchema = z
     chat: telegramChatSchema,
     text: z.string().optional(),
     caption: z.string().optional(),
+    forward_origin: telegramForwardOriginSchema.optional(),
+    media_group_id: z.string().max(128).optional(),
     photo: z.array(telegramPhotoSizeSchema).min(1).optional(),
     document: telegramDocumentSchema.optional(),
     animation: telegramAnimationSchema.optional(),
@@ -109,7 +150,12 @@ export const telegramMessageSchema = z
     voice: telegramVoiceSchema.optional(),
     audio: telegramAudioSchema.optional(),
     reply_to_message: z
-      .object({ message_id: z.number().int() })
+      .object({
+        message_id: z.number().int(),
+        from: telegramUserSchema.optional(),
+        text: z.string().optional(),
+        caption: z.string().optional(),
+      })
       .passthrough()
       .optional(),
   })

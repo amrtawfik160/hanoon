@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import {
   admitInventoryItem,
   discoverExternalInventory,

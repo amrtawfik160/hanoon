@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it } from "vitest";
 import {
   MAX_LISTED_THREAD_ASKS,
@@ -44,7 +44,7 @@ function submitTurn(
     inputText,
     now: 2_000,
   });
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
   const spawned = store.getControllerByThreadId("thr_controller") !== null;
   if (spawned) {
     expect(store.prepareControllerDispatch({

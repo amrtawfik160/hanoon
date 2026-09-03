@@ -1166,6 +1166,15 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
 
 it("projects the remaining memory, monitor, health, scorecard, and style rows from trusted state", async () => {
   const fixture = registeredControllerFixture();
+  const controller = fixture.store.getControllerForOwner("7", "7");
+  if (!controller || !fixture.turn.capabilityProfileId) throw new Error("controller capability fixture is incomplete");
+  expect(fixture.store.requestControllerCapabilityExpansion({
+    controllerKey: controller.controllerKey,
+    turnId: fixture.turn.id,
+    expectedProfileId: fixture.turn.capabilityProfileId,
+    bundleIds: ["monitoring"],
+    now: 2_000,
+  }).outcome).toBe("resume_required");
   const call = async (name: string, params: unknown) => JSON.parse(await fixture.harness.behavior.callAgentTool(
     name,
     params,
@@ -1196,7 +1205,7 @@ it("projects the remaining memory, monitor, health, scorecard, and style rows fr
   });
   expect(watching._hanoonEvidence).toMatchObject({
     outcome: "succeeded",
-    proofKinds: ["monitor_state", "obligation"],
+    proofKinds: ["monitor_state", "external_mutation", "obligation"],
     subjectRefs: [`monitor:${watching.watching.id}`],
   });
 

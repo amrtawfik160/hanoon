@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { expect, it, vi } from "vitest";
 import { parseWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import { BbRunner } from "../src/bb/runner";

@@ -1,4 +1,5 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { CONTROLLER_BURST_QUIET_GAP_MS } from "../src/controller/burst";
 import { expect, it } from "vitest";
 import plugin from "../server";
 import { protectedConnectorCapabilityFor } from "../src/credentials/connector-protocol";
@@ -293,8 +294,12 @@ it("reconciles a broker projection through the controller-fenced CLI path", asyn
   });
   const lease = store.acquireExecutorLease("executor-cli-reconcile", now, 60_000);
   if (!lease.acquired) throw new Error("cli_reconcile_executor_lease_missing");
-  expect(store.claimNextControllerTurn({ ownerId: "executor-cli-reconcile", generation: lease.generation, now: now + 1 })?.id)
-    .toBe(queued.id);
+  // A burst is claimed only once its newest message has gone quiet.
+  expect(store.claimNextControllerTurn({
+    ownerId: "executor-cli-reconcile",
+    generation: lease.generation,
+    now: now + CONTROLLER_BURST_QUIET_GAP_MS,
+  })?.id).toBe(queued.id);
   expect(store.markControllerSpawned({
     turnId: queued.id,
     ownerId: "executor-cli-reconcile",
