@@ -482,7 +482,7 @@ describe("contracted new-work vocabulary", () => {
       "clean-code-guard",
       "test-guard",
       "durable-boundary-audit",
-      "pr-writer",
+      "show-me",
     ]);
     expect(ROLE_SKILLS.planner).toEqual(["unslop", "writing-for-agents", "docs-guard"]);
     expect(CONTROLLER_DEFAULT_SKILLS).toEqual(["driving-bb", "unslop"]);

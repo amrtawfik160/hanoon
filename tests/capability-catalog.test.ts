@@ -37,11 +37,11 @@ const EXPECTED_SKILL_ROUTES = {
   handoff: "manual-only",
   implement: "manual-only",
   "improve-codebase-architecture": "manual-only",
-  "pr-writer": "worker",
   prototype: "worker",
   research: "worker",
   "resolving-merge-conflicts": "worker",
   "setup-matt-pocock-skills": "manual-only",
+  "show-me": "worker",
   tdd: "worker",
   teach: "manual-only",
   "technical-writing": "worker",
@@ -75,6 +75,10 @@ describe("capability catalog", () => {
     expect(CAPABILITY_GRAPH_DIGEST).not.toBe(HISTORICAL_RECIPE_GRAPH_DIGEST);
     expect(HISTORICAL_RECIPE_CAPABILITY_CATALOG.some((entry) => entry.id === "using-superpowers")).toBe(true);
     expect(CAPABILITY_CATALOG.some((entry) => entry.id === "using-superpowers")).toBe(false);
+    // Retired from the bundle, but its frozen recipe-v1 descriptor must survive
+    // so an installed job's recorded digest still resolves.
+    expect(HISTORICAL_RECIPE_CAPABILITY_CATALOG.some((entry) => entry.id === "pr-writer")).toBe(true);
+    expect(CAPABILITY_CATALOG.some((entry) => entry.id === "pr-writer")).toBe(false);
     expect(CAPABILITY_CATALOG.some((entry) => entry.kind === "recipe")).toBe(false);
     expect(CAPABILITY_CATALOG.some((entry) => entry.kind === "native-adapter")).toBe(false);
   });

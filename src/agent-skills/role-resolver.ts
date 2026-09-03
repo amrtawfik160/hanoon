@@ -49,8 +49,9 @@ export const ROLE_SKILLS = {
     // requires a new guard to be shown failing before it is trusted.
     "durable-boundary-audit",
     // The implementation attempt is the one that opens the pull request the
-    // reviewer then reads, so it owns writing a reviewer-facing description.
-    "pr-writer",
+    // reviewer then reads, so it owns writing a reviewer-facing description:
+    // a diff-shaped sketch, call tree, or sequence diagram of what changed.
+    "show-me",
   ],
   // The guards judge the code the change contains. This one judges what the
   // change can break outside it, which is the risk a verdict carries when it

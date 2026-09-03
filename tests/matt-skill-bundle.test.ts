@@ -44,7 +44,7 @@ const retained = [
   "docs-guard",
   "driving-bb",
   "durable-boundary-audit",
-  "pr-writer",
+  "show-me",
   "test-guard",
   "unslop",
 ] as const;

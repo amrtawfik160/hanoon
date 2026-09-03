@@ -106,7 +106,7 @@ Historical recipe promotion still exists as leftover recipe-v1 history. Adaptive
 
 ## Bundled agent skills
 
-The plugin carries a deterministic 35-skill catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus ten Hanoon, guard, delivery, writing, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are not installed. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair, and it refuses to start while a nonterminal recipe-v1 job still needs a legacy skill or state handler.
+The plugin carries a deterministic 35-skill catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus ten Hanoon, guard, writing, visualization, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are not installed. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair, and it refuses to start while a nonterminal recipe-v1 job still needs a legacy skill or state handler.
 
 BB discovers skills one directory below each registered root, so the manifest registers the Matt Pocock `engineering` and `productivity` buckets separately. New work uses the workflow navigator. Historical recipe columns, descriptors, and receipts remain readable.
 
@@ -115,7 +115,7 @@ BB discovers skills one directory below each registered root, so the manifest re
 | controller | `driving-bb`, `unslop`, and on an explicit grill request `grill-with-docs`, `grilling`, `domain-modeling`. Conduct requires unslop on every owner-facing message. |
 | planner | `unslop`, `writing-for-agents`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `show-me` |
 | review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review` |
 | documentation | `unslop`, `technical-writing`, `docs-guard` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |

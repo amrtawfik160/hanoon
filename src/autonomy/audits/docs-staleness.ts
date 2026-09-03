@@ -54,7 +54,6 @@ export const PROPOSAL_DOC_PREFIXES: readonly string[] = Object.freeze([
  * is audited normally.
  */
 export const VENDORED_DOC_PREFIXES: readonly string[] = Object.freeze([
-  "skills/delivery/",
   "skills/guards/",
   "skills/matt-pocock/",
 ]);

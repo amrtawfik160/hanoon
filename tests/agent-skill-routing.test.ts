@@ -105,6 +105,7 @@ describe("worker skill role table", () => {
     ]));
     expect(BUNDLED_SKILL_IDS).not.toEqual(expect.arrayContaining([
       "brainstorming",
+      "pr-writer",
       "proportional-development-workflow",
       "using-superpowers",
     ]));
@@ -122,7 +123,7 @@ describe("worker skill role table", () => {
         "clean-code-guard",
         "test-guard",
         "durable-boundary-audit",
-        "pr-writer",
+        "show-me",
       ],
     ],
     [

@@ -124,13 +124,15 @@ describe("least-capability worker profiles", () => {
     }).skills).toEqual(["docs-guard", "verification-before-completion"]);
   });
 
-  it("orders PR writing after verification for a settled nontrivial diff", () => {
+  // Delivery metadata is deterministic on recipe-v1: the skill that once wrote
+  // it is no longer bundled, and the frozen catalog cannot gain a replacement.
+  it("verifies a settled nontrivial diff without selecting a writing skill", () => {
     expect(selectCapabilityProfile({
       role: "implementation",
       recipe: "bounded",
       stage: "delivery",
       traits: ["nontrivial-diff"],
-    }).skills).toEqual(["verification-before-completion", "pr-writer"]);
+    }).skills).toEqual(["verification-before-completion"]);
   });
 
   it("never injects raw orchestration or manual-only skills into workers", () => {

@@ -47,6 +47,7 @@ describe("skill invocation policy", () => {
     ["ask-matt", false, true, true],
     ["implement", false, true, true],
     ["technical-writing", false, true, true],
+    ["show-me", true, true, true],
     ["diagnosing-bugs", true, true, true],
     ["code-review", true, true, true],
   ] as const)("enforces the invocation routes for %s", (id, general, navigator, owner) => {
@@ -56,7 +57,7 @@ describe("skill invocation policy", () => {
   });
 
   test("rejects legacy, unknown, and do-prefixed ids from every admitted route", () => {
-    for (const id of ["using-superpowers", "proportional-development-workflow", "do-anything", "unknown"]) {
+    for (const id of ["using-superpowers", "pr-writer", "proportional-development-workflow", "do-anything", "unknown"]) {
       expect(skillInvocationAllowed(id, "general-worker")).toBe(false);
       expect(skillInvocationAllowed(id, "navigator")).toBe(false);
       expect(skillInvocationAllowed(id, "owner")).toBe(false);

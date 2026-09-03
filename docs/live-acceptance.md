@@ -72,7 +72,7 @@ Fill this sheet with placeholders or redacted values. Use one row per attempt wh
 | review BB thread ids | `<thread id>` per attempt |
 | implementation environment id | `<environment id>` |
 | review environment ids | `<same environment id>` per attempt |
-| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`, `pr-writer`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
+| implementation skill-provider evidence | real thread id: `<pending>`; role: `implementation`; selected ids: `unslop`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | review skill-provider evidence | real thread id: `<pending>`; role: `review`; selected ids: `unslop`, `clean-code-guard`, `test-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | documentation skill-provider evidence | real thread id: `<pending>`; role: `documentation`; selected ids: `unslop`, `technical-writing`, `docs-guard`, `verification-before-completion`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |
 | final-review skill-provider evidence | real thread id: `<pending>`; role: `final-review`; selected ids: `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`; bundle digest: `<pending>`; provider-session outcome: `<pending>` |

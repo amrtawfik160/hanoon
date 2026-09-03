@@ -17,10 +17,10 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { fileURLToPath } from "node:url";
 import {
   BUNDLE_LIMITS,
-  DELIVERY_KIT,
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
+  HUMANLAYER_KIT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
   LOCKED_ROOTS,
@@ -382,9 +382,9 @@ function buildLock(stagedMatt) {
     schemaVersion: LOCK_SCHEMA_VERSION,
     mattPocockKit: MATT_POCOCK_KIT,
     guardKit: GUARD_KIT,
-    deliveryKit: DELIVERY_KIT,
     hanoonKit: HANOON_KIT,
     pstackKit: PSTACK_KIT,
+    humanlayerKit: HUMANLAYER_KIT,
     skills,
     legacySkills,
     shadowedSkills,

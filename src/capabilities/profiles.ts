@@ -94,10 +94,11 @@ function desiredCapabilities(input: CapabilityProfileSelectionInput, traits: Rea
       if (traits.has("behavioral-change")) desired.add("test-driven-development");
       desired.add("verification-before-completion");
     }
-    if (input.stage === "delivery") {
-      desired.add("verification-before-completion");
-      if (traits.has("nontrivial-diff")) desired.add("pr-writer");
-    }
+    // Delivery metadata is deterministic on this engine. The skill that used to
+    // write it is no longer bundled, and the frozen recipe-v1 catalog cannot
+    // gain its replacement without changing a digest that installed jobs
+    // recorded, so a recipe-v1 delivery selects no writing skill at all.
+    if (input.stage === "delivery") desired.add("verification-before-completion");
   }
   if (input.role === "documentation" && input.stage === "documentation" && traits.has("docs-changed")) {
     desired.add("docs-guard");

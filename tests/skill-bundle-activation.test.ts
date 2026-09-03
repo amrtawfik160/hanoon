@@ -168,7 +168,7 @@ test("verifies the real committed bundle", () => {
     "grilling",
     "technical-writing",
     "test-guard",
-    "pr-writer",
+    "show-me",
     "unslop",
     "ask-matt",
     "code-review",
@@ -179,6 +179,7 @@ test("verifies the real committed bundle", () => {
   ]));
   expect(verified.skillIds).not.toEqual(expect.arrayContaining([
     "brainstorming",
+    "pr-writer",
     "proportional-development-workflow",
     "writing-skills",
     "using-superpowers",
@@ -342,10 +343,10 @@ test.each([
   const root = copiedBundleRoot();
   const roots = [
     join(root, "skills/guards"),
-    join(root, "skills/delivery"),
     join(root, "skills/matt-pocock"),
     join(root, "skills/hanoon"),
     join(root, "skills/pstack"),
+    join(root, "skills/humanlayer"),
   ];
   fillEntryLimit(roots, join(root, "skills/guards/clean-code-guard/excess"), limit);
 

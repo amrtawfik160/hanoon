@@ -138,18 +138,18 @@ Navigator-v1 is the admission engine. `DualEngineCoordinator.persistEvaluationEv
 
 ## Agent skill runtime
 
-The repository locks one reviewed 35-skill catalog. It combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with ten retained platform, guard, delivery, writing, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are absent from the installed bundle. No runtime path downloads or repairs skills.
+The repository locks one reviewed 35-skill catalog. It combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with ten retained platform, guard, writing, visualization, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are absent from the installed bundle. No runtime path downloads or repairs skills.
 
 BB reads one level of child directories from every plugin skill root. The package therefore registers both Matt Pocock buckets, not their common parent. The three promoted ids that previously overlapped a historical discovery root now live in those registered buckets. New admissions always use navigator-v1. Historical recipe descriptors, registry digests, receipts, and columns remain readable and unchanged.
 
 | Registered root | Source | Purpose |
 | --- | --- | --- |
 | `skills/guards` | [guard-skills](https://github.com/amElnagdy/guard-skills) | `clean-code-guard`, `test-guard`, `docs-guard` |
-| `skills/delivery` | [getsentry/skills](https://github.com/getsentry/skills) | `pr-writer` |
 | `skills/matt-pocock/engineering` | [mattpocock/skills](https://github.com/mattpocock/skills) at the reviewed revision | promoted engineering skills |
 | `skills/matt-pocock/productivity` | same reviewed source | promoted productivity skills |
 | `skills/hanoon` | first-party, with source notices where adapted | four retained platform skills |
 | `skills/pstack` | [cursor/plugins](https://github.com/cursor/plugins) at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | `unslop` and `technical-writing` |
+| `skills/humanlayer` | [humanlayer/skills](https://github.com/humanlayer/skills) at revision `3c2629142c5d437428269b1b722b08c0b87f574d` | `show-me` |
 
 Each lock record binds the skill id, source path, source revision, source digest, descriptor digest, license, and invocation class. The 35-skill catalog allows model-invoked skills in general workers and requires an explicit navigator or owner route for user-invoked skills.
 
@@ -160,7 +160,7 @@ The contracted role matrix for new work is:
 | controller | `driving-bb`, `unslop`, and on an explicit grill request `grill-with-docs`, `grilling`, `domain-modeling` |
 | planner | `unslop`, `writing-for-agents`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `show-me` |
 | review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review` |
 | documentation | `unslop`, `technical-writing`, `docs-guard` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |

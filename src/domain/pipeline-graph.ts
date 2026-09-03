@@ -123,9 +123,19 @@ export function documentationRequirement(input: Readonly<{
   });
 }
 
+/**
+ * Delivery metadata on the recipe-v1 engine, which is now always deterministic.
+ *
+ * A nontrivial diff used to route to a bundled writing skill. That skill is no
+ * longer shipped, and its replacement cannot be added to the recipe-v1
+ * catalog: those descriptors are frozen by a registry digest that installed
+ * jobs already recorded. Selecting an unshipped skill would fail at the
+ * provider rather than at the boundary, so this engine names none. The fields
+ * are kept so an existing consumer reads the same shape.
+ */
 export type DeliveryMetadataPolicy = Readonly<{
-  mode: "deterministic" | "pr-writer";
-  capabilityId: "pr-writer" | null;
+  mode: "deterministic";
+  capabilityId: null;
   diffDigest: string;
 }>;
 
@@ -134,14 +144,9 @@ export function deliveryMetadataPolicy(input: Readonly<{
   diff: string;
 }>): DeliveryMetadataPolicy {
   if (!TASK_RECIPES.includes(input.recipe)) throw new TypeError(`Unknown task recipe ${String(input.recipe)}`);
-  const paths = changedPathsFromGitDiff(input.diff);
-  const addedLines = input.diff.split(/\r?\n/u)
-    .filter((line) => line.startsWith("+") && !line.startsWith("+++ ")).length;
-  const trivialDirect = input.recipe === "direct" && addedLines <= 20 && paths.length > 0 &&
-    paths.every((path) => DOCUMENTATION_PATH.test(path) || /\.(?:css|scss|less|txt|md)$/iu.test(path));
   return Object.freeze({
-    mode: trivialDirect ? "deterministic" : "pr-writer",
-    capabilityId: trivialDirect ? null : "pr-writer",
+    mode: "deterministic",
+    capabilityId: null,
     diffDigest: createHash("sha256").update(input.diff, "utf8").digest("hex"),
   });
 }

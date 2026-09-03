@@ -90,7 +90,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally. The contracted bundle admits exactly 35 reviewed skill ids and no legacy-only Superpowers, discovery, or router ids. BB registers six immediate roots: the two promoted Matt Pocock buckets plus guards, delivery, Hanoon, and pstack. Every registered runtime id has one plugin source.
+Skills are committed locally. The contracted bundle admits exactly 35 reviewed skill ids and no legacy-only Superpowers, discovery, delivery, or router ids. BB registers six immediate roots: the two promoted Matt Pocock buckets plus guards, Hanoon, pstack, and humanlayer. Every registered runtime id has one plugin source.
 
 Run the deterministic integrity gate from the repository root:
 
