@@ -6,6 +6,10 @@ import {
   type CapabilityDescriptor,
   type CapabilityRoute,
 } from "./contracts";
+import {
+  PROTECTED_CONNECTOR_OPERATIONS,
+  protectedConnectorCapabilityFor,
+} from "../credentials/connector-protocol";
 import { evaluateFindingDisposition, isBoundedPolicyKey, type FindingDispositionInput } from "./guards";
 
 export const TASK_RECIPES = [
@@ -603,6 +607,38 @@ const modelPoolDescriptors = (["fast", "standard", "strong"] as const).map((pool
   evidenceStrength: pool === "strong" ? "high" : "standard",
 }));
 
+const liveConnectorDescriptors = PROTECTED_CONNECTOR_OPERATIONS.map((operation) => descriptor({
+  id: protectedConnectorCapabilityFor(operation),
+  kind: "connector",
+  source: "first-party-protected-connector",
+  version: "protocol-v2",
+  route: "hanoon-native",
+  roles: ["executor"],
+  recipes: TASK_RECIPES,
+  stages: ["orchestration"],
+  effectClass: "read",
+  risk: "low",
+  dataClasses: ["external-content", "operational-state"],
+  credentials: operation !== "browser.vercel_project.inspect.v1",
+  egress: true,
+  hosts: ["any-readonly"],
+  permissionModes: ["none"],
+  inputSchema: "protected-connector-request-v2",
+  outputSchema: "protected-connector-response-v2",
+  timeoutMs: 60_000,
+  maxResultBytes: 32_768,
+  evidenceRequirement: "mandatory",
+  receiptType: "connector",
+  evidenceStrength: "high",
+}));
+
+export const PROTECTED_CONNECTOR_CAPABILITY_DESCRIPTORS = Object.freeze(
+  Object.fromEntries(liveConnectorDescriptors.map((entry) => [entry.id, entry])) as Record<
+    string,
+    CapabilityDescriptor
+  >,
+);
+
 function catalogDigests(catalog: readonly CapabilityDescriptor[]): Readonly<{ registry: string; graph: string }> {
   return {
     registry: createHash("sha256")
@@ -848,6 +884,7 @@ export const CAPABILITY_CATALOG = validateCapabilityCatalog([
   ...liveToolDescriptors,
   ...liveBundleDescriptors,
   ...liveModelPoolDescriptors,
+  ...liveConnectorDescriptors,
 ]);
 
 export const CAPABILITY_BY_ID: ReadonlyMap<string, CapabilityDescriptor> = new Map(

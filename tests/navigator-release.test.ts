@@ -37,6 +37,7 @@ import {
   NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS,
   NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
   CONTROLLER_BURST_MIGRATIONS,
+  PROTECTED_CONNECTOR_MIGRATIONS,
 } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { runJobExecutorService } from "../src/services/job-executor-service";
@@ -760,10 +761,14 @@ describe("navigator exact-head release", () => {
     // migration and then the managed-automation state upgrade ahead of it.
     // Each contributes several statements, so every block is located by offset
     // rather than a fixed index.
-    [...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+    [...PROTECTED_CONNECTOR_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const convergenceOffset = NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length;
+    const connectorOffset = PROTECTED_CONNECTOR_MIGRATIONS.length;
+    [...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(connectorOffset + index + 1))).toBe(migration);
+    });
+    const convergenceOffset = connectorOffset + NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length;
     [...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(convergenceOffset + index + 1))).toBe(migration);
     });
@@ -788,7 +793,8 @@ describe("navigator exact-head release", () => {
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
     expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1));
+    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1 +
+      PROTECTED_CONNECTOR_MIGRATIONS.length));
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
     expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");

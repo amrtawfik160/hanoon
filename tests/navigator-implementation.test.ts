@@ -2876,7 +2876,7 @@ describe("navigator ticket integration executor", () => {
   });
 
   it("sequentially integrates fresh ticket workers, repairs review findings, and publishes one pull request", async () => {
-    const value = fixture();
+    const value = fixture(ALL_MIGRATIONS.indexOf(NAVIGATOR_IMPLEMENTATION_UPGRADE_MIGRATIONS[0]));
     let firstAttemptInterrupted = true;
     let secondAttemptMissing = true;
     const resourceEvents: string[] = [];
