@@ -51,6 +51,9 @@ export const ROLE_SKILLS = {
     // The implementation attempt is the one that opens the pull request the
     // reviewer then reads, so it owns writing a reviewer-facing description.
     "pr-writer",
+    // A description the reviewer can see at a glance: the diff-shaped sketch,
+    // call tree, or sequence diagram that pr-writer's prose then explains.
+    "show-me",
   ],
   // The guards judge the code the change contains. This one judges what the
   // change can break outside it, which is the risk a verdict carries when it

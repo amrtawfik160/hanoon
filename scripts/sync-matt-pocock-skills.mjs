@@ -21,6 +21,7 @@ import {
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
+  HUMANLAYER_KIT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
   LOCKED_ROOTS,
@@ -342,7 +343,7 @@ function sortedSkillRecords(rootByPublicPath, requiredSkills) {
 }
 
 function assertSkillCatalog(skills, legacySkills, shadowedSkills) {
-  if (skills.length !== 35 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
+  if (skills.length !== 36 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
     skills.length + legacySkills.length + shadowedSkills.length > MAX_SKILLS) {
     fail("required active, legacy, or shadowed skill catalog differs");
   }
@@ -385,6 +386,7 @@ function buildLock(stagedMatt) {
     deliveryKit: DELIVERY_KIT,
     hanoonKit: HANOON_KIT,
     pstackKit: PSTACK_KIT,
+    humanlayerKit: HUMANLAYER_KIT,
     skills,
     legacySkills,
     shadowedSkills,

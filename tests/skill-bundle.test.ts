@@ -13,6 +13,7 @@ const registeredRoots = [
   "skills/matt-pocock/productivity",
   "skills/hanoon",
   "skills/pstack",
+  "skills/humanlayer",
 ] as const;
 const lockedRoots = [
   "skills/guards",
@@ -20,6 +21,7 @@ const lockedRoots = [
   "skills/matt-pocock",
   "skills/hanoon",
   "skills/pstack",
+  "skills/humanlayer",
 ] as const;
 
 type LockFile = Readonly<{ path: string; sha256: string }>;
@@ -39,6 +41,7 @@ type SkillLock = Readonly<{
   deliveryKit: Readonly<Record<string, string>>;
   hanoonKit: Readonly<Record<string, string>>;
   pstackKit: Readonly<Record<string, string>>;
+  humanlayerKit: Readonly<Record<string, string>>;
   skills: readonly LockSkill[];
   legacySkills: readonly LockSkill[];
   shadowedSkills: readonly LockSkill[];
@@ -98,7 +101,7 @@ describe("committed agent skill bundle", () => {
     }
   });
 
-  test("locks the contracted 35-skill catalog without leftover workflow or discovery kits", () => {
+  test("locks the contracted 36-skill catalog without leftover workflow or discovery kits", () => {
     const lock = readLock();
     const catalogSkills = new Map(
       CAPABILITY_CATALOG
@@ -106,12 +109,12 @@ describe("committed agent skill bundle", () => {
         .map((descriptor) => [descriptor.id, descriptor]),
     );
 
-    expect(lock.skills).toHaveLength(35);
+    expect(lock.skills).toHaveLength(36);
     expect(lock.legacySkills).toEqual([]);
     expect(lock.shadowedSkills).toEqual([]);
     expect(lock.workflowKit).toBeUndefined();
     expect(lock.discoveryKit).toBeUndefined();
-    expect(catalogSkills.size).toBe(35);
+    expect(catalogSkills.size).toBe(36);
     for (const skill of lock.skills) {
       const descriptor = catalogSkills.get(skill.id);
       expect(descriptor, `${skill.id} has a live descriptor`).toBeDefined();
@@ -137,6 +140,12 @@ describe("committed agent skill bundle", () => {
     expect(lock.deliveryKit.licensePath).toBe("skills/delivery/LICENSE");
     expect(lock.hanoonKit.licensePath).toBe("skills/hanoon/NOTICE");
     expect(lock.pstackKit.licensePath).toBe("skills/pstack/LICENSE");
+    expect(lock.humanlayerKit).toMatchObject({
+      revision: "3c2629142c5d437428269b1b722b08c0b87f574d",
+      sourceUrl: "https://github.com/humanlayer/skills",
+      license: "MIT",
+      licensePath: "skills/humanlayer/LICENSE",
+    });
   });
 
   test("ships every source license and notice", () => {
@@ -146,6 +155,7 @@ describe("committed agent skill bundle", () => {
       "skills/matt-pocock/LICENSE",
       "skills/hanoon/NOTICE",
       "skills/pstack/LICENSE",
+      "skills/humanlayer/LICENSE",
     ]) {
       const absolute = join(repositoryRoot, licensePath);
       expect(existsSync(absolute), `${licensePath} exists`).toBe(true);

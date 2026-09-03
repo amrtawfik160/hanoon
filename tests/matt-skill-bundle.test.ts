@@ -45,6 +45,7 @@ const retained = [
   "driving-bb",
   "durable-boundary-audit",
   "pr-writer",
+  "show-me",
   "test-guard",
   "unslop",
 ] as const;
@@ -107,12 +108,12 @@ describe("pinned Matt Pocock skill portfolio", () => {
     });
   });
 
-  test("admits exactly 35 unique skills with locked invocation classes", () => {
+  test("admits exactly 36 unique skills with locked invocation classes", () => {
     const skills = lock().skills;
     const byId = new Map(skills.map((skill) => [skill.id, skill]));
 
-    expect(skills).toHaveLength(35);
-    expect(byId.size).toBe(35);
+    expect(skills).toHaveLength(36);
+    expect(byId.size).toBe(36);
     expect([...byId.keys()].sort()).toEqual([...userInvoked, ...modelInvoked, ...retained].sort());
     for (const id of userInvoked) expect(byId.get(id)?.invocationClass).toBe("user");
     for (const id of [...modelInvoked, ...retained]) expect(byId.get(id)?.invocationClass).toBe("model");

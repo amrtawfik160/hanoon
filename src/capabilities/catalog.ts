@@ -76,6 +76,7 @@ const ADMITTED_SKILL_BUNDLE = {
   research: { sourceDigest: "985569f15739c713d6784887c3d186d4ef9ac85bec5ad9c068d25bf0739928e4", bundleDescriptorDigest: "0607555f7ea8634bff956695f02c42c4f87a814dcf1761a5555833235be0e312", invocationClass: "model" },
   "resolving-merge-conflicts": { sourceDigest: "9d8114f8ef0b31f535a265fc05c364bd8cf2e2895a830040e06c22acb11f54b0", bundleDescriptorDigest: "0d0b45ea81e64fe6eaa4e2650770d4015363c4ccf6638b76546809ed447494c8", invocationClass: "model" },
   "setup-matt-pocock-skills": { sourceDigest: "2bcd89e97777cdb705914424e39c97d5db524c8eb4eafac8120778a07774f0ec", bundleDescriptorDigest: "be6b0e4460c175a93c2e814de91584b278f7159c51211e1121a0528e90f6d6c0", invocationClass: "user" },
+  "show-me": { sourceDigest: "bea6da70a58096730b9aeb0bae293ddf4726103a98efc9ce13c481619942a810", bundleDescriptorDigest: "23801415bae1aab8db066e384f5cc4a0a0f7f56182c3e030474e13540714efca", invocationClass: "model" },
   tdd: { sourceDigest: "cb01f66bebfaa25fa1f88e6b7e769cd9fd9f35b1120b8563749820738814c927", bundleDescriptorDigest: "4cce72c6f2afef293007eecf4ec18436ee454a8a3c37e81ea860c30d0c0c566a", invocationClass: "model" },
   teach: { sourceDigest: "a32df9dcdfc0c4fdc1c98e1ed3940c5f56b84c1aa90ff60346f32b8b53915b43", bundleDescriptorDigest: "d1cbc2515700c1370b8f74a0e7e41df053dc3299e579b90b054588daf66bd0df", invocationClass: "user" },
   "technical-writing": { sourceDigest: "bd0cb21034f4fe6695cfdf8cd3561026eec943f0bb6e9300bc78a2b3340865a7", bundleDescriptorDigest: "9d355e8d479c993462baf65f53560ed273056346a17b69a3e5022696b4a5972f", invocationClass: "user" },
@@ -692,6 +693,7 @@ function admittedSkillSource(id: AdmittedCapabilitySkillId): { source: string; v
   if (id === "technical-writing" || id === "unslop") {
     return { source: "https://github.com/cursor/plugins", version: "pstack@60c641e4" };
   }
+  if (id === "show-me") return { source: "https://github.com/humanlayer/skills", version: "show-me@3c262914" };
   if (["blast-radius", "checking-system-logs", "driving-bb", "durable-boundary-audit"].includes(id)) {
     return { source: "first-party", version: "1" };
   }
@@ -749,6 +751,16 @@ function admittedSkillRouting(id: AdmittedCapabilitySkillId): Pick<DescriptorInp
       return {
         roles: ["implementation"],
         stages: ["delivery"],
+        receiptType: "worker",
+        modelPools: ["fast", "standard"],
+      };
+    // Draws the sketch a PR description opens with, so it follows the prose
+    // writer it illustrates rather than competing with it for the same text.
+    case "show-me":
+      return {
+        roles: ["implementation"],
+        stages: ["delivery"],
+        orderAfter: ["pr-writer"],
         receiptType: "worker",
         modelPools: ["fast", "standard"],
       };

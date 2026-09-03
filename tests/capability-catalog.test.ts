@@ -42,6 +42,7 @@ const EXPECTED_SKILL_ROUTES = {
   research: "worker",
   "resolving-merge-conflicts": "worker",
   "setup-matt-pocock-skills": "manual-only",
+  "show-me": "worker",
   tdd: "worker",
   teach: "manual-only",
   "technical-writing": "worker",
@@ -66,7 +67,7 @@ function redigest(descriptor: CapabilityDescriptor): CapabilityDescriptor {
 }
 
 describe("capability catalog", () => {
-  it("freezes the historical recipe registry while the live catalog admits 35 navigator skills", () => {
+  it("freezes the historical recipe registry while the live catalog admits 36 navigator skills", () => {
     expect(HISTORICAL_RECIPE_REGISTRY_DIGEST)
       .toBe("d14130f744f1ca484beec08d8956a20e16db854b88a304f9576fcc79bdaa0481");
     expect(HISTORICAL_RECIPE_GRAPH_DIGEST)

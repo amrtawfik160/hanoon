@@ -1725,6 +1725,7 @@ it("routes verified implementation attempts through their exact durable effect b
       "test-guard",
       "durable-boundary-audit",
       "pr-writer",
+      "show-me",
     ],
   });
   expect(firstStart.instructions).toContain("Verified worker role: implementation");

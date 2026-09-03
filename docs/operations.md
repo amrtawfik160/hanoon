@@ -90,7 +90,7 @@ If the broker client's private key may have leaked, treat it as a compromised cr
 
 ## Verify the bundled skill runtime
 
-Skills are committed locally. The contracted bundle admits exactly 35 reviewed skill ids and no legacy-only Superpowers, discovery, or router ids. BB registers six immediate roots: the two promoted Matt Pocock buckets plus guards, delivery, Hanoon, and pstack. Every registered runtime id has one plugin source.
+Skills are committed locally. The contracted bundle admits exactly 36 reviewed skill ids and no legacy-only Superpowers, discovery, or router ids. BB registers seven immediate roots: the two promoted Matt Pocock buckets plus guards, delivery, Hanoon, pstack, and humanlayer. Every registered runtime id has one plugin source.
 
 Run the deterministic integrity gate from the repository root:
 
@@ -98,7 +98,7 @@ Run the deterministic integrity gate from the repository root:
 npm run skills:verify
 ```
 
-The command checks package root order, schema 2 lock structure, the 35-skill catalog with empty legacy and shadow lists, file bounds and regular-file type, complete SHA-256 coverage, frontmatter and directory names, invocation metadata, nested local Markdown resources, and every source license and provenance record. Success prints `bundleDigest`, `admittedSkillCount=35`, and `legacySkillCount=0`. Any malformed lock, leftover workflow or discovery kit, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter mismatch, unsupported id, or digest mismatch exits nonzero. Build and activation run the same verifier before plugin registration.
+The command checks package root order, schema 2 lock structure, the 36-skill catalog with empty legacy and shadow lists, file bounds and regular-file type, complete SHA-256 coverage, frontmatter and directory names, invocation metadata, nested local Markdown resources, and every source license and provenance record. Success prints `bundleDigest`, `admittedSkillCount=36`, and `legacySkillCount=0`. Any malformed lock, leftover workflow or discovery kit, missing or unlocked file, escaped path, symlink, oversized entry, frontmatter mismatch, unsupported id, or digest mismatch exits nonzero. Build and activation run the same verifier before plugin registration.
 
 Only a maintainer may synchronize the promoted portfolio. Use a clean, already-reviewed absolute checkout at the pinned revision:
 

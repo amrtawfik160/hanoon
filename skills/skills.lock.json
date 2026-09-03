@@ -31,6 +31,12 @@
     "license": "MIT",
     "licensePath": "skills/pstack/LICENSE"
   },
+  "humanlayerKit": {
+    "revision": "3c2629142c5d437428269b1b722b08c0b87f574d",
+    "sourceUrl": "https://github.com/humanlayer/skills",
+    "license": "MIT",
+    "licensePath": "skills/humanlayer/LICENSE"
+  },
   "skills": [
     {
       "id": "ask-matt",
@@ -273,6 +279,17 @@
       "license": "MIT",
       "invocationClass": "user",
       "descriptorDigest": "be6b0e4460c175a93c2e814de91584b278f7159c51211e1121a0528e90f6d6c0"
+    },
+    {
+      "id": "show-me",
+      "skillPath": "skills/humanlayer/show-me/SKILL.md",
+      "sourcePath": "skills/humanlayer/show-me/SKILL.md",
+      "source": "https://github.com/humanlayer/skills",
+      "sourceRevision": "3c2629142c5d437428269b1b722b08c0b87f574d",
+      "sourceDigest": "bea6da70a58096730b9aeb0bae293ddf4726103a98efc9ce13c481619942a810",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "23801415bae1aab8db066e384f5cc4a0a0f7f56182c3e030474e13540714efca"
     },
     {
       "id": "tdd",
@@ -552,6 +569,14 @@
     {
       "path": "skills/hanoon/NOTICE",
       "sha256": "8fbf5191ba3003e33cbbfde1c107d1618db4a9a51c4a34addecf6d40304dc655"
+    },
+    {
+      "path": "skills/humanlayer/LICENSE",
+      "sha256": "5f13c18ea00ea5c1384f41745feeca774079164f7f59a92e4ac0899ad217b26f"
+    },
+    {
+      "path": "skills/humanlayer/show-me/SKILL.md",
+      "sha256": "bea6da70a58096730b9aeb0bae293ddf4726103a98efc9ce13c481619942a810"
     },
     {
       "path": "skills/matt-pocock/engineering/ask-matt/agents/openai.yaml",

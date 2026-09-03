@@ -25,6 +25,7 @@ export const MATT_POCOCK_ENGINEERING_ROOT = `${MATT_POCOCK_ROOT}/engineering`;
 export const MATT_POCOCK_PRODUCTIVITY_ROOT = `${MATT_POCOCK_ROOT}/productivity`;
 export const HANOON_ROOT = "skills/hanoon";
 export const PSTACK_ROOT = "skills/pstack";
+export const HUMANLAYER_ROOT = "skills/humanlayer";
 export const LOCK_PATH = "skills/skills.lock.json";
 
 // BB discovers only immediate child skill directories. The contracted bundle
@@ -36,6 +37,7 @@ export const REGISTERED_ROOTS = Object.freeze([
   MATT_POCOCK_PRODUCTIVITY_ROOT,
   HANOON_ROOT,
   PSTACK_ROOT,
+  HUMANLAYER_ROOT,
 ]);
 
 export const LOCKED_ROOTS = Object.freeze([
@@ -44,6 +46,7 @@ export const LOCKED_ROOTS = Object.freeze([
   MATT_POCOCK_ROOT,
   HANOON_ROOT,
   PSTACK_ROOT,
+  HUMANLAYER_ROOT,
 ]);
 
 const workflowSkillIds = [
@@ -73,6 +76,7 @@ const retainedHanoonSkillIds = [
 ];
 const hanoonSkillIds = [...retainedHanoonSkillIds];
 const pstackSkillIds = ["technical-writing", "unslop"];
+const humanlayerSkillIds = ["show-me"];
 
 const promotedMattSkills = [
   { bucket: "engineering", id: "ask-matt", invocationClass: "user" },
@@ -153,6 +157,14 @@ export const PSTACK_KIT = Object.freeze({
   licensePath: `${PSTACK_ROOT}/LICENSE`,
 });
 
+// Visual explanation for reviewer-facing prose, vendored from humanlayer/skills.
+export const HUMANLAYER_KIT = Object.freeze({
+  revision: "3c2629142c5d437428269b1b722b08c0b87f574d",
+  sourceUrl: "https://github.com/humanlayer/skills",
+  license: "MIT",
+  licensePath: `${HUMANLAYER_ROOT}/LICENSE`,
+});
+
 export const WORKFLOW_PROVENANCE = Object.freeze({
   source: WORKFLOW_KIT.sourceUrl,
   license: WORKFLOW_KIT.license,
@@ -166,6 +178,10 @@ export const MATT_POCOCK_PROVENANCE = Object.freeze({
 });
 export const HANOON_PROVENANCE = Object.freeze({ source: HANOON_KIT.sourceUrl, license: HANOON_KIT.license });
 export const PSTACK_PROVENANCE = Object.freeze({ source: PSTACK_KIT.sourceUrl, license: PSTACK_KIT.license });
+export const HUMANLAYER_PROVENANCE = Object.freeze({
+  source: HUMANLAYER_KIT.sourceUrl,
+  license: HUMANLAYER_KIT.license,
+});
 
 function localSkill({ id, root, provenance, sourceRevision, invocationClass = "model" }) {
   const skillPath = `${root}/${id}/SKILL.md`;
@@ -208,6 +224,13 @@ export const REQUIRED_PSTACK_SKILLS = Object.freeze(pstackSkillIds.map((id) =>
     sourceRevision: PSTACK_KIT.revision,
     invocationClass: id === "technical-writing" ? "user" : "model",
   })));
+export const REQUIRED_HUMANLAYER_SKILLS = Object.freeze(humanlayerSkillIds.map((id) =>
+  localSkill({
+    id,
+    root: HUMANLAYER_ROOT,
+    provenance: HUMANLAYER_PROVENANCE,
+    sourceRevision: HUMANLAYER_KIT.revision,
+  })));
 
 export const REQUIRED_MATT_POCOCK_SKILLS = Object.freeze(promotedMattSkills.map(({ bucket, id, invocationClass }) =>
   Object.freeze({
@@ -231,6 +254,7 @@ export const REQUIRED_SKILLS = Object.freeze([
   ...REQUIRED_DELIVERY_SKILLS,
   ...REQUIRED_RETAINED_HANOON_SKILLS,
   ...REQUIRED_PSTACK_SKILLS,
+  ...REQUIRED_HUMANLAYER_SKILLS,
 ].sort((left, right) => left.id.localeCompare(right.id)));
 
 export const SYNC_EXCLUDED_SEGMENTS = Object.freeze([

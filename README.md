@@ -106,7 +106,7 @@ Historical recipe promotion still exists as leftover recipe-v1 history. Adaptive
 
 ## Bundled agent skills
 
-The plugin carries a deterministic 35-skill catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus ten Hanoon, guard, delivery, writing, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are not installed. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair, and it refuses to start while a nonterminal recipe-v1 job still needs a legacy skill or state handler.
+The plugin carries a deterministic 36-skill catalog. It vendors the 25 skills in the reviewed Matt Pocock plugin manifest at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76`, plus eleven Hanoon, guard, delivery, writing, visualization, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are not installed. Every source tree, invocation class, provenance record, license, and supporting file is locked locally. Plugin startup performs no skill download or repair, and it refuses to start while a nonterminal recipe-v1 job still needs a legacy skill or state handler.
 
 BB discovers skills one directory below each registered root, so the manifest registers the Matt Pocock `engineering` and `productivity` buckets separately. New work uses the workflow navigator. Historical recipe columns, descriptors, and receipts remain readable.
 
@@ -115,7 +115,7 @@ BB discovers skills one directory below each registered root, so the manifest re
 | controller | `driving-bb`, `unslop`, and on an explicit grill request `grill-with-docs`, `grilling`, `domain-modeling`. Conduct requires unslop on every owner-facing message. |
 | planner | `unslop`, `writing-for-agents`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer` |
+| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `pr-writer`, `show-me` |
 | review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review` |
 | documentation | `unslop`, `technical-writing`, `docs-guard` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
@@ -125,7 +125,7 @@ The admission catalog records whether each skill is model-invoked or must be exp
 
 Selection is fail-closed. Structurally, a worker must be from plugin `telegram-agent` with a non-fork origin, use a `standard` project and a `managed-worktree`, and have an anchored title of the form `Telegram <jobId> <role-token> <attemptId>`. Job ids are 1 to 256 characters from `[A-Za-z0-9_-]`; attempt ids are 1 to 264 characters from `[A-Za-z0-9_.:-]`. Durably, the exact attempt or stage record, effect, project, environment, thread, role, and routing mode must match. Any mismatch receives no tools and no skills.
 
-`npm run skills:verify` validates the registered roots, the schema 2 lock, the 35-skill catalog with empty legacy and shadow lists, bounded regular files, frontmatter, nested local Markdown resources, provenance, licenses, and every SHA-256 file digest. Success prints a bounded `bundleDigest`, `admittedSkillCount`, and `legacySkillCount`. Build and activation run the same verifier before plugin code can register. A missing, unlocked, escaped, oversized, symlinked, malformed, leftover-kit, or digest-mismatched bundle fails closed.
+`npm run skills:verify` validates the registered roots, the schema 2 lock, the 36-skill catalog with empty legacy and shadow lists, bounded regular files, frontmatter, nested local Markdown resources, provenance, licenses, and every SHA-256 file digest. Success prints a bounded `bundleDigest`, `admittedSkillCount`, and `legacySkillCount`. Build and activation run the same verifier before plugin code can register. A missing, unlocked, escaped, oversized, symlinked, malformed, leftover-kit, or digest-mismatched bundle fails closed.
 
 A maintainer can refresh the promoted portfolio only from an already-reviewed clean local checkout at the pinned full revision:
 
