@@ -1292,7 +1292,7 @@ export class LunaControllerService {
     if (!turn || turn.state !== "submitted" || controller.threadId === null ||
         turn.acceptedFinalizationId !== null ||
         this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
-    const decision = evaluateSupervisor({
+    const signals = {
       toolCalls: turn.toolCalls,
       // Spend for *this* turn: the reported figure counts the whole thread,
       // which has answered every earlier message too.
@@ -1301,17 +1301,30 @@ export class LunaControllerService {
       evidenceRows: this.dependencies.store.countControllerEvidence(turnId),
       steersIssued: turn.supervisorSteers,
       steeredReasons: turn.supervisorReasons,
-    });
+    };
+    const decision = evaluateSupervisor(signals);
     if (decision.kind === "continue") return false;
     if (decision.kind === "steer") {
       return this.issueSupervisorSteer(turn, controller, fence, signal, decision.reason, decision.text);
     }
     if (this.dependencies.store.getAcceptedControllerFinalization(turnId) !== null) return false;
+    // The stored error names the budget and the figures. "Exceeded its budget"
+    // alone once sent a diagnosis to the raw event log to learn that a
+    // ten-call turn had been stopped for tokens.
+    this.dependencies.warn?.(JSON.stringify({
+      event: "controller_supervisor_stop",
+      turnId: turn.id,
+      controllerThreadId: controller.threadId,
+      reason: decision.reason,
+      toolCalls: signals.toolCalls,
+      totalTokens: signals.totalTokens,
+      commandFailures: signals.commandFailures,
+    }));
     this.failAndRetire(
       turn,
       controller,
       fence,
-      "Controller turn exceeded its budget",
+      `Controller turn exceeded its budget (${decision.reason}: ${signals.toolCalls} tool calls, ${signals.totalTokens} uncached tokens)`,
       "budget_exceeded",
     );
     return true;

@@ -610,6 +610,52 @@ describe("ordered rejection branches", () => {
     );
   });
 
+  it("tells a claim on the wrong proof which kinds its evidence can carry", () => {
+    // A spawn command's result was cited for an external_mutation claim. The
+    // fixed correction asked for a source report, which that evidence cannot
+    // back either, so the corrected retry was rejected with the same words.
+    const validation = validateControllerFinalization(
+      claimFinalization({
+        kind: "external_mutation",
+        outcome: "succeeded",
+        subjectRef: "bb-item:i80",
+        evidenceRefs: ["evidence:214"],
+        text: "The spawn command ran.",
+      }),
+      contextWithEvidence(evidenceRow("evidence:214", "command_result", "succeeded", "bb-item:i80")),
+    );
+
+    expect(validation).toMatchObject({ outcome: "rejected", code: "proof_incompatible" });
+    const correction = validation.outcome === "rejected" ? validation.correction : "";
+    expect(correction).toContain("evidence:214");
+    expect(correction).toContain("execution_result");
+    expect(correction).not.toContain("observed_state");
+  });
+
+  it("tells a claim whose outcome contradicts its evidence what the evidence shows", () => {
+    const validation = validateControllerFinalization(
+      claimFinalization({ kind: "execution_result", outcome: "succeeded", text: "The check ran." }),
+      contextWithEvidence(evidenceRow("evidence:1", "command_result", "failed")),
+    );
+
+    expect(validation).toMatchObject({ outcome: "rejected", code: "proof_incompatible" });
+    const correction = validation.outcome === "rejected" ? validation.correction : "";
+    expect(correction).toContain("evidence outcome: failed");
+  });
+
+  it("keeps the source-report correction for a proof rejection raised by claim text", () => {
+    const validation = validateControllerFinalization(
+      claimFinalization({ kind: "observed_state", outcome: "observed", text: "The deployment succeeded." }),
+      contextWithEvidence(evidenceRow("evidence:1", "project_state", "observed")),
+    );
+
+    expect(validation).toMatchObject({
+      outcome: "rejected",
+      code: "proof_incompatible",
+      correction: controllerFinalizationCorrection("proof_incompatible"),
+    });
+  });
+
   it("does not treat merge-only pipeline evidence as production proof", () => {
     expectRejection(
       claimFinalization({ kind: "pipeline_outcome", outcome: "succeeded", text: "Deployment succeeded." }),
