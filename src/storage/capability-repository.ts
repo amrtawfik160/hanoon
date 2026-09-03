@@ -571,7 +571,7 @@ export class CapabilityRepository {
     });
 
     try {
-      const profileId = create.immediate();
+      const profileId = this.db.inTransaction ? create() : create.immediate();
       const profile = this.getProfileById(profileId);
       if (!profile) throw new Error(`Capability profile ${profileId} disappeared after creation`);
       return profile;

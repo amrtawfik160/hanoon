@@ -208,7 +208,7 @@ function activeProviderFixture(recipe: TaskRecipe): ActiveProviderFixture {
     inputText: RECIPE_TASK[recipe],
     now: 601,
   });
-  expect(store.claimNextControllerTurn({ ownerId, generation: lease.generation, now: 602 })?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ownerId, generation: lease.generation, now: 3602 })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     turnId: turn.id,
     ownerId,
@@ -403,7 +403,7 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
     });
     const firstLease = store.acquireExecutorLease("controller-first", 10_000, 30_000);
     if (!firstLease.acquired) throw new Error("controller lease missing");
-    expect(store.claimNextControllerTurn({ ownerId: "controller-first", generation: firstLease.generation, now: 10_000 })?.id)
+    expect(store.claimNextControllerTurn({ ownerId: "controller-first", generation: firstLease.generation, now: 13000 })?.id)
       .toBe(turn.id);
     expect(store.markControllerSpawned({
       turnId: turn.id,
@@ -444,7 +444,7 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
     expect(store.claimNextControllerTurn({
       ownerId: "controller-continuation",
       generation: continuation.generation,
-      now: 10_007,
+      now: 13007,
     })?.id).toBe(turn.id);
     expect(store.markControllerSpawned({
       turnId: turn.id,
@@ -516,7 +516,7 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
     expect(fixture.store.claimNextControllerTurn({
       ownerId: fixture.ownerId,
       generation: fixture.generation,
-      now: 703,
+      now: 3703,
     })?.id).toBe(nextTurn.id);
     expect(fixture.store.markControllerTurnSubmitted({
       turnId: nextTurn.id,

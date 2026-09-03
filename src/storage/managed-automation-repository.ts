@@ -897,7 +897,7 @@ export class ManagedAutomationRepository {
     }
     const rows = this.db.prepare(
       `SELECT * FROM managed_automations
-        WHERE state IN ('active', 'paused', 'updating', 'retiring', 'failed') AND bb_automation_id IS NOT NULL
+        WHERE state IN ('pending', 'active', 'paused', 'updating', 'retiring', 'failed') AND bb_automation_id IS NOT NULL
           AND (last_reconciled_at IS NULL OR last_reconciled_at <= ?)
         ORDER BY COALESCE(last_reconciled_at, 0), created_at LIMIT ?`,
     ).all(before, limit) as ManagedAutomationRow[];
@@ -1286,12 +1286,55 @@ export class ManagedAutomationRepository {
     const definitionSha256 = managedAutomationDigest(definition);
     return this.db.transaction(() => {
       const existing = this.getBySource(input.controllerKey, input.sourceKey);
+      if (existing && existing.definitionSha256 === definitionSha256 && existing.state !== "retired") {
+        return existing;
+      }
       if (existing) {
-        if (existing.definitionSha256 !== definitionSha256 || existing.state === "retired") {
+        // Only a binding that holds a live BB automation must keep its
+        // definition. A retired source is a closed chapter, and a failed one
+        // that never reached BB holds nothing durable there, so either may be
+        // re-armed under the requested definition with its history attached.
+        if (existing.state !== "retired" && !(existing.state === "failed" && existing.bbAutomationId === null)) {
           throw new Error("managed automation source already has a different durable definition");
         }
-        if (input.operation) this.ensureOperation(existing, input.operation, currentAuthority!, input.controllerFence!);
-        return input.operation ? this.get(existing.id)! : existing;
+        // A re-armed source starts a fresh operation lineage: revision,
+        // authority, capability evidence, and ownership marker follow the
+        // requested definition rather than the closed chapter's, so the
+        // operation attached below sees a coherent binding.
+        const reopened = this.db.prepare(
+          `UPDATE managed_automations
+              SET project_id = ?, bb_automation_id = NULL, name = ?, mode = ?,
+                  provider_ownership_marker = NULL,
+                  definition_json = ?, definition_sha256 = ?, authority_json = ?,
+                  notification_policy = ?, state = 'pending', legacy_monitor_id = ?,
+                  definition_revision = ?, authority_version = ?,
+                  capability_profile_id = ?, capability_profile_revision = ?, capability_evidence_json = ?,
+                  last_operation_id = NULL, last_operation_outcome = NULL,
+                  observed_json = NULL, observed_sha256 = NULL, last_reconciled_at = NULL,
+                  last_error = NULL, updated_at = ?
+            WHERE id = ? AND (state = 'retired' OR (state = 'failed' AND bb_automation_id IS NULL))`,
+        ).run(
+          input.projectId,
+          input.name,
+          input.definition.mode,
+          definitionJson,
+          definitionSha256,
+          authorityJson,
+          input.notificationPolicy,
+          input.legacyMonitorId,
+          definitionRevision,
+          authorityVersion(authority),
+          authorityEvidence(authority)?.profileId ?? null,
+          authorityEvidence(authority)?.profileRevision ?? null,
+          authorityEvidence(authority) ? canonical(authorityEvidence(authority)) : null,
+          input.now,
+          existing.id,
+        );
+        if (reopened.changes !== 1) throw new Error("managed automation re-arm fence was lost");
+        if (input.operation) {
+          this.ensureOperation(this.get(existing.id)!, input.operation, currentAuthority!, input.controllerFence!);
+        }
+        return this.get(existing.id)!;
       }
       const id = "automation-binding-" + managedAutomationDigest({
         controllerKey: input.controllerKey,
@@ -1478,6 +1521,25 @@ export class ManagedAutomationRepository {
     }).immediate();
   }
 
+  /**
+   * Records BB's automation id the moment BB acknowledges it, before the exact
+   * read-back that activates the binding. Reconciliation can then finish or
+   * fail a create that was interrupted between the two.
+   */
+  public attach(input: {
+    id: string;
+    automationId: string;
+    now: number;
+  }): ManagedAutomationBinding {
+    const result = this.db.prepare(
+      `UPDATE managed_automations SET bb_automation_id = ?, updated_at = ?
+        WHERE id = ? AND state IN ('pending', 'failed')
+          AND (bb_automation_id IS NULL OR bb_automation_id = ?)`,
+    ).run(input.automationId, input.now, input.id, input.automationId);
+    if (result.changes !== 1) throw new Error("managed automation attachment fence was lost");
+    return this.get(input.id)!;
+  }
+
   private ensureOperation(
     binding: ManagedAutomationBinding,
     request: ManagedAutomationOperationRequest,
@@ -1604,11 +1666,25 @@ export class ManagedAutomationRepository {
     return this.get(input.id)!;
   }
 
-  public fail(id: string, errorClass: string, now: number): ManagedAutomationBinding {
+  /**
+   * `detach` records that the BB resource this binding pointed at is gone, so
+   * the next create asks BB for a fresh one instead of reconciling a ghost.
+   */
+  public fail(
+    id: string,
+    errorClass: string,
+    now: number,
+    options: Readonly<{ detach?: boolean }> = {},
+  ): ManagedAutomationBinding {
+    const detach = options.detach === true ? 1 : 0;
     const result = this.db.prepare(
-      `UPDATE managed_automations SET state = 'failed', last_error = ?, updated_at = ?
+      `UPDATE managed_automations
+          SET state = 'failed', last_error = ?, updated_at = ?,
+              bb_automation_id = CASE WHEN ? THEN NULL ELSE bb_automation_id END,
+              observed_json = CASE WHEN ? THEN NULL ELSE observed_json END,
+              observed_sha256 = CASE WHEN ? THEN NULL ELSE observed_sha256 END
         WHERE id = ? AND state NOT IN ('updating', 'retiring', 'retired')`,
-    ).run(errorClass.slice(0, 256), now, id);
+    ).run(errorClass.slice(0, 256), now, detach, detach, detach, id);
     if (result.changes !== 1) throw new Error("managed automation failure fence was lost");
     return this.get(id)!;
   }
@@ -1648,17 +1724,6 @@ export class ManagedAutomationRepository {
         WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
     ).run(now, now, id);
     if (result.changes !== 1) throw new Error("managed automation policy block fence was lost");
-    return this.get(id)!;
-  }
-
-  public markExecutionContractBlocked(id: string, now: number): ManagedAutomationBinding {
-    const result = this.db.prepare(
-      `UPDATE managed_automations
-          SET state = 'paused', last_error = 'bb_agent_execution_contract_unsupported',
-              last_reconciled_at = ?, updated_at = ?
-        WHERE id = ? AND state IN ('active', 'paused', 'updating', 'failed')`,
-    ).run(now, now, id);
-    if (result.changes !== 1) throw new Error("managed automation execution contract block fence was lost");
     return this.get(id)!;
   }
 

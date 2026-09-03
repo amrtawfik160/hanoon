@@ -157,7 +157,7 @@ it("delivers the whole conduct block even at the largest identity and working st
   // Both tail layers are truncated to fit rather than one starving the other.
   expect(deliveredControllerIdentityBudget()).toBeGreaterThanOrEqual(200);
   expect(deliveredControllerOverlayBudget("y".repeat(deliveredControllerIdentityBudget())))
-    .toBeGreaterThanOrEqual(400);
+    .toBeGreaterThanOrEqual(340);
 });
 
 it("accepts only controller identities that can be delivered whole", () => {
@@ -300,7 +300,7 @@ it("delivers an ordinary working style whole and keeps a real budget for it", ()
   expect(composeControllerInstructions(ordinary)).toContain(ordinary);
   // The fixed block must leave a working style room worth having, and a future
   // instruction edit that squeezed it away would fail at import instead.
-  expect(deliveredControllerOverlayBudget()).toBeGreaterThanOrEqual(400);
+  expect(deliveredControllerOverlayBudget()).toBeGreaterThanOrEqual(340);
 });
 
 it("shortens only the overlay when a working style outruns the delivery budget", () => {

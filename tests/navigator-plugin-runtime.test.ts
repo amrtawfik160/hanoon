@@ -1,9 +1,11 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { hashSecret } from "../src/crypto";
 import {
+  createNavigatorReleaseEffectAdapter,
   createNavigatorRuntime,
+  createNavigatorTicketEffectAdapter,
   PluginNavigatorGitObserver,
   PluginNavigatorPullRequestPublisher,
   PluginNavigatorTicketWorkerRunner,
@@ -15,7 +17,19 @@ import {
   navigatorTicketWorkerProfile,
   navigatorTicketWorkOrderSchema,
 } from "../src/navigator/implementation-contracts";
-import type { NavigatorTicketWorkerAttempt } from "../src/navigator/implementation-executor";
+import type {
+  NavigatorTicketWorkerAttempt,
+} from "../src/navigator/implementation-executor";
+import type { NavigatorPullRequestRecord } from "../src/navigator/implementation-contracts";
+import type {
+  NavigatorReleaseEffectContext,
+  NavigatorTicketEffectContext,
+} from "../src/navigator/effect-protocol";
+import type {
+  NavigatorTicketWorkerInput,
+  NavigatorTicketWorkerOperation,
+} from "../src/navigator/ticket-adapter";
+import { navigatorReleaseOperationId } from "../src/navigator/release-contracts";
 import { openStore } from "../src/storage/store";
 import { stableWorkArtifactId } from "../src/work-artifacts/repository";
 import { policyFixture } from "./helpers";
@@ -26,6 +40,210 @@ const REMOTE_HEAD = "ab".repeat(20);
 const EXTERNAL_DIGEST = "e".repeat(64);
 
 let fixtureSequence = 0;
+
+function ticketAdapterContext(): NavigatorTicketEffectContext {
+  const { bb } = createFakePluginHost({ pluginId: `ticket-adapter-context-${++fixtureSequence}` });
+  const store = openStore(bb.storage, bb.storage.kv, () => 1);
+  const projectId = "proj_ticket_adapter";
+  const specification = store.captureWorkArtifact({
+    artifactId: stableWorkArtifactId(projectId, "specification"),
+    projectId,
+    effortId: "effort-ticket-adapter",
+    operationId: "specification",
+    kind: "specification",
+    status: "ready",
+    trackerKind: "github",
+    trackerNamespace: "github:acme/ticket-adapter",
+    externalId: "specification",
+    externalUrl: null,
+    externalRevision: "1",
+    externalStatus: "open",
+    assignees: [],
+    title: "Ticket adapter specification",
+    trackerOrder: 0,
+    content: "# Ticket adapter specification\n\nKeep the accepted contract.",
+    acceptanceCriteria: ["The adapter receives immutable inputs"],
+    relationships: [],
+    capturedAt: 1,
+  });
+  const ticket = store.captureWorkArtifact({
+    artifactId: stableWorkArtifactId(projectId, "ticket"),
+    projectId,
+    effortId: "effort-ticket-adapter",
+    operationId: "ticket",
+    kind: "implementation_ticket",
+    status: "ready",
+    trackerKind: "github",
+    trackerNamespace: "github:acme/ticket-adapter",
+    externalId: "ticket",
+    externalUrl: null,
+    externalRevision: "1",
+    externalStatus: "open",
+    assignees: [],
+    title: "Ticket adapter worker",
+    trackerOrder: 1,
+    content: "# Ticket adapter worker\n\nReturn a typed receipt.",
+    acceptanceCriteria: ["The worker result is strictly parsed"],
+    relationships: [{
+      kind: "parent",
+      sourceArtifactId: stableWorkArtifactId(projectId, "ticket"),
+      sourceRef: `artifact:${stableWorkArtifactId(projectId, "ticket")}`,
+      targetArtifactId: specification.artifact.id,
+      targetRef: `artifact:${specification.artifact.id}`,
+    }],
+    capturedAt: 1,
+  });
+  const draft = store.createJob({
+    id: "job-ticket-adapter",
+    sourceUpdateId: 1,
+    requestText: "Run the ticket adapter contract.",
+    workflow: { engine: "navigator-v1", mode: "deterministic" },
+    now: 1,
+  });
+  const selected = store.applyJobEvent(draft.id, draft.version, {
+    type: "PROJECT_SELECTED",
+    projectId,
+    policyVersion: 1,
+    policy: policyFixture({ projectId }),
+  }, 2);
+  const ticketRecord = store.getWorkArtifact(ticket.artifact.id);
+  const ticketSnapshot = store.getCurrentWorkArtifactSnapshot(ticket.artifact.id);
+  if (!ticketRecord || !ticketSnapshot) throw new Error("ticket adapter fixture artifact was not stored");
+  store.observeWorkArtifact({
+    artifactId: ticket.artifact.id,
+    expectedExternalRevision: ticketRecord.externalRevision,
+    externalRevision: "2",
+    externalStatus: "open",
+    assignees: ["owner"],
+    title: ticketSnapshot.title,
+    content: ticketSnapshot.content,
+    acceptanceCriteria: ticketSnapshot.acceptanceCriteria,
+    relationships: ticketSnapshot.relationships,
+    observedAt: 4,
+  });
+  const currentSpecification = store.getCurrentWorkArtifactSnapshot(specification.artifact.id);
+  const currentTicket = store.getCurrentWorkArtifactSnapshot(ticket.artifact.id);
+  if (!currentSpecification || !currentTicket) throw new Error("ticket adapter fixture snapshot was not stored");
+  store.bindNavigatorJobArtifacts({
+    jobId: selected.id,
+    expectedVersion: selected.version,
+    artifactBindings: [
+      { artifactId: specification.artifact.id, snapshotId: currentSpecification.id, snapshotDigest: currentSpecification.snapshotDigest },
+      { artifactId: ticket.artifact.id, snapshotId: currentTicket.id, snapshotDigest: currentTicket.snapshotDigest },
+    ],
+    now: 5,
+  });
+  bb.storage.database().prepare(
+    "UPDATE jobs SET state = 'implementing', task_outcome = NULL, task_constraints_json = '[]' WHERE id = ?",
+  ).run(selected.id);
+  const executorLease = store.acquireExecutorLease("ticket-adapter-owner", 5, 10_000);
+  if (!executorLease.acquired) throw new Error("ticket adapter fixture executor lease was unavailable");
+  const claim = store.claimWorkArtifact({
+    artifactId: ticket.artifact.id,
+    workflowStepId: "slice-ticket-adapter",
+    jobId: selected.id,
+    snapshotId: store.getCurrentWorkArtifactSnapshot(ticket.artifact.id)!.id,
+    externalAssignee: "owner",
+    ownerId: "ticket-adapter-owner",
+    generation: executorLease.generation,
+    now: 5,
+    leaseMs: 10_000,
+  });
+  if (!claim) throw new Error("ticket adapter fixture claim was not stored");
+  const job = store.getJob(selected.id);
+  if (!job) throw new Error("ticket adapter fixture job was not stored");
+  const effectIdempotencyKey = "effect-ticket-adapter";
+  const workOrder = navigatorTicketWorkOrderSchema.parse({
+    kind: "navigator_ticket_work_order",
+    jobId: job.id,
+    integrationBranch: "hanoon/ticket-adapter",
+    baseBranch: "main",
+    worktreeId: "env_ticket_adapter",
+    baseHeadSha: WORKTREE_HEAD,
+    comparisonBaseHeadSha: WORKTREE_HEAD,
+    projectPolicyVersion: job.policyVersion,
+    projectPolicy: job.policy,
+    projectPolicyDigest: navigatorJsonDigest(job.policy),
+    specification: job.artifactBindings[0],
+    ticket: job.artifactBindings[1],
+    taskEvidence: [],
+    evidenceRefs: ["ticket-adapter:accepted"],
+    changedPaths: [],
+  });
+  const attempt: NavigatorTicketWorkerAttempt = {
+    id: "attempt-ticket-adapter",
+    jobId: job.id,
+    sliceId: "slice-ticket-adapter",
+    kind: "implementation",
+    ordinal: 1,
+    effectIdempotencyKey,
+    workOrder,
+    workOrderDigest: navigatorJsonDigest(workOrder),
+    stepContract: NAVIGATOR_TICKET_STEP_CONTRACTS.implementation,
+    profile: navigatorTicketWorkerProfile({ kind: "implementation", taskEvidence: [], changedPaths: [] }),
+    modelRoute: { pool: "standard", ...DEFAULT_MODEL_POOL_REGISTRY.worker.standard },
+    resource: null,
+    createdAt: 5,
+    updatedAt: 5,
+  };
+  return {
+    kind: "run_navigator_ticket_worker",
+    effect: {
+      idempotencyKey: effectIdempotencyKey,
+      jobId: job.id,
+      kind: "run_navigator_ticket_worker",
+      payload: { attemptId: attempt.id },
+      status: "leased",
+      attempts: 1,
+      leaseOwner: "ticket-adapter-owner",
+      leaseGeneration: 1,
+      leaseExpiresAt: 10_000,
+      nextAttemptAt: 1,
+      lastError: null,
+      createdAt: 5,
+      updatedAt: 5,
+    },
+    job,
+    fence: { ownerId: "ticket-adapter-owner", generation: 1 },
+    signal: new AbortController().signal,
+    artifactBindings: job.artifactBindings,
+    resourceClaims: [],
+    authorityOperations: ["worktree", "commit", "push", "pull_request"],
+    capabilityEvidence: [],
+    workflowStep: null,
+    acceptedProposal: null,
+    ticket: {
+      attempt,
+      integration: {
+        jobId: job.id,
+        worktreeId: "env_ticket_adapter",
+        integrationBranch: "hanoon/ticket-adapter",
+        currentHeadSha: WORKTREE_HEAD,
+        state: "implementing",
+        activeSliceId: "slice-ticket-adapter",
+      },
+      activeSlice: {
+        id: "slice-ticket-adapter",
+        ticketArtifactId: ticket.artifact.id,
+        claimId: claim.id,
+        state: "active",
+        acceptedHeadSha: null,
+      },
+      claim,
+      specificationSnapshot: store.getWorkArtifactSnapshot(currentSpecification.id)!,
+      ticketSnapshot: store.getWorkArtifactSnapshot(currentTicket.id)!,
+    },
+  };
+}
+
+function releaseAdapterContext(): NavigatorReleaseEffectContext {
+  return {
+    kind: "run_navigator_release",
+    effect: { idempotencyKey: "effect-release-adapter", jobId: "job-release-adapter" } as NavigatorReleaseEffectContext["effect"],
+    job: { requestText: "Ship the accepted change" } as NavigatorReleaseEffectContext["job"],
+    attempt: { id: "attempt-release-adapter" } as NavigatorReleaseEffectContext["attempt"],
+  } as NavigatorReleaseEffectContext;
+}
 
 function encoded(value: string): string {
   return Buffer.from(value, "utf8").toString("base64");
@@ -290,12 +508,32 @@ describe("plugin navigator inference and release adapters", () => {
       createdAt: 30_002,
       updatedAt: 30_002,
     };
-    const bindings: string[] = [];
-    const result = await new PluginNavigatorTicketWorkerRunner(bb.sdk, store).run(attempt, {
-      bindResource: async (resource) => { bindings.push(resource.id); },
-    }, new AbortController().signal);
+    const input: NavigatorTicketWorkerInput = {
+      attempt,
+      workOrder,
+      specification: store.getWorkArtifactSnapshot(specification.snapshot.id)!,
+      ticket: store.getWorkArtifactSnapshot(ticket.snapshot.id)!,
+      ticketClaim: {
+        id: 1,
+        artifactId: ticket.artifact.id,
+        workflowStepId: "workflow-worker-43",
+        jobId: "job_worker_43",
+        snapshotId: ticket.snapshot.id,
+        externalAssignee: "",
+        state: "held",
+        ownerId: "worker-owner",
+        generation: 1,
+        leaseExpiresAt: 31_000,
+        acquiredAt: 30_002,
+        renewedAt: 30_002,
+        releasedAt: null,
+        releaseReason: null,
+      },
+      resourceClaims: [],
+      capabilityEvidence: [],
+    };
+    const result = await new PluginNavigatorTicketWorkerRunner(bb.sdk).run(input, new AbortController().signal);
 
-    expect(bindings).toEqual(["thr_real_worker"]);
     expect(result.resource).toEqual({ kind: "bb_thread", id: "thr_real_worker" });
     expect(spawned[0]).toMatchObject({
       projectId: "proj_1",
@@ -304,9 +542,190 @@ describe("plugin navigator inference and release adapters", () => {
       providerId: DEFAULT_MODEL_POOL_REGISTRY.worker.standard.providerId,
       model: DEFAULT_MODEL_POOL_REGISTRY.worker.standard.modelId,
     });
-    const packet = JSON.parse(Buffer.from(uploads[0]!.clientFile).toString("utf8")) as Record<string, any>;
+    const packet = JSON.parse(Buffer.from(uploads[0]!.clientFile).toString("utf8")) as {
+      specification: { content: string };
+      ticket: { content: string };
+      ticketClaim: { artifactId: string; snapshotId: string };
+    };
     expect(packet.specification.content).toContain("exact accepted contract");
     expect(packet.ticket.content).toContain("real worker path");
+    expect(packet.ticketClaim).toMatchObject({
+      artifactId: ticket.artifact.id,
+      snapshotId: ticket.snapshot.id,
+    });
+  });
+
+  it("returns a typed ticket receipt without settling durable state", async () => {
+    const durableState = { workflow: "pending", effect: "leased", outbox: [] as string[] };
+    const before = structuredClone(durableState);
+    const operation: NavigatorTicketWorkerOperation = {
+      run: vi.fn(async (_input) => ({
+        resource: { kind: "bb_thread" as const, id: "thr_ticket_adapter" },
+        result: {
+          kind: "worker_failure" as const,
+          failureClass: "permanent" as const,
+          retryClass: "bounded_exponential" as const,
+          attempts: 1,
+          summary: "worker rejected the test operation",
+        },
+      })),
+      reconcile: vi.fn(),
+      observe: vi.fn(),
+    };
+    const adapter = createNavigatorTicketEffectAdapter(operation);
+
+    const outcome = await adapter.execute(ticketAdapterContext());
+
+    expect(outcome).toEqual({
+      outcome: "completed",
+      receipt: {
+        kind: "run_navigator_ticket_worker",
+        effectIdempotencyKey: "effect-ticket-adapter",
+        attemptId: "attempt-ticket-adapter",
+        resource: { kind: "bb_thread", id: "thr_ticket_adapter" },
+        exactHeadSha: WORKTREE_HEAD,
+        result: {
+          kind: "worker_failure",
+          failureClass: "permanent",
+          retryClass: "bounded_exponential",
+          attempts: 1,
+          summary: "worker rejected the test operation",
+        },
+        gitObservation: null,
+      },
+    });
+    expect(operation.run).toHaveBeenCalledTimes(1);
+    expect(operation.reconcile).not.toHaveBeenCalled();
+    expect(durableState).toEqual(before);
+  });
+
+  it("turns malformed worker output into a typed failure receipt", async () => {
+    const operation: NavigatorTicketWorkerOperation = {
+      run: vi.fn(async () => ({
+        resource: { kind: "bb_thread" as const, id: "thr_malformed_ticket" },
+        result: { kind: "not-a-navigator-result" },
+      })),
+      reconcile: vi.fn(),
+      observe: vi.fn(),
+    };
+
+    const outcome = await createNavigatorTicketEffectAdapter(operation).execute(ticketAdapterContext());
+
+    expect(outcome).toMatchObject({
+      outcome: "completed",
+      receipt: {
+        kind: "run_navigator_ticket_worker",
+        resource: { kind: "bb_thread", id: "thr_malformed_ticket" },
+        exactHeadSha: WORKTREE_HEAD,
+        result: {
+          kind: "worker_failure",
+          failureClass: "permanent",
+          retryClass: "bounded_exponential",
+          attempts: 1,
+        },
+        gitObservation: null,
+      },
+    });
+    expect(operation.observe).not.toHaveBeenCalled();
+  });
+
+  it("returns a typed release receipt without settling durable state through processLeased", async () => {
+    const durableState = { workflow: "pending", effect: "leased", outbox: [] as string[] };
+    const before = structuredClone(durableState);
+    const executeEntry = vi.fn(async () => ({
+      operationId: navigatorReleaseOperationId("job-release-adapter"),
+      jobId: "job-release-adapter",
+      number: 43,
+      url: "https://github.com/acme/cyndra/pull/43",
+      headSha: REMOTE_HEAD,
+    }));
+    const reconcileEntry = vi.fn(async () => executeEntry());
+    const integrationEnvironmentId = vi.fn(() => "env_release_adapter");
+    const operation = { executeEntry, reconcileEntry, integrationEnvironmentId };
+    const adapter = createNavigatorReleaseEffectAdapter(operation);
+
+    const outcome = await adapter.execute(releaseAdapterContext());
+
+    expect(outcome).toEqual({
+      outcome: "completed",
+      receipt: {
+        kind: "run_navigator_release",
+        effectIdempotencyKey: "effect-release-adapter",
+        attemptId: "attempt-release-adapter",
+        jobId: "job-release-adapter",
+        operationId: navigatorReleaseOperationId("job-release-adapter"),
+        resource: { kind: "environment", id: "env_release_adapter" },
+        number: 43,
+        url: "https://github.com/acme/cyndra/pull/43",
+        environmentId: "env_release_adapter",
+      },
+    });
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+    expect(executeEntry).toHaveBeenCalledWith(
+      expect.objectContaining({ operationId: navigatorReleaseOperationId("job-release-adapter") }),
+      undefined,
+    );
+    expect(reconcileEntry).not.toHaveBeenCalled();
+    expect(durableState).toEqual(before);
+  });
+
+  it.each([
+    ["invalid number", { number: 0 }, "env_release_adapter"],
+    ["invalid URL", { url: "not-a-url" }, "env_release_adapter"],
+    ["invalid environment", {}, ""],
+  ] as const)("rejects a %s release entry record at the adapter boundary", async (_label, change, environmentId) => {
+    const published = {
+      operationId: navigatorReleaseOperationId("job-release-adapter"),
+      jobId: "job-release-adapter",
+      number: 43,
+      url: "https://github.com/acme/cyndra/pull/43",
+      headSha: REMOTE_HEAD,
+      ...change,
+    } as unknown as NavigatorPullRequestRecord;
+    const executeEntry = vi.fn(async () => published);
+    const adapter = createNavigatorReleaseEffectAdapter({
+      executeEntry,
+      reconcileEntry: async () => published,
+      integrationEnvironmentId: () => environmentId,
+    });
+
+    await expect(adapter.execute(releaseAdapterContext())).resolves.toEqual({
+      outcome: "permanent",
+      reason: "Navigator release entry receipt is invalid",
+    });
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["job", { jobId: "job-release-other" }],
+    ["operation", { operationId: navigatorReleaseOperationId("job-release-other") }],
+  ] as const)("rejects a %s identity mismatch from execution and reconciliation", async (_label, change) => {
+    const published: NavigatorPullRequestRecord = {
+      operationId: navigatorReleaseOperationId("job-release-adapter"),
+      jobId: "job-release-adapter",
+      number: 43,
+      url: "https://github.com/acme/cyndra/pull/43",
+      headSha: REMOTE_HEAD,
+      ...change,
+    };
+    const executeEntry = vi.fn(async () => published);
+    const reconcileEntry = vi.fn(async () => published);
+    const adapter = createNavigatorReleaseEffectAdapter({
+      executeEntry,
+      reconcileEntry,
+      integrationEnvironmentId: () => "env_release_adapter",
+    });
+
+    await expect(adapter.execute(releaseAdapterContext())).resolves.toEqual({
+      outcome: "permanent",
+      reason: "Navigator release entry identity is invalid",
+    });
+    await expect(adapter.reconcile?.(releaseAdapterContext())).resolves.toEqual({
+      outcome: "permanent",
+      reason: "Navigator release entry identity is invalid",
+    });
+    expect(executeEntry).toHaveBeenCalledTimes(1);
+    expect(reconcileEntry).toHaveBeenCalledTimes(1);
   });
 
   it("publishes one pull request and verifies the remote base, branch, and exact head", async () => {
@@ -511,12 +930,14 @@ describe("plugin navigator inference and release adapters", () => {
     });
     const record = await publishPluginNavigatorPullRequest(bb.sdk, {
       jobId: "job_pr_head",
+      operationId: navigatorReleaseOperationId("job_pr_head"),
       title: "Ship accepted navigator tickets",
       body: "Exact-head release of the accepted implementation tickets.",
     });
 
     expect(record).toMatchObject({
       jobId: "job_pr_head",
+      operationId: navigatorReleaseOperationId("job_pr_head"),
       number: 43,
       url: "https://github.com/acme/cyndra/pull/43",
       headSha: REMOTE_HEAD,

@@ -233,7 +233,7 @@ export class JobMemoryService {
         now: this.dependencies.clock.now(),
       });
     }
-    if (status === "active" || status === "starting" || status === "stopping") {
+    if (status === "active" || status === "pending" || status === "starting" || status === "stopping") {
       return expired && this.dependencies.store.failJobMemoryExtraction({
         jobId: extraction.jobId,
         error: "Memory extraction outlived its deadline",

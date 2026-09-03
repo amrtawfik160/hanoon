@@ -1491,13 +1491,16 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       answered_at: NOW,
       delivered_at: null,
     }));
-    exactOutbox(fixture.store, {
-      logicalKey: "callback:callback-70001",
+    // The callback nudge wakes the executor, whose pass may already have
+    // leased this acknowledgement by the time the microtask poll above
+    // returns. What must still hold is that nothing has reached Telegram and
+    // the interaction has not been resolved from anything but the denial.
+    expect(fixture.store.getOutbox("callback:callback-70001")).toMatchObject({
       chatId: "7",
       messageId: null,
       payload: { text: "Got it." },
-      status: "pending",
-      attempts: 0,
+      status: expect.stringMatching(/^(pending|leased)$/),
+      lastError: null,
     });
     await waitForCondition(() => expect(state.preReopenGetBlocked).toBe(true));
     expect(state.orderLedger).toEqual([

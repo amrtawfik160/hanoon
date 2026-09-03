@@ -62,7 +62,9 @@ import type { ProjectPolicy } from "../../src/domain/models";
 import type { TelegramAgentStore } from "../../src/storage/store";
 import plugin from "../../server";
 
-const FIXTURE_NOW = 1_000;
+const FIXTURE_NOW = 4_000;
+/** Turn receipts sit one quiet gap before the fixed fixture clock. */
+const FIXTURE_RECEIVED_AT = 1_000;
 const CONTROLLER_KEY = "owner-7-controller";
 const OWNER_ID = "7";
 const JOB_ID = "job_fixture_1";
@@ -1099,7 +1101,7 @@ async function runScenario(input: Readonly<{
     telegramChatId: OWNER_ID,
     updateId: seed * 10_000 + trial + (scenarioCase.id === "plain-conversation" ? 0 : 5_000),
     inputText: scenarioCase.ownerMessage,
-    now: FIXTURE_NOW,
+    now: FIXTURE_RECEIVED_AT,
   });
   activeTurnId = turn.id;
   const fence = { ownerId: executionOwnerId, generation: lease.generation, signal };
@@ -1434,7 +1436,7 @@ async function runExtendedScenario(input: Readonly<{
     telegramChatId: OWNER_ID,
     updateId: seed * 10_000 + trial + 20_000,
     inputText: scenarioCase.ownerMessage,
-    now: FIXTURE_NOW,
+    now: FIXTURE_RECEIVED_AT,
   });
   activeTurnId = turn.id;
   const fence = { ownerId: executionOwnerId, generation: lease.generation, signal };

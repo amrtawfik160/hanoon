@@ -1,16 +1,23 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { vi } from "vitest";
-import { productionResourceKey, projectResourceKey } from "../../src/autonomy/models";
+import { productionResourceKey, projectResourceKey, repositoryMergeResourceKey } from "../../src/autonomy/models";
 import { DEFAULT_MODEL_POOL_REGISTRY } from "../../src/capabilities/models";
 import { navigatorAcceptanceCriteria } from "../../src/navigator/implementation-contracts";
 import {
   NavigatorImplementationExecutor,
-  type NavigatorTicketWorkerAttempt,
 } from "../../src/navigator/implementation-executor";
+import {
+  createNavigatorTicketEffectAdapter,
+  type NavigatorTicketWorkerInput,
+  type NavigatorTicketWorkerOperation,
+} from "../../src/navigator/ticket-adapter";
+import { NavigatorEffectProtocol } from "../../src/navigator/effect-protocol";
 import { assertNavigatorLiveScenarioEvidence } from "../../src/navigator/live-evidence";
 import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/navigator/promotion";
+import { createNavigatorReleaseEffectAdapter } from "../../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../../src/navigator/release-executor";
+import { navigatorReleaseOperationId } from "../../src/navigator/release-contracts";
 import { EffectRunner } from "../../src/services/effect-runner";
 import type { ProductionStageSnapshot } from "../../src/services/production-runner";
 import type { TelegramAgentStore } from "../../src/storage/store";
@@ -159,8 +166,15 @@ function openLiveJob(
     now: now(),
   });
   if (scenario !== "interrupted_tracker_create") {
-    database.prepare("UPDATE jobs SET state = 'implementing' WHERE id = ?").run(selected.id);
+    database.prepare(
+      "UPDATE jobs SET state = 'implementing', task_outcome = NULL, task_constraints_json = '[]' WHERE id = ?",
+    ).run(selected.id);
   }
+  database.prepare(
+    `INSERT INTO job_admissions (
+       job_id, project_id, queue_seq, state, resume_event, queued_at, admitted_at
+     ) VALUES (?, 'proj_1', ?, 'admitted', 'CONFIRMED', ?, ?)`,
+  ).run(selected.id, 100_000 + sequence * 100 + NAVIGATOR_LIVE_SCENARIOS.indexOf(scenario), now(), now());
   return { jobId: selected.id, specificationId, ticketId };
 }
 
@@ -213,98 +227,122 @@ function claimTicket(
   return first;
 }
 
+function claimProjectResource(
+  database: Database.Database,
+  jobId: string,
+  ownerId: string,
+  generation: number,
+  now: () => number,
+): void {
+  const acquiredAt = now();
+  database.prepare(
+    `INSERT INTO job_resource_claims (
+       job_id, resource_key, resource_kind, state, owner_id, generation,
+       lease_expires_at, acquired_at, renewed_at
+     ) VALUES (?, ?, 'project', 'held', ?, ?, ?, ?, ?)`,
+  ).run(jobId, projectResourceKey("proj_1"), ownerId, generation, acquiredAt + 100_000, acquiredAt, acquiredAt);
+}
+
 function implementationExecutor(
   store: TelegramAgentStore,
   database: Database.Database,
   now: () => number,
   options: Readonly<{ staleHead: boolean; findingsOnFirstReview: boolean }>,
 ) {
-  return new NavigatorImplementationExecutor({
-    store,
-    database,
-    workerRunner: {
-      run: vi.fn(async (attempt: NavigatorTicketWorkerAttempt, hooks) => {
-        const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
-        await hooks.bindResource(resource);
-        if (attempt.kind === "implementation") {
-          const ticketSnapshot = store.getWorkArtifactSnapshot(attempt.workOrder.ticket.snapshotId)!;
-          return {
-            resource,
-            result: {
-              kind: "implementation_result",
-              baseHeadSha: attempt.workOrder.baseHeadSha,
-              headSha: attempt.ordinal === 1 ? NEXT_HEAD : REPAIR_HEAD,
-              summary: "Implemented.",
-              changedPaths: ["src/app.ts"],
-              focusedVerification: [{ command: "npm test", outcome: "passed" }],
-              fullVerification: [{ command: "npm run check", outcome: "passed" }],
-              acceptanceCriteria: navigatorAcceptanceCriteria(ticketSnapshot).map(({ id }) => ({
-                criterionId: id,
-                outcome: "passed",
-                evidenceRefs: [`acceptance:${id}`],
-              })),
-              capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
-                capabilityId, outcome: "passed", evidenceRefs: [`worker:${attempt.id}`],
-              })),
-            },
-          };
-        }
-        const needsRepair = attempt.workOrder.verificationOf !== undefined ||
-          (options.findingsOnFirstReview && attempt.ordinal === 1);
-        const findings = needsRepair
-          ? attempt.workOrder.verificationOf?.findings ?? [{
-            rootCauseId: "live-repair",
-            capabilityId: "code-review",
-            ruleId: "LIVE-REPAIR",
-            severity: "high" as const,
-            subject: "src/app.ts",
-            line: 1,
-            requirementId: "LIVE-REPAIR",
-            summary: "Repair this finding.",
-            evidenceRefs: ["review:1"],
-          }]
-          : [];
+  const gitObserver = {
+    observe: async (request: Readonly<{
+      worktreeId: string;
+      integrationBranch: string;
+      expectedHeadSha: string;
+      baseHeadSha: string;
+      comparisonBaseHeadSha: string;
+      expectedChangedPaths: readonly string[];
+    }>) => ({
+      kind: "navigator_git_observation" as const,
+      worktreeId: request.worktreeId,
+      branch: request.integrationBranch,
+      headSha: options.staleHead ? STALE_HEAD : request.expectedHeadSha,
+      baseHeadSha: request.baseHeadSha,
+      baseHeadIsAncestor: true,
+      comparisonBaseHeadSha: request.comparisonBaseHeadSha,
+      comparisonBaseHeadIsAncestor: true,
+      clean: true,
+      changedPaths: [...request.expectedChangedPaths],
+      evidenceRef: `git-observation:${request.expectedHeadSha}`,
+      observedAt: 2_000,
+    }),
+  };
+  const ticketOperation: NavigatorTicketWorkerOperation = {
+    run: vi.fn(async (input: NavigatorTicketWorkerInput) => {
+      const { attempt, ticket: ticketSnapshot } = input;
+      const resource = attempt.resource ?? { kind: "bb_thread" as const, id: `thr_${attempt.id}` };
+      if (attempt.kind === "implementation") {
         return {
           resource,
           result: {
-            kind: "code_review_result",
-            reviewedHeadSha: attempt.workOrder.baseHeadSha,
-            outcome: needsRepair ? "findings" : "passed",
-            summary: needsRepair ? "Repair the finding." : "Passed.",
-            axes: {
-              requirements: {
-                outcome: needsRepair ? "findings" : "passed",
-                evidenceRefs: [`requirements:${attempt.id}`],
-              },
-              standards: { outcome: "passed", evidenceRefs: [`standards:${attempt.id}`] },
-            },
-            findings,
+            kind: "implementation_result",
+            baseHeadSha: attempt.workOrder.baseHeadSha,
+            headSha: attempt.ordinal === 1 ? NEXT_HEAD : REPAIR_HEAD,
+            summary: "Implemented.",
+            changedPaths: ["src/app.ts"],
+            focusedVerification: [{ command: "npm test", outcome: "passed" }],
+            fullVerification: [{ command: "npm run check", outcome: "passed" }],
+            acceptanceCriteria: navigatorAcceptanceCriteria(ticketSnapshot).map(({ id }) => ({
+              criterionId: id,
+              outcome: "passed",
+              evidenceRefs: [`acceptance:${id}`],
+            })),
             capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
-              capabilityId,
-              outcome: needsRepair ? "findings" : "passed",
-              evidenceRefs: [`worker:${attempt.id}`],
+              capabilityId, outcome: "passed", evidenceRefs: [`worker:${attempt.id}`],
             })),
           },
         };
-      }),
-      reconcileUnavailableResource: vi.fn(),
-    },
-    gitObserver: {
-      observe: async (request) => ({
-        kind: "navigator_git_observation" as const,
-        worktreeId: request.worktreeId,
-        branch: request.integrationBranch,
-        headSha: options.staleHead ? STALE_HEAD : request.expectedHeadSha,
-        baseHeadSha: request.baseHeadSha,
-        baseHeadIsAncestor: true,
-        comparisonBaseHeadSha: request.comparisonBaseHeadSha,
-        comparisonBaseHeadIsAncestor: true,
-        clean: true,
-        changedPaths: [...request.expectedChangedPaths],
-        evidenceRef: `git-observation:${request.expectedHeadSha}`,
-        observedAt: 2_000,
-      }),
-    },
+      }
+      const needsRepair = attempt.workOrder.verificationOf !== undefined ||
+        (options.findingsOnFirstReview && attempt.ordinal === 1);
+      const findings = needsRepair
+        ? attempt.workOrder.verificationOf?.findings ?? [{
+          rootCauseId: "live-repair",
+          capabilityId: "code-review",
+          ruleId: "LIVE-REPAIR",
+          severity: "high" as const,
+          subject: "src/app.ts",
+          line: 1,
+          requirementId: "LIVE-REPAIR",
+          summary: "Repair this finding.",
+          evidenceRefs: ["review:1"],
+        }]
+        : [];
+      return {
+        resource,
+        result: {
+          kind: "code_review_result",
+          reviewedHeadSha: attempt.workOrder.baseHeadSha,
+          outcome: needsRepair ? "findings" : "passed",
+          summary: needsRepair ? "Repair the finding." : "Passed.",
+          axes: {
+            requirements: {
+              outcome: needsRepair ? "findings" : "passed",
+              evidenceRefs: [`requirements:${attempt.id}`],
+            },
+            standards: { outcome: "passed", evidenceRefs: [`standards:${attempt.id}`] },
+          },
+          findings,
+          capabilityOutcomes: attempt.profile.assignments.map(({ capabilityId }) => ({
+            capabilityId,
+            outcome: needsRepair ? "findings" : "passed",
+            evidenceRefs: [`worker:${attempt.id}`],
+          })),
+        },
+      };
+    }),
+    reconcile: vi.fn(),
+    observe: gitObserver.observe,
+  };
+  const executor = new NavigatorImplementationExecutor({
+    store,
+    database,
+    gitObserver,
     pullRequests: {
       createOrRefresh: vi.fn(async (request) => ({
         jobId: request.jobId,
@@ -317,6 +355,17 @@ function implementationExecutor(
     modelRoute: (kind) => kind === "review" ? modelRoute() : workerRoute(),
     clock: { now },
   });
+  const unused = async () => ({ outcome: "permanent" as const, reason: "unused in live scenario" });
+  const protocol = new NavigatorEffectProtocol({
+    store,
+    clock: { now },
+    adapters: [
+      { kind: "run_navigator_skill", execute: unused },
+      createNavigatorTicketEffectAdapter(ticketOperation),
+      { kind: "run_navigator_release", execute: unused },
+    ],
+  });
+  return { executor, protocol };
 }
 
 function isolateLiveIntegration(database: Database.Database, jobId: string): void {
@@ -327,6 +376,7 @@ function isolateLiveIntegration(database: Database.Database, jobId: string): voi
 
 async function processTicketUntil(
   executor: NavigatorImplementationExecutor,
+  protocol: NavigatorEffectProtocol,
   jobId: string,
   fence: { ownerId: string; generation: number; signal: AbortSignal },
   desired: "repair_pending" | "accepted" | "failed",
@@ -334,9 +384,9 @@ async function processTicketUntil(
   for (let step = 0; step < 8; step += 1) {
     const slice = executor.snapshot(jobId).activeSlice;
     if (slice?.state === desired) return;
-    const progressed = await executor.processOne(fence, new AbortController().signal);
+    const progressed = await protocol.processOne(fence, new AbortController().signal);
     if (!progressed) {
-      throw new Error(`ticket worker stopped in ${slice?.state ?? "no-slice"}, wanted ${desired}`);
+      throw new Error(`ticket worker for ${jobId} stopped in ${slice?.state ?? "no-slice"}, wanted ${desired}`);
     }
   }
   throw new Error(`ticket worker never reached ${desired}`);
@@ -344,12 +394,13 @@ async function processTicketUntil(
 
 async function processUntilOutcome(
   executor: NavigatorImplementationExecutor,
+  protocol: NavigatorEffectProtocol,
   jobId: string,
   fence: { ownerId: string; generation: number; signal: AbortSignal },
 ): Promise<void> {
   for (let step = 0; step < 8; step += 1) {
     if (executor.snapshot(jobId).outcomes.length > 0) return;
-    const progressed = await executor.processOne(fence, new AbortController().signal);
+    const progressed = await protocol.processOne(fence, new AbortController().signal);
     if (!progressed) throw new Error("ticket worker produced no outcome");
   }
   throw new Error("ticket worker never recorded an outcome");
@@ -365,7 +416,8 @@ async function runImplementation(
   options: Readonly<{ staleHead: boolean; findingsOnFirstReview: boolean }>,
 ) {
   isolateLiveIntegration(database, opened.jobId);
-  const executor = implementationExecutor(store, database, now, options);
+  const running = implementationExecutor(store, database, now, options);
+  const executor = running.executor;
   executor.startIntegration({
     jobId: opened.jobId,
     specificationArtifactId: opened.specificationId,
@@ -377,6 +429,7 @@ async function runImplementation(
     evidenceRefs: ["live:scenario"],
   });
   const claimed = claimTicket(store, opened.ticketId, opened.jobId, ownerId, generation, now);
+  claimProjectResource(database, opened.jobId, ownerId, generation, now);
   executor.beginClaimedTicket({
     jobId: opened.jobId,
     ticketArtifactId: opened.ticketId,
@@ -388,16 +441,17 @@ async function runImplementation(
   });
   const fence = { ownerId, generation, signal: new AbortController().signal };
   if (options.staleHead) {
-    await processUntilOutcome(executor, opened.jobId, fence);
+    await processUntilOutcome(executor, running.protocol, opened.jobId, fence);
   } else {
     await processTicketUntil(
       executor,
+      running.protocol,
       opened.jobId,
       fence,
       options.findingsOnFirstReview ? "repair_pending" : "accepted",
     );
   }
-  return { executor, fence, claimed };
+  return { executor, protocol: running.protocol, fence, claimed };
 }
 
 async function repairAndAccept(
@@ -424,7 +478,7 @@ async function repairAndAccept(
     ticketArtifactId: opened.ticketId,
     proposalId: repairDecision.proposalId,
   });
-  await processTicketUntil(running.executor, opened.jobId, running.fence, "accepted");
+  await processTicketUntil(running.executor, running.protocol, opened.jobId, running.fence, "accepted");
 }
 
 function closeTicket(
@@ -583,15 +637,30 @@ function seedProduction(
     ).run(jobId, job.projectId, queueSeq, now(), now());
   }
   const expires = now() + 180_000;
+  const acquired = now();
+  // A resource may carry several historical claim rows; only one may be held,
+  // so reactivation takes the newest and leaves the rest released.
+  const updateClaim = database.prepare(
+    `UPDATE job_resource_claims
+        SET job_id = ?, state = 'held', owner_id = ?, generation = ?, lease_expires_at = ?,
+            renewed_at = ?, released_at = NULL, release_reason = NULL
+      WHERE claim_id = (
+        SELECT claim_id FROM job_resource_claims WHERE resource_key = ?
+         ORDER BY claim_id DESC LIMIT 1
+      )`,
+  );
   const insertClaim = database.prepare(
     `INSERT INTO job_resource_claims (
        job_id, resource_key, resource_kind, state, owner_id, generation,
        lease_expires_at, acquired_at, renewed_at
      ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)`,
   );
-  const acquired = now();
-  insertClaim.run(jobId, projectResourceKey(job.projectId), "project", ownerId, generation, expires, acquired, acquired);
-  insertClaim.run(jobId, productionResourceKey(job.policy), "production_target", ownerId, generation, expires, acquired, acquired);
+  const reactivateClaim = (resourceKey: string, resourceKind: string): void => {
+    const updated = updateClaim.run(jobId, ownerId, generation, expires, acquired, resourceKey);
+    if (updated.changes === 0) insertClaim.run(jobId, resourceKey, resourceKind, ownerId, generation, expires, acquired, acquired);
+  };
+  reactivateClaim(projectResourceKey(job.projectId), "project");
+  reactivateClaim(productionResourceKey(job.policy), "production_target");
   const current = store.getJob(jobId)!;
   const kind = state === "deploying" ? "deploy_production" : "verify_production";
   database.prepare(
@@ -668,10 +737,11 @@ function startResolvedIntegration(
   opened: Readonly<{ jobId: string; specificationId: string; ticketId: string }>,
 ): void {
   isolateLiveIntegration(database, opened.jobId);
-  const executor = implementationExecutor(store, database, now, {
+  const running = implementationExecutor(store, database, now, {
     staleHead: false,
     findingsOnFirstReview: false,
   });
+  const executor = running.executor;
   executor.startIntegration({
     jobId: opened.jobId,
     specificationArtifactId: opened.specificationId,
@@ -848,23 +918,50 @@ export async function runRequiredNavigatorLiveScenarios(input: Readonly<{
         body: "Implements the live scenario with one repair.",
       });
       markShippedChange(input.database, opened.jobId);
-      propose(input.store, opened.jobId, input.now, {
+      const releaseDecision = propose(input.store, opened.jobId, input.now, {
         kind: "start_release",
         implementationTicketIds: [opened.ticketId],
       });
+      if (!releaseDecision.effectIdempotencyKey) throw new Error("live release effect was not accepted");
+      const releaseJob = input.store.getJob(opened.jobId);
+      if (!releaseJob?.policy || releaseJob.projectId === null) throw new Error("live release policy is missing");
+      const releaseClaimNow = input.now();
+      // The executor must simply hold these claims before the release runs.
+      // Ticket execution may already hold one of them, so this ensures the
+      // held state rather than assuming the row is absent.
+      const insertReleaseClaim = input.database.prepare(
+        `INSERT INTO job_resource_claims (
+           job_id, resource_key, resource_kind, state, owner_id, generation,
+           lease_expires_at, acquired_at, renewed_at
+         ) VALUES (?, ?, ?, 'held', ?, ?, ?, ?, ?)
+         ON CONFLICT(resource_key) WHERE state = 'held' DO UPDATE SET
+           job_id = excluded.job_id, resource_kind = excluded.resource_kind,
+           state = 'held', owner_id = excluded.owner_id, generation = excluded.generation,
+           lease_expires_at = excluded.lease_expires_at, renewed_at = excluded.renewed_at`,
+      );
+      insertReleaseClaim.run(opened.jobId, projectResourceKey(releaseJob.projectId), "project", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
+      insertReleaseClaim.run(opened.jobId, repositoryMergeResourceKey(releaseJob.policy.githubRepository), "repository_merge", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
+      insertReleaseClaim.run(opened.jobId, productionResourceKey(releaseJob.policy), "production_target", ownerId, lease.generation, releaseClaimNow + 180_000, releaseClaimNow, releaseClaimNow);
       const release = new NavigatorReleaseExecutor({
-        store: input.store,
         publishPullRequest: async () => ({
-          operationId: "pr-43",
+          operationId: navigatorReleaseOperationId(opened.jobId),
           jobId: opened.jobId,
           number: 43,
           url: "https://github.com/acme/cyndra/pull/43",
           headSha: NEXT_HEAD,
         }),
         integrationWorktreeId: () => `env_${opened.jobId}`,
-        clock: { now: input.now },
       });
-      await release.processOne({
+      const releaseProtocol = new NavigatorEffectProtocol({
+        store: input.store,
+        clock: { now: input.now },
+        adapters: [
+          { kind: "run_navigator_skill", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          { kind: "run_navigator_ticket_worker", execute: async () => ({ outcome: "permanent" as const, reason: "unused" }) },
+          createNavigatorReleaseEffectAdapter(release),
+        ],
+      });
+      await releaseProtocol.processOne({
         ownerId,
         generation: lease.generation,
         signal: new AbortController().signal,

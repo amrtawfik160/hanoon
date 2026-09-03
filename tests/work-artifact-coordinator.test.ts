@@ -67,7 +67,7 @@ function recordEvidence(
     now: input.now,
   });
   const fence = { ownerId: input.ownerId, generation: input.generation, now: input.now };
-  if (store.claimNextControllerTurn(fence)?.id !== turn.id) throw new Error("turn was not claimed");
+  if (store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id !== turn.id) throw new Error("turn was not claimed");
   if (!store.reserveControllerSpawn({
     controllerKey,
     turnId: turn.id,

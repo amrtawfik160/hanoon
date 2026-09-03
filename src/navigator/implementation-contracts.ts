@@ -161,6 +161,40 @@ export const navigatorTicketWorkerResultSchema = z.discriminatedUnion("kind", [
 
 export type NavigatorTicketWorkerResult = Readonly<z.infer<typeof navigatorTicketWorkerResultSchema>>;
 
+const navigatorWorkerResourceObservationSchema = z.object({
+  resource: z.object({
+    kind: z.literal("bb_thread"),
+    id: identifierSchema,
+  }).strict(),
+  state: z.enum(["terminal", "missing"]),
+  evidenceRef: boundedTextSchema,
+  observedAt: z.number().int().nonnegative(),
+}).strict();
+
+export const navigatorTicketWorkerUnavailableResultSchema = z.object({
+  kind: z.literal("worker_unavailable"),
+  reason: z.enum(["missing", "stale"]),
+  resourceObservation: navigatorWorkerResourceObservationSchema,
+}).strict();
+
+export const navigatorTicketWorkerFailureResultSchema = z.object({
+  kind: z.literal("worker_failure"),
+  failureClass: z.enum(["retryable", "permanent"]),
+  retryClass: z.literal("bounded_exponential"),
+  attempts: z.number().int().positive(),
+  summary: boundedTextSchema,
+}).strict();
+
+export const navigatorTicketWorkerReceiptResultSchema = z.union([
+  navigatorTicketWorkerResultSchema,
+  navigatorTicketWorkerUnavailableResultSchema,
+  navigatorTicketWorkerFailureResultSchema,
+]);
+
+export type NavigatorTicketWorkerUnavailableResult = Readonly<z.infer<typeof navigatorTicketWorkerUnavailableResultSchema>>;
+export type NavigatorTicketWorkerFailureResult = Readonly<z.infer<typeof navigatorTicketWorkerFailureResultSchema>>;
+export type NavigatorTicketWorkerReceiptResult = Readonly<z.infer<typeof navigatorTicketWorkerReceiptResultSchema>>;
+
 export type NavigatorAcceptanceCriterion = Readonly<{
   id: string;
   text: string;

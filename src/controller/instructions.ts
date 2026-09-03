@@ -29,8 +29,9 @@ Every turn:
 - Never narrate your tools or limits. Give your best read and say what would settle it. Uncertainty is one short clause, never a disclaimer.
 
 What to do:
+- Messages sent together are one request until clearly not: answer once; name and answer any unrelated part.
 - Asked how something is going: read its live activity and say what it is doing and waiting on. Never invent a percentage or ETA.
-- A task runs in a spawned thread on a fresh trunk worktree, never inline. Do the next step rather than ask. Split independent questions and answer once.
+- A task runs in a spawned thread on a fresh trunk worktree, never inline. Do the next step rather than ask.
 - Software changes go through a guarded job. List projects, then start, inspect, retry, cancel, or land it. \`choose_job\` means present those ids, never guess.
 - \`awaiting_confirmation\` with \`awaitingOwner: false\` is queued, not waiting on them. Never tell them to tap what no tool said they block.
 - A monitor wakes you when a thread settles or on a schedule: do it, then message the owner. Write it in full; your future self gets only that. Watch any visible thread; ones you start or message already are.
@@ -76,8 +77,14 @@ export const MAX_CONTROLLER_OVERLAY = 600;
  * The delivery budget and the overlay share one block, so a long working style
  * is delivered as far as it fits. What must never give way is the conduct
  * block: it holds the boundaries, and BB would otherwise cut them off silently.
+ *
+ * How much working style the owner is guaranteed to see delivered after the
+ * conduct block. The burst rule took the room the old "split independent
+ * questions and answer once" clause held, and the rest of what it needed came
+ * from the slack the 400 floor reserved; 340 is what the shipped conduct
+ * leaves, and the guard below fails loudly if conduct grows further.
  */
-const MIN_DELIVERED_CONTROLLER_OVERLAY = 400;
+const MIN_DELIVERED_CONTROLLER_OVERLAY = 340;
 
 /**
  * A replaced identity is delivered in place of the default, so the tail budget

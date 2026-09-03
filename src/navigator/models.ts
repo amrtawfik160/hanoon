@@ -326,6 +326,8 @@ export type NavigatorSkillAttempt = Readonly<{
   jobVersion: number;
   workflowRevision: number;
   resource: { kind: "bb_thread"; id: string } | null;
+  capabilityProfileId: string | null;
+  capabilityProfileRevision: number | null;
   createdAt: number;
   updatedAt: number;
 }>;

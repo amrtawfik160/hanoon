@@ -61,7 +61,7 @@ function answerFixture(questions: { id: string; prompt: string }[]) {
     inputText: "ship the release",
     now: 2_000,
   });
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     ...fence, turnId: turn.id, projectId: "proj_answer", hostId: "host_answer", threadId: THREAD_ID,
   })).toBe(true);

@@ -1,5 +1,7 @@
+import { redactError } from "../errors";
 import {
   BbAutomationNotFoundError,
+  BbAutomationProjectUnavailableError,
   DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
   DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
 } from "../bb/automation";
@@ -92,15 +94,6 @@ export type ManagedAutomationAdapter = Readonly<{
     signal?: AbortSignal;
   }): Promise<ManagedAutomationObservation | null>;
 }>;
-
-export class ManagedAgentExecutionContractUnsupportedError extends Error {
-  public readonly code = "BB_AGENT_EXECUTION_CONTRACT_UNSUPPORTED";
-
-  public constructor() {
-    super("BB cannot enforce this agent automation's execution contract");
-    this.name = "ManagedAgentExecutionContractUnsupportedError";
-  }
-}
 
 export type CreateManagedAutomationInput = Readonly<{
   scope: ManagedAutomationScope;
@@ -251,15 +244,6 @@ function executorMutation(
     if (result.outcome === "stale") throw new ManagedAutomationExecutorFenceLostError();
     return result.mutationValue;
   };
-}
-
-function agentExecutionContractIsSupported(adapter: ManagedAutomationAdapter): boolean {
-  const support = adapter.agentAutomationCapabilities;
-  return support.executionTimeout && support.resultContract && support.preRunAuthority;
-}
-
-function assertAgentExecutionContractSupported(adapter: ManagedAutomationAdapter): void {
-  if (!agentExecutionContractIsSupported(adapter)) throw new ManagedAgentExecutionContractUnsupportedError();
 }
 
 async function deleteAutomationForRetirement(
@@ -480,7 +464,6 @@ export class ManagedAutomationService {
     if (deferred && (!input.operation || !input.controllerFence || !input.mutate)) {
       throw new TypeError("deferred managed automation creation requires an operation fence");
     }
-    if (!deferred && input.definition.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     const reserved = applyMutation(input.mutate, () => this.repository.reserve({
       controllerKey: input.controllerKey,
       sourceKey: input.sourceKey,
@@ -525,6 +508,12 @@ export class ManagedAutomationService {
         signal: input.signal,
       });
     }
+    // BB's create has no idempotency key, so the durable order is: stamp a
+    // deterministic ownership marker, ask BB once, verify the receipt carries
+    // that exact marker, persist the provider id, read it back exactly, and
+    // only then activate. A crash anywhere in between is finished by
+    // reconciliation — which finds the marked automation rather than creating
+    // a second schedule.
     const providerIdentity: ManagedAutomationProviderIdentity = {
       operationId: reserved.id,
       ownershipMarker: ownershipMarkerFor(reserved.id),
@@ -567,6 +556,9 @@ export class ManagedAutomationService {
       }));
     } catch (error) {
       try {
+        // A create BB acknowledged is never deleted to tidy up: the binding
+        // keeps BB's id and the ownership marker, so reconciliation retries the
+        // exact read-back and can still recognise the schedule as Hanoon's.
         applyMutation(input.mutate, () => this.repository.fail(
           reserved.id,
           receipt === null ? automationErrorClass(error) : "bb_automation_provider_readback_failed",
@@ -603,12 +595,10 @@ export class ManagedAutomationService {
       (operation.authority.origin === "owner" && operation.authority.taskAuthority.turnId !== operation.controllerFence.turnId))) {
       return { allowed: false, errorClass: "managed_automation_operation_stale" };
     }
+    // A retired binding still admits its own retirement, which is how an
+    // interrupted retire finishes.
     if (binding.state === "retired" && operation.operationClass !== "retire") {
       return { allowed: false, errorClass: "managed_automation_binding_retired" };
-    }
-    if (["create", "update", "enable", "run_now"].includes(operation.operationClass) &&
-      binding.mode === "agent" && !agentExecutionContractIsSupported(this.adapter)) {
-      return { allowed: false, errorClass: "bb_agent_execution_contract_unsupported" };
     }
     if (!this.authorityIsCurrent(binding)) {
       return { allowed: false, errorClass: "managed_automation_authority_stale" };
@@ -986,15 +976,6 @@ export class ManagedAutomationService {
       });
       return applyMutation(input.mutate, () => this.repository.retire(input.binding.id, input.now));
     }
-    if (input.binding.mode === "agent" && !agentExecutionContractIsSupported(this.adapter)) {
-      return this.pauseForUnsupportedAgentExecution({
-        binding: input.binding,
-        scope: input.scope,
-        now: input.now,
-        mutate: input.mutate,
-        signal: input.signal,
-      });
-    }
     if (input.binding.mode === "agent" && !this.authorityIsCurrent(input.binding)) {
       return this.pauseForStaleAuthority({
         binding: input.binding,
@@ -1068,7 +1049,6 @@ export class ManagedAutomationService {
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
     const binding = requireActiveBinding(this.repository, input.id);
-    if (input.enabled && binding.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     if (input.enabled && binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
       throw new Error("managed automation authority is not current");
     }
@@ -1092,7 +1072,6 @@ export class ManagedAutomationService {
     mutate?: ManagedAutomationMutation;
     signal?: AbortSignal;
   }): Promise<ManagedAutomationBinding> {
-    if (input.definition.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     const updating = applyMutation(input.mutate, () => this.repository.beginUpdate({
       id: input.id,
       definition: input.definition,
@@ -1157,29 +1136,6 @@ export class ManagedAutomationService {
     return applyMutation(input.mutate, () => this.repository.markPolicyBlocked(binding.id, input.now));
   }
 
-  public async pauseForUnsupportedAgentExecution(input: {
-    binding: ManagedAutomationBinding;
-    scope: ManagedAutomationScope;
-    now: number;
-    mutate?: ManagedAutomationMutation;
-    signal?: AbortSignal;
-  }): Promise<ManagedAutomationBinding> {
-    let binding = input.binding;
-    if (binding.observed?.enabled !== false) {
-      const paused = await this.adapter.setEnabled({
-        scope: input.scope,
-        projectId: binding.projectId,
-        automationId: binding.bbAutomationId!,
-        enabled: false,
-        expectedDefinition: binding.definition,
-        identity: existingProviderIdentity(binding),
-        signal: input.signal,
-      });
-      binding = applyMutation(input.mutate, () => this.repository.activate({ id: binding.id, automation: paused, now: input.now }));
-    }
-    return applyMutation(input.mutate, () => this.repository.markExecutionContractBlocked(binding.id, input.now));
-  }
-
   public async runNow(input: {
     id: string;
     scope: ManagedAutomationScope;
@@ -1188,7 +1144,6 @@ export class ManagedAutomationService {
     signal?: AbortSignal;
   }): Promise<ManagedAutomationRun> {
     const binding = requireActiveBinding(this.repository, input.id);
-    if (binding.mode === "agent") assertAgentExecutionContractSupported(this.adapter);
     if (binding.mode === "agent" && !this.authorityIsCurrent(binding)) {
       throw new Error("managed automation authority is not current");
     }
@@ -1239,6 +1194,7 @@ function requireActiveBinding(
 }
 
 function automationErrorClass(error: unknown): string {
+  if (error instanceof BbAutomationProjectUnavailableError) return "bb_automation_project_unavailable";
   const message = error instanceof Error ? error.message.toLowerCase() : "";
   if (message.includes("timed out")) return "bb_automation_timeout";
   if (message.includes("aborted")) return "bb_automation_aborted";
@@ -1274,7 +1230,11 @@ export async function migrateLegacyClockMonitor(input: {
     definition: {
       mode: "agent",
       projectId: input.projectId,
-      name: input.monitor.systemKey ?? `Hanoon schedule ${input.monitor.id.slice(0, 24)}`,
+      // Same name as a fresh install of the same upkeep, so a later pass that
+      // no longer sees the legacy row reserves the identical durable definition.
+      name: input.monitor.systemKey
+        ? `Hanoon ${input.monitor.systemKey}`
+        : `Hanoon schedule ${input.monitor.id.slice(0, 24)}`,
       trigger: { kind: "cron", cron: input.monitor.cron, timezone: "Etc/UTC" },
       prompt: input.monitor.instruction,
       providerId: input.providerId,
@@ -1325,7 +1285,11 @@ export class ManagedAutomationReconciler {
   public constructor(private readonly dependencies: Readonly<{
     repository: ManagedAutomationRepository;
     service: ManagedAutomationService;
-    store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "getProjectPolicy" | "enqueueControllerTurn" | "runExecutorMutation">;
+    store: Pick<
+      TelegramAgentStore,
+      "getOwner" | "getControllerForOwner" | "getProjectPolicy" | "enqueueControllerTurn" |
+      "cancelMonitor" | "runExecutorMutation"
+    >;
     notify(): void;
     warn?(message: string): void;
     clock?: { now(): number };
@@ -1384,7 +1348,7 @@ export class ManagedAutomationReconciler {
       try {
         if (binding.mode === "agent" && !managedAutomationAuthorityIsCurrent(
           binding,
-          controller?.controllerKey ?? null,
+          controller,
           this.dependencies.store.getProjectPolicy(binding.projectId)?.policy.enabled === true,
         )) {
           await this.dependencies.service.pauseForStaleAuthority({
@@ -1409,12 +1373,12 @@ export class ManagedAutomationReconciler {
             })
           : binding;
         if (!mutate) {
-          await this.dependencies.service.reconcile({
+          this.finishLegacyHandover(await this.dependencies.service.reconcile({
             binding: current,
             scope: { kind: "host", hostId, cwd: null },
             now,
             signal,
-          });
+          }), now);
           didWork = true;
           continue;
         }
@@ -1431,22 +1395,34 @@ export class ManagedAutomationReconciler {
         if (submitted) {
           didWork = true;
         } else if (!isOwnerManagedAutomation(current)) {
-          await this.dependencies.service.reconcile({
+          this.finishLegacyHandover(await this.dependencies.service.reconcile({
             binding: current,
             scope: { kind: "host", hostId, cwd: null },
             now,
             mutate,
             signal,
-          });
+          }), now);
           didWork = true;
         }
       } catch (error) {
         if (error instanceof ManagedAutomationExecutorFenceLostError) break;
-        this.dependencies.warn?.(`Managed automation ${binding.id} could not be reconciled`);
+        this.dependencies.warn?.(
+          `Managed automation ${binding.id} could not be reconciled: ${redactError(error).slice(0, 200)}`,
+        );
       }
     }
 
     return didWork;
+  }
+
+  /**
+   * The handover to BB was interrupted after BB had read the schedule back.
+   * Finishing it here keeps one task out of two schedulers.
+   */
+  private finishLegacyHandover(reconciled: ManagedAutomationBinding, now: number): void {
+    if (reconciled.legacyMonitorId === null) return;
+    if (!this.dependencies.store.cancelMonitor(reconciled.legacyMonitorId, now)) return;
+    this.dependencies.warn?.(`Managed automation ${reconciled.id} cancelled its leftover legacy schedule`);
   }
 
   private async processDurableOperations(
@@ -1629,10 +1605,16 @@ function isOwnerManagedAutomation(binding: ManagedAutomationBinding): boolean {
 
 export function managedAutomationAuthorityIsCurrent(
   binding: ManagedAutomationBinding,
-  currentControllerKey: string | null,
-  projectEnabled: boolean,
+  controller: Readonly<{ controllerKey: string; projectId: string | null }> | null,
+  projectPolicyEnabled: boolean,
 ): boolean {
-  if (!projectEnabled || currentControllerKey !== binding.controllerKey) return false;
+  if (controller === null || controller.controllerKey !== binding.controllerKey) return false;
+  // The controller's own project needs no repository policy: upkeep and the
+  // owner's follow-up schedules run where the controller itself already runs.
+  // Any other project must still be an enabled Hanoon project.
+  const projectAuthorized = projectPolicyEnabled ||
+    (controller.projectId !== null && controller.projectId === binding.projectId);
+  if (!projectAuthorized) return false;
   if (isCurrentManagedAutomationAuthority(binding.authority)) {
     return binding.authority.controllerKey === binding.controllerKey &&
       binding.authority.projectId === binding.projectId &&

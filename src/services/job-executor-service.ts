@@ -62,20 +62,14 @@ export type JobExecutorDependencies = {
     isStreaming?(): boolean;
     /** Milliseconds until the in-flight turn is out of time, if one is running. */
     nextStallDeadlineMs?(now: number): number | null;
+    /** Milliseconds until a waiting burst has gone quiet, if one is waiting. */
+    nextBurstQuietWaitMs?(now: number): number | null;
   };
   operations?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
-  /** Deterministic navigator-v1 work. Recipe-v1 jobs never enter this executor. */
-  navigator?: {
-    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
-  };
-  /** Deterministic navigator-v1 ticket integration work. */
-  navigatorImplementation?: {
-    processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
-  };
-  /** Deterministic navigator-v1 exact-head release work. */
-  navigatorRelease?: {
+  /** One fenced protocol for every deterministic navigator-v1 effect. */
+  navigatorEffects?: {
     processOne(fence: EffectFence, signal: AbortSignal): Promise<boolean>;
   };
   monitors?: {
@@ -939,14 +933,8 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         if (deps.operations) {
           didWork = await deps.operations.processOne(effectFence, workAbort.signal) || didWork;
         }
-        if (deps.navigator) {
-          didWork = await deps.navigator.processOne(effectFence, workAbort.signal) || didWork;
-        }
-        if (deps.navigatorImplementation) {
-          didWork = await deps.navigatorImplementation.processOne(effectFence, workAbort.signal) || didWork;
-        }
-        if (deps.navigatorRelease) {
-          didWork = await deps.navigatorRelease.processOne(effectFence, workAbort.signal) || didWork;
+        if (deps.navigatorEffects) {
+          didWork = await deps.navigatorEffects.processOne(effectFence, workAbort.signal) || didWork;
         }
         if (deps.monitors) {
           didWork = await deps.monitors.processDue() || didWork;
@@ -1578,7 +1566,11 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         // producing events: a silent thread produces none, which is exactly the
         // case the deadline exists for.
         const deadlineWaitMs = deps.controller?.nextStallDeadlineMs?.(deps.clock.now()) ?? null;
-        const waitMs = [presenceWaitMs, deadlineWaitMs].reduce<number>(
+        // A burst still arriving holds its claim until the quiet gap has passed
+        // its newest message, so the loop wakes exactly then rather than
+        // answering half of what the owner sent.
+        const burstWaitMs = deps.controller?.nextBurstQuietWaitMs?.(deps.clock.now()) ?? null;
+        const waitMs = [presenceWaitMs, deadlineWaitMs, burstWaitMs].reduce<number>(
           (soonest, candidate) => candidate === null ? soonest : Math.min(soonest, Math.max(1, candidate)),
           ordinaryAndSweepWaitMs,
         );
