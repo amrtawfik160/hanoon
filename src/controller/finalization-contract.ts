@@ -506,8 +506,9 @@ export function renderControllerFinalization(candidate: ControllerFinalization):
 function rejected(
   code: FinalizationRejectionCode,
   storedCandidate: ControllerFinalization,
+  correction: string | null = null,
 ): ControllerFinalizationValidation {
-  return { outcome: "rejected", code, correction: CORRECTIONS[code], storedCandidate };
+  return { outcome: "rejected", code, correction: correction ?? CORRECTIONS[code], storedCandidate };
 }
 
 function fixedStorageProjection(): ControllerFinalization {
@@ -620,6 +621,44 @@ function hasProofIncompatibility(
   context: ControllerFinalizationValidationContext,
 ): boolean {
   return candidateClaims.some((claim) => !evidenceSupportsClaim(claim, evidenceRows(claim, context)));
+}
+
+/**
+ * A proof mismatch is the one rejection the fixed correction cannot steer out
+ * of. That text tells every claim to become a source report, but a source
+ * report needs thread-state proof, and a claim resting on a command result has
+ * none: a model that follows the correction exactly is rejected again with the
+ * same words. One turn was rejected twice that way, spent a model call on each
+ * attempt, and was stopped by the token budget while still trying. Naming the
+ * kinds the cited evidence can carry gives the model a move the validator will
+ * accept. Only the evidence-backed mismatch is specific; the text-based
+ * `proof_incompatible` branches keep the source-report guidance, which is the
+ * right answer for them. Returns null when no claim fails on proof or outcome.
+ */
+function proofIncompatibilityCorrection(
+  candidateClaims: readonly ControllerClaim[],
+  context: ControllerFinalizationValidationContext,
+): string | null {
+  for (const claim of candidateClaims) {
+    const rows = evidenceRows(claim, context);
+    const refs = claim.evidenceRefs.join(", ");
+    if (!evidenceProofsSupportClaim(claim, rows)) {
+      const proofs = [...new Set(rows.flatMap((row) => row.proofKinds))].join(", ");
+      const kinds = CONTROLLER_CLAIM_KINDS.filter((kind) => (
+        kind !== "uncertainty" &&
+        rows.every((row) => row.proofKinds.some((proof) => CLAIM_PROOFS[kind].has(proof)))
+      ));
+      if (kinds.length === 0) {
+        return `Claim kind ${claim.kind} cannot rest on ${refs} (proof: ${proofs}), and no single claim kind covers that evidence. Cite evidence that proves the claim, or say it in plain text without a claim.`;
+      }
+      return `Claim kind ${claim.kind} cannot rest on ${refs} (proof: ${proofs}). That evidence supports ${kinds.join(" or ")}: use that kind with the outcome the evidence shows, or say it in plain text without a claim.`;
+    }
+    if (!evidenceOutcomesSupportClaim(claim, rows)) {
+      const outcomes = [...new Set(rows.map((row) => row.outcome))].join(", ");
+      return `Claim outcome ${claim.outcome} does not match ${refs} (evidence outcome: ${outcomes}). Use the outcome the evidence shows, or say it in plain text without a claim.`;
+    }
+  }
+  return null;
 }
 
 function normalizedSentences(text: string): string[] {
@@ -1518,6 +1557,9 @@ export function validateControllerFinalization(
   }
   for (const reading of readings) {
     const rejectionCode = semanticRejectionCode(candidate, reading, context);
+    if (rejectionCode === "proof_incompatible") {
+      return rejected(rejectionCode, candidate, proofIncompatibilityCorrection(claims(candidate), context));
+    }
     if (rejectionCode) return rejected(rejectionCode, candidate);
   }
   return { outcome: "accepted", candidate, renderedMessage };

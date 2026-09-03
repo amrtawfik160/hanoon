@@ -140,6 +140,24 @@ it("counts tool starts, failed commands, and the cumulative token total", async 
   expect(observation).toMatchObject({ toolCalls: 2, commandFailures: 1, totalTokens: 9_004 });
 });
 
+it("counts the tokens a call spent, not the cached context it re-read", async () => {
+  // Figures from a real controller thread: the provider re-reads the whole
+  // conversation from cache on every call, so `totalTokens` grows by ~80k a
+  // call while the call itself produced a few hundred fresh tokens.
+  const adapter = observingAdapter([[
+    event(1, "thread/tokenUsage/updated", { tokenUsage: { total: {
+      totalTokens: 1_624_683, inputTokens: 1_612_411, cachedInputTokens: 1_564_928, outputTokens: 12_272,
+    } } }),
+    event(2, "thread/tokenUsage/updated", { tokenUsage: { total: {
+      totalTokens: 1_704_814, inputTokens: 1_691_446, cachedInputTokens: 1_638_400, outputTokens: 13_368,
+    } } }),
+  ]]);
+
+  const observation = await adapter.events("thr_controller", 0, AbortSignal.timeout(1_000));
+
+  expect(observation.totalTokens).toBe(1_704_814 - 1_638_400);
+});
+
 it("reports no usage for a window that carried none", async () => {
   const adapter = observingAdapter([[event(1, "item/agentMessage/delta", { delta: "hi" })]]);
 
@@ -437,7 +455,7 @@ it("steers a turn that crosses the soft tool budget, then stops it at the hard b
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({
     state: "failed",
-    lastError: "Controller turn exceeded its budget",
+    lastError: expect.stringContaining("Controller turn exceeded its budget"),
   });
   expect(store.getControllerForOwner("7", "7")).toMatchObject({ threadId: null, state: "pending_spawn" });
   expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text)
@@ -605,6 +623,51 @@ it("budgets this turn's tokens, not the whole thread's history", async () => {
 
   expect(store.getControllerTurn(turn.id)).toMatchObject({
     state: "failed",
-    lastError: "Controller turn exceeded its budget",
+    lastError: expect.stringContaining("Controller turn exceeded its budget"),
   });
+});
+
+it("lets a short turn on a long-lived thread finish when every call re-reads a large cached context", async () => {
+  const { store, fence } = storeFixture("cached-context");
+  const turn = submittedTurn(store, fence);
+  // The nine cumulative thread totals BB reported during one real turn that
+  // made ten tool calls and produced ~6k output tokens. Each call added ~80k
+  // to the total because the provider re-read the ~80k conversation from
+  // cache; measured by the total alone, the turn "spent" 660k and was killed
+  // while it was delivering its answer.
+  const calls: ReadonlyArray<readonly [total: number, cached: number]> = [
+    [1_624_683, 1_564_928],
+    [1_704_814, 1_638_400],
+    [1_785_507, 1_717_248],
+    [1_866_431, 1_797_504],
+    [1_947_498, 1_878_016],
+    [2_030_402, 1_958_784],
+    [2_113_933, 2_040_832],
+    [2_199_000, 2_123_648],
+    [2_284_543, 2_207_360],
+  ];
+  const pages = calls.map(([total, cached], index) => [
+    event(index * 2 + 1, "item/started", { item: { type: "toolCall", id: `t${index}` } }),
+    event(index * 2 + 2, "thread/tokenUsage/updated", { tokenUsage: { total: {
+      totalTokens: total, inputTokens: total - 2_000, cachedInputTokens: cached, outputTokens: 2_000,
+    } } }),
+  ]);
+  const observing = observingAdapter(pages);
+  const adapter = serviceAdapter(() => observation(), () => "active");
+  adapter.events = vi.fn((threadId: string, afterSeq: number, signal: AbortSignal) =>
+    observing.events(threadId, afterSeq, signal));
+  const service = new LunaControllerService({ store, adapter, evidenceProjector: testEvidenceProjector, clock: { now: () => 2_001 } });
+  const runFence = { ...fence, signal: AbortSignal.timeout(5_000) };
+
+  for (let poll = 0; poll < calls.length; poll += 1) {
+    await expect(service.reconcile(runFence, runFence.signal)).resolves.toBe(true);
+  }
+
+  expect(store.getControllerTurn(turn.id)).toMatchObject({
+    state: "submitted",
+    toolCalls: calls.length,
+    lastError: null,
+  });
+  expect(adapter.steer).not.toHaveBeenCalled();
+  expect(store.getOutbox(`controller:${turn.id}:reply`)?.payload.text).not.toMatch(/safety limit/);
 });

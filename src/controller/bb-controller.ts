@@ -79,7 +79,8 @@ export type ControllerEventObservation = {
   toolCalls: number;
   /** Non-zero command exits in this window; the caller accumulates them. */
   commandFailures: number;
-  /** Highest cumulative thread token total in this window, else 0. */
+  /** Highest cumulative thread token total in this window, else 0. Fresh input
+   *  plus output only: the cached context re-read on every call is excluded. */
   totalTokens: number;
 };
 
@@ -164,6 +165,26 @@ const TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
   "fileChange",
   "backgroundTask",
 ]);
+
+/**
+ * What a thread has spent, cumulatively: fresh input plus output. BB's
+ * `totalTokens` also counts the cached prefix the provider re-reads on every
+ * call, and on a long-lived controller thread that prefix is the whole
+ * conversation so far. The turn that first hit the token budget made ten tool
+ * calls and produced ~6k output tokens, yet its total grew by ~80k a call
+ * because ~79k of each call was the same cached context. Counting that would
+ * make the budget a bound on the thread's age rather than on the turn's work,
+ * so it is left out. A missing cached figure counts as zero, which falls back
+ * to the raw total rather than inventing spend the provider never reported.
+ */
+function uncachedTokenTotal(
+  total: Readonly<{ totalTokens: number; cachedInputTokens?: number }>,
+): number {
+  if (!Number.isFinite(total.totalTokens)) return 0;
+  const cached = total.cachedInputTokens;
+  const cachedCount = typeof cached === "number" && Number.isFinite(cached) ? cached : 0;
+  return Math.max(0, total.totalTokens - cachedCount);
+}
 
 type BbSdk = BbPluginApi["sdk"];
 type ControllerPromptInput = Parameters<BbSdk["threads"]["send"]>[0]["input"];
@@ -681,8 +702,8 @@ export class BbControllerAdapter implements ControllerAdapterMethods {
           if (typeof exitCode === "number" && exitCode !== 0) commandFailures += 1;
         }
         if (row.type === "thread/tokenUsage/updated") {
-          const total = row.data.tokenUsage.total.totalTokens;
-          if (Number.isFinite(total) && total > totalTokens) totalTokens = total;
+          const spent = uncachedTokenTotal(row.data.tokenUsage.total);
+          if (spent > totalTokens) totalTokens = spent;
         }
         if (row.type === "system/error" || row.type === "provider/error") {
           failure = providerFailure(row, inputAccepted);

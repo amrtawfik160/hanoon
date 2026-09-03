@@ -21,8 +21,12 @@ export const SUPERVISOR_MAX_STEERS_PER_TURN = 2;
 export const SUPERVISOR_SOFT_TOOL_CALLS = 60;
 export const SUPERVISOR_HARD_TOOL_CALLS = 120;
 
-// Opus runs a 1M window, so tokens bound cost rather than context. A long
-// investigation lands under 300k; past 600k the turn is not converging.
+// Tokens bound cost rather than context, so the figure is what a turn spent:
+// fresh input plus output, with the cached prefix the provider re-reads on
+// every call left out. Counted with that prefix, a ten-call turn on a mature
+// thread read as 660k and was stopped while delivering its answer; without
+// it the same turn is ~20k. A long investigation lands under 300k; past 600k
+// the turn is not converging.
 export const SUPERVISOR_SOFT_TOKENS = 300_000;
 export const SUPERVISOR_HARD_TOKENS = 600_000;
 

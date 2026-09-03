@@ -261,7 +261,8 @@ export type ControllerTurnRecord = {
   toolCalls: number;
   /** Non-zero command exits observed so far on this turn. */
   commandFailures: number;
-  /** Highest cumulative thread token total observed on this turn. */
+  /** Highest cumulative thread token total observed on this turn: fresh input
+   *  plus output, with the cached context re-read on every call excluded. */
   totalTokens: number;
   /** The thread's cumulative token total before this turn began, so spend can
    *  be measured for the turn rather than for the thread's whole lifetime. */
