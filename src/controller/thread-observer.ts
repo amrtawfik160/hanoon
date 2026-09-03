@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 type BbSdk = BbPluginApi["sdk"];
 type ListedThread = Awaited<ReturnType<BbSdk["threads"]["list"]>>[number];
@@ -16,7 +16,7 @@ type ThreadProjectionInput = Pick<ListedThread,
 
 const THREAD_SCAN_LIMIT = 100;
 const LIST_THREADS_RESULT_BUDGET_BYTES = 5_000;
-const ACTIVE_STATUSES = new Set(["active", "starting", "stopping"]);
+const ACTIVE_STATUSES = new Set(["active", "pending", "starting", "stopping"]);
 const ACTIVE_RUNTIME_STATUSES = new Set(["active", "starting", "stopping", "provisioning", "host-reconnecting", "waiting-for-host"]);
 const ETA_REASON = "BB does not expose a reliable completion estimate for provider turns";
 

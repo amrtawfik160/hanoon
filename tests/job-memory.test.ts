@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { ALL_MIGRATIONS } from "../src/storage/migrations";
@@ -56,7 +56,7 @@ function service(
   store: TelegramAgentStore,
   threads: {
     spawnHidden?: (input: { projectId: string; title: string; prompt: string; modelRoute: ModelRoute }) => Promise<string>;
-    status?: (threadId: string) => Promise<"idle" | "active" | "error" | "missing">;
+    status?: (threadId: string) => Promise<"idle" | "active" | "pending" | "error" | "missing">;
     output?: (threadId: string) => Promise<string>;
   } = {},
   now = () => 3_000,
@@ -202,6 +202,19 @@ it("runs one extraction at a time so learning never competes with real work", as
   expect(spawnHidden).toHaveBeenCalledTimes(1);
   expect(store.listJobMemoryExtractions("running", 10)).toHaveLength(1);
   expect(store.listJobMemoryExtractions("pending", 10)).toHaveLength(1);
+});
+
+it("keeps a pending memory extraction in flight instead of treating it as ended", async () => {
+  const { store } = fixture();
+  finishedJob(store, "job_pending", "blocked");
+  const { service: pass, output } = service(store, { status: async () => "pending" });
+
+  await expect(pass.processDue()).resolves.toBe(true);
+  await expect(pass.processDue()).resolves.toBe(false);
+
+  expect(store.listJobMemoryExtractions("running", 10)).toMatchObject([{ jobId: "job_pending" }]);
+  expect(store.listJobMemoryExtractions("failed", 10)).toEqual([]);
+  expect(output).not.toHaveBeenCalled();
 });
 
 it("fails the extraction when its thread ends without an answer", async () => {

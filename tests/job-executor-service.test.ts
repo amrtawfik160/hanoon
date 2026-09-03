@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
@@ -396,12 +396,12 @@ function addSubmittedControllerTurn(store: TelegramAgentStore): string {
     telegramChatId: "7",
     updateId: 900,
     inputText: "work",
-    now: 1_000,
+    now: 0,
   });
   const lease = store.acquireExecutorLease("presence-setup", 1_000, 30_000);
   if (!lease.acquired) throw new Error("missing presence setup lease");
   const fence = { ownerId: "presence-setup", generation: lease.generation, now: 1_000 };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(turn.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: 4_000 })?.id).toBe(turn.id);
   expect(store.markControllerSpawned({
     ...fence,
     turnId: turn.id,
@@ -428,7 +428,7 @@ function submitAnotherControllerTurn(
     inputText: "next question",
     now,
   });
-  const claim = { ownerId: fence.ownerId, generation: fence.generation, now };
+  const claim = { ownerId: fence.ownerId, generation: fence.generation, now: now + 3_000 };
   expect(store.claimNextControllerTurn(claim)?.id).toBe(turn.id);
   expect(store.markControllerTurnSubmitted({ ...claim, turnId: turn.id })).toBe(true);
   return turn.id;

@@ -1,6 +1,6 @@
 ---
 name: driving-bb
-description: "Drive BB from the shell: terminals for anything long-running, waiting on work instead of polling it, environments and diffs, automations, machines and models, and sharing a running server with the owner. Use when your own tools do not cover what is being asked, or when work needs watching while it runs."
+description: "Drive BB when controller tools do not cover the work. Use for long-lived terminals, event waiting, environments and diffs, scheduled automations, machine or model selection, and sharing a running server with the remote owner."
 ---
 
 # Driving BB
@@ -107,70 +107,26 @@ Steer for a wrong direction or a hard stop. Queue for a follow-up that can wait.
 
 ## Scheduled work
 
-Monitors are yours for work you started. BB automations are for the owner's
-recurring work. Pass `--project` on every automation command.
-
-Use a script when the output is fully determined by code: a check, a watchdog, a
-health poll. A script that exits 0 with empty stdout stays silent. Exit non-zero
-only when the check itself failed.
-
-```bash
-bb automation create --project <id> --name "..." --cron "0 9 * * 1-5" \
-  --timezone "America/New_York" --script-file ./check.sh
-```
-
-Use an agent when the run needs reasoning, a chosen model, or a multi-step fix.
-`--prompt`, `--provider`, and `--model` are required together. Do not invent a
-script to stand in for that.
-
-```bash
-bb automation create --project <id> --name "..." --cron "0 23 * * *" \
-  --timezone "Etc/UTC" --provider codex --model gpt-5.6-sol \
-  --permission-mode full --new-environment worktree --base-branch main \
-  --prompt "..."
-```
-
-`--new-environment worktree` makes each run a fresh managed worktree from
-`--base-branch`. `--permission-mode` is `accept-edits`, `auto`, or `full`. Grok
-ACP (`acp-grok`) rejects `auto`; use `full` or `accept-edits`. Reasoning level
-belongs on child `bb thread spawn` calls inside the prompt, not on
-`automation create`.
-
-`bb automation create --help` without a mode exits 1. Do not run it. After
-create, `bb automation show <id> --project <id>` and then answer. Do not keep
-listing providers, projects, or help text.
-
-```bash
-bb automation list --project <id>
-bb automation show <id> --project <id>
-```
+For recurring or one-shot clock work, read
+[`references/automations.md`](references/automations.md) before acting. A
+schedule is complete only after the exact BB automation reads back with the
+intended project, trigger, execution mode, authority ceiling, and next run.
 
 ## Machines, providers, models
 
-```bash
-bb machine list --json
-bb provider list --json
-bb provider models <provider-id> --json
-```
+For machine placement, provider/model choice, permission compatibility, or ACP
+recovery, read
+[`references/machines-and-models.md`](references/machines-and-models.md).
+Selection is complete only when the chosen model exists on the execution
+machine and the requested permission mode is supported there.
 
-Never guess a model id: ask the provider on the machine the work will run on.
+## Authenticated browser work
 
-Cursor (`acp-cursor`) and Grok (`acp-grok`) reject `--permission-mode auto`. When you spawn one yourself, pass `accept-edits` or `full`:
-
-```bash
-bb thread spawn --project <id> --provider acp-cursor --model cursor-grok-4.6-medium \
-  --permission-mode accept-edits --prompt "..."
-bb thread spawn --project <id> --provider acp-grok --model grok-4.6 \
-  --permission-mode full --prompt "..."
-```
-
-Do not run `bb thread compact` on a Cursor thread. Cursor ACP does not expose it.
-
-If a Cursor or Grok follow-up fails with `No active ACP session`, revive that thread instead of starting over:
-
-```bash
-bb acp-session-recover now <thread-id>
-```
+For an authenticated website journey, read
+[`references/managed-browser.md`](references/managed-browser.md) before acting.
+Use only a dedicated Hanoon employee profile and its existing exact-origin
+grants. A successful page action is not completion until the intended outcome
+is read back from the provider without exposing credentials or session data.
 
 ## Guarded jobs
 
@@ -195,3 +151,7 @@ bb provider-retry retry <id>   # continue a failed provider turn
 bb thread stop <id>            # when it is stuck or no longer wanted
 bb thread compact <id>         # Codex, Claude Code, or Pi when context is the problem. Not Cursor.
 ```
+
+Finish by reading the exact thread, terminal, environment, or automation back
+from BB. Report that observed state; a successful command exit alone is not the
+result.

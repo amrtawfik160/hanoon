@@ -1,5 +1,20 @@
-import { nextCronOccurrence } from "./monitor-service";
+import { redactError } from "../errors";
 import type { TelegramAgentStore } from "../storage/store";
+import { capabilityDescriptorById } from "../capabilities/catalog";
+import type {
+  ManagedAutomationAuthority,
+  ManagedAutomationCapabilityEvidence,
+} from "../domain/managed-automation";
+import {
+  BbAutomationProjectUnavailableError,
+  DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
+  DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+} from "../bb/automation";
+import { nextCronOccurrence } from "./monitor-service";
+import {
+  ManagedAutomationService,
+  migrateLegacyClockMonitor,
+} from "./managed-automation-service";
 
 /**
  * Monitors the plugin sets for itself. The agent already knows how to act on a
@@ -38,42 +53,178 @@ export const SYSTEM_MONITORS: readonly SystemMonitorDefinition[] = Object.freeze
   }),
 ]);
 
-export type SystemMonitorInstaller = {
-  store: Pick<TelegramAgentStore, "getOwner" | "getControllerForOwner" | "ensureSystemMonitor">;
+const SYSTEM_MAINTENANCE_CAPABILITY_ID = "telegram_agent_watch";
+const SYSTEM_MAINTENANCE_AUTHORITY_REVISION = 1;
+type SystemMaintenanceAuthority = Extract<ManagedAutomationAuthority, { origin: "system-maintenance" }>;
+
+export function systemMaintenanceCapabilityEvidence(systemKey: string): ManagedAutomationCapabilityEvidence {
+  const descriptor = capabilityDescriptorById(SYSTEM_MAINTENANCE_CAPABILITY_ID);
+  if (!descriptor || descriptor.status !== "admitted") {
+    throw new Error("system-maintenance capability is not admitted");
+  }
+  return {
+    version: 1,
+    profileId: `system-maintenance:${systemKey}`,
+    profileRevision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
+    capabilityId: descriptor.id,
+    descriptorVersion: descriptor.version,
+    descriptorDigest: descriptor.digest,
+    evidenceRefs: [
+      `capability-admission:${descriptor.id}:${descriptor.version}:${descriptor.digest}`,
+      `system-maintenance:${systemKey}:standing-authority:${SYSTEM_MAINTENANCE_AUTHORITY_REVISION}`,
+    ],
+  };
+}
+
+export function systemMaintenanceAuthority(input: Readonly<{
+  systemKey: string;
+  controllerKey: string;
+  projectId: string;
+  hostId: string;
+}>): SystemMaintenanceAuthority {
+  return {
+    version: 1,
+    origin: "system-maintenance",
+    controllerKey: input.controllerKey,
+    projectId: input.projectId,
+    hostId: input.hostId,
+    taskAuthority: null,
+    standingAuthority: {
+      version: 1,
+      kind: "system-maintenance",
+      systemKey: input.systemKey,
+      revision: SYSTEM_MAINTENANCE_AUTHORITY_REVISION,
+    },
+    capabilityEvidence: systemMaintenanceCapabilityEvidence(input.systemKey),
+    mayWidenAutomation: false,
+  };
+}
+
+export function systemAutomationInstallationComplete(installed: number): boolean {
+  return installed === SYSTEM_MONITORS.length;
+}
+
+export type SystemAutomationInstaller = Readonly<{
+  store: Pick<
+    TelegramAgentStore,
+    "getOwner" | "getControllerForOwner" | "listSystemMonitors" | "cancelMonitor" | "ensureSystemMonitor"
+  >;
+  service: ManagedAutomationService;
+  providerId: string;
+  execution: Readonly<{
+    model: string;
+    reasoningLevel?: string;
+    serviceTier?: "default" | "fast";
+    permissionMode: "accept-edits" | "auto" | "full";
+  }>;
   clock: { now(): number };
+  signal?: AbortSignal;
   warn?: (message: string) => void;
-};
+}>;
 
 /**
- * Installs on the first pass that finds a paired owner, and stays idempotent
- * afterwards: pairing can happen long after the plugin starts, so this cannot
- * be a one-shot at activation.
+ * Installs reasoning-based upkeep in BB's scheduler. Existing plugin-local
+ * schedules are handed over only after BB reads back an active next run.
+ *
+ * BB refuses to host automations for some projects, notably its personal
+ * project, which is where the controller runs on a single-owner installation.
+ * There the upkeep stays a plugin-local clock schedule, which the monitor
+ * service already fires, and the installer says so instead of retrying BB.
  */
-export function installSystemMonitors(dependencies: SystemMonitorInstaller): number {
+export async function installSystemAutomations(dependencies: SystemAutomationInstaller): Promise<number> {
   const owner = dependencies.store.getOwner();
   if (!owner) return 0;
   const controller = dependencies.store.getControllerForOwner(owner.userId, owner.chatId);
-  if (!controller) return 0;
+  if (!controller?.projectId || !controller.hostId) return 0;
   const now = dependencies.clock.now();
+  const legacy = new Map(
+    dependencies.store.listSystemMonitors().map((monitor) => [monitor.systemKey, monitor] as const),
+  );
   let installed = 0;
   for (const definition of SYSTEM_MONITORS) {
-    const dueAt = nextCronOccurrence(definition.cron, now);
-    if (dueAt === null) {
-      dependencies.warn?.(`System monitor ${definition.systemKey} has an unusable schedule`);
-      continue;
-    }
     try {
-      dependencies.store.ensureSystemMonitor({
-        systemKey: definition.systemKey,
-        controllerKey: controller.controllerKey,
-        cron: definition.cron,
-        instruction: definition.instruction,
-        dueAt,
-        now,
-      });
+      const old = legacy.get(definition.systemKey);
+      if (old?.state === "armed") {
+        await migrateLegacyClockMonitor({
+          monitor: old,
+          store: dependencies.store,
+          service: dependencies.service,
+          scope: { kind: "host", hostId: controller.hostId, cwd: null },
+          projectId: controller.projectId,
+          controllerKey: controller.controllerKey,
+          providerId: dependencies.providerId,
+          model: dependencies.execution.model,
+          reasoningLevel: dependencies.execution.reasoningLevel,
+          serviceTier: dependencies.execution.serviceTier,
+          permissionMode: dependencies.execution.permissionMode,
+          hostId: controller.hostId,
+          authority: systemMaintenanceAuthority({
+            systemKey: definition.systemKey,
+            controllerKey: controller.controllerKey,
+            projectId: controller.projectId,
+            hostId: controller.hostId,
+          }),
+          now,
+          signal: dependencies.signal,
+        });
+      } else {
+        await dependencies.service.create({
+          scope: { kind: "host", hostId: controller.hostId, cwd: null },
+          controllerKey: controller.controllerKey,
+          sourceKey: definition.systemKey,
+          definition: {
+            mode: "agent",
+            projectId: controller.projectId,
+            name: `Hanoon ${definition.systemKey}`,
+            trigger: { kind: "cron", cron: definition.cron, timezone: "Etc/UTC" },
+            prompt: definition.instruction,
+            providerId: dependencies.providerId,
+            model: dependencies.execution.model,
+            ...(dependencies.execution.reasoningLevel
+              ? { reasoningLevel: dependencies.execution.reasoningLevel }
+              : {}),
+            ...(dependencies.execution.serviceTier
+              ? { serviceTier: dependencies.execution.serviceTier }
+              : {}),
+            permissionMode: dependencies.execution.permissionMode,
+            target: { kind: "project-default" },
+            timeoutMs: DEFAULT_BB_AGENT_AUTOMATION_TIMEOUT_MS,
+            resultContract: DEFAULT_BB_AGENT_AUTOMATION_RESULT_CONTRACT,
+          },
+          authority: systemMaintenanceAuthority({
+            systemKey: definition.systemKey,
+            controllerKey: controller.controllerKey,
+            projectId: controller.projectId,
+            hostId: controller.hostId,
+          }),
+          notificationPolicy: "material",
+          now,
+          signal: dependencies.signal,
+        });
+      }
       installed += 1;
     } catch (error) {
-      dependencies.warn?.(`System monitor ${definition.systemKey} could not be installed`);
+      if (error instanceof BbAutomationProjectUnavailableError) {
+        const dueAt = nextCronOccurrence(definition.cron, now);
+        if (dueAt !== null) {
+          dependencies.store.ensureSystemMonitor({
+            systemKey: definition.systemKey,
+            controllerKey: controller.controllerKey,
+            cron: definition.cron,
+            instruction: definition.instruction,
+            dueAt,
+            now,
+          });
+          installed += 1;
+          dependencies.warn?.(
+            `BB automations are not available for project ${error.projectId}; ${definition.systemKey} stays a plugin-local schedule`,
+          );
+          continue;
+        }
+      }
+      dependencies.warn?.(
+        `System automation ${definition.systemKey} could not be installed: ${redactError(error).slice(0, 200)}`,
+      );
     }
   }
   return installed;

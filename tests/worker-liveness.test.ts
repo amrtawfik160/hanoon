@@ -8,7 +8,7 @@ import {
   projectWorkerLiveness,
   workerRegistrationGeneration,
 } from "../src/services/worker-liveness";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 
 let fixtureNumber = 0;
@@ -54,6 +54,9 @@ function storeFixture(): TelegramAgentStore {
 
 describe("worker liveness projection", () => {
   it.each([
+    // BB 0.4.34 reports a queued thread as pending before it starts; it is
+    // not yet working, and it is certainly not finished.
+    ["pending", { status: "pending", runtime: { displayStatus: "pending", hostReconnectGraceExpiresAt: null } }, "starting"],
     ["starting", { status: "starting" }, "starting"],
     ["provisioning", { runtime: { displayStatus: "provisioning", hostReconnectGraceExpiresAt: null } }, "starting"],
     ["active", { status: "active" }, "active"],

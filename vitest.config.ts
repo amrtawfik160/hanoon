@@ -17,7 +17,7 @@ const TEMP_ROOT_SETUP = ["./tests/setup/worker-temp-root.ts"];
 // imports the SDK by its concrete path, so this alias does not recurse.
 const FAKE_PLUGIN_HOST_ALIAS = [
   {
-    find: "@bb/plugin-sdk/testing",
+    find: "@get-bb/plugin-sdk/testing",
     replacement: fileURLToPath(new URL("./tests/support/fake-plugin-host.ts", import.meta.url)),
   },
   // The wrapper's own way back to the real module. The package's export map
@@ -26,7 +26,7 @@ const FAKE_PLUGIN_HOST_ALIAS = [
   {
     find: "@bb/plugin-sdk-testing-actual",
     replacement: fileURLToPath(
-      new URL("./node_modules/@bb/plugin-sdk/dist/testing/index.js", import.meta.url),
+      new URL("./node_modules/@get-bb/plugin-sdk/dist/testing/index.js", import.meta.url),
     ),
   },
 ];
@@ -36,6 +36,10 @@ const SETUP_FILES = [...TEMP_ROOT_SETUP, "./tests/support/dispose-fake-hosts.ts"
 
 export default defineConfig({
   test: {
+    // The suite opens SQLite workers, TLS servers, and child processes. Letting
+    // Vitest use every host core can starve its own RPC and trip unrelated
+    // five-second tests, so keep file-level concurrency bounded and repeatable.
+    maxWorkers: 2,
     globalSetup: ["./tests/setup/temp-root.ts"],
     projects: [
       {

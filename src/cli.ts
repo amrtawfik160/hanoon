@@ -2,7 +2,7 @@ import type {
   BbPluginApi,
   PluginCliContext,
   PluginCliResult,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createSecret, hashSecret } from "./crypto";
 import {

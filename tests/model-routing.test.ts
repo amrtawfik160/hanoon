@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
-import type { BbPluginApi } from "@bb/plugin-sdk";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import {
   assessModelRouteShadowEvidence,

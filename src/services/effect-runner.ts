@@ -225,10 +225,11 @@ function expectedStates(kind: JobEffect["kind"]): readonly string[] {
     case "recover_worker": return ["recovering_worker"];
     case "stop_thread": return [];
     case "steer_implementation": return ["implementing", "remediating"];
-    case "run_navigator_skill": return [];
-    case "run_navigator_ticket_worker": return [];
-    case "run_navigator_release": return [];
     case "reconcile_job": return [];
+    case "run_navigator_skill":
+    case "run_navigator_ticket_worker":
+    case "run_navigator_release":
+      return [];
     default: {
       const unreachable: never = kind;
       return [unreachable];
@@ -258,9 +259,6 @@ const KNOWN_EFFECT_KINDS = new Set<string>([
   "recover_worker",
   "stop_thread",
   "steer_implementation",
-  "run_navigator_skill",
-  "run_navigator_ticket_worker",
-  "run_navigator_release",
   "reconcile_job",
 ]);
 
@@ -2762,18 +2760,11 @@ export class EffectRunner {
         await this.dependencies.bb.sendSteering(threadId, text);
         return;
       }
-      case "run_navigator_skill":
-        throw new PermanentEffectError("navigator skill effects require the navigator executor");
-      case "run_navigator_ticket_worker":
-        throw new PermanentEffectError("navigator ticket effects require the navigator implementation executor");
-      case "run_navigator_release":
-        throw new PermanentEffectError("navigator release effects require the navigator release executor");
       case "reconcile_job":
         await this.reconcile(effect, job);
         return;
       default: {
-        const unreachable: never = effect.kind;
-        throw new PermanentEffectError(`Unknown effect kind: ${String(unreachable)}`);
+        throw new PermanentEffectError(`Unknown effect kind: ${String(effect.kind)}`);
       }
     }
   }

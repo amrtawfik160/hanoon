@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { posix, win32 } from "node:path";
 import { withAbortDeadline } from "../async";
 import type { TelegramAgentStore } from "../storage/store";

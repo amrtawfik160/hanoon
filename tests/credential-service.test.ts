@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import {
@@ -145,7 +145,7 @@ function serviceFixture(options: Readonly<{ origin?: "owner" | "system" }> = {})
   const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
   if (!lease.acquired) throw new Error("executor lease was not acquired");
   let fence = { ownerId: "executor", generation: lease.generation, now: 2_000 };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(queued.id);
+  expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(queued.id);
   expect(store.markControllerSpawned({
     ...fence, turnId: queued.id, projectId: "proj_1", hostId: "host_1", threadId,
   })).toBe(true);

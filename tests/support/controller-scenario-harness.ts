@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import type {
   ControllerAdapter,
@@ -62,7 +62,9 @@ import type { ProjectPolicy } from "../../src/domain/models";
 import type { TelegramAgentStore } from "../../src/storage/store";
 import plugin from "../../server";
 
-const FIXTURE_NOW = 1_000;
+const FIXTURE_NOW = 4_000;
+/** Turn receipts sit one quiet gap before the fixed fixture clock. */
+const FIXTURE_RECEIVED_AT = 1_000;
 const CONTROLLER_KEY = "owner-7-controller";
 const OWNER_ID = "7";
 const JOB_ID = "job_fixture_1";
@@ -234,7 +236,11 @@ function controllerConfigurationContext(pluginId: string): PluginAgentConfigurat
       branchName: null,
     },
     host: { id: "host_fixed", name: "Fixed controller host" },
-    provider: { id: "codex", model: "scripted-controller" },
+    provider: {
+      id: "codex",
+      model: "scripted-controller",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId },
   };
 }
@@ -456,17 +462,17 @@ function registeredToolSurface(agentTools: ReadonlyArray<{
   name: string;
   description: string;
   inputSchema: unknown;
-  experimentalStatusLabels: unknown;
+  presentation: unknown;
   instructions: string | null;
 }>) {
   const metadataToolNames = new Set<string>(CONTROLLER_METADATA_TOOL_NAMES);
   const tools = [...agentTools]
     .filter(({ name }) => !metadataToolNames.has(name))
-    .map(({ name, description, inputSchema, experimentalStatusLabels, instructions }) => ({
+    .map(({ name, description, inputSchema, presentation, instructions }) => ({
       name,
       description,
       inputSchema,
-      experimentalStatusLabels,
+      presentation,
       instructions,
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
@@ -1095,7 +1101,7 @@ async function runScenario(input: Readonly<{
     telegramChatId: OWNER_ID,
     updateId: seed * 10_000 + trial + (scenarioCase.id === "plain-conversation" ? 0 : 5_000),
     inputText: scenarioCase.ownerMessage,
-    now: FIXTURE_NOW,
+    now: FIXTURE_RECEIVED_AT,
   });
   activeTurnId = turn.id;
   const fence = { ownerId: executionOwnerId, generation: lease.generation, signal };
@@ -1270,9 +1276,9 @@ async function runExtendedScenario(input: Readonly<{
       const result = parseScenarioToolResult(await harness.behavior.callAgentTool(
         "telegram_agent_watch",
         {
-          kind: "schedule",
-          cron: "0 1 * * *",
-          instruction: "Check whether thread_fixture_1 has finished.",
+          kind: "thread_idle",
+          threadId: externalTargetThreadId,
+          instruction: "Tell the owner when the watched thread finishes.",
         },
         toolContext,
       ));
@@ -1430,7 +1436,7 @@ async function runExtendedScenario(input: Readonly<{
     telegramChatId: OWNER_ID,
     updateId: seed * 10_000 + trial + 20_000,
     inputText: scenarioCase.ownerMessage,
-    now: FIXTURE_NOW,
+    now: FIXTURE_RECEIVED_AT,
   });
   activeTurnId = turn.id;
   const fence = { ownerId: executionOwnerId, generation: lease.generation, signal };

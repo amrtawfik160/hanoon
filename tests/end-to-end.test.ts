@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import type { GateInput } from "../src/domain/gates";
 import type { Job } from "../src/domain/models";
@@ -595,7 +595,8 @@ describe("Task 12 complete mocked Telegram-to-merge workflow", () => {
     const controllerTurn = store.claimNextControllerTurn({
       ownerId: "controller-setup",
       generation: controllerLease.generation,
-      now: time,
+      // Past the burst quiet gap of the intake turns.
+      now: time + 3_000,
     });
     if (!controllerTurn) throw new Error("controller turn was not claimable");
     expect(store.reserveControllerSpawn({

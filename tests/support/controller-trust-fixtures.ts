@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import type Database from "better-sqlite3";
 import { expect, vi } from "vitest";
 import { hashSecret } from "../../src/crypto";
@@ -7,6 +7,7 @@ import { registerControllerTools } from "../../src/controller/tools";
 import { BUNDLED_SKILL_IDS } from "../../src/agent-skills/role-resolver";
 import { openStore, type TelegramAgentStore } from "../../src/storage/store";
 import { policyFixture } from "../helpers";
+import { createTestManagedAutomations } from "./managed-automation-fixture";
 
 let fixtureNumber = 0;
 type DisposableControllerFixture = Readonly<{ dispose(): Promise<void> }>;
@@ -67,7 +68,8 @@ export function submittedControllerFixture(options: SubmittedControllerFixtureOp
     generation: lease.generation,
     now: 2_000,
   };
-  expect(store.claimNextControllerTurn(fence)?.id).toBe(queued.id);
+  // The claim waits out the burst quiet gap past the 2_000 receipt.
+  expect(store.claimNextControllerTurn({ ...fence, now: 5_000 })?.id).toBe(queued.id);
   expect(store.reserveControllerSpawn({
     controllerKey: queued.controllerKey,
     turnId: queued.id,
@@ -394,6 +396,7 @@ export function registeredControllerFixture(options: { staleLease?: boolean } = 
   });
   const notify = vi.fn();
   const health = vi.fn(() => ({ ok: true }));
+  const automations = createTestManagedAutomations();
   registerControllerTools(fixture.bb, {
     store: fixture.store,
     sdk: fixture.bb.sdk,
@@ -402,12 +405,20 @@ export function registeredControllerFixture(options: { staleLease?: boolean } = 
     notify,
     now: () => 2_000,
     controllerProviderId: () => "codex",
+    controllerExecution: () => ({
+      model: "gpt-5.6-sol",
+      reasoningLevel: "high",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }),
+    automations,
   });
   return {
     ...fixture,
     request,
     notify,
     health,
+    automations,
     toolContext: {
       threadId: controller.threadId,
       projectId: controller.projectId,
@@ -439,7 +450,11 @@ export function configuredControllerFixture(options: { staleLease?: boolean } = 
       branchName: null,
     },
     host: { id: controller.hostId, name: "Host" },
-    provider: { id: "codex", model: "gpt-5.6-luna" },
+    provider: {
+      id: "codex",
+      model: "gpt-5.6-luna",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
     origin: { kind: null, pluginId: fixture.bb.pluginId },
   };
   return {

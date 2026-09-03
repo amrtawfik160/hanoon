@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createPlugin } from "./src/plugin";
 import { resolvePluginRoot, verifySkillBundle } from "./src/agent-skills/bundle-integrity.js";
 

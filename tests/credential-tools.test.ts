@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { CONTROLLER_CAPABILITIES } from "../src/controller/capability-policy";
@@ -140,7 +140,7 @@ function toolFixture(options: Readonly<{ origin?: "owner" | "system"; wireCreden
   const lease = store.acquireExecutorLease("executor", 2_000, 30_000);
   if (!lease.acquired) throw new Error("missing executor lease");
   const fence = { ownerId: "executor", generation: lease.generation, now: 2_000 };
-  const turn = store.claimNextControllerTurn(fence);
+  const turn = store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 });
   if (!turn) throw new Error("missing controller turn");
   expect(store.markControllerSpawned({
     ...fence, turnId: turn.id, projectId: "proj_personal", hostId: "host_personal", threadId: "thr_controller",

@@ -40,4 +40,9 @@ export const ANSWER_CLAUSE_ANCHORS: Readonly<Record<string, AnswerClauseAnchor>>
     positive: "The issue is a failed dependency check, so retrying will not change it.",
     negative: "I will investigate and return with an update.",
   }),
+  "plain-language": Object.freeze({
+    definition: "The reply is easy to follow without specialist knowledge. It uses direct wording and explains a technical term when that term is necessary to understand the result. Familiar product names and a concise status label are allowed.",
+    positive: "The release is blocked because the database check failed. That check makes sure old data still works with the new code.",
+    negative: "The final_validating transition hit a non-monotonic ledger convergence invariant in the remediation submachine.",
+  }),
 });

@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
@@ -43,7 +43,7 @@ describe("Telegram presence target resolution", () => {
     const queued = controllerFixture();
     expect(resolveTelegramPresenceTarget(queued.store)).toBeNull();
 
-    expect(queued.store.claimNextControllerTurn(queued.fence)).toMatchObject({ state: "dispatching" });
+    expect(queued.store.claimNextControllerTurn({ ...queued.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     expect(resolveTelegramPresenceTarget(queued.store)).toEqual({
       key: `controller:${queued.turn.id}`,
       chatId: "70",
@@ -72,7 +72,7 @@ describe("Telegram presence target resolution", () => {
 
   it("fails closed for failed turns, revoked owners, and missing controller mappings", () => {
     const failed = controllerFixture();
-    expect(failed.store.claimNextControllerTurn(failed.fence)).toMatchObject({ state: "dispatching" });
+    expect(failed.store.claimNextControllerTurn({ ...failed.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     expect(failed.store.failControllerTurn({
       ...failed.fence,
       turnId: failed.turn.id,
@@ -81,7 +81,7 @@ describe("Telegram presence target resolution", () => {
     expect(resolveTelegramPresenceTarget(failed.store)).toBeNull();
 
     const revoked = controllerFixture();
-    expect(revoked.store.claimNextControllerTurn(revoked.fence)).toMatchObject({ state: "dispatching" });
+    expect(revoked.store.claimNextControllerTurn({ ...revoked.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     expect(revoked.store.revokeOwner(2_001)).toBe(true);
     expect(resolveTelegramPresenceTarget(revoked.store)).toBeNull();
 
@@ -95,7 +95,7 @@ describe("Telegram presence target resolution", () => {
 
   it("keeps an actively responding controller visible", () => {
     const active = controllerFixture();
-    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    expect(active.store.claimNextControllerTurn({ ...active.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     expect(resolveTelegramPresenceTarget(active.store))
       .toEqual({ key: `controller:${active.turn.id}`, chatId: "70" });
   });
@@ -104,7 +104,7 @@ describe("Telegram presence target resolution", () => {
 describe("Telegram presence heartbeat", () => {
   it("sends immediately, throttles the same work, and refreshes at four seconds", async () => {
     const active = controllerFixture();
-    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    expect(active.store.claimNextControllerTurn({ ...active.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     const sendChatAction = vi.fn(async () => undefined);
     const coordinator = new TelegramPresenceCoordinator({
       store: active.store,
@@ -126,7 +126,7 @@ describe("Telegram presence heartbeat", () => {
 
   it("isolates and redacts a failed typing action without retrying before the deadline", async () => {
     const active = controllerFixture();
-    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    expect(active.store.claimNextControllerTurn({ ...active.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     const sendChatAction = vi.fn(async () => {
       throw new Error("bot123:supersecret rejected presence");
     });
@@ -182,7 +182,7 @@ describe("Telegram presence heartbeat", () => {
 
   it("leaves a safety margin after Telegram's retry_after deadline", async () => {
     const active = controllerFixture();
-    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    expect(active.store.claimNextControllerTurn({ ...active.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     const sendChatAction = vi.fn(async () => {
       throw new TelegramApiError({
         httpStatus: 429,
@@ -202,7 +202,7 @@ describe("Telegram presence heartbeat", () => {
 
   it("returns without waiting for a slow cosmetic typing request", async () => {
     const active = controllerFixture();
-    expect(active.store.claimNextControllerTurn(active.fence)).toMatchObject({ state: "dispatching" });
+    expect(active.store.claimNextControllerTurn({ ...active.fence, now: 5_000 })).toMatchObject({ state: "dispatching" });
     let resolveTyping!: () => void;
     const typing = new Promise<void>((resolve) => {
       resolveTyping = resolve;
