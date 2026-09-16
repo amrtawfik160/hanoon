@@ -5,9 +5,11 @@ import {
   CONTROLLER_DOMAIN_TOOL_IDS,
   CONTROLLER_METADATA_TOOL_IDS,
   CONTROLLER_PROTOCOL_TOOL_IDS,
+  skillInvocationAllowed,
 } from "../src/capabilities/catalog";
 import {
   CONTROLLER_BUNDLE_IDS,
+  CONTROLLER_DEFAULT_SKILLS,
   CONTROLLER_MANUAL_DISCOVERY_SKILLS,
   CONTROLLER_REPITCH_SKILLS,
   CONTROLLER_TOOL_BUNDLES,
@@ -18,6 +20,7 @@ import {
   selectControllerBundles,
   selectControllerBundlesForConversation,
 } from "../src/capabilities/controller-bundles";
+import { ROLE_SKILLS } from "../src/agent-skills/role-resolver";
 import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 
@@ -151,11 +154,36 @@ it.each([
   expect(selection.assignments.filter((entry) => entry.capabilityKind === "connector")).toHaveLength(1);
 });
 
+const GRILL_SKILL_IDS = ["grill-me", "grill-with-docs", "grilling"] as const;
+
+function selectedSkillIds(text: string): string[] {
+  return selectControllerCapabilityProfile(text).assignments
+    .filter((entry) => entry.capabilityKind === "skill")
+    .map((entry) => entry.capabilityId);
+}
+
+it("never selects a grill skill unless the owner asked", () => {
+  expect(CONTROLLER_DEFAULT_SKILLS).toEqual(["driving-bb", "unslop"]);
+  expect(CONTROLLER_DEFAULT_SKILLS).not.toEqual(expect.arrayContaining([...GRILL_SKILL_IDS]));
+  expect(skillInvocationAllowed("grilling", "general-worker")).toBe(false);
+  for (const skills of Object.values(ROLE_SKILLS)) {
+    expect(skills).not.toEqual(expect.arrayContaining([...GRILL_SKILL_IDS]));
+  }
+  for (const text of [
+    "ship the login page",
+    "add a settings page",
+    "Help me think this through",
+    "fix the checkout crash",
+  ]) {
+    expect(controllerSkillsForTurn(text)).toEqual(["driving-bb", "unslop"]);
+    expect(selectedSkillIds(text)).not.toEqual(expect.arrayContaining([
+      ...CONTROLLER_MANUAL_DISCOVERY_SKILLS,
+      ...GRILL_SKILL_IDS,
+    ]));
+  }
+});
+
 it("loads manual discovery skills only for an explicit slash invocation", () => {
-    expect(controllerSkillsForTurn("Help me think this through")).toEqual([
-    "driving-bb",
-    "unslop",
-  ]);
   for (const command of ["/grill-with-docs", "/grilling", "/domain-modeling"]) {
     expect(controllerSkillsForTurn(`${command} design the workflow`)).toEqual([
       "driving-bb",
@@ -163,9 +191,8 @@ it("loads manual discovery skills only for an explicit slash invocation", () => 
       ...CONTROLLER_MANUAL_DISCOVERY_SKILLS,
     ]);
   }
-  expect(selectControllerCapabilityProfile("/grill-with-docs design the workflow").assignments
-    .filter((entry) => entry.capabilityKind === "skill")
-    .map((entry) => entry.capabilityId)).toEqual(expect.arrayContaining([...CONTROLLER_MANUAL_DISCOVERY_SKILLS]));
+  expect(selectedSkillIds("/grill-with-docs design the workflow"))
+    .toEqual(expect.arrayContaining([...CONTROLLER_MANUAL_DISCOVERY_SKILLS]));
 });
 
 it("keeps plain language standing and loads wait-what only for an explicit repitch", () => {

@@ -94,7 +94,7 @@ const promotedMattSkills = [
   { bucket: "engineering", id: "resolving-merge-conflicts", invocationClass: "model" },
   { bucket: "engineering", id: "wizard", invocationClass: "model" },
   { bucket: "productivity", id: "grill-me", invocationClass: "user" },
-  { bucket: "productivity", id: "grilling", invocationClass: "model" },
+  { bucket: "productivity", id: "grilling", invocationClass: "user" },
   { bucket: "productivity", id: "handoff", invocationClass: "user" },
   { bucket: "productivity", id: "teach", invocationClass: "user" },
   { bucket: "productivity", id: "to-questionnaire", invocationClass: "user" },
