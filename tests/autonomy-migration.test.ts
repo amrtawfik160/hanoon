@@ -24,6 +24,7 @@ import {
   PROTECTED_CONNECTOR_MIGRATIONS,
   JOB_LEDGER_MIGRATIONS,
   DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
+  INGESTION_SOURCE_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   WorkArtifactRepository,
@@ -95,7 +96,7 @@ const PRE_TICKET_41_MIGRATION_COUNT = ALL_MIGRATIONS.length
     REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT -
       PROTECTED_CONNECTOR_MIGRATIONS.length -
         JOB_LEDGER_MIGRATIONS.length -
-          DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length;
+          (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length);
 
 function legacyDatabase(pluginId: string) {
   const { bb } = createFakePluginHost({ pluginId });
@@ -156,7 +157,7 @@ function admissionUpgradeDatabase(pluginId: string, revisionJobId = "job_1") {
       MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
         REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
           PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-            DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length
+            (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length)
     ),
   ));
   db.prepare(
@@ -296,7 +297,7 @@ it("keeps the autonomy migration after the frozen legacy positions and appends l
         FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
           REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
             PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-              DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length,
+              (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length),
   );
   for (const [index, marker] of LEGACY_MIGRATION_MARKERS) {
     expect(ALL_MIGRATIONS[index]).toContain(marker);
@@ -412,7 +413,7 @@ it("rolls back the boundary-source upgrade when active legacy evidence cannot be
         FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
           REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
             PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-            DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length),
+            (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length)),
   ));
   db.prepare(
     `INSERT INTO task_authorities (
@@ -479,7 +480,7 @@ it("backfills the mutable ticket-41 authority row into immutable revision histor
       MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
         REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
           PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-            DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length
+            (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length)
     ),
   ));
   db.prepare(
@@ -539,7 +540,7 @@ it("fails the authority upgrade when an older bound revision cannot be reconstru
       MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
         REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
           PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-            DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length
+            (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length)
     ),
   ));
   db.prepare(
@@ -607,7 +608,7 @@ it("reconstructs an older shipped revision from its authoritative release bindin
       MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT + FINDING_LEDGER_UPGRADE_MIGRATION_COUNT +
         REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
           PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-            DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length
+            (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length)
     ),
   ));
   db.prepare(
@@ -1375,7 +1376,7 @@ it("continues preceding-schema active Navigator attempts without fabricating cap
     -(NAVIGATOR_EFFECT_PROTOCOL_MIGRATION_COUNT + MANAGED_AUTOMATION_LIFECYCLE_MIGRATION_COUNT +
       FINDING_LEDGER_UPGRADE_MIGRATION_COUNT + REVIEW_CONVERGENCE_UPGRADE_MIGRATION_COUNT +
       PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-            DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length),
+            (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length)),
   ));
 
   db.pragma("foreign_keys = OFF");

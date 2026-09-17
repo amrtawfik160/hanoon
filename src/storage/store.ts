@@ -19,6 +19,11 @@ import {
   type WorkerKind,
   type WorkerRecoveryClassification,
 } from "../domain/models";
+import type {
+  IngestionSource,
+  RecordIngestionSourceInput,
+} from "../domain/ingestion-source";
+import type { IngestionReading } from "../reference/ingestion";
 import {
   deriveTaskOutcome,
   taskAuthorityAllowsEffect,
@@ -230,6 +235,7 @@ import {
   type SaveReferenceDocumentInput,
   type SaveReferenceDocumentResult,
 } from "./reference-repository";
+import { IngestionSourceRepository } from "./ingestion-source-repository";
 import {
   registerWorkArtifactRelationshipValidation,
   WorkArtifactRepository,
@@ -3264,6 +3270,9 @@ export interface TelegramAgentStore {
   getReferencePassage(id: string, projectId: string | null): ReferencePassageRecord | null;
   listReferenceChanges(documentId: string, version: number): readonly ReferenceSectionChange[];
   deleteReferenceDocument(id: string): boolean;
+  recordIngestionSource(input: RecordIngestionSourceInput): IngestionSource;
+  listIngestionSources(projectId: string): readonly IngestionSource[];
+  readIngestionRoute(projectId: string): readonly IngestionReading[];
   captureWorkArtifact(input: CaptureWorkArtifactInput): WorkArtifactCapture;
   prepareWorkArtifactCreateIntent(
     input: PrepareWorkArtifactCreateIntentInput,
@@ -5772,6 +5781,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   private readonly protectedConnectorRepository: ProtectedConnectorRepository;
   private readonly stageExecutionRepository: StageExecutionRepository;
   private readonly referenceRepository: ReferenceRepository;
+  private readonly ingestionSourceRepository: IngestionSourceRepository;
   private readonly workArtifactRepository: WorkArtifactRepository;
   private readonly navigatorRepository: NavigatorRepository;
   private readonly navigatorImplementationRepository: NavigatorImplementationRepository;
@@ -5795,6 +5805,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     this.protectedConnectorRepository = new ProtectedConnectorRepository(db);
     this.stageExecutionRepository = new StageExecutionRepository(db);
     this.referenceRepository = new ReferenceRepository(db);
+    this.ingestionSourceRepository = new IngestionSourceRepository(db);
     this.workArtifactRepository = new WorkArtifactRepository(db);
     this.navigatorRepository = new NavigatorRepository(db);
     this.navigatorImplementationRepository = new NavigatorImplementationRepository(db, this);
@@ -6207,6 +6218,18 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
   public deleteReferenceDocument(id: string): boolean {
     return this.referenceRepository.deleteReferenceDocument(id);
+  }
+
+  public recordIngestionSource(input: RecordIngestionSourceInput): IngestionSource {
+    return this.ingestionSourceRepository.recordIngestionSource(input);
+  }
+
+  public listIngestionSources(projectId: string): readonly IngestionSource[] {
+    return this.ingestionSourceRepository.listIngestionSources(projectId);
+  }
+
+  public readIngestionRoute(projectId: string): readonly IngestionReading[] {
+    return this.ingestionSourceRepository.readIngestionRoute(projectId);
   }
 
   public captureWorkArtifact(input: CaptureWorkArtifactInput): WorkArtifactCapture {
