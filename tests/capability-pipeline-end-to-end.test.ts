@@ -12,10 +12,6 @@ import {
   type GuardResultEnvelope,
 } from "../src/capabilities/guards";
 import { admitInventoryItem, type CapabilityInventoryItem } from "../src/capabilities/inventory";
-import {
-  RecipePromotionService,
-  emptyRecipePromotionEvidence,
-} from "../src/capabilities/promotion";
 import { hashSecret } from "../src/crypto";
 import { assessReviewGroup } from "../src/domain/review-lenses";
 import type { Job, JobEffect, JobEvent, StoredEffect } from "../src/domain/models";
@@ -190,13 +186,6 @@ function activeProviderFixture(recipe: TaskRecipe): ActiveProviderFixture {
   store.createPairingCode(hashSecret(`pair-${recipe}`), 500, 10_000);
   expect(store.pairOwnerWithPrivateChatCode(hashSecret(`pair-${recipe}`), "7", "70", 501)).toEqual({ ok: true });
   store.upsertProjectPolicy(policy, 502);
-  store.appendRecipeRolloutDecision({
-    recipe,
-    action: "promote",
-    reasonCode: "promotion_gates_passed",
-    evidenceDigest: "e".repeat(64),
-    now: 503,
-  });
   const ownerId = "capability-e2e";
   const lease = store.acquireExecutorLease(ownerId, 600, 120_000);
   if (!lease.acquired) throw new Error("executor lease missing");
@@ -485,67 +474,6 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
     })).toEqual({ outcome: "denied", reasonCode: "expansion_limit" });
   });
 
-  it("pins an in-flight active job while rollback returns only a new controller job to shadow", () => {
-    const fixture = activeProviderFixture("direct");
-    const activeProfile = fixture.store.getLatestCapabilityProfile("worker_attempt", fixture.attemptId);
-    expect(activeProfile).toBeNull();
-    completeTurnThroughFinalization(fixture.store, {
-      ownerId: fixture.ownerId,
-      generation: fixture.generation,
-      now: 700,
-    }, {
-      turnId: fixture.controllerTurnId,
-      controllerKey: "owner-7-controller",
-      responseText: "The active job is queued.",
-    });
-    fixture.store.appendRecipeRolloutDecision({
-      recipe: "direct",
-      action: "rollback",
-      reasonCode: "operator_requested",
-      evidenceDigest: null,
-      now: 701,
-    });
-    const nextTurn = fixture.store.enqueueControllerTurn({
-      controllerKey: "owner-7-controller",
-      telegramUserId: "7",
-      telegramChatId: "70",
-      updateId: 20_000 + fixtureId,
-      inputText: RECIPE_TASK.direct,
-      now: 702,
-    });
-    expect(fixture.store.claimNextControllerTurn({
-      ownerId: fixture.ownerId,
-      generation: fixture.generation,
-      now: 3703,
-    })?.id).toBe(nextTurn.id);
-    expect(fixture.store.markControllerTurnSubmitted({
-      turnId: nextTurn.id,
-      ownerId: fixture.ownerId,
-      generation: fixture.generation,
-      now: 704,
-    })).toBe(true);
-    const shadowJob = fixture.store.createConfirmedControllerJob({
-      controllerThreadId: "thr_controller",
-      projectId: "proj_1",
-      task: RECIPE_TASK.direct,
-      now: 705,
-    });
-
-    expect(fixture.store.getJob(fixture.effect.jobId)).toMatchObject({
-      state: "creating_implementation",
-      routingMode: "active",
-      taskRecipe: "direct",
-      workflowEngine: "recipe-v1",
-    });
-    expect(shadowJob).toMatchObject({
-      state: "awaiting_confirmation",
-      workflowEngine: "navigator-v1",
-      routingMode: "legacy",
-    });
-    expect(shadowJob.taskRecipe).not.toBe("direct");
-    expect(fixture.store.listRecipeRolloutDecisions("direct", 10).map((decision) => decision.action))
-      .toEqual(["promote", "rollback"]);
-  });
 
   it("rejects an expired merge approval through the production callback without a merge effect", async () => {
     const { bb } = createFakePluginHost({ pluginId: `capability-approval-e2e-${fixtureId++}` });
@@ -748,110 +676,6 @@ describe("adaptive capability pipeline fake-host acceptance", () => {
       .toHaveLength(1);
   });
 
-  it("keeps guards, external inventory, and promotion authority fail-closed", async () => {
-    const { bb } = createFakePluginHost({ pluginId: `capability-safety-e2e-${fixtureId++}` });
-    const store = openStore(bb.storage);
-    const docsGuard = CAPABILITY_BY_ID.get("docs-guard");
-    if (!docsGuard) throw new Error("docs guard missing");
-    const outcomes: string[] = [];
-    for (let cycle = 1; cycle <= 3; cycle += 1) {
-      const profile = store.createCapabilityProfile({
-        subjectKind: "worker_attempt",
-        subjectId: `attempt:guard-${cycle}`,
-        threadId: null,
-        recipeId: "bounded",
-        recipeVersion: 1,
-        registryDigest: CAPABILITY_REGISTRY_DIGEST,
-        graphDigest: CAPABILITY_GRAPH_DIGEST,
-        mode: "active",
-        model: {
-          pool: "standard",
-          providerId: "codex",
-          modelId: "gpt-5.6-terra",
-          reasoning: "high",
-          serviceTier: "fast",
-        },
-        assignments: [{
-          capabilityId: docsGuard.id,
-          descriptorDigest: docsGuard.digest,
-          capabilityKind: "skill",
-          mandatory: true,
-        }],
-        reasonCodes: [],
-        traits: ["docs-changed"],
-        now: cycle * 1_000,
-      });
-      const policy: GuardAssessmentPolicy = {
-        profileId: profile.id,
-        profileRevision: profile.revision,
-        reviewedHeadSha: "a".repeat(40),
-        diffDigest: "b".repeat(64),
-        selectedGuards: [{
-          capabilityId: docsGuard.id,
-          descriptorDigest: docsGuard.digest,
-          mandatory: true,
-          substitutes: [],
-        }],
-        requirementIds: [],
-        mustFixRuleIds: ["docs.required"],
-        advisoryRuleIds: [],
-      };
-      const envelope: GuardResultEnvelope = {
-        schemaVersion: 1,
-        profileId: profile.id,
-        profileRevision: profile.revision,
-        reviewedHeadSha: "a".repeat(40),
-        diffDigest: "b".repeat(64),
-        guards: [{
-          capabilityId: docsGuard.id,
-          descriptorDigest: docsGuard.digest,
-          outcome: "findings",
-          findings: [{
-            ruleId: "docs.required",
-            severity: "high",
-            subject: "docs/usage.md",
-            line: 4,
-            evidence: "The public behavior is not documented.",
-            evidenceClass: "documentation",
-            requirementId: null,
-          }],
-        }],
-      };
-      outcomes.push(persistGuardEnvelopeSettlement({
-        repository: store,
-        scopeId: "review-lineage:job-safety:final",
-        envelope,
-        policy,
-        now: cycle * 1_000 + 1,
-      }).outcome);
-    }
-    expect(outcomes).toEqual(["changes_requested", "changes_requested", "blocked"]);
-
-    const discovered: CapabilityInventoryItem = {
-      inventoryKey: "inventory:untrusted-docs",
-      capabilityId: "inventory-untrusted-docs",
-      capabilityKind: "skill",
-      source: "skill:untrusted-docs",
-      version: null,
-      digest: null,
-      hostScope: "primary",
-      status: "inventory-only",
-      metadata: {},
-      discoveredAt: 5_000,
-    };
-    expect(() => admitInventoryItem(discovered)).toThrow(/descriptor|mapping|shadow/i);
-
-    const promotions = new RecipePromotionService({
-      store,
-      readEvidence: async (recipe) => emptyRecipePromotionEvidence(recipe),
-      now: () => 6_000,
-    });
-    await expect(promotions.promote("direct")).rejects.toMatchObject({
-      assessment: { status: "incomplete", ready: false },
-    });
-    expect(promotions.listDecisions("direct", 10)).toEqual([]);
-    expect(promotions.routingStatus("direct")).toMatchObject({ routingMode: "shadow" });
-  });
 
   it("blocks the second equivalent strong-pool failure before another provider attempt", async () => {
     const fixture = activeProviderFixture("direct");

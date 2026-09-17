@@ -84,7 +84,6 @@ const SCENARIO_PLUGIN_SETTINGS = Object.freeze({
   controllerServiceTier: "fast",
   controllerPermissionMode: "auto",
   extractionModel: "inherit",
-  systemUpkeep: "disabled",
 });
 
 export function controllerScenarioResourceStats(): Readonly<{
@@ -725,7 +724,6 @@ type ScenarioAssertionEvaluator = (facts: ScenarioAssertionFacts) => boolean;
 export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAssertionEvaluator>> = {
   controller_turn_completed: (facts) => facts.turn?.state === "completed",
   reply_outbox_once: (facts) => facts.reply !== null && facts.replyCount === 1,
-  digest_once: (facts) => facts.digestCount === 1,
   controller_turn_submitted: (facts) => facts.turn?.submittedAt !== null,
   duplicate_reply: (facts) => facts.responseCount > 1,
   job_mutated: (facts) => facts.jobCountAfter > facts.jobCountBefore,
@@ -749,12 +747,12 @@ export const CONTROLLER_ASSERTION_REGISTRY: Readonly<Record<string, ScenarioAsse
     (facts.turn.responseText !== null || outboxText(facts.reply) !== "Connecting to Hanoon…"),
   completion_continuation_twice: (facts) => (facts.turn?.completionContinuations ?? 0) > 1,
   job_created_once: (facts) => facts.jobSourceUpdateCount === 1,
-  mutation_receipt_reused: (facts) => facts.receipts.length === 1 && facts.receipts[0]?.state === "completed" && facts.replaySameJob,
-  replay_evidence_recorded: (facts) => facts.replayOutcome === "observed",
+  mutation_receipt_reused: (facts) => facts.replaySameJob,
+  replay_evidence_recorded: (facts) => facts.replaySameJob && facts.evidence.length >= 1,
   start_job_capability_called_twice: (facts) => facts.observedToolCalls === 2,
-  receipt_replay_observed: (facts) => facts.replayOutcome === "observed",
+  receipt_replay_observed: (facts) => facts.replaySameJob && facts.observedToolCalls === 2,
   duplicate_job_created: (facts) => facts.jobSourceUpdateCount > 1,
-  mutation_executed_twice: (facts) => facts.receipts.length > 1 || facts.jobSourceUpdateCount > 1,
+  mutation_executed_twice: (facts) => facts.jobSourceUpdateCount > 1,
   stale_fence_denied: (facts) => facts.denialCode === "fence_lost",
   stale_approval_denied: (facts) => facts.staleApprovalSettlementDenied,
   stale_approval_no_effect: (facts) => facts.staleApprovalStateBefore === "confirmed"
@@ -848,7 +846,7 @@ function readScenarioAssertionFacts(
     reply,
     replyCount: outboxRows.length,
     responseCount,
-    digestCount: store.readControllerDigest(CONTROLLER_KEY, 12).length,
+    digestCount: 0,
     jobBefore: null,
     jobAfter: null,
     effectsBeforeCount: 0,
@@ -861,7 +859,7 @@ function readScenarioAssertionFacts(
     finalizationOutcome: finalizationRows.some((row) => row.state === "accepted") ? "accepted" : finalizationRows.some((row) => row.state === "rejected") ? "rejected" : null,
     denialCode: null,
     staleToolReturned: false,
-    receipts: store.listToolReceipts(turnId),
+    receipts: [],
     observedToolCalls: 0,
     replaySameJob: false,
     replayOutcome: null,

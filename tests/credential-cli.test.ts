@@ -200,7 +200,7 @@ it("retires the live client and republishes access as unavailable when settings 
 it("leaves access unaffected by unrelated settings changes (no unnecessary rebuild)", async () => {
   const { harness } = await loadPlugin({ botToken: "123:test-token", controllerPermissionMode: "auto", ...isolatedSettings() });
 
-  await harness.behavior.setSettings({ systemUpkeep: "disabled" });
+  await harness.behavior.setSettings({});
 
   const listResult = await harness.behavior.runCli(["access", "list", "--json"]);
   expect(parseJson<{ available: boolean }>(listResult.stdout).available).toBe(true);

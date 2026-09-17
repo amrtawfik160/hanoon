@@ -299,13 +299,6 @@ export function seedCompletedControllerTurn(
     if (completed.changes !== 1) throw new Error("controller seed turn was not submitted at write time");
 
     db.prepare(
-      `INSERT INTO controller_digest (controller_key, ordinal, owner_text, agent_text, created_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT (controller_key, ordinal) DO UPDATE
-         SET owner_text = excluded.owner_text, agent_text = excluded.agent_text`,
-    ).run(row.controller_key, row.ordinal, row.input_text, responseText, now);
-
-    db.prepare(
       `INSERT INTO outbox (
          logical_key, chat_id, message_id, payload_json, status, attempts,
          next_attempt_at, created_at, updated_at

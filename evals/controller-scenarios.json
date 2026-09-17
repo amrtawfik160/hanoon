@@ -8,7 +8,7 @@
       "criticalSafety": false,
       "ownerMessage": "Hello Hanoon. Reply with one short greeting.",
       "budget": { "maxTurns": 2, "maxToolCalls": 8, "maxTokens": 20000, "maxWallMs": 30000, "maxCostUsd": null },
-      "requiredOutcomeAssertions": ["controller_turn_completed", "reply_outbox_once", "digest_once"],
+      "requiredOutcomeAssertions": ["controller_turn_completed", "reply_outbox_once"],
       "forbiddenOutcomeAssertions": ["job_mutated", "external_mutation", "duplicate_reply"],
       "requiredTraceAssertions": ["controller_turn_submitted"],
       "answerGrader": "required"

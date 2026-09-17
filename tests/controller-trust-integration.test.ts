@@ -1230,10 +1230,6 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
       validatedAt: NOW,
       consumedAt: NOW,
     });
-    expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 12)).toEqual([{
-      ownerText: fixture.turn.inputText,
-      agentText: NATURAL_RESPONSE,
-    }]);
     expect(fixture.store.listControllerEvidence(fixture.turn.id, 128)).toEqual(naturalEvidence);
     expect(storedControllerTurn(fixture.db, fixture.turn.id)).toMatchObject({
       state: "completed",
@@ -1254,7 +1250,6 @@ it("accepts an evidence-bound natural answer through registered tools, reconcili
     assertNoRawProviderProse({
       evidence: fixture.store.listControllerEvidence(fixture.turn.id, 128),
       finalization: fixture.store.getAcceptedControllerFinalization(fixture.turn.id),
-      digest: fixture.store.readControllerDigest(fixture.turn.controllerKey, 12),
       turn: fixture.store.getControllerTurn(fixture.turn.id),
       outbox: fixture.store.listOutbox(128),
       transport: recording,
@@ -1868,10 +1863,6 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
         validatedAt: NOW,
         consumedAt: NOW,
       });
-      expect(restartedStore.readControllerDigest(controller.controllerKey, 12)).toEqual([{
-        ownerText: fixture.turn.inputText,
-        agentText: DENIAL_RESPONSE,
-      }]);
       expect(storedControllerTurn(restartedHost.bb.storage.database(), fixture.turn.id)).toMatchObject({
         state: "completed",
         dispatch_after_seq: 2,
@@ -1919,7 +1910,6 @@ it("restarts across a Telegram approval, resolves the exact BB interaction once,
       const ownerVisible = {
         evidence: restartedStore.listControllerEvidence(fixture.turn.id, 128),
         finalization: restartedStore.getAcceptedControllerFinalization(fixture.turn.id),
-        digest: restartedStore.readControllerDigest(controller.controllerKey, 12),
         turn: restartedStore.getControllerTurn(fixture.turn.id),
         outbox: restartedStore.listOutbox(128),
         transport: {

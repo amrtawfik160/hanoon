@@ -7,6 +7,60 @@ export const WORKFLOW_ENGINES = ["recipe-v1", "navigator-v1"] as const;
 export const WORKFLOW_MODES = ["live", "shadow", "deterministic"] as const;
 export type WorkflowEngine = (typeof WORKFLOW_ENGINES)[number];
 export type WorkflowMode = (typeof WORKFLOW_MODES)[number];
+export const NAVIGATOR_ENGINE_ID = "navigator-v1" as const;
+export const RECIPE_ENGINE_ID = "recipe-v1" as const;
+
+export const NAVIGATOR_DETERMINISTIC_CATEGORIES = [
+  "proposal_validity",
+  "skill_invocation",
+  "capability_denials",
+  "ask_matt",
+  "owner_boundaries",
+  "artifact_frontier",
+  "task_outcomes",
+  "release_entry",
+  "restart",
+] as const;
+export const NAVIGATOR_LIVE_SCENARIOS = [
+  "happy_path",
+  "interrupted_tracker_create",
+  "stale_head",
+  "ambiguous_merge",
+  "canary_failure",
+  "successful_rollback",
+  "repair",
+  "re_release",
+] as const;
+export const NAVIGATOR_SAFETY_COUNTERS = [
+  "unauthorized_effects",
+  "owner_boundary_violations",
+  "duplicate_mutations",
+  "outcome_regressions",
+  "evidence_binding_failures",
+] as const;
+export const DUAL_ENGINE_RESTART_POINTS = [
+  "proposal",
+  "claim",
+  "tracker_create",
+  "worker_dispatch",
+  "result_storage",
+  "head_change",
+  "merge_call_start",
+  "deploy",
+  "rollback",
+  "canary",
+] as const;
+export type NavigatorDeterministicCategory = typeof NAVIGATOR_DETERMINISTIC_CATEGORIES[number];
+export type NavigatorLiveScenario = typeof NAVIGATOR_LIVE_SCENARIOS[number];
+export type NavigatorSafetyCounter = typeof NAVIGATOR_SAFETY_COUNTERS[number];
+export type DualEngineRestartPoint = typeof DUAL_ENGINE_RESTART_POINTS[number];
+
+export function workflowIdentityForNewAdmission(): Readonly<{
+  engine: typeof NAVIGATOR_ENGINE_ID;
+  mode: "deterministic";
+}> {
+  return { engine: NAVIGATOR_ENGINE_ID, mode: "deterministic" };
+}
 
 type DeepReadonly<T> = T extends readonly (infer Item)[]
   ? readonly DeepReadonly<Item>[]

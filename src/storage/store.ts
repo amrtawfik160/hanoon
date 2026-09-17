@@ -67,20 +67,6 @@ import {
 } from "../capabilities/controller-bundles";
 import type { ModelRoute } from "../capabilities/models";
 import {
-  type AppendRecipeRolloutDecisionInput,
-  type CapabilityJobGraphMode,
-  type RecipeRolloutDecision,
-} from "../capabilities/promotion";
-import {
-  workflowIdentityForNewAdmission,
-  type AppendWorkflowEngineRolloutDecisionInput,
-  type NavigatorDeterministicCategory,
-  type NavigatorLiveScenario,
-  type NavigatorSafetyCounter,
-  type WorkflowEngineGraphMode,
-  type WorkflowEngineRolloutDecision,
-} from "../navigator/promotion";
-import {
   navigatorClaimContract,
   type NavigatorClaimContract,
   type NavigatorClaimedEffectKind,
@@ -104,7 +90,6 @@ import type {
   GuardSettlementPersistenceResult,
 } from "../capabilities/guards";
 import {
-  assessGuardEnvelope,
   guardAssessmentPolicySchema,
   guardResultEnvelopeSchema,
 } from "../capabilities/guards";
@@ -125,16 +110,11 @@ import { assessReviewGroup } from "../domain/review-lenses";
 import { formattedMessage, renderThreadInteractionRetired, renderThreadLifecycleNotice } from "../telegram/markdown";
 import { renderJobFinishNote } from "../telegram/finish-note";
 import {
-  adjustedConfidence,
-  decayedConfidence,
   cosineSimilarity,
   ftsQuery,
   memoryScore,
   semanticRanks,
   subjectsContradict,
-  MEMORY_DEMOTION,
-  MEMORY_REINFORCEMENT,
-  MEMORY_TOMBSTONE_CONFIDENCE,
 } from "./memory-ranking";
 import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
@@ -284,7 +264,6 @@ import {
   type AcceptedControllerFinalization,
   type ControllerEvidenceInput,
   type ControllerEvidenceRecord,
-  type ControllerToolReceiptSettlementInput,
   type ControllerEvidenceWrite,
   type ControllerFinalizationProposalInput,
   type ControllerFinalizationProposalResult,
@@ -356,19 +335,20 @@ import {
   type NavigatorImplementationPersistence,
 } from "../navigator/implementation-persistence";
 import type { NavigatorTicketWorkerOutcome } from "../navigator/ticket-settlement-repository";
-import type { NavigatorFindingLedgerDecision } from "../navigator/finding-ledger";
-import type {
-  NavigatorArtifactBinding,
-  NavigatorInferenceObservation,
-  NavigatorPlanningResultRecord,
-  NavigatorProposalDecision,
-  NavigatorProposalRecord,
-  NavigatorRoutingDecision,
-  NavigatorSkillAttempt,
-  NavigatorSnapshot,
-  NavigatorWorkflowStep,
-  NavigatorWorkflowStepOutcome,
-  WorkflowMode,
+import {
+  NAVIGATOR_ENGINE_ID,
+  workflowIdentityForNewAdmission,
+  type NavigatorArtifactBinding,
+  type NavigatorInferenceObservation,
+  type NavigatorPlanningResultRecord,
+  type NavigatorProposalDecision,
+  type NavigatorProposalRecord,
+  type NavigatorRoutingDecision,
+  type NavigatorSkillAttempt,
+  type NavigatorSnapshot,
+  type NavigatorWorkflowStep,
+  type NavigatorWorkflowStepOutcome,
+  type WorkflowMode,
 } from "../navigator/models";
 import {
   NAVIGATOR_RELEASE_STATES,
@@ -438,15 +418,11 @@ type NavigatorResourceClaimRow = Readonly<{
 }>;
 
 export type CapabilityDispatchSettings = Readonly<{
-  jobGraph: CapabilityJobGraphMode;
   controllerTools: "bundled" | "all-tools";
-  workflowEngineGraph?: WorkflowEngineGraphMode;
 }>;
 
 const DEFAULT_CAPABILITY_DISPATCH_SETTINGS: CapabilityDispatchSettings = Object.freeze({
-  jobGraph: "adaptive",
   controllerTools: "bundled",
-  workflowEngineGraph: "adaptive",
 });
 
 export type PairingResult =
@@ -635,32 +611,6 @@ export type MergeCallbackIdentity = {
   headSha: string;
   effectIdempotencyKey: string;
 };
-
-export type ToolReceiptKey = {
-  turnId: string;
-  toolName: string;
-  argsSha256: string;
-};
-
-/**
- * `fresh` means nothing ran before. `completed` replays the previous result
- * instead of repeating the mutation. `interrupted` means an earlier attempt
- * started and never reported — the outcome is unknown and must be checked,
- * never blindly retried.
- */
-export type ToolReceiptClaim =
-  | { outcome: "fresh" }
-  | { outcome: "completed"; result: string }
-  | { outcome: "interrupted" }
-  | { outcome: "finalized" }
-  | { outcome: "fence_lost" };
-
-export type ToolReceiptClaimInput = ToolReceiptKey & Readonly<{
-  controllerKey: string;
-  now: number;
-  ownerId?: string;
-  generation?: number;
-}>;
 
 export type ControllerFailureCode =
   | "unknown"
@@ -1573,23 +1523,7 @@ type WorkerRecoveryRow = {
   updated_at: number;
   resolved_at: number | null;
 };
-type NavigatorReleaseReviewFinding = Readonly<{
-  sourceAttemptId: string;
-  fingerprint: string;
-  capabilityId: string;
-  ruleId: string;
-  disposition: "must_fix" | "advisory";
-  findingJson: string;
-}>;
-type NavigatorReleaseReviewFindingRow = Readonly<{
-  fingerprint: string;
-  capability_id: string;
-  rule_id: string;
-  disposition: "must_fix" | "advisory";
-  event: "opened" | "reobserved" | "resolved";
-  finding_json: string;
-  occurrence: number;
-}>;
+
 type TelegramUpdateRow = {
   status: "processing" | "processed" | "failed";
   claim_owner: string | null;
@@ -1776,8 +1710,6 @@ const MAX_MEMORY_BODY = 1_000;
 const MAX_LIVE_MEMORIES_PER_SCOPE = 10;
 const DEFAULT_MEMORY_IMPORTANCE = 0.6;
 const DEFAULT_MEMORY_CONFIDENCE = 0.7;
-const MAX_DIGEST_TURNS = 12;
-const MAX_DIGEST_TEXT = 600;
 const MAX_MONITOR_INSTRUCTION = 1_000;
 const MAX_ARMED_MONITORS = 20;
 // Four is what one owner can follow in a chat, and two open fan-outs is already
@@ -1786,7 +1718,6 @@ const MAX_DELEGATION_THREADS = 4;
 const MAX_OPEN_DELEGATIONS = 2;
 const MAX_DELEGATION_SUMMARY = 600;
 const MAX_DELEGATION_TITLE = 120;
-const MAX_RECEIPT_RESULT_BYTES = 8_000;
 const MAX_CONTROLLER_PRIVATE_DRAFT_CHARS = 4_000;
 const MAX_EFFECT_KEY = 256;
 const MAX_PIPELINE_OUTPUT_BYTES = 65_536;
@@ -3427,63 +3358,6 @@ export interface TelegramAgentStore {
   }): void;
   listExternalCapabilityInventory(hostScope: string, limit: number): CapabilityInventoryItem[];
   getExternalCapabilityInventoryHealth(hostScope: string): (InventoryHealth & { hostScope: string }) | null;
-  readDurableRecipePromotionEvidenceSnapshot(recipe: TaskRecipe): unknown | null;
-  appendRecipeRolloutDecision(input: AppendRecipeRolloutDecisionInput): RecipeRolloutDecision;
-  listRecipeRolloutDecisions(recipe: TaskRecipe, limit: number): RecipeRolloutDecision[];
-  getLatestRecipeRolloutDecision(recipe: TaskRecipe): RecipeRolloutDecision | null;
-  appendWorkflowEngineRolloutDecision(input: AppendWorkflowEngineRolloutDecisionInput): WorkflowEngineRolloutDecision;
-  listWorkflowEngineRolloutDecisions(limit: number): WorkflowEngineRolloutDecision[];
-  getLatestWorkflowEngineRolloutDecision(): WorkflowEngineRolloutDecision | null;
-  readDurableNavigatorPromotionEvidenceSnapshot(): unknown | null;
-  recordNavigatorDeterministicEvidence(input: Readonly<{
-    category: NavigatorDeterministicCategory;
-    suiteId: string;
-    runId: string;
-    artifactDigest: string;
-    outcome: "passed" | "failed";
-    now: number;
-  }>): string;
-  recordNavigatorCorpusEvidence(input: Readonly<{
-    corpusDigest: string;
-    runId: string;
-    resultDigest: string;
-    total: number;
-    correct: number;
-    unauthorizedEffects: number;
-    now: number;
-  }>): string;
-  recordNavigatorLiveEvidence(input: Readonly<{
-    runId: string;
-    jobId: string;
-    scenario: NavigatorLiveScenario;
-    terminalState: "complete" | "merged" | "cancelled";
-    evidenceDigest: string;
-    now: number;
-  }>): string;
-  recordNavigatorModelTrialEvidence(input: Readonly<{
-    cohort: "candidate" | "baseline";
-    modelTrialId: string;
-    harnessDigest: string;
-    budgetDigest: string;
-    now: number;
-  }>): string;
-  recordNavigatorSafetyEvidence(input: Readonly<{
-    counter: NavigatorSafetyCounter;
-    count: number;
-    snapshotId: string;
-    evidenceDigest: string;
-    now: number;
-  }>): string;
-  publishNavigatorPromotionManifest(input: Readonly<{
-    deterministicIds: readonly string[];
-    corpusId: string | null;
-    liveRunIds: readonly string[];
-    candidateModelRefIds: readonly string[];
-    baselineModelRefIds: readonly string[];
-    safetyIds: readonly string[];
-    reviewed: boolean;
-    now: number;
-  }>): string;
   listNonterminalRecipeJobs(): Job[];
   getLatestWorkflowEngineContraction(): WorkflowEngineContraction | null;
   contractRecipeEngine(now: number): WorkflowEngineContraction;
@@ -3540,9 +3414,6 @@ export interface TelegramAgentStore {
     input: ControllerLeaseFence & Readonly<{ turnId: string }>,
   ): boolean;
   recordControllerEvidence(input: ControllerEvidenceInput): ControllerEvidenceWrite;
-  settleToolReceiptAndRecordEvidence(
-    input: ControllerToolReceiptSettlementInput,
-  ): ControllerEvidenceWrite;
   recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite;
@@ -3818,16 +3689,6 @@ export interface TelegramAgentStore {
   /** The burst members that folded into a leader, in ordinal order. */
   listControllerBurstMembers(leaderTurnId: string): ControllerTurnRecord[];
   getPendingControllerTurn(controllerKey: string): ControllerTurnRecord | null;
-  claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim;
-  completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void;
-  failToolReceipt(input: ToolReceiptKey & Readonly<{
-    error: string;
-    now: number;
-    controllerKey?: string;
-    ownerId?: string;
-    generation?: number;
-  }>): void;
-  listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[];
   listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[];
   createMonitor(input: {
     controllerKey: string;
@@ -3934,16 +3795,6 @@ export interface TelegramAgentStore {
     input: { projectId: string } & ControllerMutationFence,
   ): { outcome: "cleared" } | { outcome: "refused"; reason: string };
   clearProjectAdmissionPause(input: { projectId?: string; now: number }): number;
-  listSystemMonitors(): MonitorRecord[];
-  cancelSystemMonitors(now: number): number;
-  ensureSystemMonitor(input: {
-    systemKey: string;
-    controllerKey: string;
-    cron: string;
-    instruction: string;
-    dueAt: number;
-    now: number;
-  }): MonitorRecord;
   buildAutonomyScorecard(input: { now: number; windowMs: number }): {
     windowMs: number;
     jobs: Record<string, number>;
@@ -4015,25 +3866,10 @@ export interface TelegramAgentStore {
     turnId?: string;
     queryVector?: MemoryQueryVector;
   }): MemoryRecord[];
-  curateMemories(input: { now: number }): { decayed: number; tombstoned: number };
-  listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[];
   getControllerTurnAfter(controllerKey: string, ordinal: number): ControllerTurnRecord | null;
-  scoreRecalledMemories(input: {
-    turnId: string;
-    outcome: "reinforced" | "demoted";
-    now: number;
-  }): number;
   getMemory(id: string): MemoryRecord | null;
   forgetMemory(input: { id: string; now: number }): boolean;
   countMemories(scope: string): number;
-  appendControllerDigest(input: {
-    controllerKey: string;
-    ordinal: number;
-    ownerText: string;
-    agentText: string;
-    now: number;
-  }): void;
-  readControllerDigest(controllerKey: string, limit: number): { ownerText: string; agentText: string }[];
   createThreadOperation(input: {
     id: string;
     nonceHash: string;
@@ -4219,7 +4055,6 @@ export interface TelegramAgentStore {
   }): NavigatorTicketAttemptContext | null;
   bindNavigatorTicketWorkerResource(input: NavigatorTicketWorkerResourceBindingInput): boolean;
   settleNavigatorTicketWorkerAttempt(input: NavigatorTicketSettlementInput): NavigatorTicketWorkerOutcome | null;
-  getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision;
   getNavigatorImplementationPersistence(): NavigatorImplementationPersistence;
   getNavigatorWorkflowStepOutcome(workflowStepId: string): NavigatorWorkflowStepOutcome | null;
   recordNavigatorPlanningResult(input: {
@@ -5271,7 +5106,6 @@ type MemoryRow = {
   source: string;
   origin: string | null;
   source_turn_id: string | null;
-  curated_at: number | null;
   use_count: number;
   last_used_at: number | null;
   superseded_by: string | null;
@@ -6592,107 +6426,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.capabilityRepository.getInventoryHealth(hostScope);
   }
 
-  public readDurableRecipePromotionEvidenceSnapshot(recipe: TaskRecipe): unknown | null {
-    return this.capabilityRepository.readDurableRecipePromotionEvidenceSnapshot(recipe);
-  }
-
-  public appendRecipeRolloutDecision(input: AppendRecipeRolloutDecisionInput): RecipeRolloutDecision {
-    return this.capabilityRepository.appendRecipeRolloutDecision(input);
-  }
-
-  public listRecipeRolloutDecisions(recipe: TaskRecipe, limit: number): RecipeRolloutDecision[] {
-    return this.capabilityRepository.listRecipeRolloutDecisions(recipe, limit);
-  }
-
-  public getLatestRecipeRolloutDecision(recipe: TaskRecipe): RecipeRolloutDecision | null {
-    return this.capabilityRepository.getLatestRecipeRolloutDecision(recipe);
-  }
-
-  public appendWorkflowEngineRolloutDecision(
-    input: AppendWorkflowEngineRolloutDecisionInput,
-  ): WorkflowEngineRolloutDecision {
-    return this.workflowEngineRepository.appendWorkflowEngineRolloutDecision(input);
-  }
-
-  public listWorkflowEngineRolloutDecisions(limit: number): WorkflowEngineRolloutDecision[] {
-    return this.workflowEngineRepository.listWorkflowEngineRolloutDecisions(limit);
-  }
-
-  public getLatestWorkflowEngineRolloutDecision(): WorkflowEngineRolloutDecision | null {
-    return this.workflowEngineRepository.getLatestWorkflowEngineRolloutDecision();
-  }
-
-  public readDurableNavigatorPromotionEvidenceSnapshot(): unknown | null {
-    return this.workflowEngineRepository.readDurableNavigatorPromotionEvidenceSnapshot();
-  }
-
-  public recordNavigatorDeterministicEvidence(input: Readonly<{
-    category: NavigatorDeterministicCategory;
-    suiteId: string;
-    runId: string;
-    artifactDigest: string;
-    outcome: "passed" | "failed";
-    now: number;
-  }>): string {
-    return this.workflowEngineRepository.recordNavigatorDeterministicEvidence(input);
-  }
-
-  public recordNavigatorCorpusEvidence(input: Readonly<{
-    corpusDigest: string;
-    runId: string;
-    resultDigest: string;
-    total: number;
-    correct: number;
-    unauthorizedEffects: number;
-    now: number;
-  }>): string {
-    return this.workflowEngineRepository.recordNavigatorCorpusEvidence(input);
-  }
-
-  public recordNavigatorLiveEvidence(input: Readonly<{
-    runId: string;
-    jobId: string;
-    scenario: NavigatorLiveScenario;
-    terminalState: "complete" | "merged" | "cancelled";
-    evidenceDigest: string;
-    now: number;
-  }>): string {
-    return this.workflowEngineRepository.recordNavigatorLiveEvidence(input);
-  }
-
-  public recordNavigatorModelTrialEvidence(input: Readonly<{
-    cohort: "candidate" | "baseline";
-    modelTrialId: string;
-    harnessDigest: string;
-    budgetDigest: string;
-    now: number;
-  }>): string {
-    return this.workflowEngineRepository.recordNavigatorModelTrialEvidence(input);
-  }
-
-  public recordNavigatorSafetyEvidence(input: Readonly<{
-    counter: NavigatorSafetyCounter;
-    count: number;
-    snapshotId: string;
-    evidenceDigest: string;
-    now: number;
-  }>): string {
-    return this.workflowEngineRepository.recordNavigatorSafetyEvidence(input);
-  }
-
-  public publishNavigatorPromotionManifest(input: Readonly<{
-    deterministicIds: readonly string[];
-    corpusId: string | null;
-    liveRunIds: readonly string[];
-    candidateModelRefIds: readonly string[];
-    baselineModelRefIds: readonly string[];
-    safetyIds: readonly string[];
-    reviewed: boolean;
-    now: number;
-  }>): string {
-    return this.workflowEngineRepository.publishNavigatorPromotionManifest(input);
-  }
-
   public listNonterminalRecipeJobs(): Job[] {
     return this.workflowEngineRepository.listNonterminalRecipeJobs();
   }
@@ -6705,11 +6438,11 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.workflowEngineRepository.contractRecipeEngine(now);
   }
 
-  private admissionWorkflowIdentity(): Readonly<{ engine: "recipe-v1" | "navigator-v1"; mode: "live" | "shadow" | "deterministic" }> {
-    return workflowIdentityForNewAdmission(
-      this.capabilityDispatchSettings().workflowEngineGraph ?? "adaptive",
-      this.workflowEngineRepository.getLatestWorkflowEngineRolloutDecision(),
-    );
+  private admissionWorkflowIdentity(): Readonly<{
+    engine: typeof NAVIGATOR_ENGINE_ID;
+    mode: "deterministic";
+  }> {
+    return workflowIdentityForNewAdmission();
   }
 
   /** Leftover recipe-v1 columns for contracted new work. They never control routing, skill, model, or stage. */
@@ -6962,13 +6695,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const threadFollowUpJson = threadFollowUp === null ? null : JSON.stringify(threadFollowUp);
     assertNonNegativeInteger(input.now, "now");
     const dispatchSettings = this.capabilityDispatchSettings();
-    if (
-      !["adaptive", "legacy"].includes(dispatchSettings.jobGraph) ||
-      !["bundled", "all-tools"].includes(dispatchSettings.controllerTools) ||
-      (dispatchSettings.workflowEngineGraph !== undefined &&
-        dispatchSettings.workflowEngineGraph !== "adaptive" &&
-        dispatchSettings.workflowEngineGraph !== "recipe")
-    ) throw new TypeError("Capability dispatch settings are invalid");
+    if (!["bundled", "all-tools"].includes(dispatchSettings.controllerTools)) {
+      throw new TypeError("Capability dispatch settings are invalid");
+    }
     // The offer a short reply accepts lives in the previous answer, so bundle
     // selection reads the conversation rather than the message alone. Folded
     // placeholders are skipped: they stand in for an answer, they are not one.
@@ -7329,12 +7058,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.controllerEvidenceRepository.record(input);
   }
 
-  public settleToolReceiptAndRecordEvidence(
-    input: ControllerToolReceiptSettlementInput,
-  ): ControllerEvidenceWrite {
-    return this.controllerEvidenceRepository.settleToolReceiptAndRecordEvidence(input);
-  }
-
   public recordControllerNativeEvidence(
     input: ControllerNativeEvidenceInput,
   ): ControllerNativeEvidenceWrite {
@@ -7468,7 +7191,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction(() => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return "stale" as const;
       const turn = this.db.prepare(
-        `SELECT turn.controller_key, turn.ordinal, turn.input_text,
+        `SELECT turn.controller_key,
                 turn.accepted_finalization_id, turn.thread_follow_up_json,
                 turn.evidence_limit_exceeded_at, controller.telegram_chat_id
            FROM controller_turns AS turn
@@ -7491,17 +7214,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.generation,
       ) as {
         controller_key: string;
-        ordinal: number;
-        input_text: string;
         accepted_finalization_id: number;
         thread_follow_up_json: string | null;
         evidence_limit_exceeded_at: number | null;
         telegram_chat_id: string;
       } | undefined;
       if (!turn) return "stale" as const;
-      const fullTurnRow = this.db.prepare(
-        "SELECT * FROM controller_turns WHERE id = ?",
-      ).get(input.turnId) as ControllerTurnRow | undefined;
       const accepted = this.controllerEvidenceRepository.getAcceptedFinalization(input.turnId);
       if (!accepted || accepted.id !== turn.accepted_finalization_id || accepted.consumedAt !== null) {
         return "stale" as const;
@@ -7550,16 +7268,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       );
       if (completed.changes !== 1) return "stale" as const;
       this.markControllerThreadAsksReported(turn.controller_key, reply.reportedCount, input.now);
-      this.appendControllerDigestRow({
-        controllerKey: turn.controller_key,
-        ordinal: turn.ordinal,
-        // A burst's answer covers every member, so the conversation digest
-        // records the attributed transcript — never file contents, which only
-        // exist in the dispatch text and its attachments.
-        ownerText: fullTurnRow ? this.controllerBurstTranscript(fullTurnRow) : turn.input_text,
-        agentText: reply.text,
-        now: input.now,
-      });
       const consumed = this.db.prepare(
         "UPDATE controller_finalizations SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
       ).run(input.now, accepted.id);
@@ -9456,8 +9164,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
    * Settles one queued turn as folded into the answer identified by
    * `leaderTurnId`: the folded outcome in place of an answer of its own, and
    * the durable link to its leader. A claim-time fold needs nothing more: the
-   * leader's own answer covers the member, and the leader's digest row will
-   * carry the whole attributed transcript, so recording the member again would
+   * leader's own answer covers the member, so recording the member again would
    * count it twice and acknowledging it would describe an answer that is not
    * yet being written.
    */
@@ -9484,11 +9191,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   /**
-   * Folds one queued turn into an answer already being written, whose digest
-   * row knows nothing of it: the member's words enter the digest as their own
-   * row, and the owner is acknowledged once per folded burst — keyed by the
-   * burst's own leader, so six messages folded together draw one bubble, while
-   * a genuinely separate later burst is still told once itself.
+   * Folds one queued turn into an answer already being written: the owner is
+   * acknowledged once per folded burst — keyed by the burst's own leader, so
+   * six messages folded together draw one bubble, while a genuinely separate
+   * later burst is still told once itself.
    */
   private foldQueuedControllerTurn(input: {
     waitingTurnId: string;
@@ -9499,15 +9205,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }): boolean {
     if (!this.settleFoldedControllerTurn(input)) return false;
     const member = this.db.prepare(
-      "SELECT ordinal, origin, input_text FROM controller_turns WHERE id = ?",
-    ).get(input.waitingTurnId) as { ordinal: number; origin: string; input_text: string };
-    this.appendControllerDigestRow({
-      controllerKey: input.controllerKey,
-      ordinal: member.ordinal,
-      ownerText: member.input_text,
-      agentText: CONTROLLER_STEER_FOLDED_RESPONSE,
-      now: input.now,
-    });
+      "SELECT origin FROM controller_turns WHERE id = ?",
+    ).get(input.waitingTurnId) as { origin: string };
     // The answer itself arrives folded into the reply already being written, so
     // without this the owner's message drew no bubble at all and reads in
     // Telegram exactly like being ignored. That debt exists only for the
@@ -10588,15 +10287,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   /**
    * Put an owner message back only when the failed turn provably cost nothing.
    *
-   * A turn that opened no tool, recorded no evidence, reserved no receipt and
-   * had no accepted answer cannot have done anything worth not repeating, so
-   * replaying it is safe. `input_accepted` is deliberately not part of that
-   * test: turns have run dozens of tool calls with it still 0, so trusting it
-   * would replay real work. An image or document is left out because the retry
-   * would carry only the text, which is not the message the owner sent. The
-   * members that folded into a failed burst leader follow it to the
-   * replacement, so the retry answers the whole burst rather than its first
-   * line.
+   * A turn that opened no tool, recorded no evidence and had no accepted
+   * answer cannot have done anything worth not repeating, so replaying it is
+   * safe. `input_accepted` is deliberately not part of that test: turns have
+   * run dozens of tool calls with it still 0, so trusting it would replay real
+   * work. An image or document is left out because the retry would carry only
+   * the text, which is not the message the owner sent. The members that folded
+   * into a failed burst leader follow it to the replacement, so the retry
+   * answers the whole burst rather than its first line.
    *
    * Only an unclassified or recovery-exhausted failure is replayed. An expired
    * sign-in or a rejected provider would fail again the same way until the
@@ -10614,11 +10312,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (row.recovery_source_turn_id !== null) return false;
     if (row.tool_calls !== 0 || row.accepted_finalization_id !== null) return false;
     const touched = this.db.prepare(
-      `SELECT
-         (SELECT COUNT(*) FROM controller_evidence WHERE turn_id = ?) AS evidence,
-         (SELECT COUNT(*) FROM tool_receipts WHERE turn_id = ?) AS receipts`,
-    ).get(row.id, row.id) as { evidence: number; receipts: number };
-    if (touched.evidence !== 0 || touched.receipts !== 0) return false;
+      "SELECT COUNT(*) AS evidence FROM controller_evidence WHERE turn_id = ?",
+    ).get(row.id) as { evidence: number };
+    if (touched.evidence !== 0) return false;
     const latestUpdate = this.db.prepare(
       "SELECT COALESCE(MAX(telegram_update_id), 0) AS update_id FROM controller_turns",
     ).get() as { update_id: number };
@@ -10685,155 +10381,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         ORDER BY ordinal ASC LIMIT 1`,
     ).get(controllerKey) as ControllerTurnRow | undefined;
     return row ? parseControllerTurn(row) : null;
-  }
-
-  // Reserving before the call is what makes replay safe: a crash mid-tool leaves
-  // a 'started' receipt, which is reported as uncertain rather than repeated.
-  public claimToolReceipt(input: ToolReceiptClaimInput): ToolReceiptClaim {
-    assertControllerKey(input.controllerKey);
-    assertControllerIdentifier(input.turnId, "turnId");
-    assertControllerIdentifier(input.toolName, "toolName");
-    assertSha256Hex(input.argsSha256);
-    assertNonNegativeInteger(input.now, "now");
-    const hasFence = input.ownerId !== undefined || input.generation !== undefined;
-    if (hasFence) {
-      if (input.ownerId === undefined || input.generation === undefined) {
-        throw new TypeError("tool receipt reservation fence is incomplete");
-      }
-      assertControllerIdentifier(input.ownerId, "ownerId");
-      assertNonNegativeInteger(input.generation, "generation");
-    }
-
-    return this.db.transaction((): ToolReceiptClaim => {
-      const turn = this.db.prepare(
-        `SELECT controller_key, state, lease_owner, lease_generation, accepted_finalization_id,
-                steer_reservation_turn_id, recovery_source_turn_id
-           FROM controller_turns WHERE id = ?`,
-      ).get(input.turnId) as {
-        controller_key: string;
-        state: string;
-        lease_owner: string | null;
-        lease_generation: number | null;
-        accepted_finalization_id: number | null;
-        steer_reservation_turn_id: string | null;
-        recovery_source_turn_id: string | null;
-      } | undefined;
-      if (turn && turn.accepted_finalization_id !== null) {
-        return { outcome: "finalized" };
-      }
-      if (hasFence && (
-        !turn || turn.controller_key !== input.controllerKey || turn.state !== "submitted" ||
-        turn.lease_owner !== input.ownerId || turn.lease_generation !== input.generation ||
-        turn.steer_reservation_turn_id !== null ||
-        !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)
-      )) return { outcome: "fence_lost" };
-      let inheritedReceipt = false;
-      let existing = this.db.prepare(
-        `SELECT state, result_text, last_error, controller_key FROM tool_receipts
-          WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
-      ).get(input.turnId, input.toolName, input.argsSha256) as
-        { state: string; result_text: string | null; last_error: string | null; controller_key: string } | undefined;
-      if (!existing && turn?.recovery_source_turn_id) {
-        existing = this.db.prepare(
-          `SELECT receipt.state, receipt.result_text, receipt.last_error, receipt.controller_key
-             FROM tool_receipts AS receipt
-             JOIN controller_turns AS source ON source.id = receipt.turn_id
-            WHERE receipt.turn_id = ? AND receipt.tool_name = ? AND receipt.args_sha256 = ?
-              AND source.controller_key = ?`,
-        ).get(
-          turn.recovery_source_turn_id,
-          input.toolName,
-          input.argsSha256,
-          input.controllerKey,
-        ) as typeof existing;
-        inheritedReceipt = existing !== undefined;
-      }
-      if (inheritedReceipt && existing?.state === "failed" && existing.last_error === "authorization_failed") {
-        existing = undefined;
-      }
-      if (existing && existing.controller_key !== input.controllerKey) return { outcome: "fence_lost" };
-      if (existing?.state === "completed") {
-        return { outcome: "completed", result: existing.result_text ?? "" };
-      }
-      if (existing?.state === "started") return { outcome: "interrupted" };
-      if (existing?.state === "failed" && existing.last_error !== "authorization_failed") {
-        return { outcome: "interrupted" };
-      }
-      if (existing) {
-        this.db.prepare(
-          `UPDATE tool_receipts SET state = 'started', last_error = NULL, updated_at = ?
-            WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ?`,
-        ).run(input.now, input.turnId, input.toolName, input.argsSha256);
-        return { outcome: "fresh" };
-      }
-      this.db.prepare(
-        `INSERT INTO tool_receipts (
-           turn_id, tool_name, args_sha256, controller_key, state, result_text, last_error, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'started', NULL, NULL, ?, ?)`,
-      ).run(input.turnId, input.toolName, input.argsSha256, input.controllerKey, input.now, input.now);
-      return { outcome: "fresh" };
-    }).immediate();
-  }
-
-  public completeToolReceipt(input: ToolReceiptKey & { result: string; now: number }): void {
-    assertControllerIdentifier(input.turnId, "turnId");
-    assertControllerIdentifier(input.toolName, "toolName");
-    assertSha256Hex(input.argsSha256);
-    if (typeof input.result !== "string" || Buffer.byteLength(input.result, "utf8") > MAX_RECEIPT_RESULT_BYTES) {
-      throw new TypeError("tool receipt result must be at most 8000 UTF-8 bytes");
-    }
-    assertNonNegativeInteger(input.now, "now");
-    const completed = this.db.prepare(
-      `UPDATE tool_receipts SET state = 'completed', result_text = ?, last_error = NULL, updated_at = ?
-        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'`,
-    ).run(input.result, input.now, input.turnId, input.toolName, input.argsSha256);
-    if (completed.changes !== 1) throw new Error("exact started tool receipt was not completed");
-  }
-
-  public failToolReceipt(input: ToolReceiptKey & Readonly<{
-    error: string;
-    now: number;
-    controllerKey?: string;
-    ownerId?: string;
-    generation?: number;
-  }>): void {
-    assertNonNegativeInteger(input.now, "now");
-    const hasFence = input.ownerId !== undefined || input.generation !== undefined;
-    if (hasFence && (
-      input.ownerId === undefined || input.generation === undefined || input.controllerKey === undefined
-    )) {
-      throw new TypeError("tool receipt failure fence is incomplete");
-    }
-    if (hasFence) assertControllerKey(input.controllerKey!);
-    if (hasFence && !this.executorLeaseIsCurrent(input.ownerId!, input.generation!, input.now)) return;
-    const fencePredicate = hasFence
-      ? ` AND EXISTS (
-           SELECT 1 FROM controller_turns
-            WHERE id = ? AND controller_key = ? AND state = 'submitted'
-              AND lease_owner = ? AND lease_generation = ? AND accepted_finalization_id IS NULL
-              AND steer_reservation_turn_id IS NULL
-         )`
-      : "";
-    const parameters = hasFence
-      ? [input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256,
-          input.turnId, input.controllerKey, input.ownerId!, input.generation!]
-      : [input.error.slice(0, 500), input.now, input.turnId, input.toolName, input.argsSha256];
-    this.db.prepare(
-      `UPDATE tool_receipts SET state = 'failed', last_error = ?, updated_at = ?
-        WHERE turn_id = ? AND tool_name = ? AND args_sha256 = ? AND state = 'started'${fencePredicate}`,
-    ).run(...parameters);
-  }
-
-  public listToolReceipts(turnId: string): { toolName: string; state: string; result: string | null }[] {
-    assertControllerIdentifier(turnId, "turnId");
-    return this.db.prepare(
-      `SELECT receipt.tool_name AS toolName, receipt.state, receipt.result_text AS result
-         FROM tool_receipts AS receipt
-        WHERE receipt.turn_id = ? OR receipt.turn_id = (
-          SELECT recovery_source_turn_id FROM controller_turns WHERE id = ?
-        )
-        ORDER BY receipt.created_at ASC LIMIT 50`,
-    ).all(turnId, turnId) as { toolName: string; state: string; result: string | null }[];
   }
 
   public listControllerGenerations(controllerKey: string, limit: number): ControllerGeneration[] {
@@ -10956,52 +10503,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
   }
 
   /**
-   * Installs a monitor the plugin owns rather than the owner. Keyed so install
-   * is idempotent across restarts, and exempt from the owner's armed-monitor
-   * cap: the agent's own housekeeping must not be crowded out by watches the
-   * owner set, nor consume slots they were counting on.
-   */
-  public ensureSystemMonitor(input: {
-    systemKey: string;
-    controllerKey: string;
-    cron: string;
-    instruction: string;
-    dueAt: number;
-    now: number;
-  }): MonitorRecord {
-    assertControllerKey(input.controllerKey);
-    assertControllerIdentifier(input.systemKey, "systemKey");
-    const instruction = assertMemoryText(input.instruction, MAX_MONITOR_INSTRUCTION, "monitor instruction");
-    assertNonNegativeInteger(input.dueAt, "dueAt");
-    assertNonNegativeInteger(input.now, "now");
-    return this.db.transaction((): MonitorRecord => {
-      const existing = this.db.prepare(
-        "SELECT * FROM monitors WHERE system_key = ?",
-      ).get(input.systemKey) as MonitorRow | undefined;
-      if (existing) {
-        // Re-arm a system monitor the owner or a failure retired; its schedule
-        // and wording are owned by this release, not by whatever ran before.
-        this.db.prepare(
-          `UPDATE monitors
-              SET cron = ?, instruction = ?, updated_at = ?,
-                  state = CASE WHEN state = 'armed' THEN 'armed' ELSE 'armed' END,
-                  due_at = CASE WHEN state = 'armed' AND due_at IS NOT NULL THEN due_at ELSE ? END
-            WHERE system_key = ?`,
-        ).run(input.cron, instruction, input.now, input.dueAt, input.systemKey);
-        return this.requireMonitor(existing.id);
-      }
-      const id = `mon-${randomUUID()}`;
-      this.db.prepare(
-        `INSERT INTO monitors (
-           id, controller_key, kind, thread_id, cron, instruction, state, due_at,
-           fire_count, last_fired_at, last_error, created_at, updated_at, system_key
-         ) VALUES (?, ?, 'schedule', NULL, ?, ?, 'armed', ?, 0, NULL, NULL, ?, ?, ?)`,
-      ).run(id, input.controllerKey, input.cron, instruction, input.dueAt, input.now, input.now, input.systemKey);
-      return this.requireMonitor(id);
-    }).immediate();
-  }
-
-  /**
    * Durable counts only. Every number here is read from committed state, so the
    * agent can report it without inventing a rate the database cannot support.
    */
@@ -11105,21 +10606,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
        ON CONFLICT(singleton) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`,
     ).run(text, input.now);
     return text;
-  }
-
-  /** Retires every plugin-owned monitor; the owner's own watches are untouched. */
-  public listSystemMonitors(): MonitorRecord[] {
-    const rows = this.db.prepare(
-      "SELECT * FROM monitors WHERE system_key IS NOT NULL ORDER BY system_key ASC",
-    ).all() as MonitorRow[];
-    return rows.map(parseMonitor);
-  }
-
-  public cancelSystemMonitors(now: number): number {
-    assertNonNegativeInteger(now, "now");
-    return this.db.prepare(
-      "UPDATE monitors SET state = 'cancelled', updated_at = ? WHERE system_key IS NOT NULL AND state = 'armed'",
-    ).run(now).changes;
   }
 
   public getProductionHealth(projectId: string): ProductionHealthRecord | null {
@@ -12128,8 +11614,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     query?: string;
     limit: number;
     now: number;
-    /** Links what was recalled to the turn it informed, so the answer's
-     *  reception can later reinforce or demote exactly those memories. */
     turnId?: string;
     /** The question as a vector, when a provider produced one. */
     queryVector?: MemoryQueryVector;
@@ -12160,7 +11644,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             WHERE memories_fts MATCH ?
               AND memories.scope IN (${placeholders})
               AND memories.forgotten_at IS NULL AND memories.superseded_by IS NULL
-            ORDER BY bm25(memories_fts, 2.0, 1.0)
+            ORDER BY bm25(memories_fts)
             LIMIT 100`,
         ).all(match, ...scopes) as { id: string }[];
         matched.forEach((row, index) => lexicalRanks.set(row.id, index));
@@ -12183,7 +11667,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             semanticRank: semantic.get(row.id) ?? (semantic.size > 0 ? null : undefined),
             importance: row.importance,
             confidence: row.confidence,
-            ageMs: input.now - row.created_at,
           }),
         }))
         // An explicit question surfaces what mentions it *or what means it*:
@@ -12199,13 +11682,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       const use = this.db.prepare(
         "UPDATE memories SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
       );
-      const link = this.db.prepare(
-        `INSERT OR IGNORE INTO memory_recalls (turn_id, memory_id, recalled_at, scored_at, outcome)
-         VALUES (?, ?, ?, NULL, NULL)`,
-      );
       for (const candidate of ranked) {
         use.run(input.now, candidate.row.id);
-        if (input.turnId !== undefined) link.run(input.turnId, candidate.row.id, input.now);
       }
       return ranked.map((candidate) => this.requireMemory(candidate.row.id));
     }).immediate();
@@ -12223,66 +11701,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     ).run(input.now, input.now, input.id).changes === 1;
   }
 
-  /**
-   * Ages out memories that were never useful. Confidence decays on idle time
-   * rather than raw age, and only agent-written memories can be tombstoned:
-   * something the owner said out loud must never vanish on a timer.
-   */
-  public curateMemories(input: { now: number }): { decayed: number; tombstoned: number } {
-    assertNonNegativeInteger(input.now, "now");
-    return this.db.transaction((): { decayed: number; tombstoned: number } => {
-      const live = this.db.prepare(
-        `SELECT id, source, confidence, use_count, last_used_at, created_at, curated_at FROM memories
-          WHERE forgotten_at IS NULL AND superseded_by IS NULL`,
-      ).all() as Pick<
-        MemoryRow,
-        "id" | "source" | "confidence" | "use_count" | "last_used_at" | "created_at" | "curated_at"
-      >[];
-      const update = this.db.prepare(
-        "UPDATE memories SET confidence = ?, curated_at = ?, updated_at = ? WHERE id = ?",
-      );
-      const tombstone = this.db.prepare(
-        "UPDATE memories SET forgotten_at = ?, curated_at = ?, updated_at = ? WHERE id = ? AND forgotten_at IS NULL",
-      );
-      let decayed = 0;
-      let tombstoned = 0;
-      for (const row of live) {
-        // Decay the interval since confidence was last touched, not the whole
-        // idle span: `confidence` is already the decayed value, so re-applying
-        // the full span every pass compounds it. With a six-hour sweep that
-        // turned a 217-day half-life into nine days and deleted memories the
-        // ranking had barely begun to down-weight. Anchoring here also makes a
-        // repeat pass at the same clock a no-op.
-        const anchor = Math.max(row.curated_at ?? 0, row.last_used_at ?? 0) || row.created_at;
-        const next = decayedConfidence(row.confidence, input.now - anchor);
-        // The anchor advances on every pass, even when the value did not move,
-        // or a memory resting on the floor would keep an ancient anchor and
-        // hand the next pass an interval it has already served.
-        update.run(next, input.now, input.now, row.id);
-        if (Math.abs(next - row.confidence) > 1e-9) decayed += 1;
-        const expendable = row.source === "agent" && row.use_count === 0;
-        if (expendable && next <= MEMORY_TOMBSTONE_CONFIDENCE) {
-          tombstone.run(input.now, input.now, input.now, row.id);
-          tombstoned += 1;
-        }
-      }
-      return { decayed, tombstoned };
-    }).immediate();
-  }
-
-  /** Turns whose recalled memories have not yet been judged by what came next. */
-  public listUnscoredRecallTurns(limit: number): { turnId: string; controllerKey: string; ordinal: number }[] {
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError("limit must be between 1 and 100");
-    const rows = this.db.prepare(
-      `SELECT DISTINCT recall.turn_id AS turnId, turn.controller_key AS controllerKey, turn.ordinal AS ordinal
-         FROM memory_recalls AS recall
-         JOIN controller_turns AS turn ON turn.id = recall.turn_id
-        WHERE recall.scored_at IS NULL AND turn.state IN ('completed', 'failed')
-        ORDER BY recall.recalled_at ASC LIMIT ?`,
-    ).all(limit) as { turnId: string; controllerKey: string; ordinal: number }[];
-    return rows;
-  }
-
   /** The owner's next message after a turn, which is how that turn is judged. */
   public getControllerTurnAfter(controllerKey: string, ordinal: number): ControllerTurnRecord | null {
     assertControllerKey(controllerKey);
@@ -12292,37 +11710,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         ORDER BY ordinal ASC LIMIT 1`,
     ).get(controllerKey, ordinal) as ControllerTurnRow | undefined;
     return row ? parseControllerTurn(row) : null;
-  }
-
-  public scoreRecalledMemories(input: {
-    turnId: string;
-    outcome: "reinforced" | "demoted";
-    now: number;
-  }): number {
-    if (input.outcome !== "reinforced" && input.outcome !== "demoted") {
-      throw new TypeError("a recall is scored as reinforced or demoted");
-    }
-    assertNonNegativeInteger(input.now, "now");
-    const delta = input.outcome === "reinforced" ? MEMORY_REINFORCEMENT : -MEMORY_DEMOTION;
-    return this.db.transaction((): number => {
-      const recalls = this.db.prepare(
-        "SELECT memory_id FROM memory_recalls WHERE turn_id = ? AND scored_at IS NULL",
-      ).all(input.turnId) as { memory_id: string }[];
-      if (recalls.length === 0) return 0;
-      const read = this.db.prepare("SELECT confidence FROM memories WHERE id = ?");
-      const update = this.db.prepare(
-        "UPDATE memories SET confidence = ?, updated_at = ? WHERE id = ?",
-      );
-      for (const recall of recalls) {
-        const memory = read.get(recall.memory_id) as { confidence: number } | undefined;
-        if (!memory) continue;
-        update.run(adjustedConfidence(memory.confidence, delta), input.now, recall.memory_id);
-      }
-      this.db.prepare(
-        "UPDATE memory_recalls SET scored_at = ?, outcome = ? WHERE turn_id = ? AND scored_at IS NULL",
-      ).run(input.now, input.outcome, input.turnId);
-      return recalls.length;
-    }).immediate();
   }
 
   public countMemories(scope: string): number {
@@ -12347,7 +11734,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           lexicalRank: null,
           importance: row.importance,
           confidence: row.confidence,
-          ageMs: now - row.created_at,
         }),
       }))
       .sort((left, right) => left.score - right.score)
@@ -12360,67 +11746,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const memory = this.getMemory(id);
     if (!memory) throw new Error("stored memory disappeared before it could be read");
     return memory;
-  }
-
-  // The conversation outlives the BB thread that hosted it: a provider failure
-  // retires the thread, and this digest is what re-seeds its replacement.
-  public appendControllerDigest(input: {
-    controllerKey: string;
-    ordinal: number;
-    ownerText: string;
-    agentText: string;
-    now: number;
-  }): void {
-    assertControllerKey(input.controllerKey);
-    assertNonNegativeInteger(input.ordinal, "ordinal");
-    assertNonNegativeInteger(input.now, "now");
-    this.db.transaction(() => this.appendControllerDigestRow(input)).immediate();
-  }
-
-  private appendControllerDigestRow(input: {
-    controllerKey: string;
-    ordinal: number;
-    ownerText: string;
-    agentText: string;
-    now: number;
-  }): void {
-    {
-      this.db.prepare(
-        `INSERT INTO controller_digest (controller_key, ordinal, owner_text, agent_text, created_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (controller_key, ordinal) DO UPDATE
-           SET owner_text = excluded.owner_text, agent_text = excluded.agent_text`,
-      ).run(
-        input.controllerKey,
-        input.ordinal,
-        input.ownerText.slice(0, MAX_DIGEST_TEXT),
-        input.agentText.slice(0, MAX_DIGEST_TEXT),
-        input.now,
-      );
-      this.db.prepare(
-        `DELETE FROM controller_digest
-          WHERE controller_key = ? AND ordinal <= (
-            SELECT MAX(ordinal) - ? FROM controller_digest WHERE controller_key = ?
-          )`,
-      ).run(input.controllerKey, MAX_DIGEST_TURNS, input.controllerKey);
-    }
-  }
-
-  public readControllerDigest(
-    controllerKey: string,
-    limit: number,
-  ): { ownerText: string; agentText: string }[] {
-    assertControllerKey(controllerKey);
-    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_DIGEST_TURNS) {
-      throw new TypeError(`limit must be between 1 and ${MAX_DIGEST_TURNS}`);
-    }
-    const rows = this.db.prepare(
-      `SELECT owner_text, agent_text FROM controller_digest
-        WHERE controller_key = ? ORDER BY ordinal DESC LIMIT ?`,
-    ).all(controllerKey, limit) as { owner_text: string; agent_text: string }[];
-    return rows
-      .reverse()
-      .map((row) => ({ ownerText: row.owner_text, agentText: row.agent_text }));
   }
 
   public createThreadOperation(input: {
@@ -13053,7 +12378,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     origin: AutonomousJobOrigin;
     /** Floor for the recipe, so a diagnosis or a revert cannot route as a typo. */
     minimumRecipe?: TaskRecipe;
-    /** Present when the daily allowance and the finding ledger both apply. */
+    /** Present when the daily intake allowance applies. */
     intake?: { fingerprint: string; auditId: string; subject: string };
     /** Present for a revert, which is bounded once per merge commit for all time. */
     revert?: { mergeCommitSha: string; mergedJobId: string };
@@ -13491,10 +12816,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.navigatorRepository.settleNavigatorTicketWorkerAttempt(input);
   }
 
-  public getNavigatorFindingLedgerDecision(jobId: string): NavigatorFindingLedgerDecision {
-    return this.navigatorRepository.getNavigatorFindingLedgerDecision(jobId);
-  }
-
   public getNavigatorImplementationPersistence(): NavigatorImplementationPersistence {
     return this.navigatorImplementationRepository;
   }
@@ -13664,7 +12985,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     event: JobEvent;
     evidenceGate: { valid: boolean; completeReviewAttemptIds: readonly string[] };
   }>): void {
-    const { current, input: settlement, transitioned, event, evidenceGate } = input;
+    const { current, input: settlement, transitioned, event } = input;
     persistJobTransition(this.db, current.id, current.version, transitioned.job);
     persistPendingEffects(this.db, transitioned.effects, settlement.now);
     this.settleNavigatorReleaseReturn({
@@ -13672,7 +12993,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       next: transitioned.job,
       event,
       now: settlement.now,
-      reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
     });
     this.enqueueFinishNoteInTransaction(current, transitioned.job, settlement.now);
     this.markAdmissionDrainingForTerminal(transitioned.job, settlement.now);
@@ -14690,7 +14010,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         next: transitioned.job,
         event,
         now,
-        reviewAttemptIds: [],
       });
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(jobId, "head_changed", now);
@@ -14767,7 +14086,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         next: transitioned.job,
         event: input.event,
         now: input.now,
-        reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
       });
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(input.jobId, "head_changed", input.now);
@@ -18575,16 +17893,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     next: Job;
     event: JobEvent;
     now: number;
-    reviewAttemptIds: readonly string[];
   }>): void {
     if (input.previous.workflowEngine !== "navigator-v1") return;
     if (!(NAVIGATOR_RELEASE_STATES as readonly string[]).includes(input.previous.state)) return;
-    this.recordNavigatorReleaseReviewFindings(
-      input.previous,
-      input.event,
-      input.reviewAttemptIds,
-      input.now,
-    );
     const returnedToNavigation = input.next.state === "implementing";
     const releaseFinished = input.next.state === "complete" ||
       input.next.state === "merged" || input.next.state === "production_failed";
@@ -18635,156 +17946,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
          next_attempt_at, created_at, updated_at
        ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)`,
     ).run(item.logicalKey, item.chatId, payloadJson, input.now, input.now, input.now);
-  }
-
-  private recordNavigatorReleaseReviewFindings(
-    job: Job,
-    event: JobEvent,
-    reviewAttemptIds: readonly string[],
-    now: number,
-  ): void {
-    if (job.state !== "final_reviewing" ||
-      (event.type !== "REVIEW_CHANGES_REQUESTED" && event.type !== "REVIEW_PASSED")) return;
-    if (!job.prHeadSha || reviewAttemptIds.length === 0) {
-      throw new Error("final review convergence evidence is unavailable");
-    }
-    const observed = this.normalizedReleaseReviewFindings(job, reviewAttemptIds);
-    if (event.type === "REVIEW_CHANGES_REQUESTED" && observed.size === 0) {
-      throw new Error("final review requested changes without normalized findings");
-    }
-    const currentRows = this.currentReleaseReviewFindingRows(job.id);
-    const current = new Map(currentRows.map((row) => [row.fingerprint, row]));
-    const blockingBurden = [...observed.values()].filter((finding) => finding.disposition === "must_fix").length;
-    for (const finding of observed.values()) {
-      const prior = current.get(finding.fingerprint);
-      this.appendReleaseReviewFindingEvent({
-        job,
-        sourceAttemptId: finding.sourceAttemptId,
-        fingerprint: finding.fingerprint,
-        capabilityId: finding.capabilityId,
-        ruleId: finding.ruleId,
-        disposition: finding.disposition,
-        event: prior?.event === "opened" || prior?.event === "reobserved" ? "reobserved" : "opened",
-        findingJson: finding.findingJson,
-        occurrence: Math.min(3, (prior?.occurrence ?? 0) + 1),
-        blockingBurden,
-        now,
-      });
-    }
-    this.resolveClosedReleaseReviewFindings({
-      job,
-      currentRows,
-      observed,
-      sourceAttemptId: reviewAttemptIds[0]!,
-      blockingBurden,
-      now,
-    });
-  }
-
-  private normalizedReleaseReviewFindings(
-    job: Job,
-    reviewAttemptIds: readonly string[],
-  ): Map<string, NavigatorReleaseReviewFinding> {
-    const observed = new Map<string, NavigatorReleaseReviewFinding>();
-    for (const attemptId of reviewAttemptIds) {
-      const attempt = this.getAttempt(attemptId);
-      if (!attempt || attempt.jobId !== job.id || attempt.reviewStage !== "final_review" ||
-        attempt.headSha !== job.prHeadSha || attempt.resultJson === null) {
-        throw new Error("final review convergence attempt is invalid");
-      }
-      const raw = JSON.parse(attempt.resultJson) as Record<string, unknown>;
-      const envelope = guardResultEnvelopeSchema.safeParse(raw.guardEnvelope);
-      const policy = guardAssessmentPolicySchema.safeParse(raw.guardPolicy);
-      if (!envelope.success || !policy.success) continue;
-      const assessment = assessGuardEnvelope(envelope.data, policy.data);
-      if (assessment.outcome === "blocked") throw new Error("final review guard assessment is blocked");
-      for (const finding of assessment.findings) {
-        if (observed.has(finding.fingerprint)) continue;
-        observed.set(finding.fingerprint, {
-          sourceAttemptId: attempt.id,
-          fingerprint: finding.fingerprint,
-          capabilityId: finding.capabilityId,
-          ruleId: finding.ruleId,
-          disposition: finding.disposition,
-          findingJson: JSON.stringify(finding),
-        });
-      }
-    }
-    return observed;
-  }
-
-  private currentReleaseReviewFindingRows(jobId: string): NavigatorReleaseReviewFindingRow[] {
-    return this.db.prepare(
-      `SELECT finding.* FROM navigator_release_review_finding_events AS finding
-        WHERE finding.job_id = ? AND finding.sequence = (
-          SELECT MAX(latest.sequence) FROM navigator_release_review_finding_events AS latest
-           WHERE latest.job_id = finding.job_id AND latest.fingerprint = finding.fingerprint
-        )`,
-    ).all(jobId) as NavigatorReleaseReviewFindingRow[];
-  }
-
-  private appendReleaseReviewFindingEvent(input: Readonly<{
-    job: Job;
-    sourceAttemptId: string;
-    fingerprint: string;
-    capabilityId: string;
-    ruleId: string;
-    disposition: "must_fix" | "advisory";
-    event: "opened" | "reobserved" | "resolved";
-    findingJson: string;
-    occurrence: number;
-    blockingBurden: number;
-    now: number;
-  }>): void {
-    this.db.prepare(
-      `INSERT INTO navigator_release_review_finding_events (
-         job_id, workflow_step_id, source_review_attempt_id, fingerprint,
-         capability_id, rule_id, disposition, event, head_sha, finding_json,
-         evidence_refs_json, occurrence, blocking_burden, recorded_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      input.job.id,
-      input.job.currentWorkflowStepId,
-      input.sourceAttemptId,
-      input.fingerprint,
-      input.capabilityId,
-      input.ruleId,
-      input.disposition,
-      input.event,
-      input.job.prHeadSha,
-      input.findingJson,
-      JSON.stringify([`review-attempt:${input.sourceAttemptId}`, `guard-finding:${input.fingerprint}`]),
-      input.occurrence,
-      input.blockingBurden,
-      input.now,
-    );
-  }
-
-  private resolveClosedReleaseReviewFindings(input: Readonly<{
-    job: Job;
-    currentRows: readonly NavigatorReleaseReviewFindingRow[];
-    observed: ReadonlyMap<string, NavigatorReleaseReviewFinding>;
-    sourceAttemptId: string;
-    blockingBurden: number;
-    now: number;
-  }>): void {
-    for (const prior of input.currentRows) {
-      const open = prior.event === "opened" || prior.event === "reobserved";
-      if (!open || input.observed.has(prior.fingerprint)) continue;
-      this.appendReleaseReviewFindingEvent({
-        job: input.job,
-        sourceAttemptId: input.sourceAttemptId,
-        fingerprint: prior.fingerprint,
-        capabilityId: prior.capability_id,
-        ruleId: prior.rule_id,
-        disposition: prior.disposition,
-        event: "resolved",
-        findingJson: prior.finding_json,
-        occurrence: prior.occurrence,
-        blockingBurden: input.blockingBurden,
-        now: input.now,
-      });
-    }
   }
 
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {

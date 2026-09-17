@@ -2,13 +2,11 @@
 // semantic signal without an API key; when either side has no compatible
 // vector, the exact word-based score remains authoritative.
 
-export const MEMORY_HALF_LIFE_MS = 45 * 86_400_000;
 const LEXICAL_WEIGHT = 0.45;
-const RECENCY_WEIGHT = 0.25;
 const IMPORTANCE_WEIGHT = 0.2;
 const CONFIDENCE_WEIGHT = 0.1;
 // Reciprocal rank keeps the lexical signal bounded, so one freakishly good BM25
-// score cannot drown out recency and importance the way a raw score would.
+// score cannot drown out importance the way a raw score would.
 const RECIPROCAL_RANK_K = 4;
 /**
  * Meaning is worth about as much as words: a question rarely reuses the
@@ -32,12 +30,7 @@ export type MemoryCandidate = {
   semanticRank?: number | null;
   importance: number;
   confidence: number;
-  ageMs: number;
 };
-
-export function recencyScore(ageMs: number): number {
-  return 0.5 ** (Math.max(0, ageMs) / MEMORY_HALF_LIFE_MS);
-}
 
 function reciprocalRank(rank: number | null | undefined): number {
   return rank === null || rank === undefined
@@ -52,17 +45,16 @@ function reciprocalRank(rank: number | null | undefined): number {
  * reach a memory phrased "never deploy at the end of the week". It is folded in
  * as another reciprocal rank rather than a raw cosine, for the same reason the
  * lexical signal is: one freakishly close vector should not be able to outvote
- * recency and importance together.
+ * importance.
  *
  * When no vector is available the original score is returned unchanged. When
  * one is available, semantic rank receives a fixed share of that same unit
  * scale. That keeps embedded and unembedded rows comparable while preserving
- * the exact pre-embedding ranking for a word-only corpus.
+ * the exact pre-embedding ranking for a word-only corpus. Age is not a signal.
  */
 export function memoryScore(candidate: MemoryCandidate): number {
   const semanticAvailable = candidate.semanticRank !== null && candidate.semanticRank !== undefined;
   const base = LEXICAL_WEIGHT * reciprocalRank(candidate.lexicalRank) +
-    RECENCY_WEIGHT * recencyScore(candidate.ageMs) +
     IMPORTANCE_WEIGHT * candidate.importance +
     CONFIDENCE_WEIGHT * candidate.confidence;
   if (!semanticAvailable) return base;
@@ -111,27 +103,7 @@ export function semanticRanks(
   return ranks;
 }
 
-// Ranking already down-weights an old memory through recencyScore. Decay is a
-// different question — whether a memory has ever been *useful* — so it keys on
-// idle time since last recall, and on a longer half-life than ranking, because
-// a memory should never be discarded faster than it is merely down-ranked.
-export const MEMORY_IDLE_HALF_LIFE_MS = 90 * 86_400_000;
 export const MEMORY_CONFIDENCE_FLOOR = 0.05;
-/** Below this, an agent-written memory has earned its way out of recall. */
-export const MEMORY_TOMBSTONE_CONFIDENCE = 0.15;
-export const MEMORY_REINFORCEMENT = 0.05;
-// Demotion outweighs reinforcement: being wrong in front of the owner is much
-// stronger evidence than going unchallenged.
-export const MEMORY_DEMOTION = 0.25;
-
-export function decayedConfidence(confidence: number, idleMs: number): number {
-  const decayed = confidence * 0.5 ** (Math.max(0, idleMs) / MEMORY_IDLE_HALF_LIFE_MS);
-  return Math.max(MEMORY_CONFIDENCE_FLOOR, decayed);
-}
-
-export function adjustedConfidence(confidence: number, delta: number): number {
-  return Math.min(1, Math.max(MEMORY_CONFIDENCE_FLOOR, confidence + delta));
-}
 
 /**
  * Two subjects contradict when one's words wholly contain the other's — the

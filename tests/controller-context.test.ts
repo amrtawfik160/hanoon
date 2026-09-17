@@ -90,75 +90,10 @@ describe("turn context", () => {
     expect(composeTurnInput(null, "hi")).toBe("hi");
   });
 
-  it("carries the conversation into a replacement thread but not into a live one", () => {
-    const { store } = fixture();
-    store.appendControllerDigest({
-      controllerKey: "owner-7-controller",
-      ordinal: 1,
-      ownerText: "check the billing thread",
-      agentText: "It is running the test suite.",
-      now: NOW,
-    });
-
-    const reseeded = buildTurnContext({
-      store,
-      controllerKey: "owner-7-controller",
-      inputText: "and now?",
-      includeDigest: true,
-      now: NOW,
-    });
-    const live = buildTurnContext({
-      store,
-      controllerKey: "owner-7-controller",
-      inputText: "and now?",
-      includeDigest: false,
-      now: NOW,
-    });
-
-    expect(reseeded).toContain("check the billing thread");
-    expect(reseeded).toContain("It is running the test suite.");
-    expect(live).toBeNull();
-  });
 
   it("keeps the owner's message clearly separated from injected context", () => {
     expect(composeTurnInput("What you already know", "deploy it")).toBe(
       "What you already know\n\n---\n\nOwner message:\ndeploy it",
     );
-  });
-});
-
-describe("conversation digest durability", () => {
-  it("records each answered turn so a retired thread does not lose the conversation", () => {
-    const { store } = fixture();
-    const turn = store.enqueueControllerTurn({
-      controllerKey: "owner-7-controller",
-      telegramUserId: "7",
-      telegramChatId: "70",
-      updateId: 900,
-      inputText: "what is running?",
-      now: NOW,
-    });
-    const lease = store.acquireExecutorLease("executor", NOW, 30_000);
-    if (!lease.acquired) throw new Error("missing lease");
-    const fence = { ownerId: "executor", generation: lease.generation, now: NOW };
-    expect(store.claimNextControllerTurn({ ...fence, now: fence.now + 3_000 })?.id).toBe(turn.id);
-    expect(store.markControllerSpawned({
-      ...fence,
-      turnId: turn.id,
-      projectId: "proj_personal",
-      hostId: "host_personal",
-      threadId: "thr_controller",
-    })).toBe(true);
-    expect(store.markControllerTurnSubmitted({ ...fence, turnId: turn.id })).toBe(true);
-
-    completeTurnThroughFinalization(store, fence, {
-      turnId: turn.id,
-      controllerKey: turn.controllerKey,
-      responseText: "Two threads are running.",
-    });
-
-    expect(store.readControllerDigest("owner-7-controller", 5)).toEqual([
-      { ownerText: "what is running?", agentText: "Two threads are running." },
-    ]);
   });
 });

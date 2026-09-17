@@ -25,13 +25,11 @@ Keep these proof classes separate in the final record:
 
 ## Adaptive recipe promotion status
 
-The automated fake-host suite exercises all six recipe graphs, active-mode failure and recovery, restart reconstruction, mandatory guard gating, stale approval rejection, and rollback snapshot behavior. That proof is deterministic; it is not a disposable Telegram, BB-provider, GitHub, deployment, or canary run.
+The automated fake-host suite exercises navigator admission, restart reconstruction, mandatory guard gating, and live worker recovery. That proof is deterministic; it is not a disposable Telegram, BB-provider, GitHub, deployment, or canary run.
 
-The production promotion reader and append-only evidence ledger are wired. It reads only the newest manifest and accepts it only when its integrity-bound artifact, job, receipt, model-trial, chronology, and safety references resolve to stored rows. The status command reports `incomplete` for missing, corrupt, duplicate, non-causal, or mismatched data, and typed envelopes alone cannot create evidence.
+Promotion readers and CLI promote/rollback commands are gone. `capability status --json` reports navigator-v1 admission. Recipe columns remain as unused history and do not control new work. After contraction, new admissions always use navigator-v1 even if the **Workflow engine graph** setting still says `recipe`. The leased executor runs the live navigator, implementation, and release workers.
 
-Recipe promotion still has no trusted live collector. Treat that gate as **not run/incomplete** and keep every recipe in `shadow` while following this runbook. Do not turn a passing local suite into a recipe receipt, insert evidence with ad hoc SQL, or enable a recipe to make this runbook easier to complete.
-
-Navigator-v1 evidence is different. `DualEngineCoordinator.persistEvaluationEvidence` appends the measured corpus, restart and safety counters, and the required disposable live scenarios. It rejects a job whose terminal state was only SQL-stamped. `capability status navigator-v1` and `capability promote navigator-v1` / `capability rollback navigator-v1` consume that ledger. After contraction, new admissions always use navigator-v1 even if the **Workflow engine graph** setting still says `recipe`. The leased executor runs the live navigator, implementation, and release workers.
+Do not insert promotion evidence with ad hoc SQL. There is no operator command that activates a recipe.
 
 ## Token configuration pause
 
@@ -214,29 +212,21 @@ A later trusted acceptance collector—not an operator CLI argument—must deriv
 
 The bundle write must be transactional. If any job, receipt, trial, artifact, recipe, chronology, or identity does not resolve, the write must leave no partial manifest. Recipe promotion still has no such collector, so stop here for recipes and mark this gate **incomplete**; do not substitute direct database inserts.
 
-Navigator-v1 collection is the dual-engine persist seam, not this recipe step. It still must not accept SQL-stamped terminal jobs. Inspect that engine separately:
+Navigator-v1 collection is not an operator promotion step. Inspect admission only:
 
 ```bash
-bb telegram-agent capability status navigator-v1 --json
+bb telegram-agent capability status --json
 ```
 
-Inspect the result before any rollout decision:
-
-```bash
-bb telegram-agent capability status <recipe> --json
-```
-
-Only a future `passed` and `ready: true` result may permit `capability promote <recipe>`. After promotion, create a new matching job and prove it is `active`; the acceptance job used as evidence must not be retroactively rewritten. Exercise `capability rollback <recipe>` and prove that the in-flight active job stays pinned while a later matching job returns to `shadow`. Record both append-only decisions. Do not promote the next recipe until every earlier recipe remains active.
-
-For navigator-v1, `capability promote navigator-v1` is allowed only after the dual-engine collector has written a reviewed manifest whose restart and safety records were measured. `capability rollback navigator-v1` records the operator decision without returning later admissions to recipe-v1 or rewriting in-flight navigator jobs.
+The result reports navigator-v1. There is no promote or rollback subcommand. Do not SQL-insert a promotion ledger or treat a local suite as a recipe receipt.
 
 ## Final acceptance decision
 
 Accept the base live run only when the evidence sheet contains the controller tuple and personal-workspace isolation, the no-job conversational check, all required ids, attachment names/digests, thread/environment relationships, fresh review conversations, all four concurrency/resource cases, exact post-reconcile claim adoption, executor fencing, liveness source/state, old/new full SHAs, Git-native stale-head rejection despite stale `gh` metadata, one merge result, separate deploy/canary receipts, `complete` production state, Telegram recovery, and restart recovery. Keep local-test, skill-bundle, Telegram, GitHub, deploy, canary, and promotion conclusions separate. The four role-specific capability rows must contain real thread ids, profiles, selected ids, bundle digest, exact model tuple, and mandatory terminal outcomes; deterministic bundle verification alone cannot satisfy them.
 
-A recipe promotion is a separate acceptance decision. It remains **incomplete** until step 13 has a resolved durable manifest and the status command reports `ready: true`. If the owner did not configure the token, production commands, disposable projects, or trusted collection harness needed for every case, report the affected live acceptance as **not run**, never successful. This release cannot create that recipe manifest because the trusted recipe collector is absent; do not approve a recipe for activation from local evidence.
+Recipe promotion is not part of this release. If the owner did not configure the token, production commands, or disposable projects needed for every case, report the affected live acceptance as **not run**, never successful. Do not approve a recipe for activation from local evidence.
 
-Navigator-v1 promotion is also separate. Report it **not run** unless `capability status navigator-v1` shows a resolved measured ledger and a new admission actually ran on the live navigator workers. Do not SQL-insert that ledger.
+Navigator-v1 admission is reported by `capability status --json`. Report it **not run** unless a new admission actually ran on the live navigator workers. Do not SQL-insert a promotion ledger.
 ## Trust-kernel evidence sheet
 
 Score each row separately. Mocked/deterministic, live provider, Telegram, and external-system evidence stay in different classes, and an unavailable installation, provider, bot chat, interaction shape, or host attestation makes a row **incomplete** — never passed.

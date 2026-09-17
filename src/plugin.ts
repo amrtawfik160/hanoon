@@ -30,7 +30,6 @@ import {
   parseGlobalConfig,
   selfDiagnosisEnabled,
   selfDiagnosisMode,
-  systemUpkeepEnabled,
   workspaceReclaimEnabled,
 } from "./config";
 import { parseCredentialBrokerConfig, type CredentialBrokerConfigResult } from "./credentials/config";
@@ -39,12 +38,6 @@ import { CredentialAccessService } from "./credentials/service";
 import { ProtectedConnectorAccessService } from "./credentials/protected-connector-service";
 import { evaluateCredentialStaticReadiness } from "./credentials/topology";
 import { PROTECTED_CONNECTOR_POLICY_DIGEST } from "./credentials/connector-policy";
-import {
-  RecipePromotionService,
-} from "./capabilities/promotion";
-import { DurableRecipePromotionEvidenceReader } from "./capabilities/promotion-evidence";
-import { NavigatorPromotionService } from "./navigator/promotion";
-import { DurableNavigatorPromotionEvidenceReader } from "./navigator/promotion-evidence";
 import { createNavigatorRuntime } from "./navigator/plugin-runtime";
 import { DEFAULT_CONTROLLER_CAPABILITY_MODEL } from "./capabilities/controller-bundles";
 import { BbRunner, environmentDiffText } from "./bb/runner";
@@ -134,14 +127,11 @@ import { AuditIntakeService } from "./services/audit-intake-service";
 import { CrashRevertService } from "./services/crash-revert-service";
 import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
-import { MemoryCurationService } from "./services/memory-curation-service";
 import { MemoryEmbeddingService } from "./services/memory-embedding-service";
 import {
-  installSystemAutomations,
   systemMaintenanceAuthority,
   systemMaintenanceCapabilityEvidence,
-  systemAutomationInstallationComplete,
-} from "./services/system-monitors";
+} from "./domain/system-maintenance";
 import {
   ManagedAutomationReconciler,
   ManagedAutomationService,
@@ -417,13 +407,6 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
         `Who the agent is and how it sounds, replacing the shipped character. It can change voice and manner; it can never move a safety boundary. Up to ${MAX_CONTROLLER_IDENTITY} characters; leave empty for the default.`,
       default: "",
     },
-    systemUpkeep: {
-      type: "select",
-      label: "Self-maintenance",
-      description: "Lets the agent run its own stale-work, memory, and scorecard monitors, daily read-only repository audits, and bounded deletion of old allowlisted temporary directories. It messages you when something needs a decision. Turning this off does not touch monitors you set yourself or suppress disk-pressure warnings.",
-      options: ["enabled", "disabled"],
-      default: "enabled",
-    },
     workspaceReclaim: {
       type: "boolean",
       label: "Reclaim finished worktrees and branches",
@@ -445,23 +428,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     selfDiagnosisMode: {
       type: "select",
       label: "What a diagnosis becomes",
-      description: "Draft PR pushes a branch for you to read. Pipeline files the fix as an ordinary reviewed job instead, and needs that project's policy to carry an audit intake allowance, whose daily cap and finding ledger it shares. Without one it falls back to a draft pull request.",
+      description: "Draft PR pushes a branch for you to read. Pipeline files the fix as an ordinary reviewed job instead, and needs that project's policy to carry an audit intake allowance, whose daily cap it shares. Without one it falls back to a draft pull request.",
       options: ["draft-pr", "pipeline"],
       default: "draft-pr",
-    },
-    capabilityJobGraph: {
-      type: "select",
-      label: "Capability job graph",
-      description: "Adaptive keeps unpromoted recipes in shadow. Legacy is an independent new-job kill switch.",
-      options: ["adaptive", "legacy"],
-      default: "adaptive",
-    },
-    workflowEngineGraph: {
-      type: "select",
-      label: "Workflow engine graph",
-      description: "Retired new-job kill switch. Contraction ignores this setting; new admissions always use navigator-v1.",
-      options: ["adaptive", "recipe"],
-      default: "adaptive",
     },
     controllerCapabilityMode: {
       type: "select",
@@ -534,9 +503,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     clock,
     () => config.ok ? controllerCapabilityModelRoute(config.value) : DEFAULT_CONTROLLER_CAPABILITY_MODEL,
     () => config.ok ? capabilityRoutingSettings(config.value) : {
-      jobGraph: "adaptive",
       controllerTools: "bundled",
-      workflowEngineGraph: "adaptive",
     },
   );
   const engineCoordinator = new DualEngineCoordinator({
@@ -550,18 +517,6 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
   if (retiredLivePollers > 0) {
     bb.log.warn(`Retired ${retiredLivePollers} controller schedule(s) that polled live work`);
   }
-  const promotionEvidence = new DurableRecipePromotionEvidenceReader(store);
-  const recipePromotions = new RecipePromotionService({
-    store,
-    readEvidence: (recipe) => promotionEvidence.read(recipe),
-    now: clock,
-  });
-  const enginePromotionEvidence = new DurableNavigatorPromotionEvidenceReader(store);
-  const enginePromotions = new NavigatorPromotionService({
-    store,
-    readEvidence: () => enginePromotionEvidence.read(),
-    now: clock,
-  });
   const navigatorRuntime = createNavigatorRuntime({
     store,
     database: bb.storage.database(),
@@ -841,7 +796,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       { name: "unpair", summary: "Revoke the Telegram owner and approvals", usage: "bb telegram-agent unpair [--confirm <nonce>] [--json]" },
       { name: "project", summary: "Manage enabled BB project policies", usage: "bb telegram-agent project <list|enable|disable> ... [--production-target-key <key>]" },
       { name: "job", summary: "Inspect, retry, or cancel jobs", usage: "bb telegram-agent job <list|show|retry|cancel> ..." },
-      { name: "capability", summary: "Inspect capability evidence and control recipe and navigator-v1 rollout", usage: "bb telegram-agent capability <status|inventory|receipts|promote|rollback> ..." },
+      { name: "capability", summary: "Inspect capability inventory and receipts", usage: "bb telegram-agent capability <status|inventory|receipts> ..." },
       { name: "access", summary: "Inspect and reconcile secret-free credential broker projections", usage: "bb telegram-agent access <list|status|reconcile> ... [--json]" },
       { name: "reference", summary: "Read the specifications filed for a project", usage: "bb telegram-agent reference <search|show|list> ... [--project <project-id>] [--json]" },
       { name: "doctor", summary: "Check Telegram, BB, host, provider, GitHub, and credential broker readiness", usage: "bb telegram-agent doctor [project-id] [--json]" },
@@ -853,13 +808,9 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       now: clock,
       getBotToken: () => config.ok ? config.value.botToken : undefined,
       createTelegramClient: (token) => telegramForToken(token),
-      capabilityPromotions: recipePromotions,
-      enginePromotions,
       capabilitySettings: () => config.ok ? capabilityRoutingSettings(config.value) : {
-        jobGraph: "adaptive",
         controllerTools: "bundled",
         modelRouting: "adaptive",
-        workflowEngineGraph: "adaptive",
       },
       credentialAccess: credentialAccessService,
       protectedConnectorAccess: protectedConnectorAccessService,
@@ -1469,10 +1420,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
       return healthUpdateId;
     },
-    // Deleting is upkeep the agent does unprompted, so it rides the one switch
-    // the owner already has for that rather than a knob of its own. Warnings
-    // are read-only and are never gated.
-    reclaimArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    // Temp-dir deletion was unprompted upkeep. Warnings stay; deletion does not.
+    reclaimArmed: () => false,
     warn: (message) => bb.log.warn(message),
   });
   const workspaceHousekeeping = new WorkspaceHousekeepingService({
@@ -1511,81 +1460,50 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       healthUpdateId = Math.max(healthUpdateId + 1, 2_000_000_000 + Math.max(0, now - 1_700_000_000_000));
       return healthUpdateId;
     },
-    // Read-only, so it rides the existing upkeep switch rather than adding one.
-    auditsArmed: () => config.ok && systemUpkeepEnabled(config.value),
+    auditsArmed: () => false,
     // Acting on a finding is the project's own choice, declared in its policy,
     // so this is wired unconditionally: the intake service starts nothing for a
     // project that did not ask for it.
     onResults: (project, results, now) => auditIntake.consider(project, results, now),
     warn: (message) => bb.log.warn(message),
   });
-  const memoryCuration = new MemoryCurationService({ store, clock: { now: clock } });
   const memoryEmbeddings = new MemoryEmbeddingService({
     store,
     clock: { now: clock },
     warn: (message) => bb.log.warn(message),
   });
-  let systemMonitorsInstalled = false;
-  let nextSystemAutomationAttemptAt = 0;
   const systemMonitors = {
     install: async (fence: EffectFence) => {
-      // Turning the setting off has to retire what is already armed, or the
-      // owner keeps getting the daily sweep they just switched off.
-      if (config.ok && !systemUpkeepEnabled(config.value)) {
-        if (store.cancelSystemMonitors(clock()) > 0) systemMonitorsInstalled = false;
-        const owner = store.getOwner();
-        const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
-        if (controller?.hostId) {
-          for (const binding of managedAutomations.list(controller.controllerKey, false)) {
-            const isSystemBinding = isCurrentManagedAutomationAuthority(binding.authority)
-              ? binding.authority.origin === "system-maintenance"
-              : binding.authority.source === "system";
-            if (!isSystemBinding) continue;
-            try {
-              const authority = systemMaintenanceAuthority({
-                systemKey: binding.sourceKey,
-                controllerKey: controller.controllerKey,
-                projectId: binding.projectId,
-                hostId: controller.hostId,
-              });
-              const reserved = store.runExecutorMutation(
-                { ownerId: fence.ownerId, generation: fence.generation },
-                () => managedAutomations.submitSystemMaintenanceRetirementOperation({
-                  id: binding.id,
-                  systemKey: binding.sourceKey,
-                  authority,
-                  now: clock(),
-                  mutate: (mutation) => mutation(),
-                }),
-              );
-              if (reserved.outcome === "stale") throw new Error("executor lease was lost before system retirement reservation");
-              systemMonitorsInstalled = false;
-            } catch {
-              bb.log.warn(`System automation ${binding.id} could not be retired`);
-            }
-          }
+      const owner = store.getOwner();
+      const controller = owner ? store.getControllerForOwner(owner.userId, owner.chatId) : null;
+      if (!controller?.hostId) return;
+      for (const binding of managedAutomations.list(controller.controllerKey, false)) {
+        const isSystemBinding = isCurrentManagedAutomationAuthority(binding.authority)
+          ? binding.authority.origin === "system-maintenance"
+          : binding.authority.source === "system";
+        if (!isSystemBinding) continue;
+        try {
+          const authority = systemMaintenanceAuthority({
+            systemKey: binding.sourceKey,
+            controllerKey: controller.controllerKey,
+            projectId: binding.projectId,
+            hostId: controller.hostId,
+          });
+          const reserved = store.runExecutorMutation(
+            { ownerId: fence.ownerId, generation: fence.generation },
+            () => managedAutomations.submitSystemMaintenanceRetirementOperation({
+              id: binding.id,
+              systemKey: binding.sourceKey,
+              authority,
+              now: clock(),
+              mutate: (mutation) => mutation(),
+            }),
+          );
+          if (reserved.outcome === "stale") throw new Error("executor lease was lost before system retirement reservation");
+        } catch {
+          bb.log.warn(`System automation ${binding.id} could not be retired`);
         }
-        return;
       }
-      if (systemMonitorsInstalled) return;
-      if (!config.ok) return;
-      // Installing goes through `bb automation` commands. A BB outage must not
-      // turn every executor pass into a burst of failed commands, so a partial
-      // install is retried about once a minute rather than on every pass.
-      const attemptAt = clock();
-      if (attemptAt < nextSystemAutomationAttemptAt) return;
-      nextSystemAutomationAttemptAt = attemptAt + 60_000;
-      const execution = controllerExecutionProfile(config.value);
-      const installed = await installSystemAutomations({
-        store,
-        service: managedAutomations,
-        providerId: controllerProviderFor(execution.model),
-        execution,
-        clock: { now: clock },
-        signal: fence.signal,
-        warn: (message) => bb.log.warn(message),
-      });
-      if (systemAutomationInstallationComplete(installed)) systemMonitorsInstalled = true;
     },
   };
   const threadNotices = new ThreadNoticeService({
@@ -2458,8 +2376,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       }),
       mode: () => config.ok ? selfDiagnosisMode(config.value) : "draft-pr",
       // Filed through the audit intake path on purpose, so the project's own
-      // daily allowance and finding ledger bound this too. A second source of
-      // unattended work keeping its own count would quietly double the first.
+      // daily allowance bounds this too. A second source of unattended work
+      // keeping its own count would quietly double the first.
       filePipelineJob: (input) => {
         const filed = auditIntake.file({
           projectId: input.target.projectId,
@@ -2553,7 +2471,6 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       monitors,
       threadNotices,
       jobMemory,
-      memoryCuration,
       productionHealth,
       regressionWatch,
       failureLoop,

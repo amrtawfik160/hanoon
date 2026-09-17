@@ -6,7 +6,7 @@ import {
   semanticRanks,
 } from "../src/storage/memory-ranking";
 
-const BASE = { importance: 0.5, confidence: 0.5, ageMs: 0 };
+const BASE = { importance: 0.5, confidence: 0.5 };
 
 it("ranks a corpus with no vectors exactly as it did before they existed", () => {
   // The property that makes this safe to ship before a provider is wired:
@@ -43,15 +43,15 @@ it("still puts a memory matching both above one matching only by meaning", () =>
 });
 
 it("cannot be dominated by one freakishly close vector", () => {
-  // A perfect semantic hit that is old, unimportant and doubted must not
-  // outrank a good hit that is recent, important and trusted.
-  const perfectButStale = memoryScore({
-    lexicalRank: null, semanticRank: 0, importance: 0, confidence: 0, ageMs: 400 * 86_400_000,
+  // A perfect semantic hit that is unimportant and doubted must not
+  // outrank a good hit that is important and trusted.
+  const perfectButWeak = memoryScore({
+    lexicalRank: null, semanticRank: 0, importance: 0, confidence: 0,
   });
   const goodAndTrusted = memoryScore({
-    lexicalRank: 1, semanticRank: 2, importance: 1, confidence: 1, ageMs: 0,
+    lexicalRank: 1, semanticRank: 2, importance: 1, confidence: 1,
   });
-  expect(goodAndTrusted).toBeGreaterThan(perfectButStale);
+  expect(goodAndTrusted).toBeGreaterThan(perfectButWeak);
 });
 
 it("refuses to compare vectors that cannot be compared", () => {

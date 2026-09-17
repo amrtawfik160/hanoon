@@ -19,7 +19,7 @@ import {
 } from "./ticket-adapter";
 import { NavigatorEffectProtocol } from "./effect-protocol";
 import type { NavigatorEvaluationCase } from "./evaluation-corpus";
-import type { DualEngineRestartPoint } from "./promotion";
+import type { DualEngineRestartPoint } from "./models";
 
 const EXTERNAL_DIGEST = "e".repeat(64);
 const BASE_HEAD = "1".repeat(40);

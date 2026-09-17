@@ -2,7 +2,6 @@ import type { MemoryKind, MemoryRecord, TelegramAgentStore } from "../storage/st
 import { OWNER_MEMORY_SCOPE } from "../storage/store";
 
 const MAX_RECALLED = 6;
-const MAX_DIGEST_TURNS = 6;
 const MAX_CONTEXT_CHARS = 2_000;
 
 // Explicit standing instructions only. A looser rule fills the store with
@@ -41,12 +40,6 @@ function renderMemories(memories: readonly MemoryRecord[]): string | null {
   return `What you already know about this owner:\n${lines.join("\n")}`;
 }
 
-function renderDigest(turns: readonly { ownerText: string; agentText: string }[]): string | null {
-  if (turns.length === 0) return null;
-  const lines = turns.map((turn) => `Owner: ${turn.ownerText}\nYou: ${turn.agentText}`);
-  return `Earlier in this conversation:\n${lines.join("\n\n")}`;
-}
-
 function bounded(sections: readonly (string | null)[], maxChars = MAX_CONTEXT_CHARS): string | null {
   const joined = sections.filter((section): section is string => section !== null).join("\n\n");
   if (joined.length === 0) return null;
@@ -77,7 +70,7 @@ function renderPrivateRecoveryDraft(draft: string): string | null {
  * said, so a retired thread does not read to the owner as amnesia.
  */
 export function buildTurnContext(input: {
-  store: Pick<TelegramAgentStore, "recallMemories" | "readControllerDigest" | "listToolReceipts" | "listControllerEvidence">;
+  store: Pick<TelegramAgentStore, "recallMemories" | "listControllerEvidence">;
   controllerKey: string;
   inputText: string;
   scope?: string;
@@ -91,41 +84,21 @@ export function buildTurnContext(input: {
     query: input.inputText,
     limit: MAX_RECALLED,
     now: input.now,
-    // Linking the recall to its turn is what later lets the owner's reaction
-    // reinforce or demote exactly the memories that shaped this answer.
     turnId: input.turnId,
   });
-  const digest = input.includeDigest
-    ? input.store.readControllerDigest(input.controllerKey, MAX_DIGEST_TURNS)
-    : [];
-  const receipts = input.includeDigest && input.turnId
-    ? input.store.listToolReceipts(input.turnId)
-    : [];
   const evidenceTurnIds = input.recovery && input.turnId
     ? [input.turnId, input.recovery.sourceTurnId].filter((turnId): turnId is string => turnId !== null)
     : [];
   const evidence = evidenceTurnIds.flatMap((turnId) => input.store.listControllerEvidence(turnId, 50));
   const recoveryInstruction = input.recovery
-    ? "Recovery for the same owner message: reconcile the durable evidence and receipts below. Do not repeat a completed or outcome-unknown side effect. Finish through the protocol finalization tool."
+    ? "Recovery for the same owner message: reconcile the durable evidence below. Do not repeat a completed or outcome-unknown side effect. Finish through the protocol finalization tool."
     : null;
   return bounded([
     recoveryInstruction,
-    renderReceipts(receipts),
     renderRecoveryEvidence(evidence),
     input.recovery ? renderPrivateRecoveryDraft(input.recovery.privateDraft) : null,
-    renderDigest(digest),
     renderMemories(memories),
   ], input.recovery ? 8_000 : MAX_CONTEXT_CHARS);
-}
-
-// A replacement thread must know what its predecessor already did, or it will
-// happily cancel the same job or open the same thread a second time.
-function renderReceipts(receipts: readonly { toolName: string; state: string }[]): string | null {
-  const done = receipts.filter((receipt) => receipt.state !== "failed");
-  if (done.length === 0) return null;
-  const lines = done.map((receipt) =>
-    `- ${receipt.toolName}: ${receipt.state === "completed" ? "already done" : "started, outcome unknown — check before repeating"}`);
-  return `Actions already taken for this message:\n${lines.join("\n")}`;
 }
 
 export function composeTurnInput(context: string | null, inputText: string): string {

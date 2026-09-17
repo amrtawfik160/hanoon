@@ -88,20 +88,18 @@ Agent identity replaces only who the controller is and how it sounds. Fixed cond
 
 ### Capability routing controls
 
-Four independent plugin settings control only newly created routing snapshots:
+Two independent plugin settings control only newly created routing snapshots:
 
 | Setting | Options | Default | Effect |
 | --- | --- | --- | --- |
-| Capability job graph | `adaptive`, `legacy` | `adaptive` | `adaptive` classifies new jobs into versioned recipes and uses each recipe's rollout decision; `legacy` pins new jobs to the established full/small-fix graph. |
-| Workflow engine graph | `adaptive`, `recipe` | `adaptive` | Retired new-job kill switch. Contraction ignores this setting; new admissions always use navigator-v1. |
 | Controller capabilities | `bundled`, `all-tools` | `bundled` | `bundled` selects the minimum controller bundle for each new turn; `all-tools` restores all admitted controller bundles for new turns. The job-control bundle also matches merge, land, resume, bug-fix, feature-build, and ship/deploy/release wording so those turns receive start, steer, retry, and land tools. |
 | Capability model routing | `adaptive`, `strong-only` | `adaptive` | `adaptive` selects the declared pool; `strong-only` applies a strong-pool floor to new controller turns and worker attempts. |
 
-These are kill switches, not data migrations. They do not rewrite an in-flight job, an existing controller or worker profile, a provider trial, or a capability receipt. Recipe promotion, navigator-v1 promotion, and rollback remain append-only records: a promoted job keeps its engine and routing after rollback. After contraction, the next matching job stays on navigator-v1 (or the established full/small-fix graph when the job-graph switch says `legacy`).
+These are kill switches, not data migrations. They do not rewrite an in-flight job, an existing controller or worker profile, a provider trial, or a capability receipt. New admissions always use navigator-v1 in deterministic mode.
 
 Model route identity is the exact provider, model, reasoning, and service-tier tuple. Permission remains owned by controller or project policy and is never inferred from the model pool. `strong-only` raises the model floor without granting broader filesystem, command, merge, or production authority.
 
-No setting promotes a recipe or navigator-v1. Promotion is an append-only operator decision. Recipe promotion still has no trusted collector or operator ingest path; `capability promote <recipe>` fails closed on a fresh install. Navigator-v1 evidence is appended only by `DualEngineCoordinator.persistEvaluationEvidence`, which measures the corpus, restart points, and safety counters and requires executed disposable live scenarios rather than SQL-stamped terminal jobs. Inspect with `bb telegram-agent capability status [recipe|navigator-v1] --json`. Promote or roll back with `bb telegram-agent capability promote <recipe|navigator-v1>` and `capability rollback <recipe|navigator-v1>`. Follow [Capability routing and rollout](operations.md#capability-routing-and-rollout). A fresh installation starts every adaptive recipe in `shadow` and admits new jobs on navigator-v1. Plugin start refuses while any nonterminal recipe-v1 job still needs a legacy skill or state handler.
+Inspect inventory and receipts with `bb telegram-agent capability status --json`, `capability inventory`, and `capability receipts`. Plugin start refuses while any nonterminal recipe-v1 job still needs a legacy skill or state handler.
 
 ### Background work
 
@@ -110,9 +108,8 @@ Two settings govern what the agent does when you have not asked it anything:
 | Setting | Options | Default | Purpose |
 | --- | --- | --- | --- |
 | Background learning model | `inherit` or any controller model | `inherit` | Model used to learn lessons from finished jobs. `inherit` leaves it to the project default, which is the only safe answer when the installation's providers are unknown; naming a cheaper model keeps background work off your conversational tier. |
-| Self-maintenance | `enabled`, `disabled` | `enabled` | Enables the agent's daily stale-work monitor, daily read-only repository audits, bounded deletion of old allowlisted plugin temporary directories, weekly memory audit, and weekly scorecard. |
 
-Self-maintenance schedules run as BB agent automations owned by the plugin, using the controller's provider, model, and permission mode. Turning self-maintenance off retires those automations, disables its repository audits, and prevents temporary-directory deletion. It does not touch schedules or monitors you set yourself, stop disk-pressure checks and warnings, or stop the agent learning from finished jobs. Repository audits inspect documentation staleness, debt markers, bug backlogs, and unresolved pull-request review findings through read-only Git and provider commands. Temporary cleanup is limited to old top-level entries whose names match the plugin's allowlist, and each daily pass has a deletion cap.
+The plugin does not install daily or weekly self-maintenance schedules. Owner-set monitors, thread-follow, and disk-pressure warnings stay. Temporary-directory deletion stays off unless Reclaim finished worktrees is on. Unprompted repository audits stay off.
 
 Two further settings govern what the agent does about its own failures. Both default to the most cautious value, and the second does nothing unless the first is on:
 
@@ -121,7 +118,7 @@ Two further settings govern what the agent does about its own failures. Both def
 | Self-healing | on, off | off | Inspects persisted controller and pipeline job failures out of band, fixes the cause with a change the worker verified, proposes at most one cooled-down fix at a time, and messages the owner the link without asking. |
 | What a diagnosis becomes | `draft-pr`, `pipeline` | `draft-pr` | `draft-pr` pushes a branch for you to read. `pipeline` files the same fix as an ordinary reviewed job instead. |
 
-`pipeline` needs the self-diagnosis project's policy to carry an [`autonomy.intake`](#work-the-daily-audit-starts) allowance, and it shares that allowance and its finding ledger rather than adding to them: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
+`pipeline` needs the self-diagnosis project's policy to carry an [`autonomy.intake`](#work-the-daily-audit-starts) allowance, and it shares that allowance rather than adding to it: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
 
 The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
 
@@ -667,11 +664,11 @@ controller and job failures, and what a proposed fix turns into. A diagnosis
 must report what verification ran and what it showed, or it is refused before
 any pull request exists, and the owner receives the link to whatever was
 opened or filed the moment it exists. `pipeline` files the fix
-through this project's `autonomy.intake` allowance and the same finding ledger
-rather than keeping its own count, because a project that said two jobs a day
-meant two. Without an allowance — or when the failure brake is on, work is
-already running, or that failure has already had its job — it falls back to a
-draft pull request and logs why.
+through this project's `autonomy.intake` allowance rather than keeping its own
+count, because a project that said two jobs a day meant two. Without an
+allowance — or when the failure brake is on, work is already running, or that
+failure has already had its job — it falls back to a draft pull request and
+logs why.
 
 ## Per-stage model routing
 

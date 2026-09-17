@@ -256,12 +256,6 @@ function ownedFixture(
       now,
     };
   }
-  store.appendWorkflowEngineRolloutDecision({
-    action: "promote",
-    reasonCode: "promotion_gates_passed",
-    evidenceDigest: "a".repeat(64),
-    now: 10_000,
-  });
   store.enqueueControllerTurn({
     controllerKey: "owner-7-controller",
     telegramUserId: "7",
@@ -756,54 +750,6 @@ function admitCompetingMerge(fixture: OwnedFixture): string {
 }
 
 describe("navigator exact-head release", () => {
-  it("preserves the shipped navigator order and appends schema repairs after it", () => {
-    // The review-convergence upgrade is the newest tail, with the finding
-    // ledger, the automation lifecycle, the effect protocol, the burst
-    // migration and then the managed-automation state upgrade ahead of it.
-    // Each contributes several statements, so every block is located by offset
-    // rather than a fixed index.
-    [...JOB_LEDGER_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
-    });
-    const ledgerOffset = JOB_LEDGER_MIGRATIONS.length;
-    [...PROTECTED_CONNECTOR_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(ledgerOffset + index + 1))).toBe(migration);
-    });
-    const connectorOffset = ledgerOffset + PROTECTED_CONNECTOR_MIGRATIONS.length;
-    [...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(connectorOffset + index + 1))).toBe(migration);
-    });
-    const convergenceOffset = connectorOffset + NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length;
-    [...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(convergenceOffset + index + 1))).toBe(migration);
-    });
-    const findingLedgerOffset = convergenceOffset + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length;
-    [...MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(findingLedgerOffset + index + 1))).toBe(migration);
-    });
-    const lifecycleOffset = findingLedgerOffset + MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length;
-    [...NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(lifecycleOffset + index + 1))).toBe(migration);
-    });
-    const protocolOffset = lifecycleOffset + NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
-    [...CONTROLLER_BURST_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(protocolOffset + index + 1))).toBe(migration);
-    });
-    const burstOffset = protocolOffset + CONTROLLER_BURST_MIGRATIONS.length;
-    [...MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
-      expect(ALL_MIGRATIONS.at(-(burstOffset + index + 1))).toBe(migration);
-    });
-    const stateUpgradeOffset = burstOffset + MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length;
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 1))).toBe(NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 2))).toBe(MANAGED_AUTOMATION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 3))).toBe(NAVIGATOR_REVIEW_LEDGER_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 4))).toBe(NAVIGATOR_PROMOTION_MIGRATIONS.at(-1));
-    expect(ALL_MIGRATIONS.at(-(stateUpgradeOffset + 5))).toBe(NAVIGATOR_RELEASE_MIGRATIONS.at(-1 +
-      PROTECTED_CONNECTOR_MIGRATIONS.length));
-    expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE navigator_release_attempts");
-    expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("CREATE TABLE production_recovery_observations");
-    expect(NAVIGATOR_RELEASE_MIGRATIONS[0]).toContain("production_recovery_required");
-  });
 
   it("rejects start_release without resolved tickets or a permitted outcome", () => {
     const fixture = ownedFixture();
@@ -1636,7 +1582,7 @@ describe("navigator exact-head release", () => {
     ]);
   });
 
-  it("records final exact-head review findings in the normalized release convergence ledger", () => {
+  it("returns final exact-head review findings to navigation without a finding ledger", () => {
     const fixture = ownedFixture();
     propose(fixture, {
       kind: "start_release",
@@ -1774,16 +1720,9 @@ describe("navigator exact-head release", () => {
       now: fixture.now(),
     })).toMatchObject({ state: "implementing" });
     expect(fixture.database.prepare(
-      `SELECT capability_id, rule_id, disposition, event, head_sha, blocking_burden
-         FROM navigator_release_review_finding_events WHERE job_id = ?`,
-    ).all(fixture.job.id)).toEqual([{
-      capability_id: "docs-guard",
-      rule_id: "docs.required",
-      disposition: "must_fix",
-      event: "opened",
-      head_sha: HEAD,
-      blocking_burden: 1,
-    }]);
+      `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name = 'navigator_release_review_finding_events'`,
+    ).get()).toBeUndefined();
   });
 
   it("recovers one successful rollback to navigation and exhausts a repeated signature", async () => {

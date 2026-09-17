@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, expect, it, vi } from "vitest";
@@ -6,8 +7,7 @@ import { hashSecret } from "../src/crypto";
 import { openStore } from "../src/storage/store";
 import type { ProjectPolicy } from "../src/domain/models";
 import { activeWorkerFixture, admitConfirmedJob, policyFixture, productionPolicyFixture } from "./helpers";
-import { insertResolvedPromotionLedgerFixture } from "./promotion-evidence-fixture";
-import { insertResolvedNavigatorPromotionLedger } from "./support/navigator-promotion-ledger";
+
 
 let pluginNumber = 0;
 
@@ -139,7 +139,7 @@ it.each([["--help"], ["help"]])("prints actionable command help for %s", async (
   expect(result.stdout).toContain("project list");
   expect(result.stdout).toContain("doctor [project-id]");
   expect(result.stdout).toContain("capability status");
-  expect(result.stdout).toContain("capability promote <recipe|navigator-v1>");
+  expect(result.stdout).not.toContain("capability promote");
 });
 
 // The controller tool has always resumed a blocked review; the CLI threw
@@ -243,126 +243,38 @@ it("refuses a spend report for a job it does not have", async () => {
   expect(`${result.stdout}${result.stderr}`).toContain("Job was not found");
 });
 
-it("reports bounded capability rollout status without inventing live promotion evidence", async () => {
-  const { harness, store } = await loadPlugin();
+it("reports navigator-v1 admission without promotion", async () => {
+  const { harness } = await loadPlugin();
 
-  const result = await harness.behavior.runCli(["capability", "status", "direct", "--json"]);
+  const result = await harness.behavior.runCli(["capability", "status", "--json"]);
 
   expect(result.exitCode).toBe(0);
   expect(parseJson(result.stdout)).toMatchObject({
     settings: {
-      jobGraph: "adaptive",
       controllerTools: "bundled",
       modelRouting: "adaptive",
     },
-    recipes: [{
-      recipe: "direct",
-      routingMode: "shadow",
-      promotion: { status: "incomplete", ready: false },
-    }],
+    engine: { engine: "navigator-v1", mode: "deterministic" },
   });
-  expect(store.listRecipeRolloutDecisions("direct", 10)).toEqual([]);
   expect(result.stdout).not.toMatch(/requestText|prompt|filesystem|\/root\//u);
 });
 
-it("refuses capability promotion without durable live evidence and supports append-only rollback", async () => {
-  const { harness, store } = await loadPlugin();
+it("does not expose capability promote or rollback", async () => {
+  const { harness } = await loadPlugin();
 
-  const refused = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
-  expect(refused.exitCode).toBe(1);
-  expect(parseJson(refused.stdout)).toMatchObject({
-    recipe: "direct",
-    status: "incomplete",
-    ready: false,
-  });
-  expect(store.listRecipeRolloutDecisions("direct", 10)).toEqual([]);
+  const promote = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
+  const rollback = await harness.behavior.runCli(["capability", "rollback", "navigator-v1", "--json"]);
 
-  store.appendRecipeRolloutDecision({
-    recipe: "direct",
-    action: "promote",
-    reasonCode: "promotion_gates_passed",
-    evidenceDigest: "a".repeat(64),
-    now: 2_000,
-  });
-  const rolledBack = await harness.behavior.runCli(["capability", "rollback", "direct", "--json"]);
-  expect(rolledBack.exitCode).toBe(0);
-  expect(parseJson(rolledBack.stdout)).toMatchObject({ recipe: "direct", action: "rollback" });
-  expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("rollback");
+  expect(promote.exitCode).not.toBe(0);
+  expect(rollback.exitCode).not.toBe(0);
+  expect(`${promote.stdout}${promote.stderr}`).toMatch(/unknown capability subcommand/i);
+  expect(`${rollback.stdout}${rollback.stderr}`).toMatch(/unknown capability subcommand/i);
 });
 
-it("promotes through the production CLI only after the durable reader resolves authoritative records", async () => {
-  const { bb, harness, store } = await loadPlugin();
-  insertResolvedPromotionLedgerFixture({
-    db: bb.storage.database(),
-    store,
-    prefix: "cli-production-reader",
-  });
-
-  const promoted = await harness.behavior.runCli(["capability", "promote", "direct", "--json"]);
-
-  expect(promoted.exitCode).toBe(0);
-  expect(parseJson(promoted.stdout)).toMatchObject({
-    recipe: "direct",
-    action: "promote",
-    reasonCode: "promotion_gates_passed",
-    evidenceDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
-  });
-  expect(store.getLatestRecipeRolloutDecision("direct")?.action).toBe("promote");
-});
-
-it("reports navigator-v1 engine status and refuses promotion without a reviewed evidence manifest", async () => {
-  const { harness, store } = await loadPlugin();
-
-  const status = await harness.behavior.runCli(["capability", "status", "navigator-v1", "--json"]);
-  expect(status.exitCode).toBe(0);
-  expect(parseJson(status.stdout)).toMatchObject({
-    settings: {
-      workflowEngineGraph: "adaptive",
-    },
-    engine: {
-      engine: "navigator-v1",
-      mode: "deterministic",
-      promotion: { status: "incomplete", ready: false },
-      decision: null,
-    },
-  });
-  expect(store.listWorkflowEngineRolloutDecisions(10)).toEqual([]);
-
-  const refused = await harness.behavior.runCli(["capability", "promote", "navigator-v1", "--json"]);
-  expect(refused.exitCode).toBe(1);
-  expect(parseJson(refused.stdout)).toMatchObject({
-    engine: "navigator-v1",
-    status: "incomplete",
-    ready: false,
-  });
-  expect(store.getLatestWorkflowEngineRolloutDecision()).toBeNull();
-});
-
-it("promotes navigator-v1 through the CLI only after the durable engine reader resolves a reviewed ledger", async () => {
-  const { bb, harness, store } = await loadPlugin();
-  insertResolvedNavigatorPromotionLedger({
-    db: bb.storage.database(),
-    store,
-    prefix: "cli-navigator-reader",
-  });
-
-  const promoted = await harness.behavior.runCli(["capability", "promote", "navigator-v1", "--json"]);
-  expect(promoted.exitCode).toBe(0);
-  expect(parseJson(promoted.stdout)).toMatchObject({
-    engine: "navigator-v1",
-    action: "promote",
-    reasonCode: "promotion_gates_passed",
-    evidenceDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
-  });
-  expect(store.getLatestWorkflowEngineRolloutDecision()?.action).toBe("promote");
-
-  const rolledBack = await harness.behavior.runCli(["capability", "rollback", "navigator-v1", "--json"]);
-  expect(rolledBack.exitCode).toBe(0);
-  expect(parseJson(rolledBack.stdout)).toMatchObject({
-    engine: "navigator-v1",
-    action: "rollback",
-  });
-  expect(store.getLatestWorkflowEngineRolloutDecision()?.action).toBe("rollback");
+it("does not advertise capability promote or rollback in operator docs", () => {
+  for (const path of ["docs/live-acceptance.md", "README.md", "docs/architecture.md"]) {
+    expect(readFileSync(path, "utf8"), path).not.toMatch(/capability promote|capability rollback/u);
+  }
 });
 
 it("projects bounded inventory and receipt details without sources, subjects, or evidence payloads", async () => {
@@ -1057,7 +969,7 @@ it("projects bounded admission and resource facts without lease ownership detail
   expect(projection).toMatchObject({
     id: draft.id,
     projectId: "proj_1",
-    recipe: { id: "architectural", version: 1, promotionCount: 0, routingMode: "legacy" },
+    workflow: { engine: "recipe-v1", mode: "live" },
     admission: {
       state: "admitted",
       queueSequence: expect.any(Number),

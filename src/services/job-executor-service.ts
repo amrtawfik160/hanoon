@@ -84,9 +84,6 @@ export type JobExecutorDependencies = {
   jobMemory?: {
     processDue(): Promise<boolean>;
   };
-  memoryCuration?: {
-    processDue(): boolean;
-  };
   productionHealth?: {
     processDue(): Promise<boolean>;
   };
@@ -947,9 +944,6 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
         }
         if (deps.jobMemory) {
           didWork = await deps.jobMemory.processDue() || didWork;
-        }
-        if (deps.memoryCuration) {
-          didWork = deps.memoryCuration.processDue() || didWork;
         }
         if (deps.productionHealth) {
           didWork = await deps.productionHealth.processDue() || didWork;

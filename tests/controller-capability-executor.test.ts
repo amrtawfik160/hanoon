@@ -79,93 +79,7 @@ it("does not invoke a domain call when the adopted executor fence is stale", asy
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
 });
 
-it("reserves a mutating invocation before async scope resolution can finalize the turn", async () => {
-  const fixture = executorFixture();
-  let releaseResolution!: () => void;
-  const resolutionReleased = new Promise<void>((resolve) => {
-    releaseResolution = resolve;
-  });
-  let scopeResolved!: () => void;
-  const resolutionStarted = new Promise<void>((resolve) => {
-    scopeResolved = resolve;
-  });
-  const run = vi.fn(() => ({ remembered: { id: "memory_1" } }));
 
-  const execution = executeControllerCapability(fixture.dependencies, {
-    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
-    params: { subject: "style", body: "Use short answers.", kind: "fact" },
-    context: fixture.context,
-    resolveScope: async () => {
-      scopeResolved();
-      await resolutionReleased;
-      return { scope: globalScope };
-    },
-    run,
-    projectEvidence: () => ({
-      outcome: "succeeded" as const,
-      proofKinds: ["memory_state"] as const,
-      subjectRefs: [] as const,
-    }),
-  });
-
-  await resolutionStarted;
-  expect(fixture.db.prepare(
-    "SELECT state FROM tool_receipts WHERE turn_id = ?",
-  ).get(fixture.turn.id)).toEqual({ state: "started" });
-  expect(fixture.store.proposeControllerFinalization({
-    ...fixture.fence,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-    candidate: {
-      disposition: "answered",
-      segments: [{ type: "text", text: "Here is the requested answer." }],
-      obligationRefs: [],
-    },
-  })).toMatchObject({ outcome: "rejected", code: "invocation_in_flight" });
-  expect(run).not.toHaveBeenCalled();
-
-  releaseResolution();
-  await expect(execution).resolves.toContain("evidence:1");
-  expect(run).toHaveBeenCalledOnce();
-  expect(fixture.store.proposeControllerFinalization({
-    ...fixture.fence,
-    turnId: fixture.turn.id,
-    controllerKey: fixture.turn.controllerKey,
-    candidate: {
-      disposition: "answered",
-      segments: [{ type: "text", text: "Here is the requested answer." }],
-      obligationRefs: [],
-    },
-  })).toMatchObject({ outcome: "accepted" });
-});
-
-it("rolls back receipt settlement when evidence persistence fails", async () => {
-  const fixture = executorFixture();
-  fixture.db.function("fail_controller_evidence_insert", () => {
-    throw new Error("evidence insert failed");
-  });
-  fixture.db.exec(`
-    CREATE TRIGGER fail_controller_evidence_insert
-    BEFORE INSERT ON controller_evidence
-    BEGIN
-      SELECT fail_controller_evidence_insert();
-    END
-  `);
-
-  await expect(executeControllerCapability(fixture.dependencies, {
-    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
-    params: { subject: "style", body: "Use short answers.", kind: "fact" },
-    context: fixture.context,
-    scope: globalScope,
-    run: () => ({ remembered: { id: "memory_1" } }),
-    projectEvidence: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [] }),
-  })).rejects.toThrow();
-
-  expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
-    { toolName: "telegram_agent_remember", state: "started", result: null },
-  ]);
-  expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
-});
 
 it("denies every normal capability after durable acceptance before receipts or evidence", () => {
   const fixture = executorFixture();
@@ -194,9 +108,6 @@ it("denies every normal capability after durable acceptance before receipts or e
       credentialAudienceMatches: true,
     }), descriptor.capability_id).toThrow(/turn_finalized/);
   }
-  expect(fixture.db.prepare(
-    "SELECT COUNT(*) AS count FROM tool_receipts WHERE turn_id = ?",
-  ).get(fixture.turn.id)).toEqual({ count: 0 });
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 128)).toEqual([]);
 });
 
@@ -530,139 +441,9 @@ it("uses a coded safe execution error for permanent normalization failures", asy
   expect(String(error)).not.toContain("raw-result-secret");
 });
 
-it("replays only the canonical domain object and records a fresh observation", async () => {
-  const fixture = executorFixture();
-  const run = vi.fn(() => ({ remembered: { id: "mem-1", subject: "style", scope: "owner" } }));
-  const input = {
-    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
-    params: { subject: "style", body: "Use short answers.", kind: "fact" },
-    context: fixture.context,
-    scope: globalScope,
-    run,
-    projectEvidence: () => ({
-      outcome: "succeeded" as const,
-      proofKinds: ["memory_state"] as const,
-      subjectRefs: ["memory:mem-1"],
-    }),
-  };
 
-  const first = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
-  const replay = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
 
-  expect(run).toHaveBeenCalledOnce();
-  expect(first.remembered).toEqual(replay.remembered);
-  expect(first._hanoonEvidence).toMatchObject({ ref: "evidence:1", outcome: "succeeded" });
-  expect(replay._hanoonEvidence).toMatchObject({ ref: "evidence:2", outcome: "observed" });
-  expect(fixture.store.listToolReceipts(fixture.turn.id)).toEqual([
-    expect.objectContaining({
-      state: "completed",
-      result: '{"remembered":{"id":"mem-1","scope":"owner","subject":"style"}}',
-    }),
-  ]);
-  expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toHaveLength(2);
-});
 
-it("records interrupted receipt uncertainty without invoking the domain call", async () => {
-  const fixture = executorFixture();
-  const params = { subject: "style", body: "Use short answers.", kind: "fact" };
-  const key = {
-    turnId: fixture.turn.id,
-    toolName: "telegram_agent_remember",
-    argsSha256: sha256ControllerJson(params),
-  };
-  expect(fixture.store.claimToolReceipt({
-    ...key,
-    controllerKey: fixture.turn.controllerKey,
-    now: 1_999,
-  })).toEqual({ outcome: "fresh" });
-  const run = vi.fn(() => ({ unreachable: true }));
-
-  const input = {
-    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
-    params,
-    context: fixture.context,
-    scope: globalScope,
-    run,
-    projectEvidence: () => ({
-      outcome: "succeeded" as const,
-      proofKinds: ["memory_state"] as const,
-      subjectRefs: [] as const,
-    }),
-  } as const;
-  const output = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
-  const repeated = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
-
-  expect(run).not.toHaveBeenCalled();
-  expect(output).toMatchObject({
-    outcome: "uncertain",
-    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
-  });
-  expect(repeated).toMatchObject({
-    outcome: "uncertain",
-    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
-  });
-  expect(fixture.store.listToolReceipts(fixture.turn.id)).toMatchObject([
-    { toolName: "telegram_agent_remember", state: "failed", result: null },
-  ]);
-});
-
-it("does not repeat a mutation whose domain operation threw after reservation", async () => {
-  const fixture = executorFixture();
-  const params = { subject: "style", body: "Use short answers.", kind: "fact" };
-  const run = vi.fn(() => {
-    throw new Error("write result became ambiguous");
-  });
-  const input = {
-    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
-    params,
-    context: fixture.context,
-    scope: globalScope,
-    run,
-    projectEvidence: () => ({
-      outcome: "succeeded" as const,
-      proofKinds: ["memory_state"] as const,
-      subjectRefs: [] as const,
-    }),
-  } as const;
-
-  await expect(executeControllerCapability(fixture.dependencies, input)).rejects.toThrow("ambiguous");
-  const replay = JSON.parse(await executeControllerCapability(fixture.dependencies, input));
-
-  expect(run).toHaveBeenCalledOnce();
-  expect(replay).toMatchObject({
-    outcome: "uncertain",
-    _hanoonEvidence: { outcome: "interrupted", proofKinds: [] },
-  });
-});
-
-it("rejects corrupt receipt JSON and receipt completion overflow", async () => {
-  const fixture = executorFixture();
-  const params = { subject: "style", body: "Use short answers.", kind: "fact" };
-  const key = {
-    turnId: fixture.turn.id,
-    toolName: "telegram_agent_remember",
-    argsSha256: sha256ControllerJson(params),
-  };
-  fixture.store.claimToolReceipt({ ...key, controllerKey: fixture.turn.controllerKey, now: 1_998 });
-  fixture.store.completeToolReceipt({ ...key, result: "not-json", now: 1_999 });
-
-  await expect(executeControllerCapability(fixture.dependencies, {
-    descriptor: CONTROLLER_CAPABILITIES.telegram_agent_remember,
-    params,
-    context: fixture.context,
-    scope: globalScope,
-    run: vi.fn(() => ({ unreachable: true })),
-    projectEvidence: () => ({ outcome: "succeeded", proofKinds: ["memory_state"], subjectRefs: [] }),
-  })).rejects.toThrow(/receipt|json|result/i);
-
-  expect(() => fixture.store.completeToolReceipt({
-    turnId: fixture.turn.id,
-    toolName: "telegram_agent_set_working_style",
-    argsSha256: "a".repeat(64),
-    result: `{"text":"${"é".repeat(4_000)}"}`,
-    now: 2_000,
-  })).toThrow(/receipt|started|byte|bound/i);
-});
 
 it("routes a registered tool through durable evidence before returning", async () => {
   const fixture = registeredControllerFixture();
@@ -771,72 +552,6 @@ it("denies a disabled exact project before creating a job or evidence", async ()
   expect(fixture.store.listControllerEvidence(fixture.turn.id, 10)).toEqual([]);
 });
 
-it("isolates owner monitors from system and foreign cancellation", async () => {
-  const fixture = registeredControllerFixture();
-  const ownerMonitor = fixture.store.createMonitor({
-    controllerKey: fixture.turn.controllerKey,
-    kind: "schedule",
-    cron: "0 9 * * 1-5",
-    instruction: "Review the queue.",
-    dueAt: 10_000,
-    now: 1_800,
-  });
-  const inactiveMonitor = fixture.store.createMonitor({
-    controllerKey: fixture.turn.controllerKey,
-    kind: "schedule",
-    cron: "0 10 * * 1-5",
-    instruction: "Review completed work.",
-    dueAt: 11_000,
-    now: 1_801,
-  });
-  expect(fixture.store.cancelControllerMonitor(fixture.turn.controllerKey, inactiveMonitor.id, 1_802)).toBe(true);
-  const systemMonitor = fixture.store.ensureSystemMonitor({
-    systemKey: "production-health:proj_1",
-    controllerKey: fixture.turn.controllerKey,
-    cron: "0 11 * * 1-5",
-    instruction: "Check production health.",
-    dueAt: 12_000,
-    now: 1_803,
-  });
-
-  await expect(fixture.harness.behavior.callAgentTool(
-    "telegram_agent_cancel_watch",
-    { id: systemMonitor.id },
-    fixture.toolContext,
-  )).resolves.toEqual({
-    content: [{ type: "text", text: '{"error":{"code":"scope_denied"}}' }],
-    isError: true,
-  });
-  expect(fixture.store.listSystemMonitors()[0]).toMatchObject({ id: systemMonitor.id, state: "armed" });
-
-  const cancelled = JSON.parse(await fixture.harness.behavior.callAgentTool(
-    "telegram_agent_cancel_watch",
-    { id: ownerMonitor.id },
-    fixture.toolContext,
-  ) as string);
-  expect(cancelled).toMatchObject({
-    cancelled: true,
-    _hanoonEvidence: {
-      outcome: "succeeded",
-      proofKinds: ["monitor_state"],
-      subjectRefs: [`monitor:${ownerMonitor.id}`],
-    },
-  });
-
-  const inactive = JSON.parse(await fixture.harness.behavior.callAgentTool(
-    "telegram_agent_cancel_watch",
-    { id: inactiveMonitor.id },
-    fixture.toolContext,
-  ) as string);
-  expect(inactive).toMatchObject({
-    cancelled: false,
-    _hanoonEvidence: {
-      outcome: "observed",
-      proofKinds: ["monitor_state"],
-      subjectRefs: [`monitor:${inactiveMonitor.id}`],
-    },
-  });
-});
 
 it("promotes pipeline outcome only from the real validation writer's fully bound terminal chain", async () => {
   const headSha = "a".repeat(40);
