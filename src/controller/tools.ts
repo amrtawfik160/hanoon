@@ -60,7 +60,6 @@ import { resolvePersistedWorkerProfile } from "../capabilities/profiles";
 import {
   CONTROLLER_BUNDLE_IDS,
   CONTROLLER_DEFAULT_SKILLS,
-  CONTROLLER_MANUAL_DISCOVERY_SKILLS,
   assessControllerCapabilityDescriptor,
   controllerBundleIdsFromProfile,
   controllerToolsForBundles,
@@ -3495,7 +3494,7 @@ export function registerControllerTools(bb: BbPluginApi, dependencies: ToolDepen
       assertProtocolToolsProjected(compatibilityToolNames);
       return {
         tools: compatibilityToolNames,
-        skills: [...CONTROLLER_DEFAULT_SKILLS, ...CONTROLLER_MANUAL_DISCOVERY_SKILLS],
+        skills: [...CONTROLLER_DEFAULT_SKILLS],
         instructions: composeControllerInstructions(
           dependencies.store.getControllerOverlay(),
           dependencies.controllerIdentity?.() ?? null,

@@ -584,8 +584,13 @@ async function assertProductionWiring(
   expect(configured.skills).toEqual([
     "driving-bb",
     "unslop",
-    ...(pendingTurn ? [] : ["grill-with-docs", "grilling", "domain-modeling"]),
   ]);
+  expect(configured.skills).not.toEqual(expect.arrayContaining([
+    "grill-with-docs",
+    "grilling",
+    "grill-me",
+    "domain-modeling",
+  ]));
   if (configured.instructions === null) throw new Error("controller instructions were not configured");
   expect(configured.instructions.startsWith(`${REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL}\n`)).toBe(true);
   expect(countOccurrences(configured.instructions, REQUIRED_CONTROLLER_INSTRUCTION_SENTINEL)).toBe(1);

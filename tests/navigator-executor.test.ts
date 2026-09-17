@@ -471,7 +471,7 @@ describe("navigator-v1 durable executor slice", () => {
       ...baseSignals,
       routeToDestinationVisible: false,
       requirementsUnclear: true,
-    })).toBe("grill-with-docs");
+    })).toBe("to-spec");
     expect(selectNavigatorPlanningRoute(baseSignals)).toBe("to-spec");
   });
 

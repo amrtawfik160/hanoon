@@ -33,7 +33,7 @@ const EXPECTED_SKILL_ROUTES = {
   "durable-boundary-audit": "worker",
   "grill-me": "manual-only",
   "grill-with-docs": "manual-only",
-  grilling: "worker",
+  grilling: "manual-only",
   handoff: "manual-only",
   implement: "manual-only",
   "improve-codebase-architecture": "manual-only",

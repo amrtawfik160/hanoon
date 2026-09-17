@@ -145,17 +145,20 @@ describe("least-capability worker profiles", () => {
         "executing-plans",
         "subagent-driven-development",
         "grill-with-docs",
+        "grilling",
       ],
     });
     expect(profile.skills).not.toEqual(expect.arrayContaining([
       "executing-plans",
       "subagent-driven-development",
       "grill-with-docs",
+      "grilling",
     ]));
     expect(profile.denied).toEqual(expect.arrayContaining([
       { capabilityId: "executing-plans", reasonCode: "route_not_worker" },
       { capabilityId: "subagent-driven-development", reasonCode: "route_not_worker" },
       { capabilityId: "grill-with-docs", reasonCode: "route_not_worker" },
+      { capabilityId: "grilling", reasonCode: "route_not_worker" },
     ]));
   });
 

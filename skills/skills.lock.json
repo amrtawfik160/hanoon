@@ -182,10 +182,10 @@
       "sourcePath": "skills/productivity/grilling",
       "source": "https://github.com/mattpocock/skills",
       "sourceRevision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
-      "sourceDigest": "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2",
+      "sourceDigest": "05eda00533d358bb646147c2ffa8c38129103629f679d7c977f67a6afc18ccaf",
       "license": "MIT",
-      "invocationClass": "model",
-      "descriptorDigest": "45ecfed1492a2c7647346d3b3f8e21c6a09552c078cf97c2748ab914621beeab"
+      "invocationClass": "user",
+      "descriptorDigest": "1db13da6782aabc10bf9e6be639a9da705bebbbed9d10ffaf7d88cabd76979c0"
     },
     {
       "id": "handoff",
@@ -788,11 +788,11 @@
     },
     {
       "path": "skills/matt-pocock/productivity/grilling/agents/openai.yaml",
-      "sha256": "1411d7df7d99b7e621a1ff8283c8133cc2464be63d064e52d8ce169c6800ee9b"
+      "sha256": "43ba1da595c9516a716a38542fa6e4e1faad021f4b9861c669c332e3f555a5f4"
     },
     {
       "path": "skills/matt-pocock/productivity/grilling/SKILL.md",
-      "sha256": "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2"
+      "sha256": "05eda00533d358bb646147c2ffa8c38129103629f679d7c977f67a6afc18ccaf"
     },
     {
       "path": "skills/matt-pocock/productivity/handoff/agents/openai.yaml",

@@ -249,7 +249,6 @@ export type NavigatorPlanningRoute =
   | "wayfinder"
   | "research"
   | "prototype"
-  | "grill-with-docs"
   | "to-spec"
   | "to-tickets";
 
@@ -259,7 +258,6 @@ export function selectNavigatorPlanningRoute(signals: NavigatorRoutingSignals): 
   if (signals.needsPrimarySourceFacts) return "research";
   if (signals.runnableDesignQuestion) return "prototype";
   if (signals.hugeMultiSessionEffort && !signals.routeToDestinationVisible) return "wayfinder";
-  if (signals.workingDirectoryAvailable && signals.requirementsUnclear) return "grill-with-docs";
   return "to-spec";
 }
 
