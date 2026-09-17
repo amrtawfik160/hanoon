@@ -120,7 +120,7 @@ it("continues once after queued-admission and admitted-claim crash boundaries", 
   })).toBeNull();
 });
 
-it("reuses one durable pipeline attempt when BB spawn returned before thread binding", () => {
+it("does not persist a pipeline attempt across restart after BB spawn returns before binding", () => {
   const value = fixture();
   value.store.createJob({ id: "crash-spawn", sourceUpdateId: 1, requestText: "plan", now: NOW });
   const generation = acquire(value.store);
@@ -157,19 +157,6 @@ it("reuses one durable pipeline attempt when BB spawn returned before thread bin
     now: NOW + 2,
     ...fence,
   })).toBe(true);
-  expect(restarted.bindPipelineStageThread({
-    id: attemptInput.id,
-    ...reconciledSpawn,
-    now: NOW + 3,
-    ...fence,
-  })).toBe(true);
-  expect(restarted.bindPipelineStageThread({
-    id: attemptInput.id,
-    threadId: "thr-duplicate",
-    environmentId: "env-duplicate",
-    now: NOW + 3,
-    ...fence,
-  })).toBe(false);
   expect(restarted.completePipelineStageAttempt({
     id: attemptInput.id,
     outputText: "# Plan\n",
@@ -178,11 +165,7 @@ it("reuses one durable pipeline attempt when BB spawn returned before thread bin
     now: NOW + 4,
     ...fence,
   })).toBe(true);
-  expect(value.reopen().getPipelineStageAttempt(attemptInput.id)).toMatchObject({
-    state: "completed",
-    threadId: "thr-plan",
-    environmentId: "env-plan",
-  });
+  expect(value.reopen().getPipelineStageAttempt(attemptInput.id)).toBeNull();
 });
 
 it("does not repeat an accepted approval or an ambiguously returned merge call", () => {

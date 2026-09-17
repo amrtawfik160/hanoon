@@ -1043,7 +1043,7 @@ it("does not let an explicit legacy small-fix hint downgrade behavioral work", (
   expect(job.taskRecipe).not.toBe("bounded");
 });
 
-it("creates an adopted-PR job with honest skipped planning stages", () => {
+it("creates an adopted-PR job without writing skipped planning stages", () => {
   const { store } = fixture();
   const headSha = "a".repeat(40);
   const job = store.createAdoptedControllerJob({
@@ -1068,11 +1068,8 @@ it("creates an adopted-PR job with honest skipped planning stages", () => {
     prHeadSha: headSha,
   });
   expect(job.taskRecipe).not.toBe("adopted-pr");
-  expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
-    state: "skipped",
-    outcome: { disposition: "skipped", reason: "existing_pull_request" },
-  });
-  expect(store.getLatestPipelineStageAttempt(job.id, "CRITIQUE")).toMatchObject({ state: "skipped" });
+  expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toBeNull();
+  expect(store.getLatestPipelineStageAttempt(job.id, "CRITIQUE")).toBeNull();
   const admitted = admitConfirmedJob(store, job, 10_011);
   expect(admitted.state).toBe("creating_implementation");
   expect(store.listEffectsForJob(job.id).find((effect) => effect.kind === "spawn_implementation")?.payload)

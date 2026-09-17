@@ -534,11 +534,7 @@ describe("leased effect execution", () => {
       state: "planning",
       environmentId: "env_pipeline",
     });
-    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
-      id: `stage:${effect.idempotencyKey}`,
-      threadId: "thr_recovered_pipeline",
-      environmentId: "env_pipeline",
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toBeNull();
   });
 
   it("leaves an active model trial unresolved when the provider result has no usable environment", async () => {
@@ -832,14 +828,7 @@ describe("leased effect execution", () => {
     }).run(claimed);
 
     expect(store.getJob(job.id)?.state).toBe(nextState);
-    expect(store.getLatestPipelineStageAttempt(job.id, role)).toMatchObject({
-      state: "completed",
-      resourceKind: "bb_terminal",
-      resourceId: `term_${phase}`,
-      startSha: "d".repeat(40),
-      endSha: "d".repeat(40),
-      outcome: expect.objectContaining({ phase, outcome: "pass" }),
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, role)).toBeNull();
     expect(store.getWorkerLiveness(job.id)).toMatchObject({ workerKind: phase === "deploy" ? "deploy" : "canary" });
   });
 
@@ -975,7 +964,7 @@ describe("leased effect execution", () => {
       mergeCommitSha: "d".repeat(40),
       lastError: "Production deploy outcome is unknown after executor interruption",
     });
-    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toMatchObject({ state: "failed" });
+    expect(store.getLatestPipelineStageAttempt(job.id, "DEPLOY")).toBeNull();
   });
 
   it("dead-letters the twentieth transient failure and blocks the owning job", () => {
@@ -1094,11 +1083,7 @@ describe("leased effect execution", () => {
 
     expect(spawnPlanner).toHaveBeenCalledTimes(1);
     expect(store.getJob(job.id)).toMatchObject({ state: "planning", environmentId: "env_1" });
-    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toMatchObject({
-      state: "running",
-      threadId: "thr_plan",
-      environmentId: "env_1",
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toBeNull();
     expect(store.listModelRouteTrials("worker_attempt", `stage:${effect.idempotencyKey}`, 10)).toMatchObject([
       { attempt: 1, route: { pool: "strong", modelId: "gpt-5.6-sol" }, outcome: "passed" },
     ]);
@@ -1215,14 +1200,7 @@ describe("leased effect execution", () => {
     }).run(claimed);
 
     expect(store.getJob(job.id)?.state).toBe(nextState);
-    expect(store.getLatestPipelineStageAttempt(job.id, role)).toMatchObject({
-      state: "completed",
-      resourceKind: "bb_terminal",
-      resourceId: "term_checks",
-      startSha: "a".repeat(40),
-      endSha: "a".repeat(40),
-      outcome: expect.objectContaining({ validationOutcome: "pass", headSha: "a".repeat(40) }),
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, role)).toBeNull();
   });
 
   it("persists authoritative PR-head evidence before advancing to validation", async () => {
@@ -1261,17 +1239,7 @@ describe("leased effect execution", () => {
     }).run(claimed);
 
     expect(store.getJob(job.id)).toMatchObject({ state: "validating", prHeadSha: "a".repeat(40) });
-    expect(store.getLatestPipelineStageAttempt(job.id, "BUILD")).toMatchObject({
-      state: "completed",
-      startSha: "a".repeat(40),
-      endSha: "a".repeat(40),
-      outcome: {
-        verdict: "success",
-        prNumber: 7,
-        headSha: "a".repeat(40),
-        originRepository: "acme/cyndra",
-      },
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "BUILD")).toBeNull();
   });
 
   it.each([

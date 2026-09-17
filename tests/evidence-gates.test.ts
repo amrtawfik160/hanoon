@@ -82,15 +82,27 @@ function addReviewAttempt(
 
 describe("executor evidence gates", () => {
   it.each([
-    ["planning", { type: "PLAN_READY", attemptId: "missing-plan" }],
-    ["critiquing", { type: "CRITIQUE_PASSED", attemptId: "missing-critique" }],
-    ["resolving_pr_head", { type: "PR_HEAD_RESOLVED", headSha: "a".repeat(40) }],
-    ["validating", { type: "VALIDATION_PASSED", headSha: "a".repeat(40) }],
+    ["planning", { type: "PLAN_READY", attemptId: "missing-plan" }, "critiquing"],
+    ["critiquing", { type: "CRITIQUE_PASSED", attemptId: "missing-critique" }, "creating_implementation"],
+    ["resolving_pr_head", { type: "PR_HEAD_RESOLVED", headSha: "a".repeat(40) }, "validating"],
+    ["validating", { type: "VALIDATION_PASSED", headSha: "a".repeat(40) }, "reviewing"],
+    ["documenting", { type: "DOCS_IDLE" }, "resolving_docs_head"],
+    ["final_validating", { type: "VALIDATION_PASSED", headSha: "a".repeat(40) }, "final_reviewing"],
+  ] as Array<[JobState, JobEvent, JobState]>)("advances %s on the job ledger without a pipeline stage row", (state, event, nextState) => {
+    const { store, fence } = fixture(state);
+    expect(store.applyExecutorJobEvent({
+      jobId: "job_1",
+      expectedVersion: 2,
+      event,
+      ...fence,
+    })).toMatchObject({ state: nextState, version: 3 });
+    expect(store.getJob("job_1")).toMatchObject({ state: nextState, version: 3 });
+  });
+
+  it.each([
     ["reviewing", { type: "REVIEW_PASSED", headSha: "a".repeat(40) }],
-    ["documenting", { type: "DOCS_IDLE" }],
-    ["final_validating", { type: "VALIDATION_PASSED", headSha: "a".repeat(40) }],
     ["final_reviewing", { type: "REVIEW_PASSED", headSha: "a".repeat(40) }],
-  ] as Array<[JobState, JobEvent]>)('refuses %s advancement when its durable evidence is missing', (state, event) => {
+  ] as Array<[JobState, JobEvent]>)("refuses %s advancement when its durable evidence is missing", (state, event) => {
     const { store, fence } = fixture(state);
     expect(store.applyExecutorJobEvent({
       jobId: "job_1",

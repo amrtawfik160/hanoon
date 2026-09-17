@@ -7,6 +7,7 @@ import {
   type JobOrigin,
   type RoutingMode,
   type JobEffect,
+  JOB_STATES,
   type JobState,
   type StoredEffect,
 } from "../domain/models";
@@ -29,7 +30,7 @@ import {
   type TaskConstraint,
   type TaskOutcome,
 } from "../domain/task-authority";
-import { ledgerFromJob, type JobLedgerRow } from "../domain/job-ledger";
+import { JOB_LEDGER_HEAD, ledgerFromJob, type JobLedgerRow } from "../domain/job-ledger";
 
 type SqliteDatabase = Database.Database;
 
@@ -101,34 +102,6 @@ export type EffectRow = {
   updated_at: number;
 };
 
-const JOB_STATES: ReadonlySet<JobState> = new Set([
-  "awaiting_project",
-  "awaiting_confirmation",
-  "planning",
-  "critiquing",
-  "creating_implementation",
-  "implementing",
-  "locating_pr",
-  "resolving_pr_head",
-  "reviewing",
-  "remediating",
-  "validating",
-  "documenting",
-  "resolving_docs_head",
-  "final_validating",
-  "final_reviewing",
-  "awaiting_merge_approval",
-  "merging",
-  "deploying",
-  "verifying_production",
-  "recovering_worker",
-  "production_failed",
-  "complete",
-  "failed",
-  "blocked",
-  "cancelled",
-  "merged",
-]);
 const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set([
   "plan_limit",
   "review_limit",
@@ -391,15 +364,13 @@ export function parseStoredEffect(row: EffectRow): StoredEffect {
   };
 }
 
-const LEDGER_HEAD = /^(?:|[0-9a-f]{40})$/;
-
 export function writeJobLedger(db: SqliteDatabase, row: JobLedgerRow, now: number): void {
   if (!row.id) throw new TypeError("job ledger id is required");
   if (!JOB_STATES.has(row.stage)) throw new TypeError("job ledger stage is invalid");
   if (typeof row.branch !== "string" || row.branch.length > 256) {
     throw new TypeError("job ledger branch must be a string of at most 256 characters");
   }
-  if (!LEDGER_HEAD.test(row.head)) {
+  if (!JOB_LEDGER_HEAD.test(row.head)) {
     throw new TypeError("job ledger head must be empty or a 40-character lowercase SHA");
   }
   db.prepare(
@@ -432,12 +403,13 @@ export function writeJobLedgerForCurrentJob(db: SqliteDatabase, jobId: string, n
     adopted_head_sha: string | null;
   } | undefined;
   if (!row || !JOB_STATES.has(row.state as JobState)) return;
-  writeJobLedger(db, {
+  writeJobLedger(db, ledgerFromJob({
     id: row.id,
-    stage: row.state as JobState,
-    branch: row.adopted_branch ?? "",
-    head: row.pr_head_sha ?? row.adopted_head_sha ?? "",
-  }, now);
+    state: row.state as JobState,
+    adoptedBranch: row.adopted_branch,
+    prHeadSha: row.pr_head_sha,
+    adoptedHeadSha: row.adopted_head_sha,
+  }), now);
 }
 
 export function persistJobTransition(

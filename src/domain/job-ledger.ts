@@ -1,7 +1,9 @@
-import type { Job, JobState } from "./models";
+import { JOB_STATES, type Job, type JobState } from "./models";
 
 export const JOB_LEDGER_DRAIN_REASON =
   "Upgrade drained this job because its pipeline stage could not be copied onto the job ledger without guessing.";
+
+export const JOB_LEDGER_HEAD = /^(?:|[0-9a-f]{40})$/;
 
 export type JobLedgerRow = Readonly<{
   id: string;
@@ -21,34 +23,6 @@ export type JobLedgerUpgradeDecision =
   | Readonly<{ action: "migrate"; row: JobLedgerRow }>
   | Readonly<{ action: "drain"; id: string; reason: typeof JOB_LEDGER_DRAIN_REASON }>;
 
-const MIGRATABLE_STAGES: ReadonlySet<string> = new Set<JobState>([
-  "awaiting_project",
-  "awaiting_confirmation",
-  "planning",
-  "critiquing",
-  "creating_implementation",
-  "implementing",
-  "locating_pr",
-  "resolving_pr_head",
-  "reviewing",
-  "remediating",
-  "validating",
-  "documenting",
-  "resolving_docs_head",
-  "final_validating",
-  "final_reviewing",
-  "awaiting_merge_approval",
-  "merging",
-  "deploying",
-  "verifying_production",
-  "production_failed",
-  "complete",
-  "failed",
-  "blocked",
-  "cancelled",
-  "merged",
-]);
-
 export function ledgerFromJob(job: Pick<Job, "id" | "state" | "adoptedBranch" | "prHeadSha" | "adoptedHeadSha">): JobLedgerRow {
   return {
     id: job.id,
@@ -58,12 +32,21 @@ export function ledgerFromJob(job: Pick<Job, "id" | "state" | "adoptedBranch" | 
   };
 }
 
+export function readableJobLedgerHead(head: string | null | undefined): string {
+  const value = head ?? "";
+  return JOB_LEDGER_HEAD.test(value) ? value : "";
+}
+
 function isMigratableStage(state: string): state is JobState {
-  return MIGRATABLE_STAGES.has(state);
+  return JOB_STATES.has(state as JobState) && state !== "recovering_worker";
 }
 
 export function decideJobLedgerUpgrade(snapshot: JobLedgerUpgradeSnapshot): JobLedgerUpgradeDecision {
-  if (snapshot.id.length === 0 || !isMigratableStage(snapshot.state)) {
+  if (
+    snapshot.id.length === 0 ||
+    !isMigratableStage(snapshot.state) ||
+    !JOB_LEDGER_HEAD.test(snapshot.head ?? "")
+  ) {
     return {
       action: "drain",
       id: snapshot.id,
@@ -72,11 +55,12 @@ export function decideJobLedgerUpgrade(snapshot: JobLedgerUpgradeSnapshot): JobL
   }
   return {
     action: "migrate",
-    row: {
+    row: ledgerFromJob({
       id: snapshot.id,
-      stage: snapshot.state,
-      branch: snapshot.branch ?? "",
-      head: snapshot.head ?? "",
-    },
+      state: snapshot.state,
+      adoptedBranch: snapshot.branch,
+      prHeadSha: snapshot.head,
+      adoptedHeadSha: null,
+    }),
   };
 }

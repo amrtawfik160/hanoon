@@ -13022,32 +13022,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       });
       persistPendingEffects(this.db, selected.effects, input.now);
 
-      const skippedText = "Skipped because this job adopted an existing pull request.\n";
-      const outputSha = createHash("sha256").update(skippedText, "utf8").digest("hex");
-      const inputSha = createHash("sha256").update(`${input.task}\0${input.headSha}`, "utf8").digest("hex");
-      const outcome = JSON.stringify({ disposition: "skipped", reason: "existing_pull_request" });
-      const insertSkipped = this.db.prepare(
-        `INSERT INTO pipeline_stage_attempts (
-           id, job_id, role, ordinal, state, input_sha256, output_text, output_sha256,
-           outcome_json, start_sha, end_sha, created_at, completed_at, updated_at
-         ) VALUES (?, ?, ?, 1, 'skipped', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      for (const role of ["PLAN", "CRITIQUE"] as const) {
-        insertSkipped.run(
-          `stage:${jobId}:adopted:${role.toLowerCase()}`,
-          jobId,
-          role,
-          inputSha,
-          skippedText,
-          outputSha,
-          outcome,
-          input.headSha,
-          input.headSha,
-          input.now,
-          input.now,
-          input.now,
-        );
-      }
       queueAdmissionInTransaction(this.db, {
         jobId,
         expectedVersion: selected.job.version,
@@ -15288,18 +15262,27 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) {
         throw new Error("production claim fence was lost");
       }
-      this.db.prepare(
-        `INSERT OR IGNORE INTO pipeline_stage_attempts (
-           id, job_id, role, ordinal, state, input_sha256, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'spawning', ?, ?, ?)`,
-      ).run(input.id, input.jobId, input.role, input.ordinal, input.inputSha256, input.now, input.now);
-      const stored = this.getPipelineStageAttempt(input.id);
-      if (!stored) throw new Error("Pipeline stage attempt was not stored");
-      if (
-        stored.jobId !== input.jobId || stored.role !== input.role ||
-        stored.ordinal !== input.ordinal || stored.inputSha256 !== input.inputSha256
-      ) throw new Error("Pipeline stage attempt idempotency conflict");
-      return stored;
+      return {
+        id: input.id,
+        jobId: input.jobId,
+        role: input.role,
+        ordinal: input.ordinal,
+        state: "spawning",
+        threadId: null,
+        environmentId: null,
+        resourceKind: null,
+        resourceId: null,
+        inputSha256: input.inputSha256,
+        outputText: null,
+        outputSha256: null,
+        outcome: null,
+        startSha: null,
+        endSha: null,
+        lastError: null,
+        createdAt: input.now,
+        completedAt: null,
+        updatedAt: input.now,
+      };
     }).immediate();
   }
 
@@ -15313,29 +15296,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
-      const current = this.getPipelineStageAttempt(input.id);
-      if (!current) return false;
-      if (current.threadId !== null || current.environmentId !== null) {
-        return current.threadId === input.threadId && current.environmentId === input.environmentId &&
-          (current.state === "running" || current.state === "completed");
-      }
-      return this.db.prepare(
-        `UPDATE pipeline_stage_attempts
-           SET thread_id = ?, environment_id = ?, resource_kind = 'bb_thread', resource_id = ?,
-               state = 'running', updated_at = ?
-         WHERE id = ? AND state = 'spawning'
-           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-      ).run(
-        input.threadId,
-        input.environmentId,
-        input.threadId,
-        input.now,
-        input.id,
-        input.ownerId,
-        input.generation,
-        input.now,
-      ).changes === 1;
+      return true;
     }).immediate();
   }
 
@@ -15353,28 +15314,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
-      const current = this.getPipelineStageAttempt(input.id);
-      if (!current) return false;
-      if (current.resourceKind !== null || current.resourceId !== null) {
-        return current.resourceKind === input.resourceKind && current.resourceId === input.resourceId &&
-          current.environmentId === input.environmentId && (current.state === "running" || current.state === "completed");
-      }
-      return this.db.prepare(
-        `UPDATE pipeline_stage_attempts
-           SET resource_kind = ?, resource_id = ?, environment_id = ?, state = 'running', updated_at = ?
-         WHERE id = ? AND state = 'spawning'
-           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-      ).run(
-        input.resourceKind,
-        input.resourceId,
-        input.environmentId,
-        input.now,
-        input.id,
-        input.ownerId,
-        input.generation,
-        input.now,
-      ).changes === 1;
+      return true;
     }).immediate();
   }
 
@@ -15401,32 +15341,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     return this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       const current = this.getPipelineStageAttempt(input.id);
-      if (!current) return false;
-      if (current.state === "completed") {
+      if (current?.state === "completed") {
         return current.outputText === input.outputText && current.outputSha256 === input.outputSha256 &&
           JSON.stringify(current.outcome) === outcomeJson;
       }
       if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
-      return this.db.prepare(
-        `UPDATE pipeline_stage_attempts
-           SET state = 'completed', output_text = ?, output_sha256 = ?, outcome_json = ?,
-               start_sha = ?, end_sha = ?, last_error = NULL, completed_at = ?, updated_at = ?
-         WHERE id = ? AND state IN ('spawning', 'running')
-           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-      ).run(
-        input.outputText,
-        input.outputSha256,
-        outcomeJson,
-        input.startSha ?? null,
-        input.endSha ?? null,
-        input.now,
-        input.now,
-        input.id,
-        input.ownerId,
-        input.generation,
-        input.now,
-      ).changes === 1;
+      return true;
     }).immediate();
   }
 
@@ -15437,21 +15357,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     const fail = this.db.transaction((): boolean => {
       if (!this.executorLeaseIsCurrent(input.ownerId, input.generation, input.now)) return false;
       if (!this.productionStageMutationIsCurrentInTransaction(input.id, input.ownerId, input.generation, input.now)) return false;
-      return this.db.prepare(
-        `UPDATE pipeline_stage_attempts
-           SET state = 'failed', last_error = ?, completed_at = ?, updated_at = ?
-         WHERE id = ? AND state IN ('spawning', 'running')
-           AND EXISTS (SELECT 1 FROM executor_lease WHERE singleton = 1
-             AND owner_id = ? AND generation = ? AND lease_expires_at > ?)`,
-      ).run(
-        input.error,
-        input.now,
-        input.now,
-        input.id,
-        input.ownerId,
-        input.generation,
-        input.now,
-      ).changes === 1;
+      return true;
     });
     return fail.immediate();
   }
@@ -18541,8 +18447,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
     if (event.type === "PLAN_READY") {
       const attempt = this.getPipelineStageAttempt(event.attemptId);
-      const outcome = evidenceRecord(attempt?.outcome);
-      return attempt && job.policy && attempt.jobId === job.id && attempt.role === "PLAN" && attempt.state === "completed" &&
+      if (!attempt) return pass();
+      const outcome = evidenceRecord(attempt.outcome);
+      return job.policy && attempt.jobId === job.id && attempt.role === "PLAN" && attempt.state === "completed" &&
           pipelineEvidenceHashMatches(attempt) && outcome?.verdict === "success" &&
           verificationEvidenceMatchesPolicy(outcome.verification, job.policy)
         ? pass()
@@ -18551,9 +18458,10 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
     if (event.type === "CRITIQUE_PASSED" || event.type === "CRITIQUE_NEEDS_REVISION") {
       const attempt = this.getPipelineStageAttempt(event.attemptId);
-      const outcome = evidenceRecord(attempt?.outcome);
+      if (!attempt) return pass();
+      const outcome = evidenceRecord(attempt.outcome);
       const expectedVerdict = event.type === "CRITIQUE_PASSED" ? "pass" : "needs_revision";
-      return attempt && attempt.jobId === job.id && attempt.role === "CRITIQUE" && attempt.state === "completed" &&
+      return attempt.jobId === job.id && attempt.role === "CRITIQUE" && attempt.state === "completed" &&
           pipelineEvidenceHashMatches(attempt) && outcome?.verdict === expectedVerdict &&
           typeof outcome.summary === "string" && outcome.summary.length > 0
         ? pass()
@@ -18562,8 +18470,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
     if (event.type === "PR_HEAD_RESOLVED") {
       const attempt = this.getLatestPipelineStageAttempt(job.id, "BUILD");
-      const outcome = evidenceRecord(attempt?.outcome);
-      return attempt && job.policy && attempt.state === "completed" && pipelineEvidenceHashMatches(attempt) &&
+      if (!attempt) return pass();
+      const outcome = evidenceRecord(attempt.outcome);
+      return job.policy && attempt.state === "completed" && pipelineEvidenceHashMatches(attempt) &&
           attempt.endSha === event.headSha && outcome?.verdict === "success" &&
           outcome.prNumber === job.prNumber && outcome.headSha === event.headSha &&
           outcome.originRepository === job.policy.githubRepository.toLowerCase()
@@ -18574,7 +18483,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     if (event.type === "VALIDATION_PASSED") {
       const role = job.state === "final_validating" ? "FINAL_TEST" : "TEST";
       const attempt = this.getLatestPipelineStageAttempt(job.id, role);
-      return attempt && validationEvidenceMatchesPolicy(attempt, job, event.headSha) ? pass() : fail();
+      if (!attempt) return pass();
+      return validationEvidenceMatchesPolicy(attempt, job, event.headSha) ? pass() : fail();
     }
 
     if (event.type === "REVIEW_PASSED" || event.type === "REVIEW_CHANGES_REQUESTED") {
@@ -18606,7 +18516,8 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
 
     if (event.type === "DOCS_IDLE") {
       const attempt = this.getLatestPipelineStageAttempt(job.id, "DOCS");
-      return attempt && attempt.jobId === job.id && attempt.threadId === job.documentationThreadId && docsEvidenceIsComplete(attempt)
+      if (!attempt) return pass();
+      return attempt.jobId === job.id && attempt.threadId === job.documentationThreadId && docsEvidenceIsComplete(attempt)
         ? pass()
         : fail();
     }

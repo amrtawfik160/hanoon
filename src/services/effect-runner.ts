@@ -332,7 +332,7 @@ export function validationCommandIdentity(command: string): string {
   return command.slice(0, 500);
 }
 
-function validationStageEvidence(result: ValidationSnapshot, policy: ProjectPolicy): Record<string, unknown> {
+export function validationStageEvidence(result: ValidationSnapshot, policy: ProjectPolicy): Record<string, unknown> {
   const policyCommandReceipts = result.policyCommandReceipts ?? policy.validationCommands.flatMap((configured) => {
     const receipt = result.commandReceipts.find((candidate) => candidate.command === configured.command);
     return receipt ? [{

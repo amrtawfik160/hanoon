@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
 import {
   decideJobLedgerUpgrade,
-  type JobLedgerRow,
+  ledgerFromJob,
+  readableJobLedgerHead,
   type JobLedgerUpgradeDecision,
 } from "../domain/job-ledger";
 import {
@@ -39,9 +40,9 @@ export function upgradeJobsOntoLedger(db: SqliteDatabase, now: number): JobLedge
         branch: job.adopted_branch,
         head: job.pr_head_sha ?? job.adopted_head_sha,
       });
-      outcomes.push(decision);
       if (decision.action === "migrate") {
         writeJobLedger(db, decision.row, now);
+        outcomes.push(decision);
         continue;
       }
       const cancelled = db.prepare(
@@ -50,11 +51,16 @@ export function upgradeJobsOntoLedger(db: SqliteDatabase, now: number): JobLedge
           WHERE id = ? AND version = ?`,
       ).run(job.state, decision.reason, job.version + 1, now, job.id, job.version);
       if (cancelled.changes !== 1) continue;
-      writeJobLedger(db, {
+      const drained = ledgerFromJob({
         id: job.id,
-        stage: "cancelled",
-        branch: job.adopted_branch ?? "",
-        head: job.pr_head_sha ?? job.adopted_head_sha ?? "",
+        state: "cancelled",
+        adoptedBranch: job.adopted_branch,
+        prHeadSha: job.pr_head_sha,
+        adoptedHeadSha: job.adopted_head_sha,
+      });
+      writeJobLedger(db, {
+        ...drained,
+        head: readableJobLedgerHead(drained.head),
       }, now);
       persistPendingEffects(db, [{
         idempotencyKey: `${job.id}:${job.version + 1}:render_status`,
@@ -62,6 +68,7 @@ export function upgradeJobsOntoLedger(db: SqliteDatabase, now: number): JobLedge
         kind: "render_status",
         payload: {},
       }], now);
+      outcomes.push(decision);
     }
   });
   upgrade();

@@ -622,8 +622,9 @@ function persistedWorkerThreadId(
     return attempt && attempt.jobId === title.jobId && attempt.kind === expectedKind ? attempt.threadId : undefined;
   }
   const attempt = store.getPipelineStageAttempt(title.attemptId);
+  if (!attempt) return null;
   const expectedRole = title.role === "planner" ? "PLAN" : title.role === "critic" ? "CRITIQUE" : "DOCS";
-  return attempt && attempt.jobId === title.jobId && attempt.role === expectedRole ? attempt.threadId : undefined;
+  return attempt.jobId === title.jobId && attempt.role === expectedRole ? attempt.threadId : undefined;
 }
 
 function durableWorkerIdentity(
