@@ -25,6 +25,7 @@ export const MATT_POCOCK_PRODUCTIVITY_ROOT = `${MATT_POCOCK_ROOT}/productivity`;
 export const HANOON_ROOT = "skills/hanoon";
 export const PSTACK_ROOT = "skills/pstack";
 export const HUMANLAYER_ROOT = "skills/humanlayer";
+export const UI_KIT_ROOT = "skills/ui-kit";
 export const LOCK_PATH = "skills/skills.lock.json";
 
 // BB discovers only immediate child skill directories. The contracted bundle
@@ -36,6 +37,7 @@ export const REGISTERED_ROOTS = Object.freeze([
   HANOON_ROOT,
   PSTACK_ROOT,
   HUMANLAYER_ROOT,
+  UI_KIT_ROOT,
 ]);
 
 export const LOCKED_ROOTS = Object.freeze([
@@ -44,6 +46,7 @@ export const LOCKED_ROOTS = Object.freeze([
   HANOON_ROOT,
   PSTACK_ROOT,
   HUMANLAYER_ROOT,
+  UI_KIT_ROOT,
 ]);
 
 const workflowSkillIds = [
@@ -155,6 +158,21 @@ export const HUMANLAYER_KIT = Object.freeze({
   licensePath: `${HUMANLAYER_ROOT}/LICENSE`,
 });
 
+// UI kit: polish and design-engineering skills, each from its reviewed upstream.
+export const BETTER_UI_KIT = Object.freeze({
+  revision: "267330e1adfc66a718fb65fa6918c1f06d0a689e",
+  sourceUrl: "https://github.com/jakubkrehel/skills",
+  license: "MIT",
+  licensePath: `${UI_KIT_ROOT}/better-ui/LICENSE`,
+});
+
+export const EMIL_DESIGN_ENG_KIT = Object.freeze({
+  revision: "85e8e2363b713506e1d5b6e07a0eb2da66be1bc3",
+  sourceUrl: "https://github.com/emilkowalski/skills",
+  license: "MIT",
+  licensePath: `${UI_KIT_ROOT}/emil-design-eng/LICENSE`,
+});
+
 export const WORKFLOW_PROVENANCE = Object.freeze({
   source: WORKFLOW_KIT.sourceUrl,
   license: WORKFLOW_KIT.license,
@@ -170,6 +188,14 @@ export const PSTACK_PROVENANCE = Object.freeze({ source: PSTACK_KIT.sourceUrl, l
 export const HUMANLAYER_PROVENANCE = Object.freeze({
   source: HUMANLAYER_KIT.sourceUrl,
   license: HUMANLAYER_KIT.license,
+});
+export const BETTER_UI_PROVENANCE = Object.freeze({
+  source: BETTER_UI_KIT.sourceUrl,
+  license: BETTER_UI_KIT.license,
+});
+export const EMIL_DESIGN_ENG_PROVENANCE = Object.freeze({
+  source: EMIL_DESIGN_ENG_KIT.sourceUrl,
+  license: EMIL_DESIGN_ENG_KIT.license,
 });
 
 function localSkill({ id, root, provenance, sourceRevision, invocationClass = "model" }) {
@@ -217,6 +243,20 @@ export const REQUIRED_HUMANLAYER_SKILLS = Object.freeze(humanlayerSkillIds.map((
     provenance: HUMANLAYER_PROVENANCE,
     sourceRevision: HUMANLAYER_KIT.revision,
   })));
+export const REQUIRED_UI_KIT_SKILLS = Object.freeze([
+  localSkill({
+    id: "better-ui",
+    root: UI_KIT_ROOT,
+    provenance: BETTER_UI_PROVENANCE,
+    sourceRevision: BETTER_UI_KIT.revision,
+  }),
+  localSkill({
+    id: "emil-design-eng",
+    root: UI_KIT_ROOT,
+    provenance: EMIL_DESIGN_ENG_PROVENANCE,
+    sourceRevision: EMIL_DESIGN_ENG_KIT.revision,
+  }),
+]);
 
 export const REQUIRED_MATT_POCOCK_SKILLS = Object.freeze(promotedMattSkills.map(({ bucket, id, invocationClass }) =>
   Object.freeze({
@@ -240,6 +280,7 @@ export const REQUIRED_SKILLS = Object.freeze([
   ...REQUIRED_RETAINED_HANOON_SKILLS,
   ...REQUIRED_PSTACK_SKILLS,
   ...REQUIRED_HUMANLAYER_SKILLS,
+  ...REQUIRED_UI_KIT_SKILLS,
 ].sort((left, right) => left.id.localeCompare(right.id)));
 
 export const SYNC_EXCLUDED_SEGMENTS = Object.freeze([

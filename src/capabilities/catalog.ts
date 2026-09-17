@@ -55,6 +55,7 @@ type SkillAdmissionEvidence = Readonly<{
 
 const ADMITTED_SKILL_BUNDLE = {
   "ask-matt": { sourceDigest: "b25d86fb36b1d294eeead5d7db529f86135f9671f2afcd607579a63bb2213769", bundleDescriptorDigest: "4ef913dc61cc753023e96ebc2e8d2983e89bc606a250e81d18a5d7fdc75ea8d8", invocationClass: "user" },
+  "better-ui": { sourceDigest: "2482b7b89d851a3128d36edf5367f3223e113a4ef421b7358c7e6de3f2c83faf", bundleDescriptorDigest: "005ef4ed45eb472786e7a0eb655cb0cbb2f90949fe54b0f7ebfe7d0212753c6e", invocationClass: "model" },
   "blast-radius": { sourceDigest: "efc3956ba00a6a0a06c8283fd3f8344f1b700d2923c65f73db801e05d50ac783", bundleDescriptorDigest: "6960af3e86855ebe7f58be640afa871fb2fefb032d098151399d35a83c6bed44", invocationClass: "model" },
   "checking-system-logs": { sourceDigest: "76d6b6f8ff80a410b65a1c30a51e45b1d2cfa0e82267ce251462ac0c0b64bbaf", bundleDescriptorDigest: "76cb8c6f6d5add9fe66369d8d64ab4aca1e00f42a558021f8e6d90285a5fd510", invocationClass: "model" },
   "clean-code-guard": { sourceDigest: "4694ad1d36cdcff2e1bfe3b1f903bc21820b682a35385e0f8b382e2cce897be2", bundleDescriptorDigest: "539aa4075dc5a4142705238a0c4ef35b46b09a48fa4693300c6558804fe02b6d", invocationClass: "model" },
@@ -65,6 +66,7 @@ const ADMITTED_SKILL_BUNDLE = {
   "domain-modeling": { sourceDigest: "327a2b50620e2fd70abc6893cd6965e76b20f8d0adb0dc2c8d5eb3845efb643e", bundleDescriptorDigest: "60fa9d0ae9095d4ebe066b51d5e78529ca8cb75302aed71de4181f0f946db8bb", invocationClass: "model" },
   "driving-bb": { sourceDigest: "8ad1cb127379be028e01b3bfd07e3a91defd9971cf1da1b5c268c021470f34d4", bundleDescriptorDigest: "99e1b9d2f0d8be7ad1073cb81a58eb2b32907189259a7da03958b8230e9632ae", invocationClass: "model" },
   "durable-boundary-audit": { sourceDigest: "bbe224ed820694e7b54b1030a5aa951d996b7a6d4a6758dcb5b941012484dd2c", bundleDescriptorDigest: "a145e28c30fc432520a1905f694d711f2ec8fb6827af21828c259588ae2e6b82", invocationClass: "model" },
+  "emil-design-eng": { sourceDigest: "ffbe68e6007fb42cb8149f089b400a1ca007d59ba23e8948e2be4476f3175939", bundleDescriptorDigest: "41a5a1b92858d2a6966701790319fd1dab5b7a5ce20665ef31ee6429e63aa11b", invocationClass: "model" },
   "grill-me": { sourceDigest: "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637", bundleDescriptorDigest: "b60265b7de314625667b53857322f0a543502705a8453c0b2023bc0308bd1938", invocationClass: "user" },
   "grill-with-docs": { sourceDigest: "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe", bundleDescriptorDigest: "164d91e3beb314fb449ce5aa004b63df3cde7971d9e35ea4c12cb4d8c4e99bf5", invocationClass: "user" },
   grilling: { sourceDigest: "05eda00533d358bb646147c2ffa8c38129103629f679d7c977f67a6afc18ccaf", bundleDescriptorDigest: "1db13da6782aabc10bf9e6be639a9da705bebbbed9d10ffaf7d88cabd76979c0", invocationClass: "user" },
@@ -696,6 +698,10 @@ function admittedSkillSource(id: AdmittedCapabilitySkillId): { source: string; v
     return { source: "https://github.com/cursor/plugins", version: "pstack@60c641e4" };
   }
   if (id === "show-me") return { source: "https://github.com/humanlayer/skills", version: "show-me@3c262914" };
+  if (id === "better-ui") return { source: "https://github.com/jakubkrehel/skills", version: "better-ui@267330e1" };
+  if (id === "emil-design-eng") {
+    return { source: "https://github.com/emilkowalski/skills", version: "emil-design-eng@85e8e236" };
+  }
   if (["blast-radius", "checking-system-logs", "driving-bb", "durable-boundary-audit"].includes(id)) {
     return { source: "first-party", version: "1" };
   }

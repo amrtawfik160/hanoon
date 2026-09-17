@@ -3,6 +3,7 @@ export const WORKFLOW_SKILL_STAGES = [
   "implementation",
   "architecture",
   "documentation",
+  "review",
 ] as const;
 
 export type WorkflowSkillStage = (typeof WORKFLOW_SKILL_STAGES)[number];
@@ -14,11 +15,13 @@ export const WORKFLOW_SKILL_TASK_EVIDENCE = [
   "merge-conflict",
   "agent-instructions",
   "architectural-change",
+  "ui-surface",
 ] as const;
 
 export type WorkflowSkillTaskEvidence = (typeof WORKFLOW_SKILL_TASK_EVIDENCE)[number];
+export type ImplementationDisciplineEvidence = Exclude<WorkflowSkillTaskEvidence, "ui-surface">;
 
-export const IMPLEMENTATION_DISCIPLINE_BY_EVIDENCE: Readonly<Record<WorkflowSkillTaskEvidence, string>> = {
+export const IMPLEMENTATION_DISCIPLINE_BY_EVIDENCE: Readonly<Record<ImplementationDisciplineEvidence, string>> = {
   "reproducible-bug": "diagnosing-bugs",
   "behavioral-change": "tdd",
   "interface-design": "codebase-design",
@@ -26,6 +29,8 @@ export const IMPLEMENTATION_DISCIPLINE_BY_EVIDENCE: Readonly<Record<WorkflowSkil
   "agent-instructions": "writing-for-agents",
   "architectural-change": "improve-codebase-architecture",
 };
+
+export const UI_SURFACE_SKILLS = ["better-ui", "emil-design-eng"] as const;
 
 export type WorkflowSkillFacts = Readonly<{
   stage: WorkflowSkillStage;
@@ -41,23 +46,36 @@ export type WorkflowSkillSchedule = Readonly<{
 
 const ARCHITECTURE_TASK_PATTERN =
   /\b(?:new\s+(?:system|subsystem|service|project)|greenfield|public\s+(?:api|contract)|(?:database\s+)?schema(?:\s+change)?|architectural(?:\s+change)?)\b/iu;
+const UI_SURFACE_PATTERN =
+  /\b(?:ui(?:[\s-](?:kit|polish|surface|review))?|css|scss|tsx|jsx|frontend|front-end|stylesheet|animations?|visual polish|design engineering)\b/iu;
+const MAXIMUM_TASK_EVIDENCE = 8;
 
-function isTaskEvidence(value: string): value is WorkflowSkillTaskEvidence {
-  return (WORKFLOW_SKILL_TASK_EVIDENCE as readonly string[]).includes(value);
+function isDisciplineEvidence(value: string): value is ImplementationDisciplineEvidence {
+  return value in IMPLEMENTATION_DISCIPLINE_BY_EVIDENCE;
+}
+
+function isUiSurfacePath(path: string): boolean {
+  return /\.(?:css|scss|sass|less|tsx|jsx|vue|svelte|html)$/iu.test(path)
+    || /(?:^|\/)(?:ui|components|frontend)\//iu.test(path);
+}
+
+function uiSurfaceSkills(taskEvidence: readonly string[] | undefined): readonly string[] {
+  return taskEvidence?.includes("ui-surface") === true ? UI_SURFACE_SKILLS : [];
 }
 
 export function attachedWorkflowTaskEvidence(
   declared: readonly string[],
   ticketText: string,
+  changedPaths: readonly string[] = [],
 ): string[] {
   const attached = [...new Set(declared)];
-  if (
-    ARCHITECTURE_TASK_PATTERN.test(ticketText) &&
-    !attached.includes("architectural-change") &&
-    attached.length < 6
-  ) {
-    attached.push("architectural-change");
-  }
+  const attach = (evidence: WorkflowSkillTaskEvidence) => {
+    if (!attached.includes(evidence) && attached.length < MAXIMUM_TASK_EVIDENCE) {
+      attached.push(evidence);
+    }
+  };
+  if (ARCHITECTURE_TASK_PATTERN.test(ticketText)) attach("architectural-change");
+  if (UI_SURFACE_PATTERN.test(ticketText) || changedPaths.some(isUiSurfacePath)) attach("ui-surface");
   return attached;
 }
 
@@ -70,10 +88,10 @@ export function scheduleWorkflowSkills(facts: WorkflowSkillFacts): WorkflowSkill
       return { skillIds: ["to-spec"], reasonCodes: ["planner_to_spec"] };
     case "implementation": {
       const attached = [...new Set(
-        (facts.taskEvidence ?? []).filter(isTaskEvidence)
+        (facts.taskEvidence ?? []).filter(isDisciplineEvidence)
           .map((evidence) => IMPLEMENTATION_DISCIPLINE_BY_EVIDENCE[evidence]),
       )];
-      const skillIds = [...new Set(["implement", ...attached])]
+      const skillIds = [...new Set(["implement", ...attached, ...uiSurfaceSkills(facts.taskEvidence)])]
         .sort((left, right) => left.localeCompare(right));
       return {
         skillIds,
@@ -90,5 +108,12 @@ export function scheduleWorkflowSkills(facts: WorkflowSkillFacts): WorkflowSkill
         skillIds: ["technical-writing"],
         reasonCodes: ["documentation_technical_writing"],
       };
+    case "review": {
+      const skillIds = [...uiSurfaceSkills(facts.taskEvidence)];
+      return {
+        skillIds,
+        reasonCodes: skillIds.map((skillId) => `review_${skillId.replaceAll("-", "_")}`),
+      };
+    }
   }
 }

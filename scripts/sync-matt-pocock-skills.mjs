@@ -20,6 +20,8 @@ import {
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
+  BETTER_UI_KIT,
+  EMIL_DESIGN_ENG_KIT,
   HUMANLAYER_KIT,
   LOCK_PATH,
   LOCK_SCHEMA_VERSION,
@@ -342,7 +344,7 @@ function sortedSkillRecords(rootByPublicPath, requiredSkills) {
 }
 
 function assertSkillCatalog(skills, legacySkills, shadowedSkills) {
-  if (skills.length !== 35 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
+  if (skills.length !== 37 || legacySkills.length !== 0 || shadowedSkills.length !== 0 ||
     skills.length + legacySkills.length + shadowedSkills.length > MAX_SKILLS) {
     fail("required active, legacy, or shadowed skill catalog differs");
   }
@@ -385,6 +387,8 @@ function buildLock(stagedMatt) {
     hanoonKit: HANOON_KIT,
     pstackKit: PSTACK_KIT,
     humanlayerKit: HUMANLAYER_KIT,
+    betterUiKit: BETTER_UI_KIT,
+    emilDesignEngKit: EMIL_DESIGN_ENG_KIT,
     skills,
     legacySkills,
     shadowedSkills,

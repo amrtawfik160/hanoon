@@ -90,12 +90,14 @@ function effectIdempotencyKey(jobId: string, version: number, effectKind: string
 }
 
 describe("worker skill role table", () => {
-  test("contains exactly the admitted 35-skill catalog", () => {
-    expect(BUNDLED_SKILL_IDS).toHaveLength(35);
-    expect(new Set(BUNDLED_SKILL_IDS).size).toBe(35);
+  test("contains exactly the admitted 37-skill catalog", () => {
+    expect(BUNDLED_SKILL_IDS).toHaveLength(37);
+    expect(new Set(BUNDLED_SKILL_IDS).size).toBe(37);
     expect(BUNDLED_SKILL_IDS).toEqual(expect.arrayContaining([
       "ask-matt",
+      "better-ui",
       "diagnosing-bugs",
+      "emil-design-eng",
       "implement",
       "tdd",
       "wayfinder",

@@ -1043,6 +1043,7 @@ export class NavigatorTicketSettlementRepository {
     const taskEvidence = navigatorAttemptTaskEvidence(
       input.taskEvidence,
       `${snapshot?.title ?? ""}\n${snapshot?.content ?? ""}`,
+      input.changedPaths,
     );
     const workOrder = navigatorTicketWorkOrderSchema.parse({
       kind: "navigator_ticket_work_order",

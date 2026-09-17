@@ -21,6 +21,7 @@ import { CONTROLLER_TOOL_NAMES } from "../src/controller/capability-policy";
 
 const EXPECTED_SKILL_ROUTES = {
   "ask-matt": "manual-only",
+  "better-ui": "worker",
   "blast-radius": "worker",
   "checking-system-logs": "worker",
   "clean-code-guard": "worker",
@@ -31,6 +32,7 @@ const EXPECTED_SKILL_ROUTES = {
   "domain-modeling": "worker",
   "driving-bb": "worker",
   "durable-boundary-audit": "worker",
+  "emil-design-eng": "worker",
   "grill-me": "manual-only",
   "grill-with-docs": "manual-only",
   grilling: "manual-only",
@@ -66,7 +68,7 @@ function redigest(descriptor: CapabilityDescriptor): CapabilityDescriptor {
 }
 
 describe("capability catalog", () => {
-  it("freezes the historical recipe registry while the live catalog admits 35 navigator skills", () => {
+  it("freezes the historical recipe registry while the live catalog admits 37 navigator skills", () => {
     expect(HISTORICAL_RECIPE_REGISTRY_DIGEST)
       .toBe("d14130f744f1ca484beec08d8956a20e16db854b88a304f9576fcc79bdaa0481");
     expect(HISTORICAL_RECIPE_GRAPH_DIGEST)

@@ -6,7 +6,7 @@ import { DEFAULT_MODEL_POOL_REGISTRY } from "../src/capabilities/models";
 import { navigatorTicketWorkerProfile } from "../src/navigator/implementation-contracts";
 import { NavigatorImplementationExecutor } from "../src/navigator/implementation-executor";
 import { selectNavigatorPlanningRoute } from "../src/navigator/planning-contracts";
-import { scheduleWorkflowSkills } from "../src/navigator/workflow-skills";
+import { attachedWorkflowTaskEvidence, scheduleWorkflowSkills } from "../src/navigator/workflow-skills";
 import { EffectRunner } from "../src/services/effect-runner";
 import { openStore } from "../src/storage/store";
 import { stableWorkArtifactId } from "../src/work-artifacts/repository";
@@ -298,6 +298,61 @@ describe("navigator workflow skill scheduling", () => {
     });
   });
 
+  it("schedules better-ui and emil-design-eng on UI-surface implementation and review", () => {
+    expect(attachedWorkflowTaskEvidence(["behavioral-change"], "Polish the settings page UI")).toEqual([
+      "behavioral-change",
+      "ui-surface",
+    ]);
+    expect(attachedWorkflowTaskEvidence([], "Add the integration lane", ["src/Button.tsx"])).toEqual([
+      "ui-surface",
+    ]);
+    expect(attachedWorkflowTaskEvidence(["behavioral-change"], "Add the integration lane")).toEqual([
+      "behavioral-change",
+    ]);
+    expect(scheduleWorkflowSkills({
+      stage: "implementation",
+      taskEvidence: ["ui-surface"],
+    })).toEqual({
+      skillIds: ["better-ui", "emil-design-eng", "implement"],
+      reasonCodes: [
+        "implementation_better_ui",
+        "implementation_emil_design_eng",
+        "implementation_implement",
+      ],
+    });
+    expect(scheduleWorkflowSkills({
+      stage: "review",
+      taskEvidence: ["ui-surface"],
+    })).toEqual({
+      skillIds: ["better-ui", "emil-design-eng"],
+      reasonCodes: ["review_better_ui", "review_emil_design_eng"],
+    });
+    expect(scheduleWorkflowSkills({ stage: "review" })).toEqual({
+      skillIds: [],
+      reasonCodes: [],
+    });
+    expect(navigatorTicketWorkerProfile({
+      kind: "implementation",
+      taskEvidence: ["ui-surface", "behavioral-change"],
+      changedPaths: [],
+    }).assignments.map((assignment) => assignment.capabilityId)).toEqual([
+      "better-ui",
+      "emil-design-eng",
+      "implement",
+      "tdd",
+    ]);
+    expect(navigatorTicketWorkerProfile({
+      kind: "review",
+      taskEvidence: ["ui-surface"],
+      changedPaths: ["src/Button.tsx"],
+    }).assignments.map((assignment) => assignment.capabilityId)).toEqual([
+      "better-ui",
+      "clean-code-guard",
+      "code-review",
+      "emil-design-eng",
+    ]);
+  });
+
   it("schedules improve-codebase-architecture when claiming an architecture ticket", () => {
     const { store, executor, jobId, ticketId, claimId } = ticketFixture(
       "Split the public billing schema into a new subsystem",
@@ -348,6 +403,45 @@ describe("navigator workflow skill scheduling", () => {
       "implement",
       "tdd",
     ]);
+  });
+
+  it("schedules the UI kit when claiming a UI-surface ticket", () => {
+    const { store, executor, jobId, ticketId, claimId } = ticketFixture(
+      "Polish the settings page UI",
+    );
+    executor.beginClaimedTicket({
+      jobId,
+      ticketArtifactId: ticketId,
+      claimId,
+      taskEvidence: ["behavioral-change"],
+      evidenceRefs: ["ticket:111:claim"],
+      ownerId: "executor-109",
+      generation: 1,
+    });
+    const attempt = executor.snapshot(jobId).attempts[0];
+    if (!attempt) throw new Error("ui-surface attempt missing");
+    expect(attempt.workOrder.taskEvidence).toEqual(["behavioral-change", "ui-surface"]);
+    expect(attempt.profile.assignments.map(({ capabilityId }) => capabilityId)).toEqual([
+      "better-ui",
+      "emil-design-eng",
+      "implement",
+      "tdd",
+    ]);
+    const profile = store.getLatestCapabilityProfile("worker_attempt", attempt.id);
+    expect(store.listCapabilityReceipts(profile?.id ?? "missing", 20)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          capabilityId: "better-ui",
+          eventType: "selected",
+          subjectId: attempt.id,
+        }),
+        expect.objectContaining({
+          capabilityId: "emil-design-eng",
+          eventType: "selected",
+          subjectId: attempt.id,
+        }),
+      ]),
+    );
   });
 
   it("schedules technical-writing through spawnDocs and records a selected receipt", async () => {

@@ -7,6 +7,8 @@ import {
   FORBIDDEN_SKILL_ID_PATTERN,
   GUARD_KIT,
   HANOON_KIT,
+  BETTER_UI_KIT,
+  EMIL_DESIGN_ENG_KIT,
   HUMANLAYER_KIT,
   LOCKED_ROOTS,
   MATT_POCOCK_KIT,
@@ -48,6 +50,8 @@ const expectedKits = [
   ["hanoonKit", "hanoon-kit", HANOON_KIT],
   ["pstackKit", "pstack-kit", PSTACK_KIT],
   ["humanlayerKit", "humanlayer-kit", HUMANLAYER_KIT],
+  ["betterUiKit", "better-ui-kit", BETTER_UI_KIT],
+  ["emilDesignEngKit", "emil-design-eng-kit", EMIL_DESIGN_ENG_KIT],
 ];
 
 function integrityError(reason) {

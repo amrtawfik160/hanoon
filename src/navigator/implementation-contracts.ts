@@ -20,13 +20,14 @@ const projectPathSchema = z.string().trim().min(1).max(4_096).refine(
   },
   "changed paths must be safe project-relative paths",
 );
-const taskEvidenceSchema = z.array(z.enum(WORKFLOW_SKILL_TASK_EVIDENCE)).max(6);
+const taskEvidenceSchema = z.array(z.enum(WORKFLOW_SKILL_TASK_EVIDENCE)).max(8);
 
 export function navigatorAttemptTaskEvidence(
   declared: readonly string[],
   ticketText: string,
+  changedPaths: readonly string[] = [],
 ): NavigatorTicketTaskEvidence {
-  return taskEvidenceSchema.parse(attachedWorkflowTaskEvidence(declared, ticketText));
+  return taskEvidenceSchema.parse(attachedWorkflowTaskEvidence(declared, ticketText, changedPaths));
 }
 
 export const navigatorReviewFindingSchema = z.object({
@@ -427,8 +428,13 @@ export function navigatorTicketWorkerProfile(input: Readonly<{
     : [];
   const capabilityIds = input.kind === "implementation"
     ? [...new Set([...implementation.skillIds, ...architecture])]
-    : reviewGuardIds(input.changedPaths);
-  const assignments = [...new Set(capabilityIds)].map(assignment);
+    : [...new Set([
+      ...reviewGuardIds(input.changedPaths),
+      ...scheduleWorkflowSkills({ stage: "review", taskEvidence }).skillIds,
+    ])];
+  const assignments = [...new Set(capabilityIds)]
+    .sort((left, right) => left.localeCompare(right))
+    .map(assignment);
   const unsigned = {
     role: input.kind,
     assignments,

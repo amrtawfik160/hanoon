@@ -138,7 +138,7 @@ Navigator-v1 is the admission engine. `DualEngineCoordinator.persistEvaluationEv
 
 ## Agent skill runtime
 
-The repository locks one reviewed 35-skill catalog. It combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with ten retained platform, guard, writing, visualization, and communication skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are absent from the installed bundle. No runtime path downloads or repairs skills.
+The repository locks one reviewed 37-skill catalog. It combines 25 promoted Matt Pocock skills at revision `6654f6b60cd9d5be8b54c6fafe44346dabeb3b76` with twelve retained platform, guard, writing, visualization, communication, and UI skills. Superpowers workflow ids, the duplicate discovery root, and the proportional workflow router are absent from the installed bundle. No runtime path downloads or repairs skills.
 
 BB reads one level of child directories from every plugin skill root. The package therefore registers both Matt Pocock buckets, not their common parent. The three promoted ids that previously overlapped a historical discovery root now live in those registered buckets. New admissions always use navigator-v1. Historical recipe descriptors, registry digests, receipts, and columns remain readable and unchanged.
 
@@ -150,8 +150,9 @@ BB reads one level of child directories from every plugin skill root. The packag
 | `skills/hanoon` | first-party, with source notices where adapted | four retained platform skills |
 | `skills/pstack` | [cursor/plugins](https://github.com/cursor/plugins) at revision `60c641e4fad674784b30abcf9f8915dea39df38d` | `unslop` and `technical-writing` |
 | `skills/humanlayer` | [humanlayer/skills](https://github.com/humanlayer/skills) at revision `3c2629142c5d437428269b1b722b08c0b87f574d` | `show-me` |
+| `skills/ui-kit` | [jakubkrehel/skills](https://github.com/jakubkrehel/skills) at revision `267330e1adfc66a718fb65fa6918c1f06d0a689e` and [emilkowalski/skills](https://github.com/emilkowalski/skills) at revision `85e8e2363b713506e1d5b6e07a0eb2da66be1bc3` | `better-ui`, `emil-design-eng` |
 
-Each lock record binds the skill id, source path, source revision, source digest, descriptor digest, license, and invocation class. The 35-skill catalog allows model-invoked skills in general workers and requires an explicit navigator or owner route for user-invoked skills.
+Each lock record binds the skill id, source path, source revision, source digest, descriptor digest, license, and invocation class. The 37-skill catalog allows model-invoked skills in general workers and requires an explicit navigator or owner route for user-invoked skills.
 
 The contracted role matrix for new work is:
 
@@ -160,8 +161,8 @@ The contracted role matrix for new work is:
 | controller | `driving-bb`, `unslop`, and on an explicit grill request `grill-with-docs`, `grilling`, `domain-modeling` |
 | planner | `unslop`, `writing-for-agents`, `docs-guard` |
 | critic | `unslop` |
-| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `show-me` |
-| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review` |
+| implementation | `unslop`, `diagnosing-bugs`, `tdd`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `show-me`; UI-surface tasks also schedule `better-ui` and `emil-design-eng` |
+| review | `unslop`, `clean-code-guard`, `test-guard`, `durable-boundary-audit`, `blast-radius`, `code-review`; UI-surface tasks also schedule `better-ui` and `emil-design-eng` |
 | documentation | `unslop`, `technical-writing`, `docs-guard` |
 | final-review | `unslop`, `clean-code-guard`, `test-guard`, `docs-guard`, `durable-boundary-audit`, `blast-radius` |
 | validation, merge, deploy, canary | none; these remain deterministic stages |
@@ -170,7 +171,7 @@ Role selection still requires the exact durable attempt or stage, project, manag
 
 ### Bundle integrity and maintenance
 
-`npm run skills:verify` checks the package root order, schema 2 lock, the exact 35-skill catalog with empty legacy and shadow lists, bounded regular files, complete SHA-256 coverage, frontmatter identity, invocation metadata, nested local Markdown resources, and all source provenance and licenses. Build and activation run this verifier before registration. Drift, missing support files, a path escape, a symlink, malformed metadata, a leftover workflow or discovery kit, a duplicate catalog entry, or an admitted `do-*` id stops activation. The verifier never changes the bundle.
+`npm run skills:verify` checks the package root order, schema 2 lock, the exact 37-skill catalog with empty legacy and shadow lists, bounded regular files, complete SHA-256 coverage, frontmatter identity, invocation metadata, nested local Markdown resources, and all source provenance and licenses. Build and activation run this verifier before registration. Drift, missing support files, a path escape, a symlink, malformed metadata, a leftover workflow or discovery kit, a duplicate catalog entry, or an admitted `do-*` id stops activation. The verifier never changes the bundle.
 
 Synchronization is a maintainer-only operation from a clean absolute checkout at the reviewed full commit:
 
