@@ -273,14 +273,16 @@ export function selectWorkerCapabilityProfile(input: CapabilityProfileSelectionI
 }): SelectedCapabilityProfile {
   if (input.engine === "recipe-v1") return selectCapabilityProfile(input);
   const selected = new Map<string, CapabilityDescriptor>();
-  for (const capabilityId of ROLE_SKILLS[input.role]) {
+  const skills: CapabilitySkillId[] = [];
+  for (const capabilityId of [...ROLE_SKILLS[input.role], ...input.requestedCapabilities ?? []]) {
+    if (selected.has(capabilityId)) continue;
     const descriptor = CAPABILITY_BY_ID.get(capabilityId);
     if (!descriptor || descriptor.kind !== "skill") {
       throw new TypeError(`Navigator worker role ${input.role} references unknown skill ${capabilityId}`);
     }
     selected.set(capabilityId, descriptor);
+    skills.push(capabilityId as CapabilitySkillId);
   }
-  const skills = [...ROLE_SKILLS[input.role]];
   const assignments = skills.map((capabilityId): CapabilityProfileAssignment => {
     const descriptor = selected.get(capabilityId);
     if (!descriptor) throw new Error(`Selected capability ${capabilityId} disappeared`);

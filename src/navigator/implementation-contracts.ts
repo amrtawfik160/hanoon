@@ -4,6 +4,7 @@ import { SKILL_ADMISSION_CATALOG } from "../capabilities/catalog";
 import { modelRouteSchema } from "../capabilities/models";
 import { projectPolicySchema } from "../domain/models";
 import { artifactBindingSchema } from "./models";
+import { attachedWorkflowTaskEvidence, scheduleWorkflowSkills, WORKFLOW_SKILL_TASK_EVIDENCE } from "./workflow-skills";
 import type { WorkArtifactSnapshot } from "../work-artifacts/models";
 
 const identifierSchema = z.string().trim().min(1).max(256);
@@ -19,13 +20,14 @@ const projectPathSchema = z.string().trim().min(1).max(4_096).refine(
   },
   "changed paths must be safe project-relative paths",
 );
-const taskEvidenceSchema = z.array(z.enum([
-  "reproducible-bug",
-  "behavioral-change",
-  "interface-design",
-  "merge-conflict",
-  "agent-instructions",
-])).max(5);
+const taskEvidenceSchema = z.array(z.enum(WORKFLOW_SKILL_TASK_EVIDENCE)).max(6);
+
+export function navigatorAttemptTaskEvidence(
+  declared: readonly string[],
+  ticketText: string,
+): NavigatorTicketTaskEvidence {
+  return taskEvidenceSchema.parse(attachedWorkflowTaskEvidence(declared, ticketText));
+}
 
 export const navigatorReviewFindingSchema = z.object({
   rootCauseId: identifierSchema,
@@ -341,14 +343,6 @@ export const navigatorPersistedTicketStepContractSchema = z.union([
 export type NavigatorTicketStepContract = Readonly<z.infer<typeof navigatorTicketStepContractSchema>>;
 export type NavigatorPersistedTicketStepContract = Readonly<z.infer<typeof navigatorPersistedTicketStepContractSchema>>;
 
-const DISCIPLINE_BY_EVIDENCE: Readonly<Record<NavigatorTicketTaskEvidence[number], string>> = {
-  "reproducible-bug": "diagnosing-bugs",
-  "behavioral-change": "tdd",
-  "interface-design": "codebase-design",
-  "merge-conflict": "resolving-merge-conflicts",
-  "agent-instructions": "writing-for-agents",
-};
-
 function digestJson(subject: unknown): string {
   return createHash("sha256").update(JSON.stringify(subject), "utf8").digest("hex");
 }
@@ -427,11 +421,12 @@ export function navigatorTicketWorkerProfile(input: Readonly<{
   changedPaths: readonly string[];
 }>): NavigatorTicketWorkerProfile {
   const taskEvidence = taskEvidenceSchema.parse(input.taskEvidence);
+  const implementation = scheduleWorkflowSkills({ stage: "implementation", taskEvidence });
+  const architecture = taskEvidence.includes("architectural-change")
+    ? scheduleWorkflowSkills({ stage: "architecture" }).skillIds
+    : [];
   const capabilityIds = input.kind === "implementation"
-    ? [
-      "implement",
-      ...taskEvidence.map((evidence) => DISCIPLINE_BY_EVIDENCE[evidence]),
-    ].sort((left, right) => left.localeCompare(right))
+    ? [...new Set([...implementation.skillIds, ...architecture])]
     : reviewGuardIds(input.changedPaths);
   const assignments = [...new Set(capabilityIds)].map(assignment);
   const unsigned = {
