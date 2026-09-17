@@ -5108,6 +5108,16 @@ CREATE INDEX managed_automation_operations_binding
   ON managed_automation_operations(binding_id, created_at);
 `] as const;
 
+export const JOB_LEDGER_MIGRATIONS = [String.raw`
+CREATE TABLE job_ledger (
+  id TEXT PRIMARY KEY REFERENCES jobs(id),
+  stage TEXT NOT NULL,
+  branch TEXT NOT NULL DEFAULT '',
+  head TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -5209,4 +5219,5 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
   ...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   ...PROTECTED_CONNECTOR_MIGRATIONS,
+  ...JOB_LEDGER_MIGRATIONS,
 ] as const;

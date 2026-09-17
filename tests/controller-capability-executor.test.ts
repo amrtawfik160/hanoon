@@ -23,7 +23,7 @@ afterEach(async () => {
   await disposeControllerTrustFixtures();
 });
 import { policyFixture } from "./helpers";
-import { EffectRunner } from "../src/services/effect-runner";
+import { EffectRunner, validationStageEvidence } from "../src/services/effect-runner";
 import { runProductionStage } from "../src/services/production-runner";
 import { GIT_REMOTE_COMMAND, PR_CHECKS_COMMAND, PR_HEAD_COMMAND, PR_VIEW_COMMAND } from "../src/bb/validation";
 import type { TelegramAgentStore } from "../src/storage/store";
@@ -883,6 +883,36 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
     PR_CHECKS_COMMAND(17),
     PR_HEAD_COMMAND(17),
   ];
+  const validationResult = {
+    headSha,
+    originRepository: policy.githubRepository,
+    commandReceipts: validationCommands.map((command) => ({
+      command,
+      outcome: "pass" as const,
+      exitCode: 0,
+      output: "verified",
+    })),
+    requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS", link: null }],
+    githubPr: {
+      number: 17,
+      url: "https://github.com/acme/cyndra/pull/17",
+      state: "OPEN" as const,
+      isDraft: false,
+      baseRefName: policy.baseBranch,
+      headRefName: "feature/verified-chain",
+      mergeStateStatus: "CLEAN" as const,
+      mergeable: "MERGEABLE" as const,
+      reviewDecision: null,
+      changedFiles: 1,
+      additions: 1,
+      deletions: 0,
+      mergeCommit: null,
+      mergedAt: null,
+    },
+    validationOutcome: "pass" as const,
+    completedAt: mergedAt,
+    terminalIds: ["terminal_validation", "terminal_checks"],
+  };
   await new EffectRunner({
     store: fixture.store,
     fence: {
@@ -891,37 +921,19 @@ it("promotes pipeline outcome only from the real validation writer's fully bound
       signal: new AbortController().signal,
     },
     now: () => 2_001,
-    runValidation: async () => ({
-      headSha,
-      originRepository: policy.githubRepository,
-      commandReceipts: validationCommands.map((command) => ({
-        command,
-        outcome: "pass" as const,
-        exitCode: 0,
-        output: "verified",
-      })),
-      requiredChecks: [{ name: "test", bucket: "pass", state: "SUCCESS", link: null }],
-      githubPr: {
-        number: 17,
-        url: "https://github.com/acme/cyndra/pull/17",
-        state: "OPEN",
-        isDraft: false,
-        baseRefName: policy.baseBranch,
-        headRefName: "feature/verified-chain",
-        mergeStateStatus: "CLEAN",
-        mergeable: "MERGEABLE",
-        reviewDecision: null,
-        changedFiles: 1,
-        additions: 1,
-        deletions: 0,
-        mergeCommit: null,
-        mergedAt: null,
-      },
-      validationOutcome: "pass" as const,
-      completedAt: mergedAt,
-      terminalIds: ["terminal_validation", "terminal_checks"],
-    }),
+    runValidation: async () => validationResult,
   }).run(claimed);
+  const evidence = validationStageEvidence(validationResult, policy);
+  const outputText = JSON.stringify(evidence);
+  const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
+  fixture.db.prepare(
+    `INSERT INTO pipeline_stage_attempts (
+       id, job_id, role, ordinal, state, environment_id, resource_kind, resource_id,
+       input_sha256, output_text, output_sha256, outcome_json, start_sha, end_sha,
+       created_at, completed_at, updated_at
+     ) VALUES (?, 'job_verified', 'FINAL_TEST', 1, 'completed', 'env_1', 'bb_terminal', 'terminal_checks',
+       ?, ?, ?, ?, ?, ?, 2001, 2001, 2001)`,
+  ).run(`stage:${validationEffectKey}`, "d".repeat(64), outputText, outputSha256, outputText, headSha, headSha);
   const writtenFinalTest = fixture.store.getLatestPipelineStageAttempt("job_verified", "FINAL_TEST");
   expect(writtenFinalTest).toMatchObject({
     state: "completed",

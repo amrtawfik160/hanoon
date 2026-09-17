@@ -103,7 +103,7 @@ it("persists mandatory docs outcomes before an active docs transition", () => {
   const lease = store.acquireExecutorLease("docs-executor", 1_001, 30_000);
   if (!lease.acquired) throw new Error("executor lease missing");
   const fence = { ownerId: "docs-executor", generation: lease.generation };
-  let attempt = store.createPipelineStageAttempt({
+  const attempt = store.createPipelineStageAttempt({
     id: "stage:job_active_docs:2:spawn_docs",
     jobId: draft.id,
     role: "DOCS",
@@ -119,7 +119,6 @@ it("persists mandatory docs outcomes before an active docs transition", () => {
     ...fence,
     now: 1_003,
   })).toBe(true);
-  attempt = store.getPipelineStageAttempt(attempt.id)!;
   const selected = selectCapabilityProfile({
     role: "documentation",
     recipe: "bounded",
@@ -448,7 +447,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     ]);
   });
 
-  it("persists stage identity and output under an active executor fence", () => {
+  it("does not persist stage identity or output on the retired stage machine", () => {
     const { bb } = createFakePluginHost({ pluginId: "telegram-agent-pipeline-storage" });
     const store = openStore(bb.storage);
     store.createJob({ id: "job_1", sourceUpdateId: 1, requestText: "work", now: 1_000 });
@@ -482,14 +481,8 @@ describe("fresh planner, critic, and builder conversations", () => {
       ownerId: "executor",
       generation: lease.generation,
     })).toBe(true);
-    expect(store.getLatestPipelineStageAttempt("job_1", "PLAN")).toMatchObject({
-      threadId: "thr_plan",
-      environmentId: "env_plan",
-      state: "completed",
-      outputText: "# Plan\n",
-      outputSha256: "b".repeat(64),
-    });
-    expect(store.findJobByThreadId("thr_plan")?.id).toBe("job_1");
+    expect(store.getLatestPipelineStageAttempt("job_1", "PLAN")).toBeNull();
+    expect(store.findJobByThreadId("thr_plan")).toBeNull();
   });
 
   it("settles durable plan and critique output into the canonical job transitions", () => {
@@ -506,7 +499,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     const lease = store.acquireExecutorLease("executor", 1_003, 30_000);
     if (!lease.acquired) throw new Error("lease missing");
     const fence = { ownerId: "executor", generation: lease.generation };
-    let attempt = store.createPipelineStageAttempt({
+    const attempt = store.createPipelineStageAttempt({
       id: "stage_plan_1",
       jobId: job.id,
       role: "PLAN",
@@ -528,7 +521,6 @@ describe("fresh planner, critic, and builder conversations", () => {
       threadId: "thr_plan",
       environmentId: "env_plan",
     }, 1_005);
-    attempt = store.getPipelineStageAttempt(attempt.id)!;
 
     expect(settlePipelineStageOutput({
       store,
@@ -547,13 +539,10 @@ describe("fresh planner, critic, and builder conversations", () => {
       fence,
       now: 1_006,
     })).toEqual({ outcome: "advanced", nextState: "critiquing" });
-    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")?.outcome).toMatchObject({
-      verdict: "success",
-      verification: { disposition: "commands" },
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "PLAN")).toBeNull();
 
     job = store.getJob(job.id)!;
-    let critique = store.createPipelineStageAttempt({
+    const critique = store.createPipelineStageAttempt({
       id: "stage_critique_1",
       jobId: job.id,
       role: "CRITIQUE",
@@ -569,7 +558,6 @@ describe("fresh planner, critic, and builder conversations", () => {
       ...fence,
       now: 1_008,
     })).toBe(true);
-    critique = store.getPipelineStageAttempt(critique.id)!;
 
     expect(settlePipelineStageOutput({
       store,
@@ -596,7 +584,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     job = store.applyJobEvent(job.id, job.version, { type: "PR_HEAD_RESOLVED", headSha: "c".repeat(40) }, 1_013);
     job = store.applyJobEvent(job.id, job.version, { type: "VALIDATION_PASSED", headSha: "c".repeat(40) }, 1_014);
     job = store.applyJobEvent(job.id, job.version, { type: "REVIEW_PASSED", headSha: "c".repeat(40) }, 1_015);
-    let docs = store.createPipelineStageAttempt({
+    const docs = store.createPipelineStageAttempt({
       id: "stage_docs_1",
       jobId: job.id,
       role: "DOCS",
@@ -618,7 +606,6 @@ describe("fresh planner, critic, and builder conversations", () => {
       threadId: "thr_docs",
       environmentId: "env_plan",
     }, 1_017);
-    docs = store.getPipelineStageAttempt(docs.id)!;
 
     expect(settlePipelineStageOutput({
       store,
@@ -634,10 +621,7 @@ describe("fresh planner, critic, and builder conversations", () => {
       fence,
       now: 1_018,
     })).toEqual({ outcome: "advanced", nextState: "resolving_docs_head" });
-    expect(store.getLatestPipelineStageAttempt(job.id, "DOCS")?.outcome).toMatchObject({
-      verdict: "success",
-      documentation: { disposition: "skipped" },
-    });
+    expect(store.getLatestPipelineStageAttempt(job.id, "DOCS")).toBeNull();
     expect(store.getJob(job.id)).toMatchObject({ state: "resolving_docs_head", prHeadSha: null });
   });
 
@@ -698,7 +682,7 @@ describe("fresh planner, critic, and builder conversations", () => {
     expect(settlePipelineStageOutput({
       store,
       job,
-      attempt: store.getPipelineStageAttempt(critique.id)!,
+      attempt: critique,
       output: "```json\n{not valid}\n```",
       fence,
       now: 1_009,

@@ -18,6 +18,7 @@ import {
 } from "../src/credentials/connector-protocol";
 import {
   ALL_MIGRATIONS,
+  JOB_LEDGER_MIGRATIONS,
   PROTECTED_CONNECTOR_MIGRATIONS,
 } from "../src/storage/migrations";
 import { ProtectedConnectorRepository } from "../src/storage/protected-connector-repository";
@@ -370,7 +371,10 @@ describe("append-only schema compatibility", () => {
     const { bb } = createFakePluginHost({ pluginId: "protected-connector-hanoon-migration" });
     const db = bb.storage.database();
     registerWorkArtifactRelationshipValidation(db);
-    const foundationMigrations = ALL_MIGRATIONS.slice(0, -PROTECTED_CONNECTOR_MIGRATIONS.length);
+    const foundationMigrations = ALL_MIGRATIONS.slice(
+      0,
+      -(PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length),
+    );
     bb.storage.migrate(db, foundationMigrations);
     db.prepare(`
       INSERT INTO credential_bindings (

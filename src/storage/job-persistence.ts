@@ -7,6 +7,7 @@ import {
   type JobOrigin,
   type RoutingMode,
   type JobEffect,
+  JOB_STATES,
   type JobState,
   type StoredEffect,
 } from "../domain/models";
@@ -29,6 +30,7 @@ import {
   type TaskConstraint,
   type TaskOutcome,
 } from "../domain/task-authority";
+import { JOB_LEDGER_HEAD, ledgerFromJob, type JobLedgerRow } from "../domain/job-ledger";
 
 type SqliteDatabase = Database.Database;
 
@@ -100,34 +102,6 @@ export type EffectRow = {
   updated_at: number;
 };
 
-const JOB_STATES: ReadonlySet<JobState> = new Set([
-  "awaiting_project",
-  "awaiting_confirmation",
-  "planning",
-  "critiquing",
-  "creating_implementation",
-  "implementing",
-  "locating_pr",
-  "resolving_pr_head",
-  "reviewing",
-  "remediating",
-  "validating",
-  "documenting",
-  "resolving_docs_head",
-  "final_validating",
-  "final_reviewing",
-  "awaiting_merge_approval",
-  "merging",
-  "deploying",
-  "verifying_production",
-  "recovering_worker",
-  "production_failed",
-  "complete",
-  "failed",
-  "blocked",
-  "cancelled",
-  "merged",
-]);
 const BLOCKED_REASONS: ReadonlySet<NonNullable<Job["blockedReason"]>> = new Set([
   "plan_limit",
   "review_limit",
@@ -390,6 +364,54 @@ export function parseStoredEffect(row: EffectRow): StoredEffect {
   };
 }
 
+export function writeJobLedger(db: SqliteDatabase, row: JobLedgerRow, now: number): void {
+  if (!row.id) throw new TypeError("job ledger id is required");
+  if (!JOB_STATES.has(row.stage)) throw new TypeError("job ledger stage is invalid");
+  if (typeof row.branch !== "string" || row.branch.length > 256) {
+    throw new TypeError("job ledger branch must be a string of at most 256 characters");
+  }
+  if (!JOB_LEDGER_HEAD.test(row.head)) {
+    throw new TypeError("job ledger head must be empty or a 40-character lowercase SHA");
+  }
+  db.prepare(
+    `INSERT INTO job_ledger (id, stage, branch, head, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       stage = excluded.stage,
+       branch = excluded.branch,
+       head = excluded.head,
+       updated_at = excluded.updated_at`,
+  ).run(row.id, row.stage, row.branch, row.head, now);
+}
+
+export function readJobLedger(db: SqliteDatabase, jobId: string): JobLedgerRow | null {
+  const row = db.prepare(
+    "SELECT id, stage, branch, head FROM job_ledger WHERE id = ?",
+  ).get(jobId) as JobLedgerRow | undefined;
+  return row ?? null;
+}
+
+export function writeJobLedgerForCurrentJob(db: SqliteDatabase, jobId: string, now: number): void {
+  const row = db.prepare(
+    `SELECT id, state, adopted_branch, pr_head_sha, adopted_head_sha
+       FROM jobs WHERE id = ?`,
+  ).get(jobId) as {
+    id: string;
+    state: string;
+    adopted_branch: string | null;
+    pr_head_sha: string | null;
+    adopted_head_sha: string | null;
+  } | undefined;
+  if (!row || !JOB_STATES.has(row.state as JobState)) return;
+  writeJobLedger(db, ledgerFromJob({
+    id: row.id,
+    state: row.state as JobState,
+    adoptedBranch: row.adopted_branch,
+    prHeadSha: row.pr_head_sha,
+    adoptedHeadSha: row.adopted_head_sha,
+  }), now);
+}
+
 export function persistJobTransition(
   db: SqliteDatabase,
   jobId: string,
@@ -400,62 +422,67 @@ export function persistJobTransition(
   if (transitionedJob.prUrl !== null) {
     assertSafeExternalHttpsUrl(transitionedJob.prUrl, "job.prUrl");
   }
-  const updated = db
-    .prepare(
-      `UPDATE jobs SET
-         request_text = ?, state = ?, resume_state = ?, project_id = ?,
-         policy_version = ?, policy_json = ?, environment_id = ?,
-         implementation_thread_id = ?, review_thread_id = ?, documentation_thread_id = ?, pr_number = ?,
-         pr_url = ?, pr_head_sha = ?, merge_message = ?, merge_commit_sha = ?, merged_at = ?,
-         deployment_summary = ?, canary_summary = ?, status_message_id = ?, delivery_mode = ?,
-         task_recipe = ?, recipe_version = ?, recipe_promotion_count = ?, routing_mode = ?,
-         task_traits_json = ?, task_reason_codes_json = ?, plan_cycle = ?, review_cycle = ?,
-         task_outcome = ?, task_constraints_json = ?, review_block_at = ?, cancel_requested_at = ?, merge_pre_approved_at = ?, blocked_reason = ?,
-         last_error = ?, version = ?, updated_at = ?
-       WHERE id = ? AND version = ?`,
-    )
-    .run(
-      transitionedJob.requestText,
-      transitionedJob.state,
-      transitionedJob.resumeState,
-      transitionedJob.projectId,
-      transitionedJob.policyVersion,
-      transitionedJob.policy ? JSON.stringify(transitionedJob.policy) : null,
-      transitionedJob.environmentId,
-      transitionedJob.implementationThreadId,
-      transitionedJob.reviewThreadId,
-      transitionedJob.documentationThreadId,
-      transitionedJob.prNumber,
-      transitionedJob.prUrl,
-      transitionedJob.prHeadSha,
-      transitionedJob.mergeMessage,
-      transitionedJob.mergeCommitSha,
-      transitionedJob.mergedAt,
-      transitionedJob.deploymentSummary,
-      transitionedJob.canarySummary,
-      transitionedJob.statusMessageId,
-      transitionedJob.deliveryMode,
-      transitionedJob.taskRecipe,
-      transitionedJob.recipeVersion,
-      transitionedJob.recipePromotionCount,
-      transitionedJob.routingMode,
-      JSON.stringify(transitionedJob.taskTraits),
-      JSON.stringify(transitionedJob.taskReasonCodes),
-      transitionedJob.planCycle,
-      transitionedJob.reviewCycle,
-      transitionedJob.taskOutcome,
-      JSON.stringify(transitionedJob.taskConstraints),
-      transitionedJob.reviewBlockAt,
-      transitionedJob.cancelRequestedAt,
-      transitionedJob.mergePreApprovedAt,
-      transitionedJob.blockedReason,
-      transitionedJob.lastError,
-      transitionedJob.version,
-      transitionedJob.updatedAt,
-      jobId,
-      expectedVersion,
-    );
-  if (updated.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
+  const persist = (): void => {
+    writeJobLedger(db, ledgerFromJob(transitionedJob), transitionedJob.updatedAt);
+    const updated = db
+      .prepare(
+        `UPDATE jobs SET
+           request_text = ?, state = ?, resume_state = ?, project_id = ?,
+           policy_version = ?, policy_json = ?, environment_id = ?,
+           implementation_thread_id = ?, review_thread_id = ?, documentation_thread_id = ?, pr_number = ?,
+           pr_url = ?, pr_head_sha = ?, merge_message = ?, merge_commit_sha = ?, merged_at = ?,
+           deployment_summary = ?, canary_summary = ?, status_message_id = ?, delivery_mode = ?,
+           task_recipe = ?, recipe_version = ?, recipe_promotion_count = ?, routing_mode = ?,
+           task_traits_json = ?, task_reason_codes_json = ?, plan_cycle = ?, review_cycle = ?,
+           task_outcome = ?, task_constraints_json = ?, review_block_at = ?, cancel_requested_at = ?, merge_pre_approved_at = ?, blocked_reason = ?,
+           last_error = ?, version = ?, updated_at = ?
+         WHERE id = ? AND version = ?`,
+      )
+      .run(
+        transitionedJob.requestText,
+        transitionedJob.state,
+        transitionedJob.resumeState,
+        transitionedJob.projectId,
+        transitionedJob.policyVersion,
+        transitionedJob.policy ? JSON.stringify(transitionedJob.policy) : null,
+        transitionedJob.environmentId,
+        transitionedJob.implementationThreadId,
+        transitionedJob.reviewThreadId,
+        transitionedJob.documentationThreadId,
+        transitionedJob.prNumber,
+        transitionedJob.prUrl,
+        transitionedJob.prHeadSha,
+        transitionedJob.mergeMessage,
+        transitionedJob.mergeCommitSha,
+        transitionedJob.mergedAt,
+        transitionedJob.deploymentSummary,
+        transitionedJob.canarySummary,
+        transitionedJob.statusMessageId,
+        transitionedJob.deliveryMode,
+        transitionedJob.taskRecipe,
+        transitionedJob.recipeVersion,
+        transitionedJob.recipePromotionCount,
+        transitionedJob.routingMode,
+        JSON.stringify(transitionedJob.taskTraits),
+        JSON.stringify(transitionedJob.taskReasonCodes),
+        transitionedJob.planCycle,
+        transitionedJob.reviewCycle,
+        transitionedJob.taskOutcome,
+        JSON.stringify(transitionedJob.taskConstraints),
+        transitionedJob.reviewBlockAt,
+        transitionedJob.cancelRequestedAt,
+        transitionedJob.mergePreApprovedAt,
+        transitionedJob.blockedReason,
+        transitionedJob.lastError,
+        transitionedJob.version,
+        transitionedJob.updatedAt,
+        jobId,
+        expectedVersion,
+      );
+    if (updated.changes !== 1) throw new VersionConflictError(jobId, expectedVersion);
+  };
+  if (db.inTransaction) persist();
+  else db.transaction(persist)();
 }
 
 export function persistPendingEffects(

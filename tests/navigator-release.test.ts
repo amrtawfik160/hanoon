@@ -38,6 +38,7 @@ import {
   NAVIGATOR_REVIEW_LEDGER_MIGRATIONS,
   CONTROLLER_BURST_MIGRATIONS,
   PROTECTED_CONNECTOR_MIGRATIONS,
+  JOB_LEDGER_MIGRATIONS,
 } from "../src/storage/migrations";
 import { EffectRunner } from "../src/services/effect-runner";
 import { runJobExecutorService } from "../src/services/job-executor-service";
@@ -761,10 +762,14 @@ describe("navigator exact-head release", () => {
     // migration and then the managed-automation state upgrade ahead of it.
     // Each contributes several statements, so every block is located by offset
     // rather than a fixed index.
-    [...PROTECTED_CONNECTOR_MIGRATIONS].reverse().forEach((migration, index) => {
+    [...JOB_LEDGER_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(index + 1))).toBe(migration);
     });
-    const connectorOffset = PROTECTED_CONNECTOR_MIGRATIONS.length;
+    const ledgerOffset = JOB_LEDGER_MIGRATIONS.length;
+    [...PROTECTED_CONNECTOR_MIGRATIONS].reverse().forEach((migration, index) => {
+      expect(ALL_MIGRATIONS.at(-(ledgerOffset + index + 1))).toBe(migration);
+    });
+    const connectorOffset = ledgerOffset + PROTECTED_CONNECTOR_MIGRATIONS.length;
     [...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS].reverse().forEach((migration, index) => {
       expect(ALL_MIGRATIONS.at(-(connectorOffset + index + 1))).toBe(migration);
     });

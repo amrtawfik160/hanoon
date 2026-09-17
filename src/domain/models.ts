@@ -307,6 +307,35 @@ export type JobState =
   | "cancelled"
   | "merged";
 
+export const JOB_STATES: ReadonlySet<JobState> = new Set<JobState>([
+  "awaiting_project",
+  "awaiting_confirmation",
+  "planning",
+  "critiquing",
+  "creating_implementation",
+  "implementing",
+  "locating_pr",
+  "resolving_pr_head",
+  "reviewing",
+  "remediating",
+  "validating",
+  "documenting",
+  "resolving_docs_head",
+  "final_validating",
+  "final_reviewing",
+  "awaiting_merge_approval",
+  "merging",
+  "deploying",
+  "verifying_production",
+  "recovering_worker",
+  "production_failed",
+  "complete",
+  "failed",
+  "blocked",
+  "cancelled",
+  "merged",
+]);
+
 /** One worker kind per pipeline stage, so every stage has its own model. */
 export type WorkerKind = PipelineStage;
 export type WorkerRecoveryClassification = "never_started" | "no_progress" | "missing" | "crash";
