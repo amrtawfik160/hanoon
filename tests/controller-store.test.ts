@@ -26,6 +26,7 @@ import {
   NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS,
   NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   PROTECTED_CONNECTOR_MIGRATIONS,
+  JOB_LEDGER_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -238,11 +239,11 @@ it("keeps every shipped migration at its original position and appends new ones"
       CONTROLLER_BURST_MIGRATIONS.length + NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length +
         MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length +
           NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length +
-            PROTECTED_CONNECTOR_MIGRATIONS.length,
+            PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length,
   );
   // The burst block is no longer the tail: the navigator effect protocol was
   // appended after it.
-  const burstTail = ALL_MIGRATIONS.length - PROTECTED_CONNECTOR_MIGRATIONS.length -
+  const burstTail = ALL_MIGRATIONS.length - JOB_LEDGER_MIGRATIONS.length - PROTECTED_CONNECTOR_MIGRATIONS.length -
     NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length -
     NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length - MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length -
     NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length - CONTROLLER_BURST_MIGRATIONS.length;

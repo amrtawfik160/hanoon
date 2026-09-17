@@ -138,6 +138,7 @@ import {
 } from "./memory-ranking";
 import { assertSafeFailureSummary, containsCredentialLikeText, transition } from "../domain/state-machine";
 import { ALL_MIGRATIONS } from "./migrations";
+import { upgradeJobsOntoLedger } from "./job-ledger";
 import {
   CONTROLLER_DOCUMENT_MIME_TYPES,
   CONTROLLER_MEDIA_MIME_TYPES,
@@ -212,6 +213,8 @@ import {
   readJobById,
   readJobBySourceUpdate,
   serializeBoundedJson,
+  writeJobLedger,
+  writeJobLedgerForCurrentJob,
   type EffectRow,
   type JobRow,
 } from "./job-persistence";
@@ -12854,6 +12857,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.now,
         input.now,
       );
+      writeJobLedger(this.db, {
+        id: jobId,
+        stage: "awaiting_project",
+        branch: "",
+        head: "",
+      }, input.now);
       const created = this.readJobById(jobId);
       if (!created) throw new Error("Controller job was not stored");
 
@@ -12983,6 +12992,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.now,
         input.now,
       );
+      writeJobLedger(this.db, {
+        id: jobId,
+        stage: "awaiting_project",
+        branch: input.branchName,
+        head: input.headSha,
+      }, input.now);
       const created = this.readJobById(jobId);
       if (!created) throw new Error("Adopted controller job was not stored");
 
@@ -13167,6 +13182,12 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         input.now,
         input.now,
       );
+      writeJobLedger(this.db, {
+        id: jobId,
+        stage: "awaiting_project",
+        branch: "",
+        head: "",
+      }, input.now);
       const created = this.readJobById(jobId);
       if (!created) throw new Error("Autonomous job was not stored");
 
@@ -13363,7 +13384,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       (input.workflow.engine !== "navigator-v1" ||
         (input.workflow.mode !== "shadow" && input.workflow.mode !== "deterministic"))
     ) throw new TypeError("navigator workflow identity is invalid");
-    this.db
+    const inserted = this.db
       .prepare(
         `INSERT OR IGNORE INTO jobs (
            id, source_update_id, request_text, state, review_cycle,
@@ -13371,6 +13392,14 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
          ) VALUES (?, ?, ?, 'awaiting_project', 0, 3, ?, ?, 1, ?, ?)`,
       )
       .run(input.id, input.sourceUpdateId, input.requestText, workflowEngine, workflowMode, input.now, input.now);
+    if (inserted.changes === 1) {
+      writeJobLedger(this.db, {
+        id: input.id,
+        stage: "awaiting_project",
+        branch: "",
+        head: "",
+      }, input.now);
+    }
 
     const byId = this.readJobById(input.id);
     const existing = byId ?? this.readJobBySourceUpdate(input.sourceUpdateId);
@@ -17464,6 +17493,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         )
         .run(job.version + 1, boundaryNow, jobId, job.version);
       if (cancelled.changes === 1) {
+        writeJobLedgerForCurrentJob(this.db, jobId, boundaryNow);
         persistPendingEffects(this.db, [{
           idempotencyKey: `${jobId}:${job.version + 1}:render_status`,
           jobId,
@@ -17729,6 +17759,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             job.version,
           );
         if (changed.changes === 1) {
+          writeJobLedgerForCurrentJob(this.db, input.jobId, boundaryNow);
           this.db
             .prepare(
               `INSERT OR IGNORE INTO effects (
@@ -19414,6 +19445,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         job.version,
       );
     if (changed.changes === 1) {
+      writeJobLedgerForCurrentJob(this.db, job.id, now);
       this.db
         .prepare(
           `UPDATE approvals SET consumed_at = COALESCE(consumed_at, ?), outcome = 'revoked'
@@ -19822,5 +19854,6 @@ export function openStore(
   migrateControllerInteractionStorage(storage, now());
   const db = storage.database();
   ensureApprovalOwnershipColumns(db);
+  upgradeJobsOntoLedger(db, now());
   return new SqliteTelegramAgentStore(db, kv, now, controllerModelRoute, capabilityDispatchSettings);
 }

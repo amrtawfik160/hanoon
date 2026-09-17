@@ -51,6 +51,7 @@ import {
   readJobById,
   serializeBoundedJson,
   VersionConflictError,
+  writeJobLedgerForCurrentJob,
 } from "../storage/job-persistence";
 import { WorkArtifactRepository } from "../work-artifacts/repository";
 import { OwnerBoundaryRepository } from "../storage/owner-boundary-repository";
@@ -1641,6 +1642,7 @@ export class NavigatorRepository {
             job.id,
             job.version,
           );
+          writeJobLedgerForCurrentJob(this.db, job.id, input.now);
           this.insertDecision(
             proposalId,
             job.id,
