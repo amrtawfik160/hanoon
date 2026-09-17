@@ -49,6 +49,11 @@ const retained = [
   "unslop",
 ] as const;
 
+const uiKit = [
+  "better-ui",
+  "emil-design-eng",
+] as const;
+
 type SkillRecord = Readonly<{
   id: string;
   skillPath: string;
@@ -107,15 +112,15 @@ describe("pinned Matt Pocock skill portfolio", () => {
     });
   });
 
-  test("admits exactly 35 unique skills with locked invocation classes", () => {
+  test("admits exactly 37 unique skills with locked invocation classes", () => {
     const skills = lock().skills;
     const byId = new Map(skills.map((skill) => [skill.id, skill]));
 
-    expect(skills).toHaveLength(35);
-    expect(byId.size).toBe(35);
-    expect([...byId.keys()].sort()).toEqual([...userInvoked, ...modelInvoked, ...retained].sort());
+    expect(skills).toHaveLength(37);
+    expect(byId.size).toBe(37);
+    expect([...byId.keys()].sort()).toEqual([...userInvoked, ...modelInvoked, ...retained, ...uiKit].sort());
     for (const id of userInvoked) expect(byId.get(id)?.invocationClass).toBe("user");
-    for (const id of [...modelInvoked, ...retained]) expect(byId.get(id)?.invocationClass).toBe("model");
+    for (const id of [...modelInvoked, ...retained, ...uiKit]) expect(byId.get(id)?.invocationClass).toBe("model");
     expect(skills.some((skill) => skill.id.startsWith("do-"))).toBe(false);
   });
 

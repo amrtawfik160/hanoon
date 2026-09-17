@@ -32,6 +32,18 @@
     "license": "MIT",
     "licensePath": "skills/humanlayer/LICENSE"
   },
+  "betterUiKit": {
+    "revision": "267330e1adfc66a718fb65fa6918c1f06d0a689e",
+    "sourceUrl": "https://github.com/jakubkrehel/skills",
+    "license": "MIT",
+    "licensePath": "skills/ui-kit/better-ui/LICENSE"
+  },
+  "emilDesignEngKit": {
+    "revision": "85e8e2363b713506e1d5b6e07a0eb2da66be1bc3",
+    "sourceUrl": "https://github.com/emilkowalski/skills",
+    "license": "MIT",
+    "licensePath": "skills/ui-kit/emil-design-eng/LICENSE"
+  },
   "skills": [
     {
       "id": "ask-matt",
@@ -43,6 +55,17 @@
       "license": "MIT",
       "invocationClass": "user",
       "descriptorDigest": "4ef913dc61cc753023e96ebc2e8d2983e89bc606a250e81d18a5d7fdc75ea8d8"
+    },
+    {
+      "id": "better-ui",
+      "skillPath": "skills/ui-kit/better-ui/SKILL.md",
+      "sourcePath": "skills/ui-kit/better-ui/SKILL.md",
+      "source": "https://github.com/jakubkrehel/skills",
+      "sourceRevision": "267330e1adfc66a718fb65fa6918c1f06d0a689e",
+      "sourceDigest": "2482b7b89d851a3128d36edf5367f3223e113a4ef421b7358c7e6de3f2c83faf",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "005ef4ed45eb472786e7a0eb655cb0cbb2f90949fe54b0f7ebfe7d0212753c6e"
     },
     {
       "id": "blast-radius",
@@ -153,6 +176,17 @@
       "license": "first-party",
       "invocationClass": "model",
       "descriptorDigest": "a145e28c30fc432520a1905f694d711f2ec8fb6827af21828c259588ae2e6b82"
+    },
+    {
+      "id": "emil-design-eng",
+      "skillPath": "skills/ui-kit/emil-design-eng/SKILL.md",
+      "sourcePath": "skills/ui-kit/emil-design-eng/SKILL.md",
+      "source": "https://github.com/emilkowalski/skills",
+      "sourceRevision": "85e8e2363b713506e1d5b6e07a0eb2da66be1bc3",
+      "sourceDigest": "ffbe68e6007fb42cb8149f089b400a1ca007d59ba23e8948e2be4476f3175939",
+      "license": "MIT",
+      "invocationClass": "model",
+      "descriptorDigest": "41a5a1b92858d2a6966701790319fd1dab5b7a5ce20665ef31ee6429e63aa11b"
     },
     {
       "id": "grill-me",
@@ -873,6 +907,50 @@
     {
       "path": "skills/pstack/unslop/SKILL.md",
       "sha256": "181883e539caec8258ec9129e3ba5f133409144a2cbf2aa361158ab94cfc3441"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/agents/openai.yaml",
+      "sha256": "799e0b58bded32edf5c217f97e08c364660ec24234978b2e3f7dee1868bea871"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/animations.md",
+      "sha256": "5d2d9e4cefab494b6dd0683e7d2d9bc90788df9c536449c0828c241de965e846"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/enter-exit.md",
+      "sha256": "8db1b33d6c80a097218a530cb9749dff4b0a2b992236047a2e88661af5e930ea"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/icon-transitions.md",
+      "sha256": "60098242d33133a35a675719c447129b8931aecfbf05d58a6e2aa01e7894694e"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/icons.md",
+      "sha256": "74cc78322874df4e2286bb0f5835d68114f74be1c94f993c94f6af692f44733b"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/LICENSE",
+      "sha256": "ed1dfe988fc40511b4845ccd9050a143a2002fee3bedc8064c47fa342b5d8d4f"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/performance.md",
+      "sha256": "e4bc3c90d6e0281d295e2e7e39d545fb9abd8a67667b0c10e589eda8115e5b1e"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/SKILL.md",
+      "sha256": "2482b7b89d851a3128d36edf5367f3223e113a4ef421b7358c7e6de3f2c83faf"
+    },
+    {
+      "path": "skills/ui-kit/better-ui/surfaces.md",
+      "sha256": "5508a7caf07ae8de616e7d83e282d4a08c026dd7a2d3cf54979609e4e0301048"
+    },
+    {
+      "path": "skills/ui-kit/emil-design-eng/LICENSE",
+      "sha256": "4ff5bdb7887ec1435c9cab0e8d1a7caee704d894d65c2a008ccc68b1cc2f260b"
+    },
+    {
+      "path": "skills/ui-kit/emil-design-eng/SKILL.md",
+      "sha256": "ffbe68e6007fb42cb8149f089b400a1ca007d59ba23e8948e2be4476f3175939"
     }
   ]
 }

@@ -110,7 +110,7 @@ describe("Matt Pocock maintainer sync", () => {
     };
 
     expect(result.status, result.stderr).toBe(0);
-    expect(lock.skills).toHaveLength(35);
+    expect(lock.skills).toHaveLength(37);
     expect(lock.legacySkills).toEqual([]);
     expect(lock.shadowedSkills).toEqual([]);
     expect(lock.mattPocockKit.revision).toBe(revision);

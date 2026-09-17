@@ -103,8 +103,8 @@ test("real BB loads one plugin source for every contracted skill id", async () =
       .map((capability) => capability.id);
 
     expect(result.plugin.status).not.toBe("error");
-    expect(skillIds).toHaveLength(35);
-    expect(new Set(skillIds).size).toBe(35);
+    expect(skillIds).toHaveLength(37);
+    expect(new Set(skillIds).size).toBe(37);
     expect(skillIds.filter((id) => ["domain-modeling", "grill-with-docs", "grilling"].includes(id)))
       .toEqual(["domain-modeling", "grill-with-docs", "grilling"]);
   } finally {

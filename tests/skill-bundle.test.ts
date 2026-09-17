@@ -13,6 +13,7 @@ const registeredRoots = [
   "skills/hanoon",
   "skills/pstack",
   "skills/humanlayer",
+  "skills/ui-kit",
 ] as const;
 const lockedRoots = [
   "skills/guards",
@@ -20,6 +21,7 @@ const lockedRoots = [
   "skills/hanoon",
   "skills/pstack",
   "skills/humanlayer",
+  "skills/ui-kit",
 ] as const;
 
 type LockFile = Readonly<{ path: string; sha256: string }>;
@@ -39,6 +41,8 @@ type SkillLock = Readonly<{
   hanoonKit: Readonly<Record<string, string>>;
   pstackKit: Readonly<Record<string, string>>;
   humanlayerKit: Readonly<Record<string, string>>;
+  betterUiKit: Readonly<Record<string, string>>;
+  emilDesignEngKit: Readonly<Record<string, string>>;
   skills: readonly LockSkill[];
   legacySkills: readonly LockSkill[];
   shadowedSkills: readonly LockSkill[];
@@ -98,7 +102,7 @@ describe("committed agent skill bundle", () => {
     }
   });
 
-  test("locks the contracted 35-skill catalog without leftover workflow, discovery, or delivery kits", () => {
+  test("locks the contracted 37-skill catalog without leftover workflow, discovery, or delivery kits", () => {
     const lock = readLock();
     const catalogSkills = new Map(
       CAPABILITY_CATALOG
@@ -106,12 +110,12 @@ describe("committed agent skill bundle", () => {
         .map((descriptor) => [descriptor.id, descriptor]),
     );
 
-    expect(lock.skills).toHaveLength(35);
+    expect(lock.skills).toHaveLength(37);
     expect(lock.legacySkills).toEqual([]);
     expect(lock.shadowedSkills).toEqual([]);
     expect(lock.workflowKit).toBeUndefined();
     expect(lock.discoveryKit).toBeUndefined();
-    expect(catalogSkills.size).toBe(35);
+    expect(catalogSkills.size).toBe(37);
     expect(catalogSkills.has("pr-writer")).toBe(false);
     for (const skill of lock.skills) {
       const descriptor = catalogSkills.get(skill.id);
@@ -143,6 +147,18 @@ describe("committed agent skill bundle", () => {
       license: "MIT",
       licensePath: "skills/humanlayer/LICENSE",
     });
+    expect(lock.betterUiKit).toMatchObject({
+      revision: "267330e1adfc66a718fb65fa6918c1f06d0a689e",
+      sourceUrl: "https://github.com/jakubkrehel/skills",
+      license: "MIT",
+      licensePath: "skills/ui-kit/better-ui/LICENSE",
+    });
+    expect(lock.emilDesignEngKit).toMatchObject({
+      revision: "85e8e2363b713506e1d5b6e07a0eb2da66be1bc3",
+      sourceUrl: "https://github.com/emilkowalski/skills",
+      license: "MIT",
+      licensePath: "skills/ui-kit/emil-design-eng/LICENSE",
+    });
   });
 
   test("ships every source license and notice", () => {
@@ -152,6 +168,8 @@ describe("committed agent skill bundle", () => {
       "skills/hanoon/NOTICE",
       "skills/pstack/LICENSE",
       "skills/humanlayer/LICENSE",
+      "skills/ui-kit/better-ui/LICENSE",
+      "skills/ui-kit/emil-design-eng/LICENSE",
     ]) {
       const absolute = join(repositoryRoot, licensePath);
       expect(existsSync(absolute), `${licensePath} exists`).toBe(true);
