@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   CONTROLLER_CAPABILITIES,
@@ -694,7 +694,7 @@ describe("controller capability manifest", () => {
     // which line to look at.
     const sources = execFileSync("git", ["ls-files", "src", "server.ts"], { encoding: "utf8" })
       .split("\n")
-      .filter((path) => path.endsWith(".ts"));
+      .filter((path) => path.endsWith(".ts") && existsSync(path));
     expect(sources.length).toBeGreaterThan(20);
     const offenders = sources.filter((path) => /import\s*\(\s*[^)]*\.ts["'`)]/.test(readFileSync(path, "utf8")));
     expect(offenders).toEqual([]);

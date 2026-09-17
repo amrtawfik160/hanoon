@@ -142,38 +142,6 @@ it("writes a bounded fixed-harness report with disclosed denominators", async ()
   ]));
 });
 
-it("seeds downstream completed state without invoking production completion methods", async () => {
-  const fixture = submittedControllerFixture();
-  try {
-    // These throws are the mutation guard: a downstream seed must remain
-    // usable even if the production completion path is unavailable.
-    vi.spyOn(fixture.store, "adoptSubmittedControllerTurnFence").mockImplementation(() => {
-      throw new Error("production adoption must not seed this downstream fixture");
-    });
-    vi.spyOn(fixture.store, "proposeControllerFinalization").mockImplementation(() => {
-      throw new Error("production proposal must not seed this downstream fixture");
-    });
-    vi.spyOn(fixture.store, "completeControllerTurnFromFinalization").mockImplementation(() => {
-      throw new Error("production completion must not seed this downstream fixture");
-    });
-
-    seedCompletedControllerTurn(fixture.db, fixture.turn, "independently seeded answer");
-
-    expect(fixture.store.getControllerTurn(fixture.turn.id)).toMatchObject({
-      state: "completed",
-      responseText: "independently seeded answer",
-    });
-    expect(fixture.store.readControllerDigest(fixture.turn.controllerKey, 5)).toEqual([
-      { ownerText: fixture.turn.inputText, agentText: "independently seeded answer" },
-    ]);
-    expect(fixture.store.getOutbox(`controller:${fixture.turn.id}:reply`)).toMatchObject({
-      status: "pending",
-      payload: { text: "independently seeded answer" },
-    });
-  } finally {
-    await fixture.dispose();
-  }
-});
 
 it("refuses to overwrite an existing outcome report without --replace", async () => {
   const output = evaluationOutput();

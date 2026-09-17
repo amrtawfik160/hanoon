@@ -27,6 +27,7 @@ import {
   NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   PROTECTED_CONNECTOR_MIGRATIONS,
   JOB_LEDGER_MIGRATIONS,
+  DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -239,11 +240,13 @@ it("keeps every shipped migration at its original position and appends new ones"
       CONTROLLER_BURST_MIGRATIONS.length + NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length +
         MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length +
           NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length +
-            PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length,
+            PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
+              DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length,
   );
   // The burst block is no longer the tail: the navigator effect protocol was
   // appended after it.
-  const burstTail = ALL_MIGRATIONS.length - JOB_LEDGER_MIGRATIONS.length - PROTECTED_CONNECTOR_MIGRATIONS.length -
+  const burstTail = ALL_MIGRATIONS.length - DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length -
+    JOB_LEDGER_MIGRATIONS.length - PROTECTED_CONNECTOR_MIGRATIONS.length -
     NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length -
     NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length - MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length -
     NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length - CONTROLLER_BURST_MIGRATIONS.length;
@@ -369,7 +372,8 @@ it("upgrades the shipped native SDLC schema without rewriting migration history 
   const shippedMigrationCount = ALL_MIGRATIONS.length -
     NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length -
     MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length -
-    NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length;
+    NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length -
+    DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length;
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, shippedMigrationCount));
   db.prepare(
     `INSERT INTO managed_automations (
@@ -1523,48 +1527,6 @@ it("persists acceptance and a bounded private draft without projecting the draft
   expect(JSON.stringify(store.getOutbox(`controller:${turn.id}:reply`))).not.toContain("private-start");
 });
 
-it("atomically retires an accepted broken generation into one restart-safe recovery turn", () => {
-  const { bb, store } = fixture();
-  const { turn, fence } = submittedTurn(store, "thr_recovery_broken");
-  expect(store.updateControllerStream({
-    ...fence,
-    turnId: turn.id,
-    cursor: 5,
-    phase: "responding",
-    inputAccepted: true,
-    assistantDraft: { itemId: "message-recovery", text: "Bounded unfinished answer" },
-  })).toBe(true);
-  const receipt = { turnId: turn.id, toolName: "telegram_agent_cancel", argsSha256: "a".repeat(64) };
-  expect(store.claimToolReceipt({ ...receipt, controllerKey: turn.controllerKey, ...fence })).toEqual({ outcome: "fresh" });
-  store.completeToolReceipt({ ...receipt, result: JSON.stringify({ cancelled: true }), now: fence.now });
-
-  expect(store.beginControllerRecovery({
-    ...fence,
-    turnId: turn.id,
-    controllerKey: turn.controllerKey,
-    expectedThreadId: "thr_recovery_broken",
-    error: "provider process exited",
-    nextFallbackIndex: 0,
-  })).toBe("requeued");
-
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "queued",
-    completionContinuations: 2,
-    inputAccepted: false,
-    privateDraftText: "Bounded unfinished answer",
-    retryCount: 0,
-  });
-  expect(store.listToolReceipts(turn.id)).toMatchObject([{ toolName: "telegram_agent_cancel", state: "completed" }]);
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-
-  const restarted = openStore(bb.storage, bb.storage.kv, () => 2_001);
-  expect(restarted.claimNextControllerTurn({ ...fence, now: 2_001 })).toMatchObject({
-    id: turn.id,
-    state: "dispatching",
-    completionContinuations: 2,
-    privateDraftText: "Bounded unfinished answer",
-  });
-});
 
 // The owner said yes to "Want me to sort the conflict out and put it back
 // through review?" and the turn arrived with observation tools only, so the
@@ -1686,42 +1648,6 @@ it("acknowledges two owner messages folded as one burst exactly once", () => {
   expect(announcements).toHaveLength(1);
 });
 
-it("preserves an ambiguously steered owner message and inherits exact receipts", () => {
-  const { store } = fixture();
-  const { turn: running, fence } = submittedTurn(store, "thr_ambiguous_preserve");
-  const waiting = store.enqueueControllerTurn(turnInput(78_001, "actually cancel the second job"));
-  const receipt = { turnId: running.id, toolName: "telegram_agent_cancel", argsSha256: "b".repeat(64) };
-  expect(store.claimToolReceipt({ ...receipt, controllerKey: running.controllerKey, ...fence })).toEqual({ outcome: "fresh" });
-  store.completeToolReceipt({ ...receipt, result: JSON.stringify({ cancelled: true }), now: fence.now });
-  expect(store.reserveControllerSteer({
-    ...fence,
-    runningTurnId: running.id,
-    waitingTurnId: waiting.id,
-    controllerKey: running.controllerKey,
-    expectedThreadId: "thr_ambiguous_preserve",
-  })).toBe(true);
-
-  expect(store.settleControllerSteer({
-    ...fence,
-    runningTurnId: running.id,
-    waitingTurnId: waiting.id,
-    controllerKey: running.controllerKey,
-    outcome: "unknown",
-  })).toBe("settled");
-
-  expect(store.getControllerTurn(waiting.id)).toMatchObject({
-    state: "queued",
-    recoverySourceTurnId: running.id,
-  });
-  expect(store.getOutbox(`controller:${waiting.id}:reply`)).toBeNull();
-  expect(store.claimToolReceipt({
-    turnId: waiting.id,
-    toolName: receipt.toolName,
-    argsSha256: receipt.argsSha256,
-    controllerKey: running.controllerKey,
-    now: 2_001,
-  })).toEqual({ outcome: "completed", result: JSON.stringify({ cancelled: true }) });
-});
 
 it("lets a durable acceptance win an unaccepted fail-and-retire attempt", () => {
   const { bb, store } = fixture();
@@ -1852,79 +1778,6 @@ it("repairs duplicate generations during fail-and-retire while preserving owner 
   expect(JSON.stringify(notices[0]?.payload)).not.toContain("runtime caller prose");
 });
 
-it("repairs duplicate generations during recovery while preserving receipts and finalization", () => {
-  const { bb, store } = fixture();
-  const db = bb.storage.database();
-  const key = "owner-7-controller";
-  const thread = "thr_gen_repair_recovery";
-  const { turn, fence } = submittedTurn(store, thread);
-  const waiting = store.enqueueControllerTurn(turnInput(78_901, "preserve second queued follow-up"));
-  expect(store.updateControllerStream({
-    ...fence,
-    turnId: turn.id,
-    cursor: 2,
-    phase: "responding",
-    inputAccepted: true,
-    assistantDraft: { itemId: "message-corrupt-recovery", text: "preserve private draft" },
-  })).toBe(true);
-  const receipt = { turnId: turn.id, toolName: "telegram_agent_cancel", argsSha256: "e".repeat(64) };
-  expect(store.claimToolReceipt({ ...receipt, controllerKey: key, ...fence })).toEqual({ outcome: "fresh" });
-  store.completeToolReceipt({ ...receipt, result: JSON.stringify({ cancelled: true }), now: fence.now });
-  const accepted = store.proposeControllerFinalization({
-    ...fence,
-    turnId: turn.id,
-    controllerKey: key,
-    candidate: {
-      disposition: "answered",
-      segments: [{ type: "text", text: "preserve recovery finalization" }],
-      obligationRefs: [],
-    },
-  });
-  if (accepted.outcome !== "accepted") throw new Error("accepted finalization fixture was not accepted");
-  db.exec("DROP INDEX one_open_controller_generation");
-  db.prepare("INSERT INTO controller_generations (id, controller_key, thread_id, started_at, ended_at, end_reason) VALUES ('gen-recovery-foreign', ?, 'thr_recovery_foreign', 1, NULL, NULL)")
-    .run(key);
-
-  expect(store.beginControllerRecovery({
-    ...fence,
-    turnId: turn.id,
-    controllerKey: key,
-    expectedThreadId: thread,
-    error: "recovery caller prose must stay private",
-    nextFallbackIndex: 1,
-  })).toBe("requeued");
-
-  expect(store.getControllerTurn(turn.id)).toMatchObject({
-    state: "queued",
-    inputText: "I ran into a wall",
-    privateDraftText: "preserve private draft",
-    acceptedFinalizationId: accepted.finalization.id,
-    completionContinuations: 2,
-  });
-  expect(store.getControllerTurn(waiting.id)).toMatchObject({
-    state: "queued",
-    inputText: "preserve second queued follow-up",
-  });
-  expect(store.listToolReceipts(turn.id)).toMatchObject([
-    { toolName: receipt.toolName, state: "completed", result: JSON.stringify({ cancelled: true }) },
-  ]);
-  expect(store.getAcceptedControllerFinalization(turn.id)).toMatchObject({
-    id: accepted.finalization.id,
-    consumedAt: null,
-  });
-  expect(store.getControllerForOwner("7", "7")).toMatchObject({ state: "pending_spawn", threadId: null });
-  expect(db.prepare(
-    "SELECT COUNT(*) AS count FROM controller_generations WHERE controller_key = ? AND ended_at IS NULL",
-  ).get(key)).toEqual({ count: 0 });
-  const notices = store.listOutbox(100).filter((outbox) =>
-    outbox.logicalKey === "controller-generation-recovery:owner-7-controller"
-  );
-  expect(notices).toHaveLength(1);
-  expect(notices[0]?.payload.text).toBe(
-    "I preserved that message because its delivery could not be confirmed. It will be reconciled before any action is repeated.",
-  );
-  expect(JSON.stringify(notices[0]?.payload)).not.toContain("recovery caller prose");
-});
 
 it("preserves the turn updated_at when a native batch does not advance the cursor", () => {
   const { store } = fixture();

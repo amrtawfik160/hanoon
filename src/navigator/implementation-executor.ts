@@ -13,15 +13,10 @@ import {
   type NavigatorTicketWorkOrder,
 } from "./implementation-contracts";
 import { artifactBindingSchema, type NavigatorArtifactBinding } from "./models";
-import type {
-  NavigatorFindingLedgerDecision,
-  NavigatorFindingLedgerEntry,
-} from "./finding-ledger";
 import type { NavigatorImplementationPersistence } from "./implementation-persistence";
 import type { NavigatorTicketWorkerOutcome } from "./ticket-settlement-repository";
 import type { NavigatorGitObserver } from "./ticket-adapter";
 
-export type { NavigatorFindingLedgerEntry } from "./finding-ledger";
 export type { NavigatorTicketWorkerOutcome } from "./ticket-settlement-repository";
 export type {
   NavigatorGitObservationRequest,
@@ -91,20 +86,6 @@ export type NavigatorIntegrationSnapshot = Readonly<{
   }> | null;
   attempts: readonly NavigatorTicketWorkerAttempt[];
   outcomes: readonly NavigatorTicketWorkerOutcome[];
-  findingLedgerDecision: NavigatorFindingLedgerDecision;
-  findingLedger: readonly Readonly<{
-    rootCauseId: string;
-    sliceId: string;
-    sourceReviewAttemptId: string;
-    verificationAttemptId: string;
-    disposition: "must_fix" | "advisory";
-    state: "open" | "resolved" | "disputed" | "stale";
-    occurrence: number;
-    blockingBurden: number;
-    headSha: string;
-    supersedesRootCauseId: string | null;
-    finding: NavigatorFindingLedgerEntry["finding"];
-  }>[];
 }>;
 
 export interface NavigatorPullRequestPublisher {

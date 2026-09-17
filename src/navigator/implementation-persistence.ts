@@ -666,7 +666,6 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
        WHERE attempt.job_id = ? ORDER BY outcome.recorded_at, outcome.attempt_id`,
     ).all(jobId) as OutcomeRow[];
     const activeSlice = integration.active_slice_id === null ? null : this.requireSlice(integration.active_slice_id);
-    const findingLedgerDecision = this.store.getNavigatorFindingLedgerDecision(jobId);
     return {
       integration: {
         jobId: integration.job_id,
@@ -697,20 +696,6 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
       activeSlice: activeSlice === null ? null : this.sliceValue(activeSlice),
       attempts: attempts.map(parseAttempt),
       outcomes: outcomes.map(parseOutcome),
-      findingLedgerDecision,
-      findingLedger: findingLedgerDecision.entries.map((entry) => ({
-        rootCauseId: entry.rootCauseId,
-        sliceId: entry.sliceId,
-        sourceReviewAttemptId: entry.sourceReviewAttemptId,
-        verificationAttemptId: entry.verificationAttemptId,
-        disposition: entry.disposition,
-        state: entry.state,
-        occurrence: entry.occurrence,
-        blockingBurden: entry.blockingBurden,
-        headSha: entry.headSha,
-        supersedesRootCauseId: entry.supersedesRootCauseId,
-        finding: entry.finding,
-      })),
     };
   }
 

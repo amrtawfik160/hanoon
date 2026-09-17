@@ -19,14 +19,11 @@ import type {
   ControllerEvidenceRecord,
   ControllerEvidenceOutcome,
 } from "../storage/controller-evidence-repository";
-import type { TelegramAgentStore, ToolReceiptClaim } from "../storage/store";
+import type { TelegramAgentStore } from "../storage/store";
 
 const MAX_SAFE_SUBJECTS = 16;
 const SAFE_SUBJECT_REF = /^(?:project|job|thread|monitor|memory|delegation|controller|credential-binding|credential-receipt|credential-connector-receipt|reference|reference-passage):[^\s:]{1,248}$/;
-const INTERRUPTED_DOMAIN_RESULT = Object.freeze({
-  outcome: "uncertain",
-  detail: "An identical call was already started and its outcome is unknown. Check current state before acting again.",
-});
+
 
 type JsonPrimitive = null | boolean | number | string;
 export type ControllerJsonObject = { [key: string]: ControllerJsonValue };
@@ -308,13 +305,6 @@ function safeProjection(
   return { ...projection, proofKinds: [...projection.proofKinds], subjectRefs };
 }
 
-function interruptedSubjectRefs(resolution: ControllerCapabilityScopeResolution): readonly string[] {
-  return resolution.scope.entityRefs.filter((subjectRef) =>
-    typeof subjectRef === "string" &&
-    Buffer.byteLength(subjectRef, "utf8") <= 256 &&
-    SAFE_SUBJECT_REF.test(subjectRef));
-}
-
 function maximumEnvelope(projection: ControllerCapabilityEvidenceProjection): HanoonEvidenceEnvelope {
   return {
     ref: "evidence:9007199254740991",
@@ -337,148 +327,6 @@ function assertFinalResultBound(
   return output;
 }
 
-function parseReceiptDomainObject(receipt: string): ControllerJsonObject {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(receipt);
-  } catch {
-    throw new ControllerCapabilityExecutionError("receipt_invalid");
-  }
-  let normalized: ControllerJsonObject;
-  try {
-    normalized = normalizedDomainObject(parsed, "stored controller tool receipt");
-  } catch {
-    throw new ControllerCapabilityExecutionError("receipt_invalid");
-  }
-  if (canonicalString(normalized) !== receipt) {
-    throw new ControllerCapabilityExecutionError("receipt_invalid");
-  }
-  return normalized;
-}
-
-function receiptKey(
-  authorized: AuthorizedControllerCapability,
-  descriptor: ControllerCapabilityDescriptor,
-  params: unknown,
-) {
-  let argsSha256: string;
-  try {
-    argsSha256 = sha256ControllerJson(params);
-  } catch {
-    throw new ControllerCapabilityExecutionError("params_invalid");
-  }
-  return {
-    turnId: authorized.turn.id,
-    toolName: descriptor.capability_id,
-    argsSha256,
-  };
-}
-
-type InvocationReservation = Readonly<{
-  key: ReturnType<typeof receiptKey> | null;
-  claim: ToolReceiptClaim | null;
-}>;
-
-function reserveInvocation(
-  dependencies: ControllerCapabilityDependencies,
-  authorized: AuthorizedControllerCapability,
-  input: ExecuteControllerCapabilityInput,
-): InvocationReservation {
-  if (input.descriptor.effect_class === "read") return { key: null, claim: null };
-  const key = receiptKey(authorized, input.descriptor, input.params);
-  const fence = currentFence(dependencies, authorized);
-  const claim = dependencies.store.claimToolReceipt({
-    ...key,
-    controllerKey: authorized.controller.controllerKey,
-    ownerId: fence.ownerId,
-    generation: fence.generation,
-    now: fence.now,
-  });
-  if (claim.outcome === "finalized") {
-    throw new ControllerCapabilityAuthorizationError("turn_finalized");
-  }
-  if (claim.outcome === "fence_lost") {
-    throw new ControllerCapabilityAuthorizationError("fence_lost");
-  }
-  return { key, claim };
-}
-
-function releaseFreshInvocation(
-  dependencies: ControllerCapabilityDependencies,
-  authorized: AuthorizedControllerCapability,
-  reservation: InvocationReservation,
-): void {
-  if (reservation.key === null || reservation.claim?.outcome !== "fresh") return;
-  let fence: AuthorizedControllerCapability["fence"];
-  try {
-    fence = currentFence(dependencies, authorized);
-  } catch (error) {
-    if (error instanceof ControllerCapabilityAuthorizationError) return;
-    throw error;
-  }
-  dependencies.store.failToolReceipt({
-    ...reservation.key,
-    controllerKey: authorized.controller.controllerKey,
-    ownerId: fence.ownerId,
-    generation: fence.generation,
-    error: "authorization_failed",
-    now: fence.now,
-  });
-}
-
-async function domainResultForExecution(
-  dependencies: ControllerCapabilityDependencies,
-  authorized: AuthorizedControllerCapability,
-  input: ExecuteControllerCapabilityInput,
-  resolution: ControllerCapabilityScopeResolution,
-  reservation: InvocationReservation,
-): Promise<{ domainResult: ControllerJsonObject; replay: boolean; interrupted: boolean; key: ReturnType<typeof receiptKey> | null }> {
-  const { key } = reservation;
-  if (key === null) {
-    const rawDomainValue = await input.run(resolution, authorized);
-    try {
-      return { domainResult: normalizedDomainObject(rawDomainValue), replay: false, interrupted: false, key };
-    } catch {
-      throw new ControllerCapabilityExecutionError("domain_result_invalid");
-    }
-  }
-  const claim = reservation.claim;
-  if (claim === null) throw new ControllerCapabilityExecutionError("receipt_invalid");
-  if (claim.outcome === "completed") {
-    return { domainResult: parseReceiptDomainObject(claim.result), replay: true, interrupted: false, key };
-  }
-  if (claim.outcome === "interrupted") {
-    return { domainResult: { ...INTERRUPTED_DOMAIN_RESULT }, replay: false, interrupted: true, key };
-  }
-  let rawDomainValue: unknown;
-  try {
-    rawDomainValue = await input.run(resolution, authorized);
-  } catch (error) {
-    if (input.descriptor.effect_class === "durable_local_write") {
-      const fence = currentFence(dependencies, authorized);
-      dependencies.store.failToolReceipt({
-        ...key,
-        controllerKey: authorized.controller.controllerKey,
-        ownerId: fence.ownerId,
-        generation: fence.generation,
-        error: "domain_operation_failed",
-        now: fence.now,
-      });
-    }
-    throw error;
-  }
-  try {
-    return {
-      domainResult: normalizedDomainObject(rawDomainValue),
-      replay: false,
-      interrupted: false,
-      key,
-    };
-  } catch {
-    throw new ControllerCapabilityExecutionError("domain_result_invalid");
-  }
-}
-
 export async function executeControllerCapability(
   dependencies: ControllerCapabilityDependencies,
   input: ExecuteControllerCapabilityInput,
@@ -488,62 +336,46 @@ export async function executeControllerCapability(
     policyReadable: true,
     scope: { kind: input.descriptor.project_scope === "controller_global" ? "controller_global" : "exact_entity", entityRefs: [], matches: true },
   });
-  const reservation = reserveInvocation(dependencies, preliminary, input);
-  // Reserve before any asynchronous scope read so finalization cannot win the gap before the mutation.
   let resolution: ControllerCapabilityScopeResolution;
   try {
     resolution = input.resolveScope
       ? await input.resolveScope(preliminary)
       : { scope: input.scope ?? { kind: "exact_entity", entityRefs: [], matches: false } };
   } catch (error) {
-    releaseFreshInvocation(dependencies, preliminary, reservation);
     if (error instanceof ControllerCapabilityAuthorizationError) throw error;
     throw new ControllerCapabilityAuthorizationError("policy_unreadable");
   }
-  let authorized: AuthorizedControllerCapability;
-  try {
-    authorized = authorizeControllerCapability(dependencies, {
-      ...input,
-      policyReadable: resolution.policyReadable ?? input.policyReadable ?? true,
-      scope: resolution.scope,
-    });
-    if (preliminary.turn.id !== authorized.turn.id) {
-      throw new ControllerCapabilityAuthorizationError("turn_missing");
-    }
-    currentFence(dependencies, authorized);
-  } catch (error) {
-    releaseFreshInvocation(dependencies, preliminary, reservation);
-    throw error;
+  const authorized = authorizeControllerCapability(dependencies, {
+    ...input,
+    policyReadable: resolution.policyReadable ?? input.policyReadable ?? true,
+    scope: resolution.scope,
+  });
+  if (preliminary.turn.id !== authorized.turn.id) {
+    throw new ControllerCapabilityAuthorizationError("turn_missing");
   }
-  let execution: Awaited<ReturnType<typeof domainResultForExecution>>;
+  currentFence(dependencies, authorized);
+  let domainResult: ControllerJsonObject;
+  const rawDomainValue = await input.run(resolution, authorized);
   try {
-    execution = await domainResultForExecution(dependencies, authorized, input, resolution, reservation);
-  } catch (error) {
-    if (error instanceof ControllerCapabilityAuthorizationError) {
-      releaseFreshInvocation(dependencies, authorized, reservation);
-    }
-    throw error;
+    domainResult = normalizedDomainObject(rawDomainValue);
+  } catch {
+    throw new ControllerCapabilityExecutionError("domain_result_invalid");
   }
   let projection: ControllerCapabilityEvidenceProjection;
   try {
-    const rawProjection = execution.interrupted
-      ? { outcome: "interrupted" as const, proofKinds: [] as const, subjectRefs: interruptedSubjectRefs(resolution) }
-      : await input.projectEvidence(execution.domainResult, resolution);
-    projection = safeProjection(input.descriptor, execution.replay
-      ? { ...rawProjection, outcome: "observed" }
-      : rawProjection);
+    projection = safeProjection(input.descriptor, await input.projectEvidence(domainResult, resolution));
   } catch {
     throw new ControllerCapabilityExecutionError("evidence_projection_invalid");
   }
   try {
-    assertFinalResultBound(input.descriptor, execution.domainResult, maximumEnvelope(projection));
+    assertFinalResultBound(input.descriptor, domainResult, maximumEnvelope(projection));
   } catch {
     throw new ControllerCapabilityExecutionError("result_limit_exceeded");
   }
   const fence = currentFence(dependencies, authorized);
   let evidenceWrite: ReturnType<TelegramAgentStore["recordControllerEvidence"]>;
   try {
-    const evidenceInput = {
+    evidenceWrite = dependencies.store.recordControllerEvidence({
       ...fence,
       turnId: authorized.turn.id,
       controllerKey: authorized.controller.controllerKey,
@@ -552,19 +384,10 @@ export async function executeControllerCapability(
       sourceItemId: null,
       outcome: projection.outcome,
       argsSha256: sha256ControllerJson(input.params),
-      resultSha256: sha256ControllerJson(execution.domainResult),
+      resultSha256: sha256ControllerJson(domainResult),
       proofKinds: projection.proofKinds,
       subjectRefs: projection.subjectRefs,
-    } as const;
-    evidenceWrite = execution.key !== null && !execution.replay
-      ? dependencies.store.settleToolReceiptAndRecordEvidence({
-          ...evidenceInput,
-          toolName: input.descriptor.capability_id,
-          result: canonicalString(execution.domainResult),
-          receiptState: execution.interrupted ? "failed" : "completed",
-          receiptError: execution.interrupted ? "outcome_unknown" : null,
-        })
-      : dependencies.store.recordControllerEvidence(evidenceInput);
+    });
   } catch {
     throw new ControllerCapabilityExecutionError("evidence_write_failed");
   }
@@ -579,7 +402,7 @@ export async function executeControllerCapability(
     observedAt: evidenceWrite.evidence.observedAt,
   };
   try {
-    return assertFinalResultBound(input.descriptor, execution.domainResult, envelope);
+    return assertFinalResultBound(input.descriptor, domainResult, envelope);
   } catch {
     throw new ControllerCapabilityExecutionError("final_result_invalid");
   }

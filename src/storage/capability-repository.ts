@@ -17,12 +17,6 @@ import {
   modelRouteSchema,
   type ModelRoute,
 } from "../capabilities/models";
-import type {
-  AppendRecipeRolloutDecisionInput,
-  RecipeRolloutDecision,
-} from "../capabilities/promotion";
-import { TASK_RECIPES, type TaskRecipe } from "../domain/recipes";
-import { readDurablePromotionEvidenceSnapshot } from "./promotion-evidence-snapshot";
 
 type SqliteDatabase = Database.Database;
 
@@ -161,24 +155,6 @@ const inventoryFailureSchema = z.object({
   errorClass: boundedKeySchema,
   now: nonNegativeIntegerSchema,
 }).strict();
-const appendRecipeRolloutDecisionSchema = z.object({
-  recipe: z.enum(TASK_RECIPES),
-  action: z.enum(["promote", "rollback"]),
-  reasonCode: boundedKeySchema,
-  evidenceDigest: sha256Schema.nullable(),
-  now: nonNegativeIntegerSchema,
-}).strict().superRefine((value, context) => {
-  if (value.action === "promote") {
-    if (value.reasonCode !== "promotion_gates_passed") {
-      context.addIssue({ code: "custom", message: "Promotion requires the passed-gates reason" });
-    }
-    if (value.evidenceDigest === null) {
-      context.addIssue({ code: "custom", message: "Promotion requires an evidence digest" });
-    }
-  } else if (value.evidenceDigest !== null) {
-    context.addIssue({ code: "custom", message: "Rollback cannot claim promotion evidence" });
-  }
-});
 
 export type CapabilitySubjectKind = "controller_turn" | "worker_attempt";
 export type CapabilityProfileMode = "active" | "shadow";
@@ -368,15 +344,6 @@ type InventoryHealthRow = {
   refreshed_at: number;
 };
 
-type RecipeRolloutDecisionRow = {
-  id: string;
-  subject_id: string;
-  from_recipe: TaskRecipe;
-  to_recipe: TaskRecipe;
-  reason_code: string;
-  created_at: number;
-};
-
 export class CapabilityRevisionConflictError extends Error {
   public constructor(subjectKind: CapabilitySubjectKind, subjectId: string, expected: number, actual: number) {
     super(`Capability profile revision conflict for ${subjectKind}/${subjectId}: expected ${expected}, next is ${actual}`);
@@ -435,43 +402,6 @@ function parseReceipt(row: ReceiptRow): CapabilityReceipt {
     mandatory: row.mandatory === 1,
     outcome: row.outcome,
     evidenceRefs: parseStringArray(row.evidence_refs_json, "receipt evidence"),
-    createdAt: row.created_at,
-  };
-}
-
-function parseRecipeRolloutDecision(row: RecipeRolloutDecisionRow): RecipeRolloutDecision {
-  const recipe = z.enum(TASK_RECIPES).parse(row.to_recipe);
-  if (row.from_recipe !== recipe) throw new TypeError("Persisted rollout decision changes recipe identity");
-  const prefix = `rollout:${recipe}:`;
-  if (!row.subject_id.startsWith(prefix)) throw new TypeError("Persisted rollout subject identity is invalid");
-  const suffix = row.subject_id.slice(prefix.length);
-  if (suffix.startsWith("promote:")) {
-    const [evidenceDigestValue, decisionToken, ...extra] = suffix.slice("promote:".length).split(":");
-    if (extra.length > 0 || decisionToken === undefined) {
-      throw new TypeError("Persisted promotion subject identity is invalid");
-    }
-    const evidenceDigest = sha256Schema.parse(evidenceDigestValue);
-    boundedIdSchema.parse(decisionToken);
-    if (row.reason_code !== "promotion_gates_passed") {
-      throw new TypeError("Persisted promotion reason is invalid");
-    }
-    return {
-      id: row.id,
-      recipe,
-      action: "promote",
-      reasonCode: row.reason_code,
-      evidenceDigest,
-      createdAt: row.created_at,
-    };
-  }
-  if (!suffix.startsWith("rollback:")) throw new TypeError("Persisted rollout action is invalid");
-  boundedIdSchema.parse(suffix.slice("rollback:".length));
-  return {
-    id: row.id,
-    recipe,
-    action: "rollback",
-    reasonCode: boundedKeySchema.parse(row.reason_code),
-    evidenceDigest: null,
     createdAt: row.created_at,
   };
 }
@@ -1046,72 +976,6 @@ export class CapabilityRepository {
       errorClass: row.error_class,
       refreshedAt: row.refreshed_at,
     } : null;
-  }
-
-  public readDurableRecipePromotionEvidenceSnapshot(recipe: TaskRecipe): unknown | null {
-    const parsedRecipe = z.enum(TASK_RECIPES).parse(recipe);
-    return readDurablePromotionEvidenceSnapshot(this.db, parsedRecipe);
-  }
-
-  public appendRecipeRolloutDecision(
-    rawInput: AppendRecipeRolloutDecisionInput,
-  ): RecipeRolloutDecision {
-    const input = appendRecipeRolloutDecisionSchema.parse(rawInput);
-    const subjectId = input.action === "promote"
-      ? `rollout:${input.recipe}:promote:${input.evidenceDigest ?? ""}:${randomUUID()}`
-      : `rollout:${input.recipe}:rollback:${randomUUID()}`;
-    const id = `recipe_rollout:${randomUUID()}`;
-    try {
-      this.db.prepare(
-        `INSERT INTO recipe_promotions (
-           id, subject_kind, subject_id, from_recipe, to_recipe, reason_code, created_at
-         ) VALUES (?, 'worker_attempt', ?, ?, ?, ?, ?)`,
-      ).run(id, subjectId, input.recipe, input.recipe, input.reasonCode, input.now);
-    } catch (error) {
-      if (input.action !== "promote" || !isUniqueConstraint(error)) throw error;
-    }
-    const row = this.db.prepare(
-      `SELECT id, subject_id, from_recipe, to_recipe, reason_code, created_at
-         FROM recipe_promotions
-        WHERE subject_kind = 'worker_attempt' AND subject_id = ?`,
-    ).get(subjectId) as RecipeRolloutDecisionRow | undefined;
-    if (!row) throw new Error("Recipe rollout decision disappeared after persistence");
-    const decision = parseRecipeRolloutDecision(row);
-    if (
-      decision.recipe !== input.recipe || decision.action !== input.action ||
-      decision.reasonCode !== input.reasonCode || decision.evidenceDigest !== input.evidenceDigest
-    ) {
-      throw new TypeError("Recipe rollout decision conflicts with its durable identity");
-    }
-    return decision;
-  }
-
-  public listRecipeRolloutDecisions(recipe: TaskRecipe, requestedLimit: number): RecipeRolloutDecision[] {
-    const parsedRecipe = z.enum(TASK_RECIPES).parse(recipe);
-    const rows = this.db.prepare(
-      `SELECT id, subject_id, from_recipe, to_recipe, reason_code, created_at
-         FROM (
-           SELECT rowid AS sequence, id, subject_id, from_recipe, to_recipe, reason_code, created_at
-             FROM recipe_promotions
-            WHERE subject_kind = 'worker_attempt' AND from_recipe = ? AND to_recipe = ?
-              AND subject_id LIKE ?
-            ORDER BY created_at DESC, rowid DESC LIMIT ?
-         )
-        ORDER BY created_at ASC, sequence ASC`,
-    ).all(parsedRecipe, parsedRecipe, `rollout:${parsedRecipe}:%`, boundedLimit(requestedLimit)) as RecipeRolloutDecisionRow[];
-    return rows.map(parseRecipeRolloutDecision);
-  }
-
-  public getLatestRecipeRolloutDecision(recipe: TaskRecipe): RecipeRolloutDecision | null {
-    const parsedRecipe = z.enum(TASK_RECIPES).parse(recipe);
-    const row = this.db.prepare(
-      `SELECT id, subject_id, from_recipe, to_recipe, reason_code, created_at
-         FROM recipe_promotions
-        WHERE subject_kind = 'worker_attempt' AND from_recipe = ? AND to_recipe = ?
-          AND subject_id LIKE ?
-        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-    ).get(parsedRecipe, parsedRecipe, `rollout:${parsedRecipe}:%`) as RecipeRolloutDecisionRow | undefined;
-    return row ? parseRecipeRolloutDecision(row) : null;
   }
 
   private nextRevision(subjectKind: CapabilitySubjectKind, subjectId: string): number {

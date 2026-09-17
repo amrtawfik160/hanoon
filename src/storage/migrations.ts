@@ -5118,6 +5118,31 @@ CREATE TABLE job_ledger (
 );
 `] as const;
 
+export const DEAD_DURABLE_SUBSYSTEM_MIGRATIONS = [String.raw`
+DROP TABLE IF EXISTS recipe_live_evidence_receipts;
+DROP TABLE IF EXISTS recipe_model_trial_evidence;
+DROP TABLE IF EXISTS recipe_safety_evidence;
+DROP TABLE IF EXISTS recipe_promotion_evidence_manifests;
+DROP TABLE IF EXISTS recipe_deterministic_evidence;
+DROP TABLE IF EXISTS recipe_classifier_evidence;
+DROP TABLE IF EXISTS recipe_live_evidence;
+DROP TABLE IF EXISTS recipe_promotions;
+DROP TABLE IF EXISTS navigator_model_trial_evidence;
+DROP TABLE IF EXISTS navigator_promotion_evidence_manifests;
+DROP TABLE IF EXISTS navigator_deterministic_evidence;
+DROP TABLE IF EXISTS navigator_corpus_evidence;
+DROP TABLE IF EXISTS navigator_live_evidence;
+DROP TABLE IF EXISTS navigator_safety_evidence;
+DROP TABLE IF EXISTS workflow_engine_promotions;
+DROP TABLE IF EXISTS navigator_review_finding_events;
+DROP TABLE IF EXISTS navigator_review_convergence;
+DROP TABLE IF EXISTS tool_receipts;
+DROP TABLE IF EXISTS controller_digest;
+DROP TABLE IF EXISTS memory_recalls;
+ALTER TABLE memories DROP COLUMN curated_at;
+UPDATE monitors SET state = 'cancelled' WHERE system_key IS NOT NULL AND state != 'cancelled';
+`] as const;
+
 export const ALL_MIGRATIONS = [
   ...INITIAL_MIGRATIONS,
   ...UPDATE_CLAIM_MIGRATIONS,
@@ -5220,4 +5245,5 @@ export const ALL_MIGRATIONS = [
   ...NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   ...PROTECTED_CONNECTOR_MIGRATIONS,
   ...JOB_LEDGER_MIGRATIONS,
+  ...DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
 ] as const;

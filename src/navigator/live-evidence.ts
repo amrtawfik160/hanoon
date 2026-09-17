@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { TelegramAgentStore } from "../storage/store";
-import type { NavigatorLiveScenario } from "./promotion";
+import type { NavigatorLiveScenario } from "./models";
 
 export type NavigatorLiveScenarioRun = Readonly<{
   scenario: NavigatorLiveScenario;

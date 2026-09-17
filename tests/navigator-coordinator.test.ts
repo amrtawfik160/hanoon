@@ -23,11 +23,7 @@ import {
   type NavigatorTicketWorkerOperation,
 } from "../src/navigator/ticket-adapter";
 import { NavigatorEffectProtocol } from "../src/navigator/effect-protocol";
-import { DurableNavigatorPromotionEvidenceReader } from "../src/navigator/promotion-evidence";
-import {
-  NAVIGATOR_LIVE_SCENARIOS,
-  NavigatorPromotionService,
-} from "../src/navigator/promotion";
+import { NAVIGATOR_LIVE_SCENARIOS } from "../src/navigator/models";
 import { createNavigatorReleaseEffectAdapter } from "../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../src/navigator/release-executor";
 import { navigatorReleaseOperationId } from "../src/navigator/release-contracts";
@@ -229,59 +225,7 @@ function confirmNavigatorAdmission(
 }
 
 describe("dual-engine coordinator", () => {
-  it("refuses live evidence that is only a SQL-stamped terminal job", async () => {
-    const { store, database, now, coordinator } = openCoordinatorFixture();
-    const corpus = await coordinator.evaluateCorpus();
-    const liveRuns = NAVIGATOR_LIVE_SCENARIOS.map((scenario) => {
-      const live = createLiveJob(store, database, scenario, now);
-      return {
-        scenario,
-        jobId: live.jobId,
-        terminalState: live.terminalState,
-        evidenceDigest: "c".repeat(64),
-      };
-    });
-    const trials = seedTrials(store, now);
-    expect(() => coordinator.persistEvaluationEvidence({
-      corpus,
-      liveRuns,
-      candidateTrialIds: trials.candidateTrialIds,
-      baselineTrialIds: trials.baselineTrialIds,
-      harnessDigest: NAVIGATOR_EVALUATION_HARNESS_DIGEST,
-      budgetDigest: NAVIGATOR_EVALUATION_BUDGET_DIGEST,
-      reviewed: true,
-    })).toThrow(/not an executed disposable run/);
-  });
 
-  it("evaluates the fixed corpus, persists reviewed evidence, and admits navigator-v1", async () => {
-    const { store, database, now, coordinator } = openCoordinatorFixture();
-    const corpus = await coordinator.evaluateCorpus();
-    expect(corpus).toMatchObject({ total: 58, correct: 58, unauthorizedEffects: 0 });
-
-    const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store, database, now, sequence: fixtureSequence,
-    });
-    const trials = seedTrials(store, now);
-    coordinator.persistEvaluationEvidence({
-      corpus,
-      liveRuns,
-      candidateTrialIds: trials.candidateTrialIds,
-      baselineTrialIds: trials.baselineTrialIds,
-      harnessDigest: NAVIGATOR_EVALUATION_HARNESS_DIGEST,
-      budgetDigest: NAVIGATOR_EVALUATION_BUDGET_DIGEST,
-      reviewed: true,
-    });
-
-    const promotions = new NavigatorPromotionService({
-      store,
-      readEvidence: () => new DurableNavigatorPromotionEvidenceReader(store).read(),
-      now,
-    });
-    const decision = await promotions.promote();
-    expect(decision.action).toBe("promote");
-    const { job: admitted } = confirmNavigatorAdmission(store, now);
-    expect(admitted).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
-  });
 
   it("names every restart injection point required for dual-engine promotion", () => {
     expect(DUAL_ENGINE_RESTART_POINTS).toEqual([
@@ -298,39 +242,6 @@ describe("dual-engine coordinator", () => {
     ]);
   });
 
-  it("does not persist restart as passed or safety zeros unless those were measured", async () => {
-    const { store, database, now, coordinator } = openCoordinatorFixture();
-    const corpus = await coordinator.evaluateCorpus();
-    const liveRuns = await runRequiredNavigatorLiveScenarios({
-      store, database, now, sequence: fixtureSequence,
-    });
-    const trials = seedTrials(store, now);
-    coordinator.persistEvaluationEvidence({
-      corpus: { ...corpus, unauthorizedEffects: 2, restartPointsMeasured: [] },
-      liveRuns,
-      candidateTrialIds: trials.candidateTrialIds,
-      baselineTrialIds: trials.baselineTrialIds,
-      harnessDigest: NAVIGATOR_EVALUATION_HARNESS_DIGEST,
-      budgetDigest: NAVIGATOR_EVALUATION_BUDGET_DIGEST,
-      reviewed: true,
-    });
-
-    const evidence = new DurableNavigatorPromotionEvidenceReader(store).read();
-    expect(evidence?.deterministic.find((entry) => entry.category === "restart")).toMatchObject({
-      outcome: "failed",
-    });
-    expect(evidence?.safetyCounters.find((entry) => entry.counter === "unauthorized_effects")).toMatchObject({
-      count: 2,
-    });
-    const promotions = new NavigatorPromotionService({
-      store,
-      readEvidence: () => new DurableNavigatorPromotionEvidenceReader(store).read(),
-      now,
-    });
-    await expect(promotions.promote()).rejects.toMatchObject({
-      assessment: { status: "failed", ready: false },
-    });
-  });
 });
 
 describe("disposable navigator live path", () => {
@@ -371,12 +282,6 @@ describe("disposable navigator live path", () => {
         targetArtifactId: secondTicketId,
         targetRef: `artifact:${secondTicketId}`,
       }],
-    });
-    store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: now(),
     });
     const { job: draft, leaseGeneration } = confirmNavigatorAdmission(
       store,

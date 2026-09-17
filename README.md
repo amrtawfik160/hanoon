@@ -7,13 +7,12 @@ The installed plugin and CLI namespace remain `telegram-agent`.
 ## Why Hanoon?
 
 - **Run BB from Telegram, not from BB.** Hanoon has the shell, the `bb` CLI, installed skills and MCP servers, and reach across every connected machine. A question or permission prompt it hits reaches you in Telegram; a block it cannot render into buttons is still reported, naming the thread and saying it needs you in BB.
-- **It remembers, and keeps it honest.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall. Correcting Hanoon devalues whatever misled it, notes it never uses fade, and a correction retires the belief it contradicts.
+- **It remembers, and keeps it honest.** Standing preferences, decisions, and corrections persist in SQLite with full-text recall. A correction retires the belief it contradicts.
 - **It learns from finished work.** When a job ends, Hanoon works out what is worth knowing about that repository next time — a check that always fails for a known reason, a convention it enforces — and keeps it per project.
-- **It follows up by itself.** Any thread Hanoon starts or messages is watched until it lands, including threads it did not open; you can also set a monitor on a schedule. When one fires, Hanoon does the work and messages you. It also runs its own daily and weekly upkeep, and stays quiet when nothing needs you.
+- **It follows up by itself.** Any thread Hanoon starts or messages is watched until it lands, including threads it did not open; you can also set a monitor on a schedule. When one fires, Hanoon does the work and messages you.
 - **It works in parallel.** Independent questions go out to several BB threads at once and come back as one answer.
-- **Conversations survive failures.** A dead provider session retires a BB thread, not the conversation. The replacement resumes with what was said and what was already done.
+- **Conversations survive failures.** A dead provider session retires a BB thread, not the conversation. The replacement resumes with standing memories and controller evidence for that message.
 - **Pipeline workers recover safely.** Silent or missing workers are retired and the exact stage is retried only for failure signatures that have recovered before; unfamiliar failures still stop for you.
-- **Mutations happen once.** Every mutating tool call is receipted by turn and argument hash, so a recovered agent replays the result instead of repeating the action.
 - **Fail closed at the merge boundary.** Review and validation bind to the full pull-request head resolved from Git, and approval is one-use and expiring unless that project holds a standing grant — from the owner's button tap, or from its own policy. A project may only carry that grant if GitHub already requires a status check on its base branch, and repository rules still apply either way.
 - **Use BB's isolation model.** Threads isolate provider conversations and coordination; managed worktrees isolate branches, checkouts, and filesystem mutation.
 
@@ -24,12 +23,12 @@ Hanoon has three layers:
 | Layer | Responsibility |
 | --- | --- |
 | Telegram I/O | Poll the paired private chat, durably record input, and deliver drafts, status updates, confirmations, and final replies. |
-| Durable control | Store owner pairing, project policies, controller turns and conversation digest, memories, monitors, tool receipts, jobs, effects, approvals, liveness, and the outbox in plugin SQLite. |
+| Durable control | Store owner pairing, project policies, controller turns, memories, monitors, the job ledger, effects, approvals, liveness, and the outbox in plugin SQLite. |
 | BB execution | Run the hidden controller and visible planning, implementation, review, documentation, validation, merge, deployment, and canary work. |
 
 Ingress never starts a BB session; it claims each Telegram update durably before anything acts on it. One generation-fenced executor owns controller dispatch, monitors, pipeline effects, and Telegram delivery. That executor may run bounded pipeline lanes for independent projects, while durable project claims keep each project serialized. Reviewers are newly spawned BB threads with fresh provider conversations; they reuse the implementation environment only to inspect the same worktree.
 
-Agent sessions run out of process as BB threads and never open the plugin database, so the single-writer SQLite store stays uncontended: state transitions, their effects, memory writes, and the conversation digest all commit in one transaction.
+Agent sessions run out of process as BB threads and never open the plugin database, so the single-writer SQLite store stays uncontended: state transitions, their effects, and memory writes all commit in one transaction.
 
 ## What Hanoon can do
 
@@ -100,9 +99,7 @@ The project policy chooses implementation/review providers and commands. The con
 
 ### Adaptive capability routing
 
-New jobs are admitted as navigator-v1 in deterministic mode. The classifier, recipe policy, stage projection, and recipe-keyed skill or model selection do not control or admit new work. A leftover `task_recipe` column may remain on the job row, but it does not route new work.
-
-Historical recipe promotion still exists as leftover recipe-v1 history. Adaptive recipes defaulted to `shadow`, where candidate routing was observational and could not control production behavior or manufacture success receipts. A recipe became active for leftover jobs only after an append-only promotion decision backed by a resolved durable evidence ledger. The production reader verifies recorded artifacts, an active post-merge job, failure/recovery chronology, and model trials against authoritative SQLite rows. This release exposes no operator or typed-envelope ingestion path and includes no trusted live collector, so a fresh installation cannot produce promotion evidence and no leftover recipe is enabled merely because deterministic tests pass. See [Operations](docs/operations.md#capability-routing-and-rollout) for inspection and rollback commands.
+New jobs are admitted as navigator-v1 in deterministic mode. Recipe promotion, navigator promotion, and leftover recipe routing do not control or admit new work. Inspect inventory and receipts with `bb telegram-agent capability status`, `capability inventory`, and `capability receipts`. Plugin start refuses while any nonterminal recipe-v1 job still needs a legacy skill or state handler.
 
 ## Bundled agent skills
 

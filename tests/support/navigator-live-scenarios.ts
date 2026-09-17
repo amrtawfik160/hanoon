@@ -14,7 +14,7 @@ import {
 } from "../../src/navigator/ticket-adapter";
 import { NavigatorEffectProtocol } from "../../src/navigator/effect-protocol";
 import { assertNavigatorLiveScenarioEvidence } from "../../src/navigator/live-evidence";
-import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/navigator/promotion";
+import { NAVIGATOR_LIVE_SCENARIOS, type NavigatorLiveScenario } from "../../src/navigator/models";
 import { createNavigatorReleaseEffectAdapter } from "../../src/navigator/plugin-runtime";
 import { NavigatorReleaseExecutor } from "../../src/navigator/release-executor";
 import { navigatorReleaseOperationId } from "../../src/navigator/release-contracts";

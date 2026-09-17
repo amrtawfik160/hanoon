@@ -88,25 +88,6 @@ describe("navigator dual-engine admission", () => {
     expect(job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
   });
 
-  it("ignores the retired recipe kill switch for later admissions", () => {
-    const killed = openFixture(() => ({
-      jobGraph: "adaptive",
-      controllerTools: "bundled",
-      workflowEngineGraph: "recipe",
-    }));
-    killed.store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: killed.now(),
-    });
-    const admitted = confirmControllerJob(killed.store, {
-      task: "Stay on the workflow navigator",
-      updateId: 43_003,
-      now: killed.now(),
-    });
-    expect(admitted.job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
-  });
 
   it("records shadow navigator proposals on recipe jobs without live effects", () => {
     const { store } = openFixture();
@@ -204,44 +185,6 @@ describe("navigator dual-engine admission", () => {
     expect(store.getJob(job.id)?.workflowEngine).toBe("recipe-v1");
   });
 
-  it("keeps later admissions on navigator-v1 after rollback without rewriting navigator history", () => {
-    const { store, now } = openFixture();
-    store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: now(),
-    });
-    const first = confirmControllerJob(store, {
-      task: "Navigate the first effort",
-      updateId: 43_200,
-      now: now(),
-    });
-    expect(first.job.workflowEngine).toBe("navigator-v1");
-    completeTurnThroughFinalization(store, {
-      ownerId: "executor",
-      generation: first.leaseGeneration,
-      now: now(),
-    }, {
-      turnId: first.turnId,
-      controllerKey: "owner-7-controller",
-      responseText: "Queued the first effort.",
-    });
-    store.appendWorkflowEngineRolloutDecision({
-      action: "rollback",
-      reasonCode: "operator_requested",
-      evidenceDigest: null,
-      now: now(),
-    });
-    const second = confirmControllerJob(store, {
-      task: "Stay on recipe after rollback",
-      updateId: 43_201,
-      now: now(),
-      leaseGeneration: first.leaseGeneration,
-    });
-    expect(second.job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
-    expect(store.getJob(first.job.id)?.workflowEngine).toBe("navigator-v1");
-  });
 });
 
 describe("dual-engine drain and contraction", () => {

@@ -29,6 +29,7 @@ import {
   NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS,
   PROTECTED_CONNECTOR_MIGRATIONS,
   JOB_LEDGER_MIGRATIONS,
+  DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
 } from "../src/storage/migrations";
 import {
   ControllerInteractionRepository,
@@ -525,7 +526,8 @@ it("pins the shipped migration bytes and appends the runtime repair migrations",
         NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length + MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length +
         NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length +
           NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length +
-            PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length,
+            PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
+              DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length,
   );
   expect(createHash("sha256").update([...ALL_MIGRATIONS].slice(0, 28).join("\u0000")).digest("hex")).toBe(
     "505dfd4781117dfb2c817d31640e833370189e6b3ef2c7c24e646fb1838eed56",

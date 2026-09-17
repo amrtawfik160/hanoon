@@ -31,18 +31,7 @@ import {
   type BranchProtectionVerdict,
 } from "./bb/github-protection";
 import { projectResourceWait } from "./storage/autonomy-repository";
-import {
-  RECIPE_PROMOTION_ORDER,
-  RecipePromotionIncompleteError,
-  type RecipePromotionService,
-} from "./capabilities/promotion";
-import {
-  NAVIGATOR_ENGINE_ID,
-  NavigatorPromotionIncompleteError,
-  type NavigatorPromotionService,
-  type WorkflowEngineGraphMode,
-} from "./navigator/promotion";
-import { TASK_RECIPES, type TaskRecipe } from "./domain/recipes";
+import { workflowIdentityForNewAdmission } from "./navigator/models";
 import { BROKER_BINDING_STATES, type BrokerBindingState } from "./credentials/protocol";
 import type { CredentialReadinessCheck } from "./credentials/topology";
 import type { CredentialAccessService } from "./credentials/service";
@@ -64,19 +53,9 @@ export type TelegramAgentCliDependencies = {
   getBotToken: () => string | undefined;
   createTelegramClient: (token: string) => Pick<TelegramClient, "getMe">;
   revokeAllApprovals: (now: number) => number;
-  capabilityPromotions: Pick<
-    RecipePromotionService,
-    "status" | "promote" | "rollback" | "routingStatus" | "listDecisions"
-  >;
-  enginePromotions: Pick<
-    NavigatorPromotionService,
-    "status" | "promote" | "rollback" | "routingStatus" | "listDecisions"
-  >;
   capabilitySettings: () => Readonly<{
-    jobGraph: "adaptive" | "legacy";
     controllerTools: "bundled" | "all-tools";
     modelRouting: "adaptive" | "strong-only";
-    workflowEngineGraph: WorkflowEngineGraphMode;
   }>;
   credentialAccess: Pick<CredentialAccessService, "list" | "status">;
   protectedConnectorAccess: Pick<ProtectedConnectorAccessService, "reconcileEnrollment">;
@@ -192,7 +171,6 @@ const CAPABILITY_RECEIPT_FLAGS: Record<string, FlagSpec> = {
   json: JSON_FLAG,
   limit: { kind: "value" },
 };
-const CAPABILITY_RECIPE_FLAGS: Record<string, FlagSpec> = { json: JSON_FLAG };
 const ACCESS_LIST_FLAGS: Record<string, FlagSpec> = {
   json: JSON_FLAG,
   state: { kind: "value" },
@@ -230,12 +208,10 @@ Commands:
   job spend <job-id> [--json]
   job retry <job-id> [--json]
   job cancel <job-id> [--json]
-  capability status [recipe|navigator-v1] [--json]
+  capability status [--json]
   capability inventory [--host <scope>] [--limit <1-100>] [--json]
   capability receipts <profile-id> [--limit <1-100>] [--json]
   memory import --file <absolute-path> [--host <host-id>] [--scope <scope>] [--json]
-  capability promote <recipe|navigator-v1> [--json]
-  capability rollback <recipe|navigator-v1> [--json]
   access list [--state <state>] [--after <binding-id>] [--limit <1-10>] [--json]
   access status [binding-id] [--json]
   access reconcile <project-id> --projection-json <json> [--json]
@@ -415,16 +391,6 @@ function safeJob(store: TelegramAgentStore, job: Job, now: number): JsonRecord {
       engine: job.workflowEngine,
       mode: job.workflowMode,
     },
-    ...(job.workflowEngine === "recipe-v1"
-      ? {
-          recipe: {
-            id: job.taskRecipe,
-            version: job.recipeVersion,
-            promotionCount: job.recipePromotionCount,
-            routingMode: job.routingMode,
-          },
-        }
-      : {}),
     projectId: job.projectId,
     origin: job.origin,
     autonomousOrigin: job.autonomousOrigin,
@@ -1770,13 +1736,6 @@ function referenceProjectScope(parsed: ParsedFlags, context: PluginCliContext): 
   return bound ?? requested;
 }
 
-function capabilityRecipe(value: string, label: string): TaskRecipe {
-  if (!(TASK_RECIPES as readonly string[]).includes(value)) {
-    throw new CliInputError(`${label} must be one of ${RECIPE_PROMOTION_ORDER.join(", ")}`);
-  }
-  return value as TaskRecipe;
-}
-
 function boundedCapabilityId(value: string, label: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value)) {
     throw new CliInputError(`${label} is invalid`);
@@ -1789,72 +1748,12 @@ async function capabilityStatus(
   parsed: ParsedFlags,
   json: boolean,
 ): Promise<PluginCliResult> {
-  if (parsed.positionals.length > 1) throw new CliInputError("capability status accepts at most one recipe");
+  noPositionals(parsed);
   const settings = deps.capabilitySettings();
-  const enginePromotion = await deps.enginePromotions.status();
-  const engineRouting = deps.enginePromotions.routingStatus(settings.workflowEngineGraph);
-  const engine = {
-    engine: engineRouting.engine,
-    mode: engineRouting.mode,
-    promotion: {
-      status: enginePromotion.status,
-      ready: enginePromotion.ready,
-      reasonCodes: enginePromotion.reasonCodes.slice(0, 32),
-      evidenceDigest: enginePromotion.evidenceDigest,
-      candidateSuccesses: enginePromotion.candidateSuccesses,
-      baselineSuccesses: enginePromotion.baselineSuccesses,
-    },
-    decision: engineRouting.decision ? {
-      id: engineRouting.decision.id,
-      action: engineRouting.decision.action,
-      reasonCode: engineRouting.decision.reasonCode,
-      evidenceDigest: engineRouting.decision.evidenceDigest,
-      createdAt: engineRouting.decision.createdAt,
-    } : null,
-  };
-  if (parsed.positionals[0] === NAVIGATOR_ENGINE_ID) {
-    return success(
-      { settings, engine },
-      `${engine.engine}/${engine.mode}; promotion ${engine.promotion.status}` +
-      (engine.decision ? ` (${engine.decision.action})` : ""),
-      json,
-    );
-  }
-  const recipes = parsed.positionals[0]
-    ? [capabilityRecipe(parsed.positionals[0], "recipe")]
-    : [...RECIPE_PROMOTION_ORDER];
-  const rows = await Promise.all(recipes.map(async (recipe) => {
-    const promotion = await deps.capabilityPromotions.status(recipe);
-    const routing = deps.capabilityPromotions.routingStatus(recipe, settings.jobGraph);
-    return {
-      recipe,
-      routingMode: routing.routingMode,
-      promotion: {
-        status: promotion.status,
-        ready: promotion.ready,
-        reasonCodes: promotion.reasonCodes.slice(0, 32),
-        evidenceDigest: promotion.evidenceDigest,
-        candidateSuccesses: promotion.candidateSuccesses,
-        baselineSuccesses: promotion.baselineSuccesses,
-      },
-      decision: routing.decision ? {
-        id: routing.decision.id,
-        action: routing.decision.action,
-        reasonCode: routing.decision.reasonCode,
-        evidenceDigest: routing.decision.evidenceDigest,
-        createdAt: routing.decision.createdAt,
-      } : null,
-    };
-  }));
+  const engine = workflowIdentityForNewAdmission();
   return success(
-    { settings, recipes: rows, engine },
-    [
-      ...rows.map((row) =>
-        `${row.recipe}: ${row.routingMode}; promotion ${row.promotion.status}` +
-        (row.decision ? ` (${row.decision.action})` : "")),
-      `${engine.engine}/${engine.mode}; promotion ${engine.promotion.status}` +
-      (engine.decision ? ` (${engine.decision.action})` : ""),
-    ].join("\n"),
+    { settings, engine },
+    `${engine.engine}/${engine.mode}`,
     json,
   );
 }
@@ -1933,76 +1832,6 @@ function capabilityReceipts(
   );
 }
 
-async function capabilityPromote(
-  deps: TelegramAgentCliDependencies,
-  parsed: ParsedFlags,
-  json: boolean,
-): Promise<PluginCliResult> {
-  const subject = onePositional(parsed, "capability promote");
-  if (subject === NAVIGATOR_ENGINE_ID) {
-    try {
-      const decision = await deps.enginePromotions.promote();
-      deps.notify?.();
-      return success(decision, "navigator-v1 is active for new admissions", json);
-    } catch (error) {
-      if (!(error instanceof NavigatorPromotionIncompleteError)) throw error;
-      const output = {
-        engine: NAVIGATOR_ENGINE_ID,
-        status: error.assessment.status,
-        ready: false,
-        reasonCodes: error.assessment.reasonCodes.slice(0, 32),
-        evidenceDigest: error.assessment.evidenceDigest,
-      };
-      return json
-        ? { exitCode: 1, stdout: serialize(output), stderr: "" }
-        : {
-            exitCode: 1,
-            stdout: "",
-            stderr: `Promotion ${error.assessment.status}: ${error.assessment.reasonCodes.slice(0, 8).join(", ")}\n`,
-          };
-    }
-  }
-  const recipe = capabilityRecipe(subject, "recipe");
-  try {
-    const decision = await deps.capabilityPromotions.promote(recipe);
-    deps.notify?.();
-    return success(decision, `${recipe} is active for new attempts`, json);
-  } catch (error) {
-    if (!(error instanceof RecipePromotionIncompleteError)) throw error;
-    const output = {
-      recipe,
-      status: error.assessment.status,
-      ready: false,
-      reasonCodes: error.assessment.reasonCodes.slice(0, 32),
-      evidenceDigest: error.assessment.evidenceDigest,
-    };
-    return json
-      ? { exitCode: 1, stdout: serialize(output), stderr: "" }
-      : {
-          exitCode: 1,
-          stdout: "",
-          stderr: `Promotion ${error.assessment.status}: ${error.assessment.reasonCodes.slice(0, 8).join(", ")}\n`,
-        };
-  }
-}
-
-function capabilityRollback(
-  deps: TelegramAgentCliDependencies,
-  parsed: ParsedFlags,
-  json: boolean,
-): PluginCliResult {
-  const subject = onePositional(parsed, "capability rollback");
-  if (subject === NAVIGATOR_ENGINE_ID) {
-    const decision = deps.enginePromotions.rollback();
-    deps.notify?.();
-    return success(decision, "new admissions stay on navigator-v1", json);
-  }
-  const recipe = capabilityRecipe(subject, "recipe");
-  const decision = deps.capabilityPromotions.rollback(recipe);
-  deps.notify?.();
-  return success(decision, `${recipe} is shadow-only for new attempts`, json);
-}
-
 async function runCapability(
   deps: TelegramAgentCliDependencies,
   argv: readonly string[],
@@ -2020,12 +1849,6 @@ async function runCapability(
   if (subcommand === "receipts") {
     const parsed = parseFlags(argv.slice(1), CAPABILITY_RECEIPT_FLAGS);
     return capabilityReceipts(deps, parsed, parsed.flags.has("json"));
-  }
-  if (subcommand === "promote" || subcommand === "rollback") {
-    const parsed = parseFlags(argv.slice(1), CAPABILITY_RECIPE_FLAGS);
-    return subcommand === "promote"
-      ? capabilityPromote(deps, parsed, parsed.flags.has("json"))
-      : capabilityRollback(deps, parsed, parsed.flags.has("json"));
   }
   throw new CliInputError(`Unknown capability subcommand ${subcommand}`);
 }

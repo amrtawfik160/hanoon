@@ -7,8 +7,6 @@ import { DEFAULT_MODEL_POOL_REGISTRY, modelRouteSchema, type ModelRoute } from "
 import { CapabilityRepository } from "../storage/capability-repository";
 import { WorkArtifactRepository } from "../work-artifacts/repository";
 import { guardRequirementBindings } from "../capabilities/guards";
-import { NavigatorFindingLedger } from "./finding-ledger";
-import type { NavigatorFindingLedgerDecision, NavigatorFindingLedgerEntry } from "./finding-ledger";
 import type { NavigatorTicketWorkerAttempt } from "./implementation-executor";
 import {
   navigatorTicketReceiptSchema,
@@ -41,7 +39,6 @@ import {
   type NavigatorTicketWorkerUnavailableResult,
 } from "./implementation-contracts";
 
-export type { NavigatorFindingLedgerEntry } from "./finding-ledger";
 export { compatibilityCapabilityFindingDisposition as navigatorFindingDisposition } from "../capabilities/catalog";
 
 export type NavigatorTicketWorkerOutcome = Readonly<{
@@ -299,7 +296,6 @@ type TicketSettlementAssessment = Readonly<{
   parsedResult: NavigatorTicketWorkerResult | null;
   gitObservation: NavigatorGitObservation | null;
   exactHeadSha: string;
-  findingDecision: NavigatorFindingLedgerDecision | null;
   scheduleRetry: boolean;
   retrySameAttempt: boolean;
 }>;
@@ -319,7 +315,6 @@ export class NavigatorTicketSettlementRepository {
 
   public constructor(
     private readonly db: SqliteDatabase,
-    private readonly findingLedger: NavigatorFindingLedger,
   ) {
     this.artifacts = new WorkArtifactRepository(db);
     this.capabilities = new CapabilityRepository(db);
@@ -352,10 +347,6 @@ export class NavigatorTicketSettlementRepository {
     assertIdentifier(input.resource.id, "resource id");
     assertNonNegativeInteger(input.now, "now");
     return this.db.transaction(() => this.bindResourceInTransaction(input)).immediate();
-  }
-
-  public currentFindingLedger(jobId: string): NavigatorFindingLedgerEntry[] {
-    return [...this.findingLedger.currentDecision({ jobId }).entries];
   }
 
   private settleReceipt(input: NavigatorTicketSettlementInput & Readonly<{ receipt: NavigatorTicketReceipt }>): NavigatorTicketWorkerOutcome | null {
@@ -486,12 +477,10 @@ export class NavigatorTicketSettlementRepository {
     });
     let outcome: NavigatorTicketWorkerOutcome["outcome"] = reasonCode === null ? "succeeded" : "policy_failure";
     let finalReasonCode = reasonCode ?? "accepted";
-    let findingDecision: NavigatorFindingLedgerDecision | null = null;
     if (reasonCode === null && parsedResult.success && parsedResult.data.kind === "code_review_result") {
-      const review = this.assessReview(attempt, parsedResult.data, now);
+      const review = this.assessReview(attempt, parsedResult.data);
       outcome = review.outcome;
       finalReasonCode = review.reasonCode;
-      findingDecision = review.findingDecision;
     }
     const result = parsedResult.success ? parsedResult.data : { kind: "policy_failure", reasonCode: finalReasonCode };
     return {
@@ -501,7 +490,6 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: parsedResult.success ? parsedResult.data : null,
       gitObservation,
       exactHeadSha,
-      findingDecision,
       scheduleRetry: false,
       retrySameAttempt: false,
     };
@@ -531,7 +519,6 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: null,
       gitObservation: null,
       exactHeadSha: receipt.exactHeadSha,
-      findingDecision: null,
       scheduleRetry: !exhausted,
       retrySameAttempt: false,
     };
@@ -554,7 +541,6 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: null,
       gitObservation: null,
       exactHeadSha: receipt.exactHeadSha,
-      findingDecision: null,
       scheduleRetry: false,
       retrySameAttempt: !exhausted,
     };
@@ -571,7 +557,6 @@ export class NavigatorTicketSettlementRepository {
       parsedResult: null,
       gitObservation: null,
       exactHeadSha: attempt.workOrder.baseHeadSha,
-      findingDecision: null,
       scheduleRetry: false,
       retrySameAttempt: false,
     };
@@ -580,38 +565,18 @@ export class NavigatorTicketSettlementRepository {
   private assessReview(
     attempt: NavigatorTicketWorkerAttempt,
     reviewResult: Readonly<Extract<NavigatorTicketWorkerResult, { kind: "code_review_result" }>>,
-    now: number,
-  ): Readonly<{ outcome: NavigatorTicketWorkerOutcome["outcome"]; reasonCode: string; findingDecision: NavigatorFindingLedgerDecision | null }> {
+  ): Readonly<{ outcome: NavigatorTicketWorkerOutcome["outcome"]; reasonCode: string }> {
     if (attempt.workOrder.verificationOf !== undefined) {
-      const verification = this.recordFindingVerification(attempt, reviewResult, now);
-      if (verification.failureReason !== null || verification.decision === null) {
-        return { outcome: "policy_failure", reasonCode: verification.failureReason ?? "finding_assessment_blocked", findingDecision: verification.decision };
+      if (reviewResult.outcome === "findings" && reviewResult.findings.length > 0) {
+        return { outcome: "findings", reasonCode: "confirmed_review_findings" };
       }
-      return this.reviewDecisionAssessment(verification.decision, reviewResult.findings.length > 0);
-    }
-    if (reviewResult.outcome === "findings") return { outcome: "findings", reasonCode: "review_findings_unverified", findingDecision: null };
-    return this.reviewDecisionAssessment(this.recordPassingReview(attempt, reviewResult, now), false);
-  }
-
-  private reviewDecisionAssessment(
-    decision: NavigatorFindingLedgerDecision,
-    hasFindings: boolean,
-  ): Readonly<{ outcome: NavigatorTicketWorkerOutcome["outcome"]; reasonCode: string; findingDecision: NavigatorFindingLedgerDecision }> {
-    if (decision.outcome === "blocked" || decision.allowedNextAction === "recheck" || decision.allowedNextAction === "stop") {
       return {
-        outcome: "policy_failure",
-        reasonCode: decision.reasonCode ?? "finding_assessment_blocked",
-        findingDecision: decision,
+        outcome: "succeeded",
+        reasonCode: reviewResult.findings.length > 0 ? "accepted_advisories" : "accepted",
       };
     }
-    if (decision.allowedNextAction === "repair") {
-      return { outcome: "findings", reasonCode: "confirmed_review_findings", findingDecision: decision };
-    }
-    return {
-      outcome: "succeeded",
-      reasonCode: hasFindings ? "accepted_advisories" : "findings_disputed",
-      findingDecision: decision,
-    };
+    if (reviewResult.outcome === "findings") return { outcome: "findings", reasonCode: "review_findings_unverified" };
+    return { outcome: "succeeded", reasonCode: "accepted" };
   }
 
   private resultHead(
@@ -786,7 +751,7 @@ export class NavigatorTicketSettlementRepository {
       this.scheduleFindingVerification(attempt, reviewResult, navigatorJsonDigest(assessment.result), now);
       return;
     }
-    if (assessment.findingDecision?.allowedNextAction === "repair") {
+    if (assessment.reasonCode === "confirmed_review_findings") {
       this.db.prepare(
         "UPDATE navigator_ticket_slices SET state = 'repair_pending', updated_at = ? WHERE id = ?",
       ).run(now, attempt.sliceId);
@@ -916,70 +881,6 @@ export class NavigatorTicketSettlementRepository {
       pool: "strong",
       ...DEFAULT_MODEL_POOL_REGISTRY.worker.strong,
     }, "review");
-  }
-
-  private recordPassingReview(
-    attempt: NavigatorTicketWorkerAttempt,
-    reviewResult: Readonly<{ axes: { requirements: { evidenceRefs: readonly string[] }; standards: { evidenceRefs: readonly string[] } } }>,
-    now: number,
-  ): NavigatorFindingLedgerDecision {
-    return this.findingLedger.resolvePassingReview({
-      jobId: attempt.jobId,
-      sliceId: attempt.sliceId,
-      verificationAttemptId: attempt.id,
-      verificationAttemptDigest: navigatorJsonDigest(reviewResult),
-      exactHeadSha: attempt.workOrder.baseHeadSha,
-      artifactSnapshotId: attempt.workOrder.ticket.snapshotId,
-      artifactSnapshotDigest: attempt.workOrder.ticket.snapshotDigest,
-      specificationSnapshotId: attempt.workOrder.specification.snapshotId,
-      specificationSnapshotDigest: attempt.workOrder.specification.snapshotDigest,
-      evidenceRefs: mergeEvidenceRefs(
-        reviewResult.axes.requirements.evidenceRefs,
-        reviewResult.axes.standards.evidenceRefs,
-        [`navigator-result:${attempt.id}`],
-      ),
-      now,
-      maxReviewCycles: attempt.workOrder.projectPolicy.maxReviewCycles,
-    });
-  }
-
-  private recordFindingVerification(
-    attempt: NavigatorTicketWorkerAttempt,
-    reviewResult: Readonly<{ findings: readonly NavigatorReviewFinding[] }>,
-    now: number,
-  ): Readonly<{ decision: NavigatorFindingLedgerDecision | null; failureReason: string | null }> {
-    const verification = attempt.workOrder.verificationOf;
-    if (verification === undefined) return { decision: null, failureReason: "finding_verification_source_missing" };
-    const requirementIds = this.reviewRequirementIds(attempt);
-    if (requirementIds === null) return { decision: null, failureReason: "finding_requirement_context_missing" };
-    const decision = this.findingLedger.assess({
-      jobId: attempt.jobId,
-      sliceId: attempt.sliceId,
-      sourceReviewAttemptId: verification.attemptId,
-      verificationAttemptId: attempt.id,
-      sourceAttemptDigest: verification.resultDigest,
-      verificationAttemptDigest: navigatorJsonDigest(reviewResult),
-      exactHeadSha: attempt.workOrder.baseHeadSha,
-      artifactSnapshotId: attempt.workOrder.ticket.snapshotId,
-      artifactSnapshotDigest: attempt.workOrder.ticket.snapshotDigest,
-      specificationSnapshotId: attempt.workOrder.specification.snapshotId,
-      specificationSnapshotDigest: attempt.workOrder.specification.snapshotDigest,
-      selectedGuards: attempt.profile.assignments.map(({ capabilityId, descriptorDigest }) => ({ capabilityId, descriptorDigest })),
-      requirementIds,
-      proposedFindings: verification.findings,
-      confirmedFindings: reviewResult.findings,
-      evidenceRefs: mergeEvidenceRefs(
-        reviewResult.findings.flatMap((finding) => finding.evidenceRefs),
-        [`navigator-result:${attempt.id}`],
-        [`navigator-result:${verification.attemptId}`],
-      ),
-      now,
-      maxReviewCycles: attempt.workOrder.projectPolicy.maxReviewCycles,
-    });
-    return {
-      decision,
-      failureReason: decision.outcome === "blocked" ? decision.reasonCode ?? "finding_assessment_blocked" : null,
-    };
   }
 
   private reviewRequirementIds(attempt: NavigatorTicketWorkerAttempt): readonly string[] | null {

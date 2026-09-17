@@ -16,7 +16,7 @@ import { hashSecret } from "../src/crypto";
 import { classifyTaskTraits } from "../src/capabilities/routing";
 import { selectControllerCapabilityProfile } from "../src/capabilities/controller-bundles";
 import { DualEngineCoordinator, DualEngineContractionError } from "../src/navigator/coordinator";
-import { workflowIdentityForNewAdmission } from "../src/navigator/promotion";
+import { workflowIdentityForNewAdmission } from "../src/navigator/models";
 import { transition } from "../src/domain/state-machine";
 import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { jobFixture, policyFixture, stateJob } from "./helpers";
@@ -102,95 +102,7 @@ describe("contracted new-work admission", () => {
     expect(job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
   });
 
-  it("ignores the retired recipe kill switch and promotion rollback for later admissions", () => {
-    const killed = openFixture(() => ({
-      jobGraph: "adaptive",
-      controllerTools: "bundled",
-      workflowEngineGraph: "recipe",
-    }));
-    killed.store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: killed.now(),
-    });
-    killed.store.appendWorkflowEngineRolloutDecision({
-      action: "rollback",
-      reasonCode: "operator_requested",
-      evidenceDigest: null,
-      now: killed.now(),
-    });
-    const admitted = confirmControllerJob(killed.store, {
-      task: "Stay on the workflow navigator",
-      updateId: 44_002,
-      now: killed.now(),
-    });
-    expect(admitted.job).toMatchObject({ workflowEngine: "navigator-v1", workflowMode: "deterministic" });
-    expect(workflowIdentityForNewAdmission("recipe", {
-      action: "rollback",
-      reasonCode: "operator_requested",
-    })).toEqual({ engine: "navigator-v1", mode: "deterministic" });
-  });
 
-  it("does not classify new controller jobs into a recipe or recipe-promotion routing mode", () => {
-    const { store, now } = openFixture();
-    const copyTask = "Change the README copy";
-    const migrateTask = "Migrate the public billing schema";
-    expect(classifyTaskTraits({ origin: "requested", text: copyTask }).recipe).toBe("direct");
-    expect(classifyTaskTraits({ origin: "requested", text: migrateTask }).recipe).toBe("architectural");
-    const copy = confirmControllerJob(store, { task: copyTask, updateId: 44_010, now: now() });
-    const finish = (turnId: string) => completeTurnThroughFinalization(store, {
-      ownerId: "executor",
-      generation: copy.leaseGeneration,
-      now: now(),
-    }, {
-      turnId,
-      controllerKey: "owner-7-controller",
-      responseText: "Queued the navigator effort.",
-    });
-    finish(copy.turnId);
-    const migrate = confirmControllerJob(store, {
-      task: migrateTask,
-      updateId: 44_011,
-      now: now(),
-      leaseGeneration: copy.leaseGeneration,
-    });
-    finish(migrate.turnId);
-    store.appendRecipeRolloutDecision({
-      recipe: "direct",
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: now(),
-    });
-    const afterPromote = confirmControllerJob(store, {
-      task: copyTask,
-      updateId: 44_012,
-      now: now(),
-      leaseGeneration: copy.leaseGeneration,
-    });
-
-    expect(copy.job).toMatchObject({
-      workflowEngine: "navigator-v1",
-      workflowMode: "deterministic",
-      routingMode: "legacy",
-      taskTraits: [],
-      taskReasonCodes: [],
-    });
-    expect(copy.job.taskRecipe).not.toBe("direct");
-    expect(migrate.job).toMatchObject({
-      workflowEngine: "navigator-v1",
-      routingMode: "legacy",
-      taskRecipe: copy.job.taskRecipe,
-      taskTraits: [],
-    });
-    expect(afterPromote.job).toMatchObject({
-      workflowEngine: "navigator-v1",
-      routingMode: "legacy",
-      taskRecipe: copy.job.taskRecipe,
-    });
-    expect(store.getJob(copy.job.id)?.routingMode).toBe("legacy");
-  });
 
   it("confirms navigator-v1 work without recipeExecutionPolicy", () => {
     const { store, now } = openFixture();
@@ -270,44 +182,6 @@ describe("final recipe contraction", () => {
     await expect(plugin(bb)).rejects.toThrow(DualEngineContractionError);
   });
 
-  it("records contraction once the recipe engine is empty and keeps navigator jobs untouched", () => {
-    const { store, database, now } = openFixture();
-    store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: now(),
-    });
-    const first = confirmControllerJob(store, {
-      task: "Keep this navigator job",
-      updateId: 44_200,
-      now: now(),
-    });
-    completeTurnThroughFinalization(store, {
-      ownerId: "executor",
-      generation: first.leaseGeneration,
-      now: now(),
-    }, {
-      turnId: first.turnId,
-      controllerKey: "owner-7-controller",
-      responseText: "Queued the navigator effort.",
-    });
-    const idle = store.createJob({
-      id: "job_recipe_idle",
-      sourceUpdateId: 44_201,
-      requestText: "Cancel this idle recipe job",
-      now: 2_000,
-    });
-    const coordinator = new DualEngineCoordinator({ store, database, now });
-    expect(coordinator.drainRecipeJobs()).toEqual({ cancelled: [idle.id], remaining: [] });
-    const contraction = coordinator.contractRecipeEngine();
-    expect(contraction).toMatchObject({ engine: "recipe-v1", remainingJobIds: [] });
-    expect(coordinator.contractRecipeEngine()).toEqual(contraction);
-    expect(store.getJob(first.job.id)).toMatchObject({
-      workflowEngine: "navigator-v1",
-      workflowMode: "deterministic",
-    });
-  });
 });
 
 describe("historical recipe evidence after contraction", () => {
@@ -371,12 +245,6 @@ describe("historical recipe evidence after contraction", () => {
 
   it("lets the dual-engine release restore the legacy bundle without rewriting navigator jobs", async () => {
     const { store, database, now } = openFixture();
-    store.appendWorkflowEngineRolloutDecision({
-      action: "promote",
-      reasonCode: "promotion_gates_passed",
-      evidenceDigest: "a".repeat(64),
-      now: now(),
-    });
     const navigator = confirmControllerJob(store, {
       task: "Do not rewrite this navigator job",
       updateId: 44_400,

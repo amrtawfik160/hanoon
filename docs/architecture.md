@@ -130,11 +130,7 @@ Review guards are selected from the canonical exact-head diff. Their strict enve
 
 External provider, model, plugin, and skill discovery is read-only and deadline-bound. A failed refresh preserves the previous snapshot with degraded health. Discovered entries stay `inventory-only`: discovery alone grants no execution authority, and admission requires a validated descriptor, explicit role/recipe/stage mapping, and at least five compatible shadow trials.
 
-Rollout is per recipe. `shadow` computes candidate profiles and routing evidence without controlling provider behavior or recording candidate success as production truth. `active` can control only after a durable promotion decision; rollback affects new jobs while retaining profiles, receipts, trials, and in-flight snapshots. The production promotion reader resolves the newest append-only manifest against integrity-bound deterministic and classifier artifacts, safety snapshots, an active post-merge job, distinct failure/recovery receipts, and terminal candidate/baseline model trials. Trial settlement timestamps must prove failure before recovery, both receipts before merge, merge before the live-run record, and that record before the manifest. A missing, corrupt, duplicate, cross-recipe, reversed, or mismatched reference makes the whole manifest incomplete; it never falls back to older proof.
-
-Recipe promotion still has no trusted live collector, CLI ingest path, controller tool, or plugin callback that can manufacture those records. Typed pass/fail assertions cannot create a recipe ledger. A fresh installation therefore keeps every adaptive recipe in `shadow`, and `capability promote <recipe>` fails closed until a later collector proves a disposable live job.
-
-Navigator-v1 is the admission engine. `DualEngineCoordinator.persistEvaluationEvidence` remains the trusted append seam for historical promotion evidence: it records the fixed corpus, measured restart and safety counters, and the required disposable live scenarios, then writes one integrity-bound manifest. It refuses a SQL-stamped terminal job that was never executed. `capability promote navigator-v1` / `capability rollback navigator-v1` still append those operator decisions, but contraction ignores them for later admissions. The **Workflow engine graph** setting (`adaptive` or `recipe`, default `adaptive`) is a retired kill switch: new jobs always use navigator-v1 in deterministic mode. The leased executor runs the live navigator, implementation, and release workers. Jobs never change engines in place. Historical recipe-v1 rows remain readable.
+New jobs always use navigator-v1 in deterministic mode. Recipe and navigator promotion readers, promote/rollback commands, and leftover recipe routing no longer control admission. The leased executor runs the live navigator, implementation, and release workers. Jobs never change engines in place. Historical recipe-v1 rows remain readable until contraction drains them.
 
 ## Agent skill runtime
 
@@ -207,14 +203,12 @@ The plugin database records:
 - enabled project policies as immutable versioned snapshots;
 - controller thread identity, FIFO turns, streaming cursors, and delivery state;
 - every controller thread generation with its lifetime and the reason it was retired;
-- a rolling conversation digest of answered turns;
 - long-term memories with full-text search, supersession, and provenance;
 - project and global reference documents, their structural maps, searchable passages, version changes, and section digests;
 - tracker-backed work artifacts, stable external bindings, typed parent and blocker edges, immutable content snapshots, snapshot invalidations, fenced claims, and evidenced resolutions;
-- tool receipts keyed by turn, tool name, and argument hash;
 - armed monitors, their trigger, and their firing history;
 - watched threads with their last reported status, and the interactions offered to the owner with their answers and delivery state;
-- jobs, queue admissions, resource claims, state-machine versions, stage attempts, and immutable handoff digests;
+- jobs, the job ledger (`id/stage/branch/head`), queue admissions, resource claims, and immutable handoff digests;
 - idempotent effects and retry accounting;
 - executor lease ownership and worker liveness;
 - merge approvals, callback consumption, and production receipts;
@@ -228,17 +222,11 @@ Local Markdown creation publishes only a fully synced candidate. Replacement use
 
 ## Conversation continuity
 
-A BB thread is one disposable execution generation serving a durable conversation. When a provider session fails, the thread is retired — recorded, not erased — and the next message opens a replacement seeded with:
-
-- the recent conversation digest, so the owner is not asked to repeat themselves;
-- the memories relevant to the new message;
-- receipts for what the previous generation already did for that message.
-
-Each answered turn writes its digest entry in the same transaction that records the answer, so a crash cannot leave a delivered reply that the next generation has no record of.
+A BB thread is one disposable execution generation serving a durable conversation. When a provider session fails, the thread is retired — recorded, not erased — and the next message opens a replacement seeded with standing memories and controller evidence already recorded for that message.
 
 ## Memory
 
-Memories are typed (`preference`, `fact`, `decision`, `correction`), scoped to the owner globally or to one project, and start with a deterministic blend of BM25 relevance, recency decay, importance, and confidence. A background local embedding service backfills semantic vectors without an API key. Semantic similarity contributes 30 percent only when both the query and memory already have vectors; otherwise the original score is unchanged. An owner query never initializes or downloads the model inline. A memory write commits in the same transaction as the FTS5 row it indexes, while vector backfill is independently retryable.
+Memories are typed (`preference`, `fact`, `decision`, `correction`), scoped to the owner globally or to one project, and recalled by full-text search. There is no fade, devalue, or rank-tuning pass. A background local embedding service may still backfill semantic vectors without an API key. An owner query never initializes or downloads the model inline. A memory write commits in the same transaction as the FTS5 row it indexes, while vector backfill is independently retryable.
 
 Restating a subject supersedes its predecessor instead of overwriting it, so corrections keep their history. Credential-shaped text is refused at the write, and the owner's explicit standing instructions ("always…", "never…", "remember that…") are captured at intake so they survive even if the answer itself fails.
 
@@ -309,7 +297,7 @@ A message the owner sends while an answer is still being written is steered into
 
 Several messages sent in quick succession are one request, not one request per message. Grouping happens at claim time, not at intake: the ingress keeps persisting each Telegram message the moment it arrives, and the controller claims a burst — the oldest queued owner turn plus every following queued owner turn whose receipt was within a two-second quiet gap of the one before it, in ordinal order. The claim waits out the quiet gap, so a burst still in flight is not cut and a lone message waits at most one gap. The caps are fixed constants: 25 messages per burst, 32 KB of rendered transcript, and 10 attachments; a burst that hits a cap closes there and the remainder forms the next burst. A system turn, a lifecycle follow-up, or an untranscribed voice note — which must keep its ordinal place — also closes a burst. A system turn or lifecycle follow-up never leads one either: it is claimed at once, on its own, and takes none of the owner's messages that arrived behind it.
 
-The first turn of a burst is the leader and carries the dispatch. Every other member is settled in the same transaction as the claim with the folded outcome the steer path already uses, so each Telegram update is accounted for and the owner gets exactly one answer: the leader's answer is the burst's answer, and no separate acknowledgement is sent for it. The conversation digest records the burst once, as the leader's attributed transcript with that answer. Mid-answer arrivals fold differently only in what the owner sees: the waiting burst is selected under the same gap and caps, the steer is reserved for its leader — whole or not at all — and one combined addition reaches the running answer with one "got that" acknowledgement per folded burst. A burst whose leader fails before doing anything is replayed whole: its members follow the leader's replacement.
+The first turn of a burst is the leader and carries the dispatch. Every other member is settled in the same transaction as the claim with the folded outcome the steer path already uses, so each Telegram update is accounted for and the owner gets exactly one answer: the leader's answer is the burst's answer, and no separate acknowledgement is sent for it. Mid-answer arrivals fold differently only in what the owner sees: the waiting burst is selected under the same gap and caps, the steer is reserved for its leader — whole or not at all — and one combined addition reaches the running answer with one "got that" acknowledgement per folded burst. A burst whose leader fails before doing anything is replayed whole: its members follow the leader's replacement.
 
 Each turn carries a structured provenance record — the message kind, the forwarded sender's name or a hidden-sender marker or a chat title, the quoted message's author and text when Telegram supplies them, the message id a reply refers to, and the album id — and the dispatch renders the burst as one attributed transcript with a numbered entry per member ("You:", "Forwarded from Tom Counsell:", "Reply to Tom Counsell's message above:", "File attached: …"). A lone message in the owner's own words renders exactly as before; a lone forward or reply keeps its attribution line. Whether the parts belong together is the model's judgment from that transcript, never a heuristic the plugin guesses; a conduct rule says one request until clearly not, and to name and answer clearly unrelated parts.
 
@@ -376,17 +364,9 @@ One revert per merge commit, ever. The ledger is keyed on the commit rather than
 
 ## Self-maintenance
 
-The plugin installs upkeep schedules it owns as BB agent automations, keyed so installation is idempotent across restarts and separate from the owner's own watches: the agent's upkeep must not crowd out schedules the owner set. They install on the first executor pass that finds a controller with a verified BB host and project, because pairing can happen long after the plugin starts. An installation that still carries the older plugin-local monitor rows hands each one over only after BB has read back an active schedule with a next run, then cancels the local row; a handover interrupted between those two steps is finished by the next reconciliation sweep.
+The plugin does not install daily or weekly upkeep schedules. Owner-set monitors and thread-follow stay. Disk-space checks and pressure warnings stay. Temporary-directory deletion and unprompted repository audits stay off unless a later setting arms them independently.
 
-| Schedule | Cadence | Purpose |
-| --- | --- | --- |
-| `system-stale-jobs` | daily | Surface work that has stopped needing the agent and started needing a decision. |
-| `system-memory-audit` | weekly | Re-judge the weakest memories and forget what is no longer true. |
-| `system-autonomy-scorecard` | weekly | Report the durable scorecard. |
-
-The first two are told to say nothing when nothing needs a person; upkeep that reports on quiet days trains the owner to ignore it. The scorecard is the deliberate exception, because it is a report rather than a sweep. Every figure it carries is read from committed state, so the agent can report what happened without inventing a rate the database cannot support.
-
-The same self-maintenance setting also enables two daily services outside the monitor table. A read-only repository audit checks documentation staleness, debt markers, bug backlogs, and unresolved pull-request review findings. Disk housekeeping may remove a bounded batch of old top-level temporary directories, but only when each name matches the plugin's allowlist. Disk-space checks and pressure warnings remain active when deletion is disabled.
+Leftover system-maintenance automations from an older install are retired on the next executor pass.
 
 ### Starting work from what the audit found
 

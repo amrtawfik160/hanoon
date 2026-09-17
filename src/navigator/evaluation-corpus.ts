@@ -4,8 +4,8 @@ import {
   NAVIGATOR_DETERMINISTIC_CATEGORIES,
   type DualEngineRestartPoint,
   type NavigatorDeterministicCategory,
-} from "./promotion";
-import type { WorkflowEngine } from "./models";
+  type WorkflowEngine,
+} from "./models";
 
 export const NAVIGATOR_OWNER_BOUNDARY_CODES = [
   "product_decision_required",

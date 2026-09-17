@@ -111,27 +111,7 @@ export function semanticRanks(
   return ranks;
 }
 
-// Ranking already down-weights an old memory through recencyScore. Decay is a
-// different question — whether a memory has ever been *useful* — so it keys on
-// idle time since last recall, and on a longer half-life than ranking, because
-// a memory should never be discarded faster than it is merely down-ranked.
-export const MEMORY_IDLE_HALF_LIFE_MS = 90 * 86_400_000;
 export const MEMORY_CONFIDENCE_FLOOR = 0.05;
-/** Below this, an agent-written memory has earned its way out of recall. */
-export const MEMORY_TOMBSTONE_CONFIDENCE = 0.15;
-export const MEMORY_REINFORCEMENT = 0.05;
-// Demotion outweighs reinforcement: being wrong in front of the owner is much
-// stronger evidence than going unchallenged.
-export const MEMORY_DEMOTION = 0.25;
-
-export function decayedConfidence(confidence: number, idleMs: number): number {
-  const decayed = confidence * 0.5 ** (Math.max(0, idleMs) / MEMORY_IDLE_HALF_LIFE_MS);
-  return Math.max(MEMORY_CONFIDENCE_FLOOR, decayed);
-}
-
-export function adjustedConfidence(confidence: number, delta: number): number {
-  return Math.min(1, Math.max(MEMORY_CONFIDENCE_FLOOR, confidence + delta));
-}
 
 /**
  * Two subjects contradict when one's words wholly contain the other's — the

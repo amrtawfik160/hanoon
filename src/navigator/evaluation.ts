@@ -11,8 +11,8 @@ import {
   type NavigatorEvaluationCase,
 } from "./evaluation-corpus";
 import { measureNavigatorRestartPoint } from "./restart-evaluation";
-import type { DualEngineRestartPoint, NavigatorDeterministicCategory } from "./promotion";
-import { DUAL_ENGINE_RESTART_POINTS } from "./promotion";
+import type { DualEngineRestartPoint, NavigatorDeterministicCategory } from "./models";
+import { DUAL_ENGINE_RESTART_POINTS } from "./models";
 
 const EXTERNAL_DIGEST = "e".repeat(64);
 

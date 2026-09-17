@@ -195,32 +195,15 @@ To finish work that already has a pull request, tell the controller which enable
 
 ## Capability routing and rollout
 
-New jobs use one of six recipes: `direct`, `bounded`, `bug`, `skill-authoring`, `adopted-pr`, or `architectural`. With the default adaptive job graph, an unpromoted recipe stays in `shadow`: the plugin records its candidate classification and profile, but the candidate graph cannot control delivery or create production success evidence.
+New jobs are admitted as navigator-v1 in deterministic mode. Recipe and navigator promotion are gone.
 
-Inspect all recipe decisions, one recipe, or the navigator-v1 engine gate:
-
-```bash
-bb telegram-agent capability status
-bb telegram-agent capability status direct --json
-bb telegram-agent capability status navigator-v1 --json
-```
-
-`incomplete` means at least one required proof is absent or cannot be resolved. `failed` means a durable result exists and violates a gate, such as an imperfect safety classifier, a non-zero safety counter, or candidate model results below the baseline. Neither state can write a promotion decision.
-
-Promotion evidence is not accepted as command-line values. The recipe reader uses the newest append-only manifest for that recipe and resolves every reference against stored records. It requires all eight deterministic categories, a perfect fixed-corpus classifier result, at least one active post-merge run, distinct induced-failure and recovery receipts backed by terminal model trials for that job, at least five candidate and five baseline trials under the same harness and budget, and all five zero-tolerance safety snapshots. Missing, malformed, duplicate, cross-recipe, non-causal, or mismatched references make the manifest incomplete; the reader never falls back to an older valid manifest. Recipe promotion still has no trusted collector that can prove a disposable live job and write that ledger.
-
-Navigator-v1 uses a separate append-only ledger. `DualEngineCoordinator.persistEvaluationEvidence` is the trusted collector: it writes deterministic categories from the measured corpus, including restart and safety only when those were actually measured, and it records the required disposable live scenarios only when each job is an executed run rather than a SQL-stamped terminal state. `promote()` then fails closed if restart or safety was not measured. Ordinary operator commands inspect or consume that ledger. They cannot manufacture it from typed pass/fail assertions.
-
-Recipe promotion stays incomplete on a fresh install, so every adaptive recipe starts in `shadow`. After the navigator collector has written a reviewed manifest, engine promotion follows `capability status`:
+Inspect the engine:
 
 ```bash
-bb telegram-agent capability promote direct --json
-bb telegram-agent capability rollback direct --json
-bb telegram-agent capability promote navigator-v1 --json
-bb telegram-agent capability rollback navigator-v1 --json
+bb telegram-agent capability status --json
 ```
 
-Promotion affects only newly created matching jobs. Recipe rollback returns only later matching jobs to `shadow`. Navigator rollback records the operator decision without changing later admissions, which stay on navigator-v1. Neither mutates the routing mode, model tuple, profile, receipts, or engine of a job already in flight. The independent **Capability job graph** setting can force later jobs onto `legacy` without deleting capability data. The independent **Workflow engine graph** setting is a retired kill switch and is ignored for admission. The leased executor runs the live navigator, implementation, and release workers.
+Plugin start refuses while any nonterminal recipe-v1 job still needs a legacy skill or state handler. The leased executor runs the live navigator, implementation, and release workers.
 
 For a known profile id, inspect its bounded selection and outcome receipts:
 

@@ -21,7 +21,7 @@ import {
 import { ManagedAutomationRepository, type ManagedAutomationBinding } from "../src/storage/managed-automation-repository";
 import { openStore, type MonitorRecord, type TelegramAgentStore } from "../src/storage/store";
 import { runJobExecutorService } from "../src/services/job-executor-service";
-import { systemMaintenanceAuthority } from "../src/services/system-monitors";
+import { systemMaintenanceAuthority } from "../src/domain/system-maintenance";
 import { hashSecret } from "../src/crypto";
 import { registerControllerTools } from "../src/controller/tools";
 import { policyFixture } from "./helpers";

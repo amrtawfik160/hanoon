@@ -47,9 +47,6 @@ const globalConfigSchema = z.object({
   // because a setting is the one input to the standing block that no paired
   // owner has to approve.
   controllerIdentity: z.string().max(MAX_CONTROLLER_IDENTITY).default(""),
-  systemUpkeep: z.enum(["enabled", "disabled"]).default("enabled"),
-  // Separate from systemUpkeep on purpose: reclaiming a temporary directory and
-  // deleting a branch are not the same risk, so arming one must not arm the other.
   workspaceReclaim: z.preprocess(
     (value) => value === true || value === "true",
     z.boolean().default(false),
@@ -63,8 +60,6 @@ const globalConfigSchema = z.object({
   // waits for a person; `pipeline` files the fix as ordinary work and lets the
   // gates decide. Meaningful only when self-diagnosis is on at all.
   selfDiagnosisMode: z.enum(["draft-pr", "pipeline"]).default("draft-pr"),
-  capabilityJobGraph: z.enum(["adaptive", "legacy"]).default("adaptive"),
-  workflowEngineGraph: z.enum(["adaptive", "recipe"]).default("adaptive"),
   controllerCapabilityMode: z.enum(["bundled", "all-tools"]).default("bundled"),
   capabilityModelRouting: z.enum(["adaptive", "strong-only"]).default("adaptive"),
 });
@@ -86,13 +81,10 @@ export function parseGlobalConfig(values: {
   controllerPermissionMode?: string;
   extractionModel?: string;
   controllerIdentity?: string;
-  systemUpkeep?: string;
   workspaceReclaim?: boolean | string;
   selfDiagnosisEnabled?: boolean | string;
   selfDiagnosisProjectId?: string;
   selfDiagnosisMode?: string;
-  capabilityJobGraph?: string;
-  workflowEngineGraph?: string;
   controllerCapabilityMode?: string;
   capabilityModelRouting?: string;
 }): GlobalConfigResult {
@@ -116,12 +108,6 @@ export function parseGlobalConfig(values: {
  *  answer when we cannot know which providers this installation has. */
 export function extractionModel(config: GlobalConfig): string | null {
   return config.extractionModel === "inherit" ? null : config.extractionModel;
-}
-
-/** The agent's own daily and weekly upkeep. Owners who do not want unprompted
- *  messages can turn it off without losing anything they set themselves. */
-export function systemUpkeepEnabled(config: GlobalConfig): boolean {
-  return config.systemUpkeep === "enabled";
 }
 
 export function workspaceReclaimEnabled(config: GlobalConfig): boolean {
@@ -229,16 +215,12 @@ export function backgroundCapabilityModelRoute(config: GlobalConfig): ModelRoute
 }
 
 export function capabilityRoutingSettings(config: GlobalConfig): Readonly<{
-  jobGraph: "adaptive" | "legacy";
   controllerTools: "bundled" | "all-tools";
   modelRouting: "adaptive" | "strong-only";
-  workflowEngineGraph: "adaptive" | "recipe";
 }> {
   return Object.freeze({
-    jobGraph: config.capabilityJobGraph,
     controllerTools: config.controllerCapabilityMode,
     modelRouting: config.capabilityModelRouting,
-    workflowEngineGraph: config.workflowEngineGraph,
   });
 }
 
