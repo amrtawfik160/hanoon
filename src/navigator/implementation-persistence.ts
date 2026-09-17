@@ -14,6 +14,7 @@ import {
   navigatorPullRequestRequestSchema,
   navigatorTicketRepairProposalSchema,
   navigatorTicketRepairSnapshotSchema,
+  navigatorAttemptTaskEvidence,
   navigatorTicketWorkerProfile,
   navigatorTicketWorkerProfileSchema,
   navigatorTicketWorkOrderSchema,
@@ -854,6 +855,11 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
       findings: readonly NavigatorReviewFinding[];
     }>;
   }>): NavigatorTicketWorkerAttempt {
+    const snapshot = this.store.getCurrentWorkArtifactSnapshot(input.ticket.artifact_id);
+    const taskEvidence = navigatorAttemptTaskEvidence(
+      input.taskEvidence,
+      `${snapshot?.title ?? ""}\n${snapshot?.content ?? ""}`,
+    );
     const workOrder = navigatorTicketWorkOrderSchema.parse({
       kind: "navigator_ticket_work_order",
       jobId: input.integration.job_id,
@@ -875,14 +881,14 @@ export class NavigatorImplementationRepository implements NavigatorImplementatio
         snapshotId: input.ticket.snapshot_id,
         snapshotDigest: input.ticket.snapshot_digest,
       },
-      taskEvidence: input.taskEvidence,
+      taskEvidence,
       evidenceRefs: input.evidenceRefs,
       changedPaths: input.changedPaths,
       ...(input.verificationOf === undefined ? {} : { verificationOf: input.verificationOf }),
     });
     const profile = navigatorTicketWorkerProfile({
       kind: input.kind,
-      taskEvidence: input.taskEvidence,
+      taskEvidence,
       changedPaths: input.changedPaths,
     });
     const stepContract = NAVIGATOR_TICKET_STEP_CONTRACTS[input.kind];

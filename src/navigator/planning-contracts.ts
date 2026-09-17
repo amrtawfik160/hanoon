@@ -6,6 +6,7 @@ import {
   type NavigatorArtifactBinding,
   type NavigatorSkillStepContract,
 } from "./models";
+import { scheduleWorkflowSkills } from "./workflow-skills";
 
 const identifierSchema = z.string().trim().min(1).max(256);
 const boundedTextSchema = z.string().trim().min(1).max(8_000);
@@ -254,11 +255,21 @@ export type NavigatorPlanningRoute =
 
 export function selectNavigatorPlanningRoute(signals: NavigatorRoutingSignals): NavigatorPlanningRoute {
   if (!signals.trackerConfigured) return "setup-matt-pocock-skills";
-  if (signals.specificationReady) return "to-tickets";
+  if (signals.specificationReady) {
+    return scheduleWorkflowSkills({
+      stage: "planner",
+      specificationReady: true,
+      multiStep: true,
+    }).skillIds[0] as NavigatorPlanningRoute;
+  }
   if (signals.needsPrimarySourceFacts) return "research";
   if (signals.runnableDesignQuestion) return "prototype";
   if (signals.hugeMultiSessionEffort && !signals.routeToDestinationVisible) return "wayfinder";
-  return "to-spec";
+  return scheduleWorkflowSkills({
+    stage: "planner",
+    specificationReady: false,
+    multiStep: signals.hugeMultiSessionEffort,
+  }).skillIds[0] as NavigatorPlanningRoute;
 }
 
 export function navigatorPlanningInput(input: Readonly<{

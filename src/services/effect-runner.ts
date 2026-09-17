@@ -62,6 +62,7 @@ import {
   NAVIGATOR_RELEASE_INCIDENT_BUDGET,
   type NavigatorReleaseRollbackOutcome,
 } from "../navigator/release-contracts";
+import { scheduleWorkflowSkills } from "../navigator/workflow-skills";
 
 export class PermanentEffectError extends Error {
   public constructor(message: string) {
@@ -747,6 +748,7 @@ export class EffectRunner {
     role: WorkerSkillRole,
     stage: WorkerProfileStage,
     extraTraits: readonly string[] = [],
+    scheduledSkillIds: readonly string[] = [],
   ): CapabilityWorkOrderEnvelope | undefined {
     if (job.routingMode === "legacy") return undefined;
     if (!job.policy || !job.projectId) {
@@ -759,6 +761,7 @@ export class EffectRunner {
       recipe: job.taskRecipe,
       stage,
       traits,
+      requestedCapabilities: scheduledSkillIds,
       engine: job.workflowEngine,
     });
     const pipelineRole = role === "planner" || role === "critic" || role === "documentation";
@@ -1278,11 +1281,14 @@ export class EffectRunner {
     if (!bb?.spawnDocs || !job.policy || !job.prHeadSha || !job.environmentId) {
       throw new PermanentEffectError("BB docs runner requires reviewed job context");
     }
+    const schedule = scheduleWorkflowSkills({ stage: "documentation" });
     const capabilityProfile = this.ensureWorkerCapabilityProfile(
       job,
       `stage:${effect.idempotencyKey}`,
       "documentation",
       "documentation",
+      [],
+      schedule.skillIds,
     );
     const workOrder = buildWorkOrder(job, job.policy, capabilityProfile);
     const attempt = this.createPipelineAttempt(
