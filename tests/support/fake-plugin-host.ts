@@ -17,9 +17,22 @@ type DisposableHarness = Readonly<{ dispose(): Promise<void> }>;
 const trackedHarnesses = new Set<DisposableHarness>();
 
 export function createFakePluginHost(
-  ...args: Parameters<typeof sdkTesting.createFakePluginHost>
+  options: Parameters<typeof sdkTesting.createFakePluginHost>[0] = {},
 ): FakePluginHost {
-  const host = sdkTesting.createFakePluginHost(...args);
+  const sdk = options.sdk ?? {};
+  const threads = sdk.threads ?? {};
+  // createPlugin lists BB threads fail-closed at boot. Reload rebuilds the
+  // host from these constructor options, so the empty page must live here.
+  const host = sdkTesting.createFakePluginHost({
+    ...options,
+    sdk: {
+      ...sdk,
+      threads: {
+        ...threads,
+        list: threads.list ?? (async () => []),
+      },
+    },
+  });
   trackedHarnesses.add(host.harness as DisposableHarness);
   return host;
 }

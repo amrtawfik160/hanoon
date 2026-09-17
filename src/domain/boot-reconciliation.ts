@@ -111,8 +111,21 @@ function roleMatchesStage(role: BootThreadRole, stage: JobState): boolean {
   }
 }
 
+type OccupiedJob = {
+  ledger: BootJobSnapshot["ledger"];
+  implementationThreadId: string | null;
+  reviewThreadId: string | null;
+  documentationThreadId: string | null;
+};
+
+function occupySlot(job: OccupiedJob, slot: BootThreadSlot | null, threadId: string): void {
+  if (slot === "implementation") job.implementationThreadId = threadId;
+  else if (slot === "review") job.reviewThreadId = threadId;
+  else if (slot === "documentation") job.documentationThreadId = threadId;
+}
+
 export function decideBootReconciliation(snapshot: BootReconciliationSnapshot): BootReconciliationPlan {
-  const jobsById = new Map(snapshot.jobs.map((job) => [job.ledger.id, job]));
+  const jobsById = new Map<string, OccupiedJob>(snapshot.jobs.map((job) => [job.ledger.id, { ...job }]));
   const jobs: BootJobDecision[] = snapshot.jobs.map((job) => ({
     action: "resume",
     row: job.ledger,
@@ -130,6 +143,7 @@ export function decideBootReconciliation(snapshot: BootReconciliationSnapshot): 
           jobId: job.ledger.id,
           slot: bound,
         });
+        occupySlot(job, bound, thread.threadId);
         continue;
       }
       const slot = slotForRole(thread.role);
@@ -140,6 +154,7 @@ export function decideBootReconciliation(snapshot: BootReconciliationSnapshot): 
           jobId: job.ledger.id,
           slot,
         });
+        occupySlot(job, slot, thread.threadId);
         continue;
       }
     }

@@ -4,7 +4,6 @@ import { lstat, readdir, rm, statfs } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createSecret } from "./crypto";
-import { redactError } from "./errors";
 import { recordImplementationCapabilityOutcomes } from "./capabilities/outcomes";
 import {
   CAPABILITY_GRAPH_DIGEST,
@@ -2348,51 +2347,49 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     },
   });
 
-  try {
-    await reconcileBootFromGitAndBb(bb.storage.database(), {
-      listThreads: async () => {
-        const threads: Array<{ threadId: string; title: string | null }> = [];
-        const pageSize = 100;
-        let offset = 0;
-        while (true) {
-          const page = await bb.sdk.threads.list({
-            includeHidden: true,
-            archived: false,
-            limit: pageSize,
-            offset,
+  await reconcileBootFromGitAndBb(bb.storage.database(), {
+    listThreads: async () => {
+      const threads: Array<{ threadId: string; title: string | null }> = [];
+      const pageSize = 100;
+      let offset = 0;
+      while (true) {
+        const page = await bb.sdk.threads.list({
+          includeHidden: true,
+          archived: false,
+          limit: pageSize,
+          offset,
+        });
+        for (const thread of page) {
+          if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
+          threads.push({
+            threadId: thread.id,
+            title: thread.title ?? thread.titleFallback ?? null,
           });
-          for (const thread of page) {
-            if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
-            threads.push({
-              threadId: thread.id,
-              title: thread.title ?? thread.titleFallback ?? null,
-            });
-          }
-          if (page.length < pageSize) break;
-          offset += page.length;
         }
-        return threads;
-      },
-      observeGit: async (job) => bootGitFromEnvironmentStatus(
-        await bb.sdk.environments.status({
-          environmentId: job.environmentId,
-          mergeBaseBranch: job.baseBranch,
-        }),
-      ),
-      retireMissingJobThread: (threadId) => bbRunner.retireWorker(threadId, true),
-      notifyOwner: (notice) => {
-        const owner = store.getOwner();
-        if (!owner) return;
-        store.enqueueOutbox({
-          logicalKey: `boot-orphan:${notice.threadId}`,
-          chatId: owner.chatId,
-          payload: { text: notice.text },
-        }, clock());
-      },
-    }, clock());
-  } catch (error) {
-    bb.log.warn(`Boot reconciliation could not observe git and BB: ${redactError(error)}`);
-  }
+        if (page.length < pageSize) break;
+        offset += page.length;
+      }
+      return threads;
+    },
+    observeGit: async (job) => bootGitFromEnvironmentStatus(
+      await bb.sdk.environments.status({
+        environmentId: job.environmentId,
+        mergeBaseBranch: job.baseBranch,
+      }),
+    ),
+    notifyOwner: (notice) => {
+      const owner = store.getOwner();
+      if (!owner) return;
+      store.enqueueOutbox({
+        logicalKey: `boot-orphan:${notice.threadId}`,
+        chatId: owner.chatId,
+        payload: {
+          text: notice.text,
+          ...(notice.retireResourceId ? { retireResourceId: notice.retireResourceId } : {}),
+        },
+      }, clock());
+    },
+  }, clock());
 
   bb.background.service("telegram-ingress", {
     start: (signal) => runTelegramService({
@@ -2515,6 +2512,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       clock: { now: clock },
       reconcileJob,
       getWorkerThread: (threadId) => bbRunner.getThread(threadId),
+      retireWorker: (resourceId, allowMissing) => bbRunner.retireWorker(resourceId, allowMissing),
       telegramToken: () => config.ok ? config.value.botToken : undefined,
       getTelegramClient: () => {
         if (!config.ok) throw new Error(config.message);

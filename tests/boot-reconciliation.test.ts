@@ -1,19 +1,25 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { buildWorkerThreadTitle } from "../src/agent-skills/role-resolver";
 import {
   BOOT_ORPHAN_RETIRE_REASON,
   decideBootReconciliation,
   type BootJobSnapshot,
 } from "../src/domain/boot-reconciliation";
+import { EffectRunner } from "../src/services/effect-runner";
 import {
   persistJobTransition,
   readJobById,
 } from "../src/storage/job-persistence";
 import { readJobLedger } from "../src/storage/job-ledger";
 import { reconcileJobsOnBoot } from "../src/storage/boot-reconciliation";
-import { reconcileBootFromGitAndBb } from "../src/services/boot-reconciliation-service";
-import { openStore } from "../src/storage/store";
+import {
+  applyBootOrphanOutbox,
+  bootOrphanRetireResourceId,
+  reconcileBootFromGitAndBb,
+} from "../src/services/boot-reconciliation-service";
+import type { WorkerLiveness } from "../src/domain/models";
+import { openStore, type TelegramAgentStore } from "../src/storage/store";
 import { policyFixture, sha } from "./helpers";
 
 const HEAD = sha("c");
@@ -72,6 +78,99 @@ function insertImplementingJob(
   db.prepare(
     `INSERT INTO job_ledger (id, stage, branch, head, updated_at) VALUES (?, ?, ?, ?, 1)`,
   ).run(row.id, row.state ?? "implementing", row.branch, row.head);
+}
+
+function pairOwner(db: ReturnType<typeof storeFixture>["db"]): void {
+  db.prepare(
+    `INSERT INTO owners (singleton, telegram_user_id, telegram_chat_id, paired_at) VALUES (1, '7', '70', 1)`,
+  ).run();
+}
+
+function workerTitle(jobId: string, role: "implementation" | "planner" | "review"): string {
+  return buildWorkerThreadTitle({
+    jobId,
+    attemptId: "attempt_1",
+    role,
+  });
+}
+
+function stopThreadPayload(db: ReturnType<typeof storeFixture>["db"], jobId: string): Record<string, unknown> {
+  const row = db.prepare(
+    `SELECT payload_json FROM effects WHERE job_id = ? AND kind = 'stop_thread'`,
+  ).get(jobId) as { payload_json: string } | undefined;
+  return row ? JSON.parse(row.payload_json) as Record<string, unknown> : {};
+}
+
+function admittedJob(
+  store: TelegramAgentStore,
+  db: ReturnType<typeof storeFixture>["db"],
+  row: {
+    id: string;
+    threadId: string | null;
+    branch: string;
+    head: string;
+    state?: string;
+  },
+): { ownerId: string; generation: number } {
+  const created = store.createJob({
+    id: row.id,
+    sourceUpdateId: sourceUpdateId(row.id),
+    requestText: "work",
+    now: 1_000,
+  });
+  const selected = store.applyJobEvent(created.id, created.version, {
+    type: "PROJECT_SELECTED",
+    projectId: "proj_1",
+    policyVersion: 1,
+    policy: policyFixture(),
+  }, 1_100);
+  const ownerId = "boot-executor";
+  const lease = store.acquireExecutorLease(ownerId, 1_200, 30_000);
+  if (!lease.acquired) throw new Error("executor lease missing");
+  store.queueAdmission({
+    jobId: selected.id,
+    expectedVersion: selected.version,
+    projectId: "proj_1",
+    resumeEvent: "CONFIRMED",
+    now: 1_200,
+  });
+  const attempt = store.tryAdmit({
+    jobId: selected.id,
+    maxConcurrentJobs: 8,
+    ownerId,
+    generation: lease.generation,
+    now: 1_200,
+    leaseMs: 30_000,
+  });
+  if (attempt.outcome !== "admitted") throw new Error(`test admission failed: ${attempt.reason}`);
+  db.prepare(
+    `UPDATE jobs SET state = ?, implementation_thread_id = ?, adopted_branch = ?, adopted_head_sha = ? WHERE id = ?`,
+  ).run(row.state ?? "implementing", row.threadId, row.branch, row.head, row.id);
+  db.prepare(
+    `INSERT INTO job_ledger (id, stage, branch, head, updated_at) VALUES (?, ?, ?, ?, 1)
+     ON CONFLICT(id) DO UPDATE SET stage = excluded.stage, branch = excluded.branch, head = excluded.head`,
+  ).run(row.id, row.state ?? "implementing", row.branch, row.head);
+  return { ownerId, generation: lease.generation };
+}
+
+function claimStopThread(
+  store: TelegramAgentStore,
+  db: ReturnType<typeof storeFixture>["db"],
+  jobId: string,
+  ownerId: string,
+  generation: number,
+  now: number,
+) {
+  db.prepare(
+    `UPDATE effects SET status = 'done' WHERE job_id = ? AND kind <> 'stop_thread'`,
+  ).run(jobId);
+  return store.leaseNextJobEffect({
+    jobId,
+    ownerId,
+    generation,
+    now,
+    leaseMs: 30_000,
+  });
 }
 
 it("resumes a killed mid-job at the same ledger stage, branch, and head", () => {
@@ -299,6 +398,7 @@ it("retires an orphaned thread with an owner-visible outcome", () => {
     {
       kind: "stop_thread",
       payload_json: JSON.stringify({
+        generation: 1,
         resourceId: "thr_impl",
         resourceKind: "bb_thread",
         workerKind: "implementation",
@@ -337,8 +437,7 @@ it("does not enqueue a second retire when boot runs again", () => {
 
 it("retires a worker thread whose job row is gone with an owner-visible notice", async () => {
   const { db } = storeFixture("boot-missing-job");
-  const retired: string[] = [];
-  const notices: string[] = [];
+  const notices: Array<{ text: string; retireResourceId?: string }> = [];
 
   const plan = await reconcileBootFromGitAndBb(db, {
     listThreads: async () => [{
@@ -350,11 +449,8 @@ it("retires a worker thread whose job row is gone with an owner-visible notice",
       }),
     }],
     observeGit: async () => null,
-    retireMissingJobThread: async (threadId) => {
-      retired.push(threadId);
-    },
     notifyOwner: (notice) => {
-      notices.push(notice.text);
+      notices.push({ text: notice.text, retireResourceId: notice.retireResourceId });
     },
   }, 10_000);
 
@@ -364,8 +460,16 @@ it("retires a worker thread whose job row is gone with an owner-visible notice",
     jobId: "job_gone",
     reason: BOOT_ORPHAN_RETIRE_REASON,
   }]);
-  expect(retired).toEqual(["thr_lost"]);
-  expect(notices).toEqual([BOOT_ORPHAN_RETIRE_REASON]);
+  expect(notices).toEqual([{
+    text: BOOT_ORPHAN_RETIRE_REASON,
+    retireResourceId: "thr_lost",
+  }]);
+  const retireWorker = vi.fn(async () => undefined);
+  await applyBootOrphanOutbox({
+    text: notices[0]!.text,
+    retireResourceId: notices[0]!.retireResourceId,
+  }, retireWorker);
+  expect(retireWorker).toHaveBeenCalledWith("thr_lost", true);
 });
 
 it("leaves a job unmoved when a later transition is rejected after boot resume", () => {
@@ -393,4 +497,195 @@ it("leaves a job unmoved when a later transition is rejected after boot resume",
     branch: "",
     head: "",
   });
+});
+
+it("retires a second unbound worker instead of leaving it stalled", () => {
+  expect(decideBootReconciliation({
+    jobs: [implementingSnapshot({ implementationThreadId: null })],
+    git: [],
+    threads: [
+      { threadId: "thr_a", jobId: "job_live", role: "implementation" },
+      { threadId: "thr_b", jobId: "job_live", role: "implementation" },
+    ],
+  }).threads).toEqual([
+    {
+      action: "adopt",
+      threadId: "thr_a",
+      jobId: "job_live",
+      slot: "implementation",
+    },
+    {
+      action: "retire",
+      threadId: "thr_b",
+      jobId: "job_live",
+      reason: BOOT_ORPHAN_RETIRE_REASON,
+    },
+  ]);
+});
+
+it("binds only the first unbound worker and retires the duplicate", () => {
+  const { db } = storeFixture("boot-duplicate-unbound");
+  insertImplementingJob(db, {
+    id: "job_live",
+    threadId: null,
+    branch: "feat/intake",
+    head: HEAD,
+  });
+
+  const plan = reconcileJobsOnBoot(db, {
+    git: [],
+    threads: [
+      { threadId: "thr_a", title: workerTitle("job_live", "implementation") },
+      { threadId: "thr_b", title: workerTitle("job_live", "implementation") },
+    ],
+  }, 9_500);
+
+  expect(plan.threads.map((thread) => thread.action)).toEqual(["adopt", "retire"]);
+  expect(readJobById(db, "job_live")?.implementationThreadId).toBe("thr_a");
+  expect(stopThreadPayload(db, "job_live")).toEqual({
+    generation: 1,
+    resourceId: "thr_b",
+    resourceKind: "bb_thread",
+    workerKind: "implementation",
+  });
+});
+
+it("retires a leftover worker through EffectRunner with an owner-visible notice", async () => {
+  const { store, db } = storeFixture("boot-leftover-runner");
+  pairOwner(db);
+  const fence = admittedJob(store, db, {
+    id: "job_live",
+    threadId: "thr_impl",
+    branch: "feat/intake",
+    head: HEAD,
+  });
+  store.upsertWorkerLiveness({
+    jobId: "job_live",
+    workerKind: "plan",
+    resourceKind: "bb_thread",
+    resourceId: "thr_plan",
+    generation: 7,
+    state: "active",
+    sourceUpdatedAt: 1_000,
+    observedAt: 1_000,
+    staleNotifiedAt: null,
+  });
+  const notices: string[] = [];
+
+  await reconcileBootFromGitAndBb(db, {
+    listThreads: async () => [
+      { threadId: "thr_impl", title: workerTitle("job_live", "implementation") },
+      { threadId: "thr_plan", title: workerTitle("job_live", "planner") },
+    ],
+    observeGit: async () => null,
+    notifyOwner: (notice) => {
+      notices.push(notice.text);
+    },
+  }, 9_600);
+
+  expect(stopThreadPayload(db, "job_live")).toEqual({
+    generation: 7,
+    resourceId: "thr_plan",
+    resourceKind: "bb_thread",
+    workerKind: "plan",
+  });
+  expect(notices).toEqual([BOOT_ORPHAN_RETIRE_REASON]);
+  const claimed = claimStopThread(store, db, "job_live", fence.ownerId, fence.generation, 9_601);
+  expect(claimed?.kind).toBe("stop_thread");
+  const stopWorker = vi.fn(async (_worker: WorkerLiveness) => undefined);
+  await new EffectRunner({
+    store,
+    fence: { ownerId: fence.ownerId, generation: fence.generation, signal: new AbortController().signal },
+    bb: {
+      stopWorker,
+      getThread: vi.fn(async () => ({
+        id: "thr_plan",
+        projectId: "proj_1",
+        environmentId: null,
+        parentThreadId: null,
+        title: "plan",
+        status: "idle",
+        updatedAt: 9_602,
+        runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
+      })),
+    },
+    now: () => 9_602,
+  }).run(claimed!);
+  expect(stopWorker.mock.calls.map(([worker]) => worker.resourceId)).toEqual(["thr_plan"]);
+});
+
+it("leases a draining boot-orphan stop through admission and EffectRunner", async () => {
+  const { store, db } = storeFixture("boot-draining-runner");
+  const fence = admittedJob(store, db, {
+    id: "job_dead",
+    threadId: "thr_impl",
+    branch: "feat/intake",
+    head: HEAD,
+    state: "cancelled",
+  });
+  store.upsertWorkerLiveness({
+    jobId: "job_dead",
+    workerKind: "implementation",
+    resourceKind: "bb_thread",
+    resourceId: "thr_impl",
+    generation: 4,
+    state: "active",
+    sourceUpdatedAt: 1_000,
+    observedAt: 1_000,
+    staleNotifiedAt: null,
+  });
+  expect(store.beginDraining({
+    jobId: "job_dead",
+    ownerId: fence.ownerId,
+    generation: fence.generation,
+    now: 9_700,
+  })?.state).toBe("cancelled");
+
+  reconcileJobsOnBoot(db, {
+    git: [],
+    threads: [{ threadId: "thr_impl", title: workerTitle("job_dead", "implementation") }],
+  }, 9_701);
+
+  const claimed = claimStopThread(store, db, "job_dead", fence.ownerId, fence.generation, 9_702);
+  expect(claimed?.kind).toBe("stop_thread");
+  expect(claimed?.payload).toMatchObject({
+    generation: 4,
+    resourceId: "thr_impl",
+    resourceKind: "bb_thread",
+    workerKind: "implementation",
+  });
+  const stopWorker = vi.fn(async (_worker: WorkerLiveness) => undefined);
+  await new EffectRunner({
+    store,
+    fence: { ownerId: fence.ownerId, generation: fence.generation, signal: new AbortController().signal },
+    bb: { stopWorker },
+    now: () => 9_703,
+  }).run(claimed!);
+  expect(stopWorker.mock.calls.map(([worker]) => worker.resourceId)).toEqual(["thr_impl"]);
+});
+
+it("fails closed when listing threads fails", async () => {
+  const { db } = storeFixture("boot-list-fail");
+  insertImplementingJob(db, {
+    id: "job_live",
+    threadId: "thr_impl",
+    branch: "feat/intake",
+    head: HEAD,
+  });
+
+  await expect(reconcileBootFromGitAndBb(db, {
+    listThreads: async () => {
+      throw new Error("bb threads unavailable");
+    },
+    observeGit: async () => null,
+  }, 10_100)).rejects.toThrow(/bb threads unavailable/);
+  expect(db.prepare("SELECT COUNT(*) AS count FROM effects").get()).toEqual({ count: 0 });
+});
+
+it("reads a missing-job retire resource from the durable notice payload", () => {
+  expect(bootOrphanRetireResourceId({
+    text: BOOT_ORPHAN_RETIRE_REASON,
+    retireResourceId: "thr_lost",
+  })).toBe("thr_lost");
+  expect(bootOrphanRetireResourceId({ text: BOOT_ORPHAN_RETIRE_REASON })).toBeNull();
 });

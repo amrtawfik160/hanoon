@@ -25,9 +25,27 @@ export type BootGitPorts = Readonly<{
     environmentId: string;
     baseBranch: string;
   }>): Promise<{ branch: string; head: string } | null>;
-  retireMissingJobThread?(threadId: string): Promise<void>;
-  notifyOwner?(notice: Readonly<{ text: string; threadId: string }>): void;
+  notifyOwner?(notice: Readonly<{
+    text: string;
+    threadId: string;
+    retireResourceId?: string;
+  }>): void;
 }>;
+
+export function bootOrphanRetireResourceId(payload: Record<string, unknown>): string | null {
+  return typeof payload.retireResourceId === "string" && payload.retireResourceId.length > 0
+    ? payload.retireResourceId
+    : null;
+}
+
+export async function applyBootOrphanOutbox(
+  payload: Record<string, unknown>,
+  retireWorker: (resourceId: string, allowMissing: boolean) => Promise<void>,
+): Promise<void> {
+  const resourceId = bootOrphanRetireResourceId(payload);
+  if (resourceId === null) return;
+  await retireWorker(resourceId, true);
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -83,9 +101,12 @@ export async function reconcileBootFromGitAndBb(
   const existingJobs = new Set(loadBootJobSnapshots(db).map((job) => job.ledger.id));
   for (const thread of plan.threads) {
     if (thread.action !== "retire") continue;
-    if (thread.jobId !== null && existingJobs.has(thread.jobId)) continue;
-    await ports.retireMissingJobThread?.(thread.threadId);
-    ports.notifyOwner?.({ text: BOOT_ORPHAN_RETIRE_REASON, threadId: thread.threadId });
+    const missing = thread.jobId === null || !existingJobs.has(thread.jobId);
+    ports.notifyOwner?.({
+      text: BOOT_ORPHAN_RETIRE_REASON,
+      threadId: thread.threadId,
+      ...(missing ? { retireResourceId: thread.threadId } : {}),
+    });
   }
   return plan;
 }

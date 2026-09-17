@@ -10,7 +10,7 @@ import {
   type BootThreadSlot,
 } from "../domain/boot-reconciliation";
 import { type JobLedgerRow } from "../domain/job-ledger";
-import { JOB_STATES, type JobState } from "../domain/models";
+import { JOB_STATES, type JobState, type WorkerKind } from "../domain/models";
 import { persistPendingEffects } from "./job-persistence";
 
 type SqliteDatabase = Database.Database;
@@ -49,9 +49,43 @@ function roleFromTitle(role: WorkerSkillRole): BootThreadRole {
   }
 }
 
-function workerKindForRole(role: BootThreadRole | null): string {
+function workerKindForRole(role: BootThreadRole | null): WorkerKind {
   if (role === "final-review") return "review";
   return role ?? "implementation";
+}
+
+function ensureOrphanLiveness(
+  db: SqliteDatabase,
+  jobId: string,
+  threadId: string,
+  role: BootThreadRole | null,
+  now: number,
+): { generation: number; workerKind: WorkerKind } {
+  const workerKind = workerKindForRole(role);
+  db.prepare(
+    `INSERT INTO worker_liveness (
+       job_id, worker_kind, resource_kind, resource_id, generation, state,
+       source_updated_at, observed_at, stale_notified_at
+     ) VALUES (?, ?, 'bb_thread', ?, 1, 'active', ?, ?, NULL)
+     ON CONFLICT(job_id, resource_id) DO UPDATE SET
+       worker_kind = excluded.worker_kind,
+       resource_kind = 'bb_thread',
+       generation = CASE
+         WHEN worker_liveness.generation >= 1 THEN worker_liveness.generation
+         ELSE excluded.generation
+       END,
+       state = 'active',
+       source_updated_at = excluded.source_updated_at,
+       observed_at = excluded.observed_at,
+       stale_notified_at = NULL`,
+  ).run(jobId, workerKind, threadId, now, now);
+  const stored = db.prepare(
+    `SELECT generation, worker_kind FROM worker_liveness WHERE job_id = ? AND resource_id = ?`,
+  ).get(jobId, threadId) as { generation: number; worker_kind: WorkerKind } | undefined;
+  if (!stored || !Number.isInteger(stored.generation) || stored.generation < 1) {
+    throw new TypeError("boot orphan worker generation is required");
+  }
+  return { generation: stored.generation, workerKind: stored.worker_kind };
 }
 
 export function loadBootJobSnapshots(db: SqliteDatabase): BootJobSnapshot[] {
@@ -112,6 +146,7 @@ function persistOrphanRetirement(
   role: BootThreadRole | null,
   now: number,
 ): void {
+  const worker = ensureOrphanLiveness(db, jobId, threadId, role, now);
   persistPendingEffects(db, [
     {
       idempotencyKey: `${jobId}:boot-orphan:${threadId}:render_status`,
@@ -124,9 +159,10 @@ function persistOrphanRetirement(
       jobId,
       kind: "stop_thread",
       payload: {
+        generation: worker.generation,
         resourceId: threadId,
         resourceKind: "bb_thread",
-        workerKind: workerKindForRole(role),
+        workerKind: worker.workerKind,
       },
     },
   ], now);

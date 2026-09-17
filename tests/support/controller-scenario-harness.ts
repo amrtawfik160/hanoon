@@ -111,6 +111,9 @@ async function createScenarioPluginHost(
     pluginId,
     settings: SCENARIO_PLUGIN_SETTINGS,
     agentSkillIds: [...BUNDLED_SKILL_IDS],
+    sdk: {
+      threads: { list: async () => [] },
+    },
   });
   beginScenarioResources();
   try {
