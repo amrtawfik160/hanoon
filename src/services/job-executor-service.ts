@@ -5,6 +5,7 @@ import { AutonomyScheduler } from "../autonomy/scheduler";
 import { MAX_CONCURRENT_JOBS, type MaxConcurrentJobs } from "../autonomy/models";
 import { redactError } from "../errors";
 import { EffectRunner, PermanentEffectError, retryDelay, type EffectFence } from "./effect-runner";
+import { applyBootOrphanOutbox } from "./boot-reconciliation-service";
 import { classifyTelegramError, TelegramApiError } from "../telegram/errors";
 import { TelegramRequestError, TelegramResponseValidationError } from "../telegram/client";
 import { JobLaneRunner, type JobLaneKind, type JobLaneSnapshotProvider } from "./job-lane-runner";
@@ -50,6 +51,7 @@ export type JobExecutorDependencies = {
     signal: AbortSignal,
   ) => Promise<{ bytes: Uint8Array; sizeBytes: number }>;
   getWorkerThread?: (threadId: string, signal: AbortSignal) => Promise<BbThreadObservation>;
+  retireWorker?: (resourceId: string, allowMissing: boolean) => Promise<void>;
   scheduler?: Pick<AutonomyScheduler, "run">;
   maxConcurrentJobs?: () => number | null;
   onWorkAvailable?: () => void;
@@ -1250,6 +1252,7 @@ export async function runJobExecutorService(deps: JobExecutorDependencies, signa
           };
           didWork = true;
           try {
+            if (deps.retireWorker) await applyBootOrphanOutbox(item.payload, deps.retireWorker);
             const token = deps.telegramToken?.();
             const telegram = deps.getTelegramClient?.(token) ?? deps.telegram?.(token);
             if (!telegram) throw new Error("Telegram client is not configured");
