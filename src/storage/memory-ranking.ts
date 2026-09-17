@@ -2,13 +2,11 @@
 // semantic signal without an API key; when either side has no compatible
 // vector, the exact word-based score remains authoritative.
 
-export const MEMORY_HALF_LIFE_MS = 45 * 86_400_000;
 const LEXICAL_WEIGHT = 0.45;
-const RECENCY_WEIGHT = 0.25;
 const IMPORTANCE_WEIGHT = 0.2;
 const CONFIDENCE_WEIGHT = 0.1;
 // Reciprocal rank keeps the lexical signal bounded, so one freakishly good BM25
-// score cannot drown out recency and importance the way a raw score would.
+// score cannot drown out importance the way a raw score would.
 const RECIPROCAL_RANK_K = 4;
 /**
  * Meaning is worth about as much as words: a question rarely reuses the
@@ -32,12 +30,7 @@ export type MemoryCandidate = {
   semanticRank?: number | null;
   importance: number;
   confidence: number;
-  ageMs: number;
 };
-
-export function recencyScore(ageMs: number): number {
-  return 0.5 ** (Math.max(0, ageMs) / MEMORY_HALF_LIFE_MS);
-}
 
 function reciprocalRank(rank: number | null | undefined): number {
   return rank === null || rank === undefined
@@ -52,17 +45,16 @@ function reciprocalRank(rank: number | null | undefined): number {
  * reach a memory phrased "never deploy at the end of the week". It is folded in
  * as another reciprocal rank rather than a raw cosine, for the same reason the
  * lexical signal is: one freakishly close vector should not be able to outvote
- * recency and importance together.
+ * importance.
  *
  * When no vector is available the original score is returned unchanged. When
  * one is available, semantic rank receives a fixed share of that same unit
  * scale. That keeps embedded and unembedded rows comparable while preserving
- * the exact pre-embedding ranking for a word-only corpus.
+ * the exact pre-embedding ranking for a word-only corpus. Age is not a signal.
  */
 export function memoryScore(candidate: MemoryCandidate): number {
   const semanticAvailable = candidate.semanticRank !== null && candidate.semanticRank !== undefined;
   const base = LEXICAL_WEIGHT * reciprocalRank(candidate.lexicalRank) +
-    RECENCY_WEIGHT * recencyScore(candidate.ageMs) +
     IMPORTANCE_WEIGHT * candidate.importance +
     CONFIDENCE_WEIGHT * candidate.confidence;
   if (!semanticAvailable) return base;

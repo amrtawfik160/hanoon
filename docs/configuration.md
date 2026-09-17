@@ -118,7 +118,7 @@ Two further settings govern what the agent does about its own failures. Both def
 | Self-healing | on, off | off | Inspects persisted controller and pipeline job failures out of band, fixes the cause with a change the worker verified, proposes at most one cooled-down fix at a time, and messages the owner the link without asking. |
 | What a diagnosis becomes | `draft-pr`, `pipeline` | `draft-pr` | `draft-pr` pushes a branch for you to read. `pipeline` files the same fix as an ordinary reviewed job instead. |
 
-`pipeline` needs the self-diagnosis project's policy to carry an [`autonomy.intake`](#work-the-daily-audit-starts) allowance, and it shares that allowance and its finding ledger rather than adding to them: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
+`pipeline` needs the self-diagnosis project's policy to carry an [`autonomy.intake`](#work-the-daily-audit-starts) allowance, and it shares that allowance rather than adding to it: a project that said two jobs a day meant two. Without one — or when that project's failure brake is on, it already has work running, or that failure has already had its job — it falls back to a draft pull request and logs why. Filing is not merging: the job asks for its merge on exactly the same terms as every other job on that project.
 
 The conversation's own budgets are deliberately not settings. A turn is bounded by tool calls, tokens, and repeated command failures, and those bounds sit far above any healthy turn: they exist to stop a runaway, not to be tuned from a phone. See [Architecture](architecture.md) for the exact behaviour.
 
@@ -664,11 +664,11 @@ controller and job failures, and what a proposed fix turns into. A diagnosis
 must report what verification ran and what it showed, or it is refused before
 any pull request exists, and the owner receives the link to whatever was
 opened or filed the moment it exists. `pipeline` files the fix
-through this project's `autonomy.intake` allowance and the same finding ledger
-rather than keeping its own count, because a project that said two jobs a day
-meant two. Without an allowance — or when the failure brake is on, work is
-already running, or that failure has already had its job — it falls back to a
-draft pull request and logs why.
+through this project's `autonomy.intake` allowance rather than keeping its own
+count, because a project that said two jobs a day meant two. Without an
+allowance — or when the failure brake is on, work is already running, or that
+failure has already had its job — it falls back to a draft pull request and
+logs why.
 
 ## Per-stage model routing
 

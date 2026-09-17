@@ -167,14 +167,6 @@ _Avoid_: Test failure, ordinary retry
 The registry-derived classification of a guard finding as `must_fix` or `advisory`; it is recomputed by Hanoon from stable rule identity rather than trusted from reviewer prose.
 _Avoid_: Model-selected blocker, every stylistic note blocks
 
-**Finding ledger**:
-The append-only history of independently checked review root causes, their evidence, guard disposition, repair relationship, and current `open`, `resolved`, or `disputed` state.
-_Avoid_: Latest review prose, repeated finding list
-
-**Blocking burden**:
-The number of distinct, open, confirmed `must_fix` root causes in a finding ledger. A repair loop may continue only while this number decreases, apart from one bounded recovery.
-_Avoid_: Total suggestions, review attempt count
-
 **Thread ask**:
 The one-line reason the controller gives when it messages a worker thread, recorded once the send lands and owed to the owner until a reply states it. It is the substance of the instruction, not the message text.
 _Avoid_: Tool narration, the sent message, a promise to explain later

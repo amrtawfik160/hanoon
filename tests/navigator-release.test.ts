@@ -1582,7 +1582,7 @@ describe("navigator exact-head release", () => {
     ]);
   });
 
-  it("records final exact-head review findings in the normalized release convergence ledger", () => {
+  it("returns final exact-head review findings to navigation without a finding ledger", () => {
     const fixture = ownedFixture();
     propose(fixture, {
       kind: "start_release",
@@ -1720,16 +1720,9 @@ describe("navigator exact-head release", () => {
       now: fixture.now(),
     })).toMatchObject({ state: "implementing" });
     expect(fixture.database.prepare(
-      `SELECT capability_id, rule_id, disposition, event, head_sha, blocking_burden
-         FROM navigator_release_review_finding_events WHERE job_id = ?`,
-    ).all(fixture.job.id)).toEqual([{
-      capability_id: "docs-guard",
-      rule_id: "docs.required",
-      disposition: "must_fix",
-      event: "opened",
-      head_sha: HEAD,
-      blocking_burden: 1,
-    }]);
+      `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name = 'navigator_release_review_finding_events'`,
+    ).get()).toBeUndefined();
   });
 
   it("recovers one successful rollback to navigation and exhausts a repeated signature", async () => {

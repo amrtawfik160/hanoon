@@ -445,7 +445,7 @@ it("upgrades the shipped native SDLC schema without rewriting migration history 
   expect(db.prepare(
     `SELECT name FROM sqlite_master
        WHERE type = 'table' AND name = 'navigator_release_review_finding_events'`,
-  ).get()).toEqual({ name: "navigator_release_review_finding_events" });
+  ).get()).toBeUndefined();
   expect(db.prepare("SELECT COUNT(*) AS count FROM _bb_migrations").get()).toEqual({
     count: ALL_MIGRATIONS.length,
   });

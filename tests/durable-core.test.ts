@@ -31,6 +31,7 @@ const GONE_TABLES = [
   "navigator_promotion_evidence_manifests",
   "navigator_review_finding_events",
   "navigator_review_convergence",
+  "navigator_release_review_finding_events",
 ] as const;
 const KEPT_TABLES = [
   "owners",
@@ -53,6 +54,7 @@ const GONE_SOURCE = [
   "src/navigator/promotion-evidence.ts",
   "src/storage/navigator-promotion-evidence-snapshot.ts",
   "src/services/system-monitors.ts",
+  "src/services/memory-curation-service.ts",
 ] as const;
 
 function fixture(pluginId: string) {

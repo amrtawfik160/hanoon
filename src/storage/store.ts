@@ -90,7 +90,6 @@ import type {
   GuardSettlementPersistenceResult,
 } from "../capabilities/guards";
 import {
-  assessGuardEnvelope,
   guardAssessmentPolicySchema,
   guardResultEnvelopeSchema,
 } from "../capabilities/guards";
@@ -1524,23 +1523,7 @@ type WorkerRecoveryRow = {
   updated_at: number;
   resolved_at: number | null;
 };
-type NavigatorReleaseReviewFinding = Readonly<{
-  sourceAttemptId: string;
-  fingerprint: string;
-  capabilityId: string;
-  ruleId: string;
-  disposition: "must_fix" | "advisory";
-  findingJson: string;
-}>;
-type NavigatorReleaseReviewFindingRow = Readonly<{
-  fingerprint: string;
-  capability_id: string;
-  rule_id: string;
-  disposition: "must_fix" | "advisory";
-  event: "opened" | "reobserved" | "resolved";
-  finding_json: string;
-  occurrence: number;
-}>;
+
 type TelegramUpdateRow = {
   status: "processing" | "processed" | "failed";
   claim_owner: string | null;
@@ -11661,7 +11644,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             WHERE memories_fts MATCH ?
               AND memories.scope IN (${placeholders})
               AND memories.forgotten_at IS NULL AND memories.superseded_by IS NULL
-            ORDER BY bm25(memories_fts, 2.0, 1.0)
+            ORDER BY bm25(memories_fts)
             LIMIT 100`,
         ).all(match, ...scopes) as { id: string }[];
         matched.forEach((row, index) => lexicalRanks.set(row.id, index));
@@ -11684,7 +11667,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
             semanticRank: semantic.get(row.id) ?? (semantic.size > 0 ? null : undefined),
             importance: row.importance,
             confidence: row.confidence,
-            ageMs: input.now - row.created_at,
           }),
         }))
         // An explicit question surfaces what mentions it *or what means it*:
@@ -11752,7 +11734,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
           lexicalRank: null,
           importance: row.importance,
           confidence: row.confidence,
-          ageMs: now - row.created_at,
         }),
       }))
       .sort((left, right) => left.score - right.score)
@@ -12397,7 +12378,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     origin: AutonomousJobOrigin;
     /** Floor for the recipe, so a diagnosis or a revert cannot route as a typo. */
     minimumRecipe?: TaskRecipe;
-    /** Present when the daily allowance and the finding ledger both apply. */
+    /** Present when the daily intake allowance applies. */
     intake?: { fingerprint: string; auditId: string; subject: string };
     /** Present for a revert, which is bounded once per merge commit for all time. */
     revert?: { mergeCommitSha: string; mergedJobId: string };
@@ -13004,7 +12985,7 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     event: JobEvent;
     evidenceGate: { valid: boolean; completeReviewAttemptIds: readonly string[] };
   }>): void {
-    const { current, input: settlement, transitioned, event, evidenceGate } = input;
+    const { current, input: settlement, transitioned, event } = input;
     persistJobTransition(this.db, current.id, current.version, transitioned.job);
     persistPendingEffects(this.db, transitioned.effects, settlement.now);
     this.settleNavigatorReleaseReturn({
@@ -13012,7 +12993,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
       next: transitioned.job,
       event,
       now: settlement.now,
-      reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
     });
     this.enqueueFinishNoteInTransaction(current, transitioned.job, settlement.now);
     this.markAdmissionDrainingForTerminal(transitioned.job, settlement.now);
@@ -14030,7 +14010,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         next: transitioned.job,
         event,
         now,
-        reviewAttemptIds: [],
       });
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(jobId, "head_changed", now);
@@ -14107,7 +14086,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
         next: transitioned.job,
         event: input.event,
         now: input.now,
-        reviewAttemptIds: evidenceGate.completeReviewAttemptIds,
       });
       if (current.prHeadSha !== transitioned.job.prHeadSha) {
         this.releaseAuthorityRepository.revokeForJob(input.jobId, "head_changed", input.now);
@@ -17915,16 +17893,9 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
     next: Job;
     event: JobEvent;
     now: number;
-    reviewAttemptIds: readonly string[];
   }>): void {
     if (input.previous.workflowEngine !== "navigator-v1") return;
     if (!(NAVIGATOR_RELEASE_STATES as readonly string[]).includes(input.previous.state)) return;
-    this.recordNavigatorReleaseReviewFindings(
-      input.previous,
-      input.event,
-      input.reviewAttemptIds,
-      input.now,
-    );
     const returnedToNavigation = input.next.state === "implementing";
     const releaseFinished = input.next.state === "complete" ||
       input.next.state === "merged" || input.next.state === "production_failed";
@@ -17975,156 +17946,6 @@ class SqliteTelegramAgentStore implements TelegramAgentStore {
          next_attempt_at, created_at, updated_at
        ) VALUES (?, ?, NULL, ?, 'pending', 0, ?, ?, ?)`,
     ).run(item.logicalKey, item.chatId, payloadJson, input.now, input.now, input.now);
-  }
-
-  private recordNavigatorReleaseReviewFindings(
-    job: Job,
-    event: JobEvent,
-    reviewAttemptIds: readonly string[],
-    now: number,
-  ): void {
-    if (job.state !== "final_reviewing" ||
-      (event.type !== "REVIEW_CHANGES_REQUESTED" && event.type !== "REVIEW_PASSED")) return;
-    if (!job.prHeadSha || reviewAttemptIds.length === 0) {
-      throw new Error("final review convergence evidence is unavailable");
-    }
-    const observed = this.normalizedReleaseReviewFindings(job, reviewAttemptIds);
-    if (event.type === "REVIEW_CHANGES_REQUESTED" && observed.size === 0) {
-      throw new Error("final review requested changes without normalized findings");
-    }
-    const currentRows = this.currentReleaseReviewFindingRows(job.id);
-    const current = new Map(currentRows.map((row) => [row.fingerprint, row]));
-    const blockingBurden = [...observed.values()].filter((finding) => finding.disposition === "must_fix").length;
-    for (const finding of observed.values()) {
-      const prior = current.get(finding.fingerprint);
-      this.appendReleaseReviewFindingEvent({
-        job,
-        sourceAttemptId: finding.sourceAttemptId,
-        fingerprint: finding.fingerprint,
-        capabilityId: finding.capabilityId,
-        ruleId: finding.ruleId,
-        disposition: finding.disposition,
-        event: prior?.event === "opened" || prior?.event === "reobserved" ? "reobserved" : "opened",
-        findingJson: finding.findingJson,
-        occurrence: Math.min(3, (prior?.occurrence ?? 0) + 1),
-        blockingBurden,
-        now,
-      });
-    }
-    this.resolveClosedReleaseReviewFindings({
-      job,
-      currentRows,
-      observed,
-      sourceAttemptId: reviewAttemptIds[0]!,
-      blockingBurden,
-      now,
-    });
-  }
-
-  private normalizedReleaseReviewFindings(
-    job: Job,
-    reviewAttemptIds: readonly string[],
-  ): Map<string, NavigatorReleaseReviewFinding> {
-    const observed = new Map<string, NavigatorReleaseReviewFinding>();
-    for (const attemptId of reviewAttemptIds) {
-      const attempt = this.getAttempt(attemptId);
-      if (!attempt || attempt.jobId !== job.id || attempt.reviewStage !== "final_review" ||
-        attempt.headSha !== job.prHeadSha || attempt.resultJson === null) {
-        throw new Error("final review convergence attempt is invalid");
-      }
-      const raw = JSON.parse(attempt.resultJson) as Record<string, unknown>;
-      const envelope = guardResultEnvelopeSchema.safeParse(raw.guardEnvelope);
-      const policy = guardAssessmentPolicySchema.safeParse(raw.guardPolicy);
-      if (!envelope.success || !policy.success) continue;
-      const assessment = assessGuardEnvelope(envelope.data, policy.data);
-      if (assessment.outcome === "blocked") throw new Error("final review guard assessment is blocked");
-      for (const finding of assessment.findings) {
-        if (observed.has(finding.fingerprint)) continue;
-        observed.set(finding.fingerprint, {
-          sourceAttemptId: attempt.id,
-          fingerprint: finding.fingerprint,
-          capabilityId: finding.capabilityId,
-          ruleId: finding.ruleId,
-          disposition: finding.disposition,
-          findingJson: JSON.stringify(finding),
-        });
-      }
-    }
-    return observed;
-  }
-
-  private currentReleaseReviewFindingRows(jobId: string): NavigatorReleaseReviewFindingRow[] {
-    return this.db.prepare(
-      `SELECT finding.* FROM navigator_release_review_finding_events AS finding
-        WHERE finding.job_id = ? AND finding.sequence = (
-          SELECT MAX(latest.sequence) FROM navigator_release_review_finding_events AS latest
-           WHERE latest.job_id = finding.job_id AND latest.fingerprint = finding.fingerprint
-        )`,
-    ).all(jobId) as NavigatorReleaseReviewFindingRow[];
-  }
-
-  private appendReleaseReviewFindingEvent(input: Readonly<{
-    job: Job;
-    sourceAttemptId: string;
-    fingerprint: string;
-    capabilityId: string;
-    ruleId: string;
-    disposition: "must_fix" | "advisory";
-    event: "opened" | "reobserved" | "resolved";
-    findingJson: string;
-    occurrence: number;
-    blockingBurden: number;
-    now: number;
-  }>): void {
-    this.db.prepare(
-      `INSERT INTO navigator_release_review_finding_events (
-         job_id, workflow_step_id, source_review_attempt_id, fingerprint,
-         capability_id, rule_id, disposition, event, head_sha, finding_json,
-         evidence_refs_json, occurrence, blocking_burden, recorded_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      input.job.id,
-      input.job.currentWorkflowStepId,
-      input.sourceAttemptId,
-      input.fingerprint,
-      input.capabilityId,
-      input.ruleId,
-      input.disposition,
-      input.event,
-      input.job.prHeadSha,
-      input.findingJson,
-      JSON.stringify([`review-attempt:${input.sourceAttemptId}`, `guard-finding:${input.fingerprint}`]),
-      input.occurrence,
-      input.blockingBurden,
-      input.now,
-    );
-  }
-
-  private resolveClosedReleaseReviewFindings(input: Readonly<{
-    job: Job;
-    currentRows: readonly NavigatorReleaseReviewFindingRow[];
-    observed: ReadonlyMap<string, NavigatorReleaseReviewFinding>;
-    sourceAttemptId: string;
-    blockingBurden: number;
-    now: number;
-  }>): void {
-    for (const prior of input.currentRows) {
-      const open = prior.event === "opened" || prior.event === "reobserved";
-      if (!open || input.observed.has(prior.fingerprint)) continue;
-      this.appendReleaseReviewFindingEvent({
-        job: input.job,
-        sourceAttemptId: input.sourceAttemptId,
-        fingerprint: prior.fingerprint,
-        capabilityId: prior.capability_id,
-        ruleId: prior.rule_id,
-        disposition: prior.disposition,
-        event: "resolved",
-        findingJson: prior.finding_json,
-        occurrence: prior.occurrence,
-        blockingBurden: input.blockingBurden,
-        now: input.now,
-      });
-    }
   }
 
   private enqueueFinishNoteInTransaction(previous: Job, completed: Job, now: number): void {

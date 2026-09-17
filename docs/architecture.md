@@ -332,13 +332,9 @@ One extraction runs at a time, in a hidden thread on the job's own project, and 
 
 ## Keeping memory honest
 
-Memory that only ever grows becomes memory that is mostly wrong, so two forces curate it, and neither needs a model.
+There is no fade, devalue, or rank-tuning pass. The list stays bounded: when a scope is full, the weakest live memory is forgotten. Recall matches standing memories by words and optional meaning, then by importance and confidence, not by age.
 
-**What the owner said next is the verdict on the last answer.** Every recall is linked to the turn it informed. When the owner's following message is a correction, exactly those memories lose confidence; when they move on, those memories gain a little. Demotion outweighs reinforcement, because being wrong in front of the owner is much stronger evidence than going unchallenged. A turn stays unscored until there *is* a next message — silence is not a verdict.
-
-**Idle time ages out what was never useful.** Confidence decays on time since last recall rather than raw age, on a longer half-life than the ranking's, so a memory is never discarded faster than it is merely down-ranked. Only agent-written memories that were never recalled can be tombstoned; something the owner said out loud decays in confidence but never vanishes on a timer, and tombstoning sets `forgotten_at` rather than deleting.
-
-A correction also retires the beliefs it contradicts. Two subjects contradict when one's words wholly contain the other's — "deploy on fridays" against "never deploy on fridays" — and only a `correction` may trigger it. A single shared word is a coincidence, and an ordinary restatement is not a refutation.
+A correction retires the beliefs it contradicts. Two subjects contradict when one's words wholly contain the other's — "deploy on fridays" against "never deploy on fridays" — and only a `correction` may trigger it. A single shared word is a coincidence, and an ordinary restatement is not a refutation.
 
 ## Watching production
 

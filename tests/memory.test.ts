@@ -67,6 +67,26 @@ it("ranks a fresh important memory above a stale unimportant one", () => {
   expect(hits).toHaveLength(2);
 });
 
+it("does not let age outrank a more important older memory", () => {
+  const { store } = fixture();
+  const important = remember(store, {
+    subject: "old deploy note",
+    body: "Deploy notes from a long time ago.",
+    importance: 0.9,
+    now: NOW - 200 * DAY_MS,
+  });
+  remember(store, {
+    subject: "new deploy note",
+    body: "Deploy notes from today.",
+    importance: 0.2,
+  });
+
+  const hits = store.recallMemories({ scope: "owner", query: "deploy notes", limit: 5, now: NOW });
+
+  expect(hits[0]?.id).toBe(important.id);
+  expect(hits).toHaveLength(2);
+});
+
 it("keeps project memories out of unrelated projects but always keeps owner memories", () => {
   const { store } = fixture();
   remember(store, { subject: "global tone", body: "Keep answers short." });
@@ -142,7 +162,7 @@ it("refuses to keep a secret the owner pasted", () => {
   expect(store.countMemories("owner")).toBe(0);
 });
 
-it("records that a recalled memory was used so it decays more slowly", () => {
+it("records that a recalled memory was used", () => {
   const { store } = fixture();
   const memory = remember(store);
 

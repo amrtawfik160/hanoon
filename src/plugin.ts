@@ -127,7 +127,6 @@ import { AuditIntakeService } from "./services/audit-intake-service";
 import { CrashRevertService } from "./services/crash-revert-service";
 import { createAuditAccess } from "./services/audit-access";
 import { createWorkspaceAccess } from "./services/workspace-access";
-import { MemoryCurationService } from "./services/memory-curation-service";
 import { MemoryEmbeddingService } from "./services/memory-embedding-service";
 import {
   systemMaintenanceAuthority,
@@ -429,7 +428,7 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     selfDiagnosisMode: {
       type: "select",
       label: "What a diagnosis becomes",
-      description: "Draft PR pushes a branch for you to read. Pipeline files the fix as an ordinary reviewed job instead, and needs that project's policy to carry an audit intake allowance, whose daily cap and finding ledger it shares. Without one it falls back to a draft pull request.",
+      description: "Draft PR pushes a branch for you to read. Pipeline files the fix as an ordinary reviewed job instead, and needs that project's policy to carry an audit intake allowance, whose daily cap it shares. Without one it falls back to a draft pull request.",
       options: ["draft-pr", "pipeline"],
       default: "draft-pr",
     },
@@ -1468,7 +1467,6 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
     onResults: (project, results, now) => auditIntake.consider(project, results, now),
     warn: (message) => bb.log.warn(message),
   });
-  const memoryCuration = new MemoryCurationService({ clock: { now: clock } });
   const memoryEmbeddings = new MemoryEmbeddingService({
     store,
     clock: { now: clock },
@@ -2378,8 +2376,8 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       }),
       mode: () => config.ok ? selfDiagnosisMode(config.value) : "draft-pr",
       // Filed through the audit intake path on purpose, so the project's own
-      // daily allowance and finding ledger bound this too. A second source of
-      // unattended work keeping its own count would quietly double the first.
+      // daily allowance bounds this too. A second source of unattended work
+      // keeping its own count would quietly double the first.
       filePipelineJob: (input) => {
         const filed = auditIntake.file({
           projectId: input.target.projectId,
@@ -2473,7 +2471,6 @@ export async function createPlugin(bb: BbPluginApi, pluginRoot: string): Promise
       monitors,
       threadNotices,
       jobMemory,
-      memoryCuration,
       productionHealth,
       regressionWatch,
       failureLoop,

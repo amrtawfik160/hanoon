@@ -998,8 +998,7 @@ export function admittedCapabilityFindingPolicy(input: Readonly<{
 
 /**
  * Compatibility classification for callers that still expose the old helper.
- * Navigator assessment uses the versioned ledger policy, including evidence and
- * requirement inputs, through `NavigatorFindingLedger.assess`.
+ * Guard disposition is recomputed from the versioned catalog policy.
  */
 type CompatibilityFindingInput = Readonly<{
   capabilityId: string;

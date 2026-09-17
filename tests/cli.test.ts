@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, expect, it, vi } from "vitest";
@@ -268,6 +269,12 @@ it("does not expose capability promote or rollback", async () => {
   expect(rollback.exitCode).not.toBe(0);
   expect(`${promote.stdout}${promote.stderr}`).toMatch(/unknown capability subcommand/i);
   expect(`${rollback.stdout}${rollback.stderr}`).toMatch(/unknown capability subcommand/i);
+});
+
+it("does not advertise capability promote or rollback in operator docs", () => {
+  for (const path of ["docs/live-acceptance.md", "README.md", "docs/architecture.md"]) {
+    expect(readFileSync(path, "utf8"), path).not.toMatch(/capability promote|capability rollback/u);
+  }
 });
 
 it("projects bounded inventory and receipt details without sources, subjects, or evidence payloads", async () => {
