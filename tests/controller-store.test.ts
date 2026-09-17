@@ -28,6 +28,7 @@ import {
   PROTECTED_CONNECTOR_MIGRATIONS,
   JOB_LEDGER_MIGRATIONS,
   DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
+  INGESTION_SOURCE_MIGRATIONS,
 } from "../src/storage/migrations";
 import { IdempotencyConflictError, openStore, type ControllerFailureCode } from "../src/storage/store";
 import { completeTurnThroughFinalization } from "./support/controller-trust-fixtures";
@@ -241,11 +242,11 @@ it("keeps every shipped migration at its original position and appends new ones"
         MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length + NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length +
           NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length +
             PROTECTED_CONNECTOR_MIGRATIONS.length + JOB_LEDGER_MIGRATIONS.length +
-              DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length,
+              (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length),
   );
   // The burst block is no longer the tail: the navigator effect protocol was
   // appended after it.
-  const burstTail = ALL_MIGRATIONS.length - DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length -
+  const burstTail = ALL_MIGRATIONS.length - (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length) -
     JOB_LEDGER_MIGRATIONS.length - PROTECTED_CONNECTOR_MIGRATIONS.length -
     NAVIGATOR_REVIEW_CONVERGENCE_UPGRADE_MIGRATIONS.length -
     NAVIGATOR_FINDING_LEDGER_UPGRADE_MIGRATIONS.length - MANAGED_AUTOMATION_LIFECYCLE_MIGRATIONS.length -
@@ -373,7 +374,7 @@ it("upgrades the shipped native SDLC schema without rewriting migration history 
     NAVIGATOR_RELEASE_REVIEW_LEDGER_UPGRADE_MIGRATIONS.length -
     MANAGED_AUTOMATION_STATE_UPGRADE_MIGRATIONS.length -
     NAVIGATOR_EFFECT_PROTOCOL_MIGRATIONS.length -
-    DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length;
+    (DEAD_DURABLE_SUBSYSTEM_MIGRATIONS.length + INGESTION_SOURCE_MIGRATIONS.length);
   bb.storage.migrate(db, [...ALL_MIGRATIONS].slice(0, shippedMigrationCount));
   db.prepare(
     `INSERT INTO managed_automations (

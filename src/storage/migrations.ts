@@ -5118,6 +5118,18 @@ CREATE TABLE job_ledger (
 );
 `] as const;
 
+export const INGESTION_SOURCE_MIGRATIONS = [String.raw`
+CREATE TABLE ingestion_source (
+  id TEXT PRIMARY KEY,
+  chat_ref TEXT NOT NULL CHECK (length(chat_ref) BETWEEN 1 AND 256),
+  project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 256),
+  captured_at INTEGER NOT NULL CHECK (captured_at >= 0),
+  excerpt TEXT NOT NULL CHECK (length(excerpt) BETWEEN 1 AND 2000),
+  status TEXT NOT NULL DEFAULT 'disabled' CHECK (status IN ('disabled', 'enabled')),
+  UNIQUE (chat_ref, project_id)
+);
+`] as const;
+
 export const DEAD_DURABLE_SUBSYSTEM_MIGRATIONS = [String.raw`
 DROP TABLE IF EXISTS recipe_live_evidence_receipts;
 DROP TABLE IF EXISTS recipe_model_trial_evidence;
@@ -5249,4 +5261,5 @@ export const ALL_MIGRATIONS = [
   ...PROTECTED_CONNECTOR_MIGRATIONS,
   ...JOB_LEDGER_MIGRATIONS,
   ...DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
+  ...INGESTION_SOURCE_MIGRATIONS,
 ] as const;

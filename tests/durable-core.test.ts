@@ -5,7 +5,11 @@ import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import { parseGlobalConfig } from "../src/config";
 import { hashSecret } from "../src/crypto";
-import { ALL_MIGRATIONS, DEAD_DURABLE_SUBSYSTEM_MIGRATIONS } from "../src/storage/migrations";
+import {
+  ALL_MIGRATIONS,
+  DEAD_DURABLE_SUBSYSTEM_MIGRATIONS,
+  INGESTION_SOURCE_MIGRATIONS,
+} from "../src/storage/migrations";
 import { openStore } from "../src/storage/store";
 import { policyFixture } from "./helpers";
 
@@ -43,6 +47,7 @@ const KEPT_TABLES = [
   "monitors",
   "memories",
   "effects",
+  "ingestion_source",
 ] as const;
 const GONE_SOURCE = [
   "src/navigator/finding-ledger.ts",
@@ -70,7 +75,8 @@ function tableNames(db: ReturnType<typeof fixture>["db"]): Set<string> {
 }
 
 it("appends the drop after every shipped migration", () => {
-  expect(ALL_MIGRATIONS.at(-1)).toBe(DEAD_DURABLE_SUBSYSTEM_MIGRATIONS[0]);
+  expect(ALL_MIGRATIONS.at(-2)).toBe(DEAD_DURABLE_SUBSYSTEM_MIGRATIONS[0]);
+  expect(ALL_MIGRATIONS.at(-1)).toBe(INGESTION_SOURCE_MIGRATIONS[0]);
   expect(DEAD_DURABLE_SUBSYSTEM_MIGRATIONS[0]).toContain("DROP TABLE");
 });
 
